@@ -1,0 +1,43 @@
+npm warn Unknown env config "http-proxy". This will stop working in the next major version of npm.
+
+> pi-session-mcp-bridge-prototype@0.1.0 test
+> node --test test/*.test.mjs
+
+✔ permissions: most specific, recent explicit field, unset inherits, final deny (2.542632ms)
+✔ create durable empty session; create allowed while send denied (32.475242ms)
+✔ no-read lists opaque ID only and cannot leak through search (40.188521ms)
+✔ saved idle_only resumes first; process reused (17.957505ms)
+✔ idle_only skips busy while native and strategy modes retain Pi semantics (21.028476ms)
+✔ concurrent same request_id sends once; new IDs do not content-dedupe (22.355095ms)
+✔ unknown acceptance is journaled; retries never resend; late ACK repairs receipt (19.786977ms)
+✔ context edits and branch selection; raw remains distinct; read does not write (32.939463ms)
+✔ compaction preserves checkpoint and kept context; existing summary only (13.298336ms)
+✔ bounded oversized records can be reconstructed; stale cursors reject (26.593365ms)
+✔ delete stops active process, moves to recoverable trash, leaves project alone (24.245809ms)
+✔ create idempotence persists across a bridge restart (17.48268ms)
+✔ project symlink cannot borrow lexical parent permissions (14.429937ms)
+✔ cycles, duplicate IDs, malformed and unsupported files are not exposed (13.456506ms)
+✔ oversized entry IDs cannot bypass read response bounds (13.043117ms)
+✔ overlapping bridge state and session storage is rejected (9.530009ms)
+✔ shutdown stops admission and drains sends before closing owned runtime (8.88469ms)
+✔ official Pi CLI RPC resumes a durable empty session without credentials (517.440907ms)
+✔ real Pi SDK with faux provider sends, persists, reads and resumes (no real model) (77.615947ms)
+✔ standard MCP stdio client initializes and exercises all five tools (1284.902752ms)
+✔ MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and content read (2577.323507ms)
+✔ RPC pipe failure still requires confirmed process exit before stop returns (5.003986ms)
+✔ pool terminates an unusable old runtime before replacement (1.392356ms)
+ℹ tests 23
+ℹ suites 0
+ℹ pass 23
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 5783.939823
+npm notice
+npm notice New major version of npm available! 11.9.0 -> 12.2.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.2.0
+npm notice To update run: npm install -g npm@12.2.0
+npm notice
+
+Syntax checks: all src/research/test .mjs files passed.
