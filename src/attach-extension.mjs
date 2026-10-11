@@ -3,8 +3,10 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, hash, pageRecords, recordsFor, assertSingleSessionFile, loadSession } from './data.mjs';
-import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, claimFile, updateOwner, AttachmentFailure } from './attachments.mjs';
+import { atomicJson, hash, renderRead, assertSingleSessionFile, loadSession } from './data.mjs';
+import { activityObservation } from './activity.mjs';
+import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, claimFile, updateOwner, assertNoOtherLiveOwner, AttachmentFailure } from './attachments.mjs';
 
 export default function attachExtension(pi){
   const dir=process.env.PI_MCP_ATTACH_DIR;let active;
@@ -17,8 +19,14 @@ export default function attachExtension(pi){
   }
   async function validateStorage(runtime) {
     try {
-      const stat=await assertSingleSessionFile(runtime.session.file,{allowMissing:!runtime.fileObserved});
-      if(!stat&&runtime.ctx.sessionManager.getEntries().some(e=>e.type==='message'&&['user','assistant'].includes(e.message?.role)))throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      let stat=await assertSingleSessionFile(runtime.session.file,{allowMissing:!runtime.fileObserved});
+      if(!stat&&runtime.ctx.sessionManager.getEntries().some(e=>e.type==='message'&&['user','assistant'].includes(e.message?.role))){
+        // First persistence can occur after the missing-file snapshot but
+        // before the in-memory snapshot. Recheck the now-required file before
+        // deciding that those observations represent a storage failure.
+        stat=await assertSingleSessionFile(runtime.session.file);
+      }
+      if(!stat&&runtime.session.header.version!==3)throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
       if(stat&&!runtime.fileObserved){
         const saved=await loadSession(runtime.session.file);
         if(saved.header.id!==runtime.session.header.id)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
@@ -52,20 +60,12 @@ export default function attachExtension(pi){
     record.socket=path.join(dir,`${owner.pid}-${record.generation.slice(0,8)}.sock`);
     let fileObserved;
     await registryTransaction(dir,async()=>{
-      const stat=await assertSingleSessionFile(file,{allowMissing:true});
-      fileObserved=Boolean(stat);
-      if(!stat){
-        // Only a native new/unflushed session may reserve an absent target.
-        const entries=ctx.sessionManager.getEntries();
-        if(header.version!==3||entries.some(e=>e.type==='message'&&['user','assistant'].includes(e.message?.role)))throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
-        // A pending path has no inode yet. Do not permit a different native ID
-        // to reserve that same path while another process still owns it.
-        for(const name of await fs.readdir(dir)){
-          if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name))continue;
-          const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
-          if(other.file===file&&other.sessionId!==header.id&&await ownerAlive(other.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-        }
-      }
+      const observation={session,ctx,fileObserved:false};
+      await validateStorage(observation);
+      fileObserved=observation.fileObserved;
+      // The same path cannot be reserved under another live native identity,
+      // whether first persistence has happened yet or not.
+      await assertNoOtherLiveOwner(dir,session);
       const old=await readClaim(dir,session);
       const sameProcess=old&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
       if(old&&await ownerAlive(old.owner)&&!sameProcess){ctx.shutdown();throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');}
@@ -84,7 +84,7 @@ export default function attachExtension(pi){
       let buffer='',handled=false;
       socket.on('data',async chunk=>{
         if(handled)return;buffer+=chunk;
-        if(Buffer.byteLength(buffer)>500000){socket.destroy();return;}
+        if(Buffer.byteLength(buffer)>MAX_ATTACHMENT_REQUEST_BYTES){socket.destroy();return;}
         const end=buffer.indexOf('\n');if(end<0)return;handled=true;
         try{
           const request=JSON.parse(buffer.slice(0,end));check(request);await validateStorage(runtime);check(request);let data;const args=request.body??{};
@@ -93,8 +93,8 @@ export default function attachExtension(pi){
             const entries=ctx.sessionManager.getEntries(),leafId=ctx.sessionManager.getLeafId();
             const revisionInput={entries,leaf:leafId,generation:record.generation};
             if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)throw new AttachmentFailure('SESSION_TOO_LARGE');
-            const view=args.view??'context',records=recordsFor({entries,leafId},{...args,view});
-            data={view,leaf_id:view!=='raw'&&args.leaf_id!==undefined?args.leaf_id:leafId,generation:record.generation,context_kind:view==='context'?'pi_session_projection_not_final_provider_payload':undefined,...pageRecords(records,{...args,view},hash(revisionInput))};
+            const activity=activityObservation('attached_context',{idle:ctx.isIdle?.(),pending:ctx.hasPendingMessages?.()});
+            data=renderRead({entries,leafId,revision:hash(revisionInput),activity},args,{leafSource:'live',generation:record.generation});
           }else if(request.op==='send'){
             if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))throw new AttachmentFailure('INVALID_ATTACHED_SEND');
             if(args.mode==='idle_only'&&!ctx.isIdle())data={status:'skipped',reason:'busy'};

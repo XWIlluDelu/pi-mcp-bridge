@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { hash, atomicJson } from './data.mjs';
+import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 export class Journal {
   constructor(config) { this.config = config; this.running = new Map(); this.writes = new Map(); }
   file(id) { return path.join(this.config.stateDir,'receipts',`${hash(`${this.config.principal}\0${id}`)}.json`); }
@@ -24,13 +25,14 @@ export class Journal {
     const prior = await this.get(id);
     if (prior) {
       if (prior.key !== key || (body !== undefined && prior.fingerprint !== fingerprint)) throw new Error('REQUEST_ID_CONFLICT');
+      diagnostics.emit('receipt.replay',{op,mutation_ref:diagnosticRef(id),status:prior.receipt.status});
       return prior.receipt;
     }
     if (body === undefined) throw new Error('RECEIPT_NOT_FOUND');
     const base = {key,fingerprint,receipt:{request_id:id,operation:op,status:'unknown'}};
     const save = async result => {
       if (result.status === 'unknown' && ['accepted','rejected'].includes(base.receipt.status)) return base.receipt;
-      base.receipt = {request_id:id,operation:op,...result}; await this.put(id,base); return base.receipt;
+      base.receipt = {request_id:id,operation:op,...result}; await this.put(id,base);diagnostics.emit('receipt.saved',{op,mutation_ref:diagnosticRef(id),status:base.receipt.status,disposition:base.receipt.disposition});return base.receipt;
     };
     // Persist uncertainty before any side effect. A restart never blindly replays.
     await this.put(id,base);

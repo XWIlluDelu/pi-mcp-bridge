@@ -1,3 +1,5 @@
+import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -5,15 +7,24 @@ import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { atomicJson, opaqueId, assertSingleSessionFile } from './data.mjs';
 export class AttachmentFailure extends Error {
-  constructor(code,uncertain=false){super(code);this.code=code;this.uncertain=uncertain;}
+  constructor(code,uncertain=false,options){super(code,options);this.code=code;this.uncertain=uncertain;}
 }
 export async function processIdentity(pid=process.pid){
   if(process.platform!=='linux'||!Number.isSafeInteger(pid)||pid<1)throw new AttachmentFailure('PROCESS_IDENTITY_UNAVAILABLE');
   try {
-    const [stat,boot]=await Promise.all([fs.readFile(`/proc/${pid}/stat`,'utf8'),fs.readFile('/proc/sys/kernel/random/boot_id','utf8')]);
+    let stat;
+    try {stat=await fs.readFile(`/proc/${pid}/stat`,'utf8');}
+    catch(error){
+      // Linux can open stat while the task exists, then return ESRCH from
+      // read after it exits. Only errors from this PID's stat prove absence.
+      if(['ENOENT','ESRCH'].includes(error.code))return null;
+      throw error;
+    }
+    const boot=await fs.readFile('/proc/sys/kernel/random/boot_id','utf8');
     const fields=stat.slice(stat.lastIndexOf(')')+2).split(' ');
+    if(!/^\d+$/.test(fields[19]??'')||!fields[0]||!boot.trim())throw new Error('INVALID_PROCESS_IDENTITY');
     return {pid,start:fields[19],boot:boot.trim(),state:fields[0]};
-  }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('PROCESS_IDENTITY_UNAVAILABLE');}
+  }catch(cause){throw new AttachmentFailure('PROCESS_IDENTITY_UNAVAILABLE',false,{cause});}
 }
 export async function ownerAlive(owner){
   const current=await processIdentity(owner.pid);
@@ -49,9 +60,19 @@ export async function readClaim(dir,session){
     return record;
   }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');}
 }
+// Call while holding registryTransaction: a changed header must not bypass
+// an existing path owner merely because its claim has a different filename.
+export async function assertNoOtherLiveOwner(dir,session){
+  for(const name of await fs.readdir(dir)){
+    if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name))continue;
+    const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
+    if(other.file===session.file&&other.sessionId!==session.header.id&&await ownerAlive(other.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+  }
+}
 export async function reserveOwner(dir,session,kind,owner=undefined){
   return registryTransaction(dir,async()=>{
     await assertSingleSessionFile(session.file);
+    await assertNoOtherLiveOwner(dir,session);
     const old=await readClaim(dir,session);
     if(old&&await ownerAlive(old.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     const record={kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};
@@ -82,6 +103,11 @@ export async function waitOwnerExit(owner,timeout=5000){
 export class AttachedRuntime {
   constructor(config,session,record){this.config=config;this.session=session;this.record=record;this.alive=true;this.attached=true;}
   async request(op,body={},timeout=5000){
+    return diagnostics.measure('attached.request',{op,generation:this.record.generation},()=>this.requestOnce(op,body,timeout));
+  }
+  async requestOnce(op,body={},timeout=5000){
+    const serialized=JSON.stringify({op,body,generation:this.record.generation,file:this.record.file,sessionId:this.record.sessionId})+'\n';
+    if(Buffer.byteLength(serialized)>MAX_ATTACHMENT_REQUEST_BYTES)throw new AttachmentFailure('ATTACHMENT_REQUEST_TOO_LARGE');
     const current=await readClaim(this.config.attachmentDir,this.session);
     if(current?.generation!==this.record.generation)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
     if(!await ownerAlive(this.record.owner)||current.phase!=='ready')throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
@@ -91,7 +117,7 @@ export class AttachedRuntime {
       const timer=setTimeout(()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')),timeout);
       socket.on('error',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')));
       socket.on('end',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')));
-      socket.on('connect',()=>{written=true;socket.write(JSON.stringify({op,body,generation:this.record.generation,file:this.record.file,sessionId:this.record.sessionId})+'\n');});
+      socket.on('connect',()=>{written=true;socket.write(serialized);});
       socket.on('data',chunk=>{
         bytes+=chunk.toString();if(Buffer.byteLength(bytes)>100000)return finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&op==='send'));
         const newline=bytes.indexOf('\n');if(newline<0)return;

@@ -1,10 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { createInterface } from 'node:readline';
+import { readLfLines } from './lf-lines.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile } from './data.mjs';
+import { rpcActivity } from './activity.mjs';
+import { diagnostics } from './diagnostics.mjs';
 import { reserveOwner, updateOwner, releaseOwner, processIdentity, readClaim, ownerAlive, AttachedRuntime, AttachmentFailure } from './attachments.mjs';
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) { super(code); this.code = code; this.uncertain = uncertain; }
@@ -33,6 +35,7 @@ export class PiRpc {
     // Deliberate clean environment: do not borrow host keys or subscriptions.
     this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes',...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
     this.alive = true;
+    const runtimeLog=diagnostics.capture();this.child.once('spawn',()=>runtimeLog('runtime.spawned',{kind:'rpc',generation:this.generation}));
     this.stderr = '';
     this.child.stderr.on('data', chunk => { this.stderr = (this.stderr + chunk.toString()).slice(-4000); });
     const fail = () => {
@@ -41,11 +44,10 @@ export class PiRpc {
       this.pending.clear();
     };
     this.child.once('error', () => { if (!this.child.pid) this.exited = true; fail(); });
-    this.child.once('exit', () => { this.exited = true; this.promptAdmission = null; fail(); });
+    this.child.once('exit', () => { runtimeLog('runtime.exited',{kind:'rpc',generation:this.generation});this.exited = true; this.promptAdmission = null; fail(); });
     this.child.stdin.on('error', fail);
-    this.lines = createInterface({input:this.child.stdout});
     const generation = this.generation;
-    this.lines.on('line', line => {
+    this.lines = readLfLines(this.child.stdout, line => {
       let event; try { event = JSON.parse(line); } catch { return; }
       this.receiveResponse(event, generation);
     });
@@ -69,7 +71,7 @@ export class PiRpc {
     this.pending.delete(event.id); clearTimeout(req.timer);
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation) this.promptAdmission = null;
     const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
-    if (req.timedOut) { req.onLate?.(result); return; }
+    if (req.timedOut) { req.log?.('rpc.late_ack',{op:req.commandType,generation,late:true,status:result.ok?'ok':'error'});req.onLate?.(result); return; }
     if (result.ok) req.resolve(result.data); else req.reject(new RpcFailure(result.code));
   }
   async command(command, timeout = 5000, onLate) {
@@ -81,27 +83,38 @@ export class PiRpc {
     let result, rejection;
     try { result = await this.dispatch(command, timeout, late); }
     catch (error) { if (error.code !== 'PI_REJECTED') throw error; rejection = error; }
-    try { await this.state(); } catch (error) { if (command.type === 'prompt') error.uncertain = true; throw error; }
+    let checkedState;
+    try { checkedState = await this.state(); } catch (error) { if (command.type === 'prompt') error.uncertain = true; throw error; }
     if (rejection) throw rejection;
+    if (command.type === 'get_entries') return {...result,activity:rpcActivity(checkedState,Boolean(this.promptAdmission))};
     return result;
   }
   dispatch(command, timeout = 5000, onLate) {
+    return diagnostics.measure('rpc.command',{op:command.type,generation:this.generation},()=>this.dispatchRequest(command,timeout,onLate));
+  }
+  dispatchRequest(command, timeout = 5000, onLate) {
     if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
     if (command.type === 'prompt' && this.promptAdmission) return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
     const id = randomUUID(), generation = this.generation;
     const serialized = `${JSON.stringify({...command,id})}\n`;
     if (command.type === 'prompt') this.promptAdmission = {id,generation};
     return new Promise((resolve,reject) => {
-      const req = {resolve,reject,onLate,generation,commandType:command.type,written:false,timedOut:false};
+      const req = {resolve,reject,onLate:onLate&&diagnostics.bind(onLate),generation,commandType:command.type,written:false,timedOut:false,log:diagnostics.capture()};
+      const discardRead = () => {
+        if (['get_state','get_entries'].includes(command.type)) this.pending.delete(id);
+      };
       req.timer = setTimeout(() => {
         req.timedOut = true;
+        discardRead();
         reject(new RpcFailure('ACK_TIMEOUT', req.written));
-        // Keep until a late authoritative response or process exit; never resend.
+        // Reads have no durable side effect or useful late result. Prompts keep
+        // their authoritative late-ACK recovery and admission fence.
       },timeout);
       this.pending.set(id,req);
       req.written = true;
       const writeFailed = () => {
         clearTimeout(req.timer); req.timedOut = true;
+        discardRead();
         // A write error does not prove that Pi failed to receive the command.
         // Keep matching ACK recovery possible and keep the admission fence.
         reject(new RpcFailure('WRITE_UNKNOWN',true));
@@ -147,19 +160,19 @@ export class RuntimePool {
       if(claim.phase!=='ready')throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
       if(existing?.attached&&existing.alive&&existing.record.generation===claim.generation)return existing;
       if(existing)await existing.stop();
-      const attached=await new AttachedRuntime(this.config,session,claim).start();this.instances.set(session.id,attached);return attached;
+      const attached=await diagnostics.measure('runtime.attach',{kind:'attached',generation:claim.generation},()=>new AttachedRuntime(this.config,session,claim).start());this.instances.set(session.id,attached);return attached;
     }
-    if(existing?.attached){await existing.stop();this.instances.delete(session.id);return null;}
+    if(existing?.attached){diagnostics.emit('runtime.detached',{kind:'attached',generation:existing.record.generation});await existing.stop();this.instances.delete(session.id);return null;}
     return existing?.alive?existing:null;
   }
   async resolve(session) {
     if(this.starting.has(session.id))return this.starting.get(session.id);
-    const attached=await this.forRead(session);if(attached)return attached;
+    const attached=await this.forRead(session);if(attached){diagnostics.emit('runtime.reused',{kind:attached.attached?'attached':'rpc',generation:attached.generation??attached.record?.generation});return attached;}
     const existing = this.instances.get(session.id);
     if (existing?.alive) return existing;
     if (existing) await existing.stop();
     if (this.starting.has(session.id)) return this.starting.get(session.id);
-    const start = this.factory(session).then(runtime => { this.instances.set(session.id,runtime); return runtime; }).finally(() => this.starting.delete(session.id));
+    const start = diagnostics.measure('runtime.start',{kind:'rpc'},()=>this.factory(session)).then(runtime => { this.instances.set(session.id,runtime); return runtime; }).finally(() => this.starting.delete(session.id));
     this.starting.set(session.id,start); return start;
   }
   get(id) { const r = this.instances.get(id); return r?.alive ? r : null; }

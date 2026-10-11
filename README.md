@@ -139,6 +139,7 @@ cwd, and omits invalid/in-progress files and files over 32 MiB.
 | `context` (default) | Effective native projection with compaction and context edits |
 | `raw` | Stored entries, including hidden originals and other branches |
 | `summary` | Compaction/branch-summary records in the selected projection |
+| `overview` | Extractive source locators, excerpts and tool observations |
 
 Live reads use the owner's entries/leaf; saved reads use the persisted resume
 leaf. `leaf_id` selects ancestry, `entry_id` selects a source and `query` filters
@@ -151,6 +152,16 @@ maximums are 50 / 32,768. Oversized records return `json_fragment`, `char_offset
 and `total_chars`; concatenate fragments before JSON decoding. Continue
 `next_cursor` with the same selection; page budgets may change. Changed history
 or selection yields `STALE_CURSOR`. Response metadata adds overhead.
+
+Overview selects up to 19 records within 10,000 serialized units plus a manifest.
+Its excerpts sample text blocks, pair tools by native call ID, and expose source
+locators and omitted ranges. A missing tool result means unobserved, not running.
+`entry_id`/`query` filter this selection, not the whole history. Excerpt offsets
+address serialized JSON. Use source-linked context/raw reads for complete content.
+
+`activity` describes the current runtime separately from the content snapshot,
+including on historical reads. Unknown values remain unknown; saved-history reads
+do not start a runtime.
 
 ### send
 
@@ -240,3 +251,6 @@ Preserve native session identity and mutation request IDs during recovery.
 Before removing a stale Bridge, registry or permission-editor lock, confirm the
 relevant processes have stopped. Unregistered writers remain outside cooperative
 coordination.
+
+Optional content-free `PI_MCP_LOG=1` diagnostics write to stderr; see
+[measurement boundaries](deploy/diagnostics.md).

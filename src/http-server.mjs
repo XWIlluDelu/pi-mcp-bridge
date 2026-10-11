@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Bridge } from './bridge.mjs';
 import { makeServer } from './server.mjs';
+import { diagnostics } from './diagnostics.mjs';
 
 export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
 export const TOKEN_HEADER = 'x-pi-bridge-token';
@@ -43,6 +44,7 @@ function headers(req, name) {
 }
 function reject(res, status, code) {
   if (res.destroyed || res.writableEnded) return;
+  diagnostics.emit('http.rejected',{http_status:status});
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', Connection: 'close' });
   res.end(JSON.stringify({ error: code }));
 }
@@ -79,7 +81,12 @@ export function createHttpService(bridge, { token, port = 0 }) {
   const listener = http.createServer({ maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 }, (req, res) => {
     req.on('error', () => {});
     res.on('error', () => res.destroy());
-    void handle(req, res).catch(() => reject(res, 500, 'REQUEST_FAILED'));
+    diagnostics.withContext({},()=>{
+      const started=performance.now(),log=diagnostics.capture();
+      log('http.received');
+      res.once('close',()=>log('http.closed',{duration_ms:performance.now()-started,http_status:res.statusCode,response_finished:res.writableFinished}));
+      void handle(req, res).catch(() => reject(res, 500, 'REQUEST_FAILED'));
+    });
   });
   listener.maxConnections = 32;
   async function handle(req, res) {
@@ -133,11 +140,13 @@ export function createHttpService(bridge, { token, port = 0 }) {
         listener.listen(port, '127.0.0.1', () => { listener.off('error', reject); resolve(); });
       });
       expectedHost = `127.0.0.1:${listener.address().port}`;
+      diagnostics.emit('service.ready',{transport:'http'});
       return `http://${expectedHost}/mcp`;
     },
     close() {
       if (closing) return closing;
       stopping = true;
+      diagnostics.emit('service.stopping',{transport:'http'});
       closing = (async () => {
         const stopped = new Promise((resolve, reject) => listener.close(error => error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve()));
         // Stop incomplete uploads/validation; admitted tools remain alive.

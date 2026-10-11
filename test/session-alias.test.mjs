@@ -5,11 +5,87 @@ import os from 'node:os';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { discover, loadSession } from '../src/data.mjs';
-import { reserveOwner, releaseOwner } from '../src/attachments.mjs';
+import { reserveOwner, releaseOwner, updateOwner, processIdentity } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { readClaim, AttachedRuntime } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
+
+test('RPC reservation rejects a different live native ID at the same path before spawning',async t=>{
+ for(const kind of ['tui','rpc'])await t.test(kind,async t=>{
+  const f=await fixture(t),claim=await reserveOwner(f.config.attachmentDir,f.session,kind);
+  const header={...f.session.header,id:'replacement-public-id'};
+  await fs.writeFile(f.session.file,JSON.stringify(header)+'\n');
+  const changed=(await discover(f.config))[0];assert.notEqual(changed.id,f.session.id);
+  for(const phase of ['starting','ready','transitioning']){
+   await updateOwner(f.config.attachmentDir,f.session,claim,{phase});
+   const before=await readClaim(f.config.attachmentDir,f.session);
+   await assert.rejects(reserveOwner(f.config.attachmentDir,changed,'rpc'),/LIVE_OWNER_UNREACHABLE/);
+   const runtime=new PiRpc(f.config,changed);t.after(()=>runtime.stop());
+   await assert.rejects(runtime.start(),/LIVE_OWNER_UNREACHABLE/);assert.equal(runtime.child,undefined);
+   assert.deepEqual(await readClaim(f.config.attachmentDir,f.session),before);
+   assert.equal(await readClaim(f.config.attachmentDir,changed),null);
+  }
+  await releaseOwner(f.config.attachmentDir,f.session,claim);
+  const replacement=await reserveOwner(f.config.attachmentDir,changed,'rpc');
+  await releaseOwner(f.config.attachmentDir,changed,replacement);
+ });
+});
+
+test('an obsolete exact process identity does not fence a replacement native ID forever',async t=>{
+ const f=await fixture(t),identity=await processIdentity();
+ const stale=await reserveOwner(f.config.attachmentDir,f.session,'rpc',{...identity,start:'obsolete-start'});
+ const header={...f.session.header,id:'replacement-public-id'};await fs.writeFile(f.session.file,JSON.stringify(header)+'\n');
+ const changed=(await discover(f.config))[0],replacement=await reserveOwner(f.config.attachmentDir,changed,'rpc');
+ assert.equal(replacement.sessionId,header.id);
+ assert.equal((await readClaim(f.config.attachmentDir,f.session)).generation,stale.generation);
+ await releaseOwner(f.config.attachmentDir,changed,replacement);
+});
+
+test('initial attachment rechecks first persistence after a missing-file snapshot',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const handlers={};let stopped=false;attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
+ const manager=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=manager.getSessionFile(),realLstat=fs.lstat;let raced=false;
+ t.mock.method(fs,'lstat',async function(target,...args){
+  try{return await realLstat.call(fs,target,...args);}catch(error){
+   if(target===file&&error.code==='ENOENT'&&!raced){raced=true;manager.appendMessage({role:'user',content:'initial persistence fixture',timestamp:Date.now()});}
+   throw error;
+  }
+ });
+ try{
+  await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+  assert.equal(raced,true);assert.equal(stopped,false);
+  const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session);
+  assert.equal(claim.phase,'ready');assert.equal((await new AttachedRuntime(f.config,session,claim).state()).sessionId,session.header.id);
+ }finally{t.mock.restoreAll();await handlers.session_shutdown({});if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
+});
+
+test('initial attachment rejects a persisted file belonging to a different native manager',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const handlers={};let stopped=false;attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
+ const first=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=first.getSessionFile(),second=SessionManager.open(file);
+ assert.notEqual(first.getSessionId(),second.getSessionId());
+ first.appendMessage({role:'user',content:'first owner persisted',timestamp:Date.now()});
+ try{
+  await assert.rejects(handlers.session_start({},{mode:'tui',sessionManager:second,isIdle:()=>true,shutdown:()=>{stopped=true;}}),/RUNTIME_SESSION_CHANGED/);
+  assert.equal(stopped,true);assert.equal(await readClaim(f.config.attachmentDir,{file,header:second.getHeader()}),null);
+ }finally{await handlers.session_shutdown({});if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
+});
+
+test('persisted paths retain protection against a different live native owner claim',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const a={},b={};attachExtension({on:(name,fn)=>{a[name]=fn;}});attachExtension({on:(name,fn)=>{b[name]=fn;}});
+ const first=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=first.getSessionFile(),second=SessionManager.open(file);
+ const sessionA={file,header:first.getHeader()},sessionB={file,header:second.getHeader()};let stopped=false;
+ try{
+  await a.session_start({},{mode:'tui',sessionManager:first,isIdle:()=>true,shutdown:()=>{}});
+  const claim=await readClaim(f.config.attachmentDir,sessionA);
+  second.appendMessage({role:'user',content:'second manager persisted first',timestamp:Date.now()});
+  await assert.rejects(b.session_start({},{mode:'tui',sessionManager:second,isIdle:()=>true,shutdown:()=>{stopped=true;}}),/LIVE_OWNER_UNREACHABLE/);
+  assert.equal(stopped,true);assert.equal(await readClaim(f.config.attachmentDir,sessionB),null);
+  assert.equal((await readClaim(f.config.attachmentDir,sessionA)).generation,claim.generation);
+ }finally{await a.session_shutdown({});await b.session_shutdown({});if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
+});
 
 async function fixture(t) {
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-alias-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
@@ -103,6 +179,49 @@ test('missing targets do not bypass canonical parent or observed-file checks',as
   await assert.rejects(handlers.agent_settled(),{code:'ENOENT'});assert.equal(stopped,true);
  }finally{
   await handlers.session_shutdown({reason:'quit'});
+  if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;
+ }
+});
+
+test('first persistence between missing lstat and memory snapshot is revalidated before shutdown',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const handlers={};let stopped=false;attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
+ const realLstat=fs.lstat;
+ try{
+  for(const mutation of ['valid','valid-name-event','hardlink','wrong-header','removed']){
+   if(mutation!=='valid')await handlers.session_shutdown({reason:'new'});
+   stopped=false;
+   const manager=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=manager.getSessionFile();
+   await handlers.session_start({reason:'new'},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+   const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session),runtime=new AttachedRuntime(f.config,session,claim);
+   let raced=false;
+   t.mock.method(fs,'lstat',async function(target,...args){
+    try{return await realLstat.call(fs,target,...args);}
+    catch(error){
+     if(target===file&&error.code==='ENOENT'&&!raced){
+      raced=true;
+      manager.appendMessage({role:'user',content:'first persisted fixture',timestamp:Date.now()});
+      if(mutation==='hardlink')await fs.link(file,path.join(f.dir,'racing-alias.jsonl'));
+      if(mutation==='wrong-header'){
+       const lines=(await fs.readFile(file,'utf8')).trim().split('\n').map(JSON.parse);lines[0].id='different-native-id';await fs.writeFile(file,lines.map(JSON.stringify).join('\n')+'\n');
+      }
+      if(mutation==='removed')await fs.unlink(file);
+     }
+     throw error; // Return the old missing-file observation after persistence.
+    }
+   });
+   try{
+    if(mutation.startsWith('valid')){
+     if(mutation==='valid-name-event')await handlers.session_info_changed({name:'public fixture'});
+     assert.equal((await runtime.state()).sessionId,session.header.id);assert.equal(stopped,false);
+     assert.equal((await runtime.read({session_id:'fixture',view:'raw'})).items.length,1);
+    }else{await assert.rejects(runtime.state());assert.equal(stopped,true);}
+    assert.equal(raced,true);
+    assert.equal((await readClaim(f.config.attachmentDir,session)).generation,claim.generation);
+   }finally{t.mock.restoreAll();}
+  }
+ }finally{
+  t.mock.restoreAll();await handlers.session_shutdown({reason:'quit'});
   if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;
  }
 });

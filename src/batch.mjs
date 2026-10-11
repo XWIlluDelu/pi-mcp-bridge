@@ -1,4 +1,5 @@
 import { batchSchema } from './tool-schemas.mjs';
+import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 export const BATCH_RESPONSE_LIMIT=32768;
 // Ten 100,000-code-unit prompts, worst-case JSON escaping, plus envelopes.
 export const BATCH_INPUT_LIMIT=6100000;
@@ -35,7 +36,7 @@ export async function executeBatch(bridge,input){
   const item={index,op};
   const actual=op==='read'?{...args,max_chars:Math.min(args.max_chars??12000,readBudget)}:args;
   if(op==='read')item.applied_max_chars=actual.max_chars;
-  try{item.result=await bridge[op](actual);}catch(e){item.error={code:publicError(e)};}
+  try{item.result=await diagnostics.measure('batch.item',{op,index,mutation_ref:diagnosticRef(args.request_id),session_ref:diagnosticRef(args.session_id)},()=>bridge[op](actual));}catch(e){item.error={code:publicError(e)};}
   payload.results.push(item);
  }
  // Do not silently truncate a result or invent a continuation cursor. Normal receipts fit the reserve.
