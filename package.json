@@ -1,0 +1,1 @@
+{"name":"pi-session-mcp-bridge-prototype","private":true,"type":"module","version":"0.1.0","scripts":{"test":"node --test test/*.test.mjs","start":"node src/server.mjs"},"dependencies":{"@earendil-works/pi-coding-agent":"1.1.0","@modelcontextprotocol/sdk":"1.29.0","zod":"3.25.76"}}

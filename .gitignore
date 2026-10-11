@@ -1,0 +1,6 @@
+node_modules/
+.npm-cache/
+upstream-pi/
+demo/state/
+demo/sessions/
+demo/owner-config.json
