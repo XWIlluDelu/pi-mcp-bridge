@@ -131,3 +131,63 @@ test('MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and c
     const removed=await call('delete',{session_id,request_id:'delete'});assert.equal(removed.status,'deleted');
   } finally {await client.close();}
 });
+
+
+test('real RPC preparation barrier preserves unknown receipts and fences admission until ACK or process exit',async t=>{
+  const f=await configFixture(t),extension=path.join(f.dir,'admission-barrier.mjs');
+  const entered=path.join(f.dir,'entered.jsonl'),release=path.join(f.dir,'release');
+  await fs.writeFile(extension,`import fs from 'node:fs/promises';
+import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(path.join(base,'node_modules/@earendil-works/pi-ai/dist/index.js'))};
+export default function(pi){
+ globalThis.fetch=async()=>{throw new Error('OFFLINE_FIXTURE');};
+ const faux=fauxProvider({provider:'admission-fixture',models:[{id:'slow',name:'Offline admission fixture'}],tokensPerSecond:10,tokenSize:{min:1,max:1}});
+ faux.setResponses([fauxAssistantMessage('Long synthetic response holds the first run active for normal steer and queue admission.')]);pi.registerProvider(faux.provider);
+ pi.on('before_agent_start',async(event)=>{
+  await fs.appendFile(${JSON.stringify(entered)},JSON.stringify({pid:process.pid,prompt:event.prompt})+'\\n');
+  if(event.prompt.startsWith('HOLD'))while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,5));
+ });
+}`);
+  f.config.piArgs=['-e',extension,'--provider','admission-fixture','--model','slow','--thinking','off'];
+  const bridge=await new Bridge(f.config).init();
+  const rows=async()=>{try{return (await fs.readFile(entered,'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);}catch(e){if(e.code==='ENOENT')return [];throw e;}};
+  const until=async predicate=>{const end=Date.now()+10000;while(Date.now()<end){if(await predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('ADMISSION_FIXTURE_DEADLINE');};
+  try{
+   const made=await bridge.create({folder_id:'project',request_id:'create'}),session_id=made.session_id;
+   const first=await bridge.send({session_id,request_id:'first',text:'HOLD first',timeout_ms:50});
+   assert.equal(first.status,'unknown');assert.equal(first.reason,'ACK_TIMEOUT');
+   const runtime=bridge.pool.get(session_id);
+   await until(async()=> (await rows()).length===1);
+   assert.equal((await runtime.state()).isStreaming,false); // Pi has not published busy during preparation.
+   assert.deepEqual(await bridge.send({session_id,request_id:'first'}),first);
+   for(const mode of ['native','idle_only','steer','queue']){
+    const receipt=await bridge.send({session_id,request_id:'blocked-'+mode,text:'BLOCKED '+mode,mode});
+    assert.equal(receipt.status,'rejected');assert.equal(receipt.reason,'PROMPT_ADMISSION_PENDING');
+   }
+   assert.equal((await rows()).length,1);
+   await fs.writeFile(release,'release');
+   let recovered;
+   await until(async()=>{recovered=await bridge.send({session_id,request_id:'first'});return recovered.status==='accepted';});
+   assert.equal(recovered.disposition,'started');assert.equal(recovered.completion,'not_tracked');
+   for(const mode of ['steer','queue']){
+    const receipt=await bridge.send({session_id,request_id:mode,text:'normal '+mode,mode});
+    assert.equal(receipt.status,'accepted');assert.equal(receipt.disposition,'queued');
+   }
+   assert.equal((await bridge.send({session_id,request_id:'blocked-idle_only'})).reason,'PROMPT_ADMISSION_PENDING');
+   assert.equal((await rows()).some(row=>row.prompt.startsWith('BLOCKED')),false);
+   await bridge.pool.stop(session_id);
+   assert.equal(runtime.exited,true);
+   // A separate held admission ends with exact child death, not a late ACK.
+   await fs.unlink(release);
+   const held=await bridge.send({session_id,request_id:'exit-held',text:'HOLD until exit',timeout_ms:50});
+   assert.equal(held.status,'unknown');
+   const old=bridge.pool.get(session_id),oldGeneration=old.generation;
+   assert.ok(old.promptAdmission);
+   await bridge.pool.stop(session_id);
+   assert.equal(old.exited,true);assert.equal(old.promptAdmission,null);
+   assert.deepEqual(await bridge.send({session_id,request_id:'exit-held'}),held);
+   await fs.writeFile(release,'release');
+   const next=await bridge.send({session_id,request_id:'after-exit',text:'fresh runtime',timeout_ms:5000});
+   assert.equal(next.status,'accepted');assert.equal(next.disposition,'started');
+   assert.notEqual(bridge.pool.get(session_id).generation,oldGeneration);
+  }finally{await bridge.close();}
+});

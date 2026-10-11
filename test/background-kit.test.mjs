@@ -36,7 +36,8 @@ test('user-service template parses with systemd without installing or starting a
 test('bounded detached MCP client survives launcher exit and reloads owner grants without a TUI',async()=>{
  const f=await fixture();let pid;
  const ready=path.join(f.dir,'ready'),changed=path.join(f.dir,'changed'),stop=path.join(f.dir,'stop'),stopped=path.join(f.dir,'stopped');
- async function wait(file){const end=Date.now()+10000;while(Date.now()<end){try{return await fs.readFile(file,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}await new Promise(r=>setTimeout(r,30));}throw new Error('Detached fixture deadline');}
+ // writeFile can expose an empty/partial JSON marker before the writer finishes.
+ async function wait(file,parse=value=>value){const end=Date.now()+10000;while(Date.now()<end){try{return parse(await fs.readFile(file,'utf8'));}catch(e){if(e.code!=='ENOENT'&&!(e instanceof SyntaxError))throw e;}await new Promise(r=>setTimeout(r,30));}throw new Error('Detached fixture deadline');}
  const clientFile=path.join(f.dir,'client.mjs'),launcherFile=path.join(f.dir,'launcher.mjs');
  const sdk=path.join(base,'node_modules/@modelcontextprotocol/sdk/dist/esm/client');
  await fs.writeFile(clientFile,`import fs from 'node:fs/promises';import {Client} from ${JSON.stringify(path.join(sdk,'index.js'))};import {StdioClientTransport} from ${JSON.stringify(path.join(sdk,'stdio.js'))};
@@ -49,8 +50,8 @@ test('bounded detached MCP client survives launcher exit and reloads owner grant
  await fs.writeFile(launcherFile,`import {spawn} from 'node:child_process';const child=spawn(process.execPath,[${JSON.stringify(clientFile)}],{detached:true,stdio:'ignore',env:{PATH:process.env.PATH}});child.unref();`);
  try{
   const launcher=spawn(process.execPath,[launcherFile],{stdio:'ignore',env:{PATH:process.env.PATH}});const launcherPid=launcher.pid;assert.equal(await new Promise(r=>launcher.once('exit',r)),0);
-  const identity=JSON.parse(await wait(ready));pid=identity.pid;assert.notEqual(identity.ppid,launcherPid);process.kill(pid,0);
-  f.config.grants[0].new_session=false;await fs.writeFile(f.file,JSON.stringify(f.config));await fs.writeFile(path.join(f.dir,'check'),'check');assert.equal(JSON.parse(await wait(changed)).folders,0);
+  const identity=await wait(ready,JSON.parse);pid=identity.pid;assert.notEqual(identity.ppid,launcherPid);process.kill(pid,0);
+  f.config.grants[0].new_session=false;await fs.writeFile(f.file,JSON.stringify(f.config));await fs.writeFile(path.join(f.dir,'check'),'check');assert.equal((await wait(changed,JSON.parse)).folders,0);
   await fs.writeFile(stop,'stop');await wait(stopped);await assert.rejects(fs.stat(path.join(f.config.stateDir,'bridge.lock')),{code:'ENOENT'});
  }finally{
   await fs.writeFile(stop,'stop');if(pid)await wait(stopped).catch(()=>{try{process.kill(pid,'SIGTERM');}catch{}});await fs.rm(f.dir,{recursive:true,force:true});

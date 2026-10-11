@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, opaqueId } from './data.mjs';
+import { atomicJson, opaqueId, assertSingleSessionFile } from './data.mjs';
 export class AttachmentFailure extends Error {
   constructor(code,uncertain=false){super(code);this.code=code;this.uncertain=uncertain;}
 }
@@ -51,6 +51,7 @@ export async function readClaim(dir,session){
 }
 export async function reserveOwner(dir,session,kind,owner=undefined){
   return registryTransaction(dir,async()=>{
+    await assertSingleSessionFile(session.file);
     const old=await readClaim(dir,session);
     if(old&&await ownerAlive(old.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     const record={kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};

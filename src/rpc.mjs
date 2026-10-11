@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { assertSingleSessionFile } from './data.mjs';
 import { reserveOwner, updateOwner, releaseOwner, processIdentity, readClaim, ownerAlive, AttachedRuntime, AttachmentFailure } from './attachments.mjs';
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) { super(code); this.code = code; this.uncertain = uncertain; }
@@ -22,8 +23,9 @@ export function launchProfile(config, hostEnv = process.env) {
   return {agentDir,env,toolArgs:tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
 }
 export class PiRpc {
-  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; }
+  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; }
   async start() {
+    await assertSingleSessionFile(this.session.file);
     const {agentDir,env,toolArgs} = launchProfile(this.config);
     await fs.mkdir(agentDir, {recursive:true, mode:0o700});
     const cli = fileURLToPath(new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url));
@@ -39,18 +41,13 @@ export class PiRpc {
       this.pending.clear();
     };
     this.child.once('error', () => { if (!this.child.pid) this.exited = true; fail(); });
-    this.child.once('exit', () => { this.exited = true; fail(); });
+    this.child.once('exit', () => { this.exited = true; this.promptAdmission = null; fail(); });
     this.child.stdin.on('error', fail);
     this.lines = createInterface({input:this.child.stdout});
+    const generation = this.generation;
     this.lines.on('line', line => {
       let event; try { event = JSON.parse(line); } catch { return; }
-      if (event.type !== 'response') return; // Never attribute a later settled event to a unique send.
-      const req = this.pending.get(event.id);
-      if (!req) return;
-      this.pending.delete(event.id); clearTimeout(req.timer);
-      const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
-      if (req.timedOut) { req.onLate?.(result); return; }
-      if (result.ok) req.resolve(result.data); else req.reject(new RpcFailure(result.code));
+      this.receiveResponse(event, generation);
     });
     try {
       if(this.ownerRecord){const owner=await processIdentity(this.child.pid);if(!owner)throw new RpcFailure('RUNTIME_START_FAILED');await updateOwner(this.config.attachmentDir,this.session,this.ownerRecord,{owner,phase:'ready'});}
@@ -60,6 +57,20 @@ export class PiRpc {
       await this.stop();
       throw new RpcFailure('RUNTIME_START_FAILED');
     }
+  }
+  receiveResponse(event, generation) {
+    if (generation !== this.generation || !event || event.type !== 'response') return;
+    const req = this.pending.get(event.id);
+    if (!req || req.generation !== generation) return;
+    // Only the matching prompt ACK is evidence of completed admission. State,
+    // timers, unrelated events and malformed responses cannot clear uncertainty.
+    if (req.commandType === 'prompt' && (event.command !== 'prompt' ||
+        (event.success !== false && !(event.success === true && ['started','queued','handled'].includes(event.data?.disposition))))) return;
+    this.pending.delete(event.id); clearTimeout(req.timer);
+    if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation) this.promptAdmission = null;
+    const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
+    if (req.timedOut) { req.onLate?.(result); return; }
+    if (result.ok) req.resolve(result.data); else req.reject(new RpcFailure(result.code));
   }
   async command(command, timeout = 5000, onLate) {
     if (command.type === 'get_state') return this.state(timeout);
@@ -76,9 +87,12 @@ export class PiRpc {
   }
   dispatch(command, timeout = 5000, onLate) {
     if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
-    const id = randomUUID();
+    if (command.type === 'prompt' && this.promptAdmission) return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
+    const id = randomUUID(), generation = this.generation;
+    const serialized = `${JSON.stringify({...command,id})}\n`;
+    if (command.type === 'prompt') this.promptAdmission = {id,generation};
     return new Promise((resolve,reject) => {
-      const req = {resolve,reject,onLate,written:false,timedOut:false};
+      const req = {resolve,reject,onLate,generation,commandType:command.type,written:false,timedOut:false};
       req.timer = setTimeout(() => {
         req.timedOut = true;
         reject(new RpcFailure('ACK_TIMEOUT', req.written));
@@ -86,9 +100,14 @@ export class PiRpc {
       },timeout);
       this.pending.set(id,req);
       req.written = true;
-      this.child.stdin.write(`${JSON.stringify({...command,id})}\n`, err => {
-        if (err) { clearTimeout(req.timer); this.pending.delete(id); reject(new RpcFailure('WRITE_UNKNOWN',true)); }
-      });
+      const writeFailed = () => {
+        clearTimeout(req.timer); req.timedOut = true;
+        // A write error does not prove that Pi failed to receive the command.
+        // Keep matching ACK recovery possible and keep the admission fence.
+        reject(new RpcFailure('WRITE_UNKNOWN',true));
+      };
+      try { this.child.stdin.write(serialized, err => { if (err) writeFailed(); }); }
+      catch { writeFailed(); }
     });
   }
   async state(timeout = 5000) {
@@ -102,13 +121,13 @@ export class PiRpc {
   entries() { return this.command({type:'get_entries'}); }
   async stop() {
     const release=async()=>{if(this.ownerRecord){await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);this.ownerRecord=null;}};
-    if (!this.child || this.exited) {await release();return;}
+    if (!this.child || this.exited) {this.promptAdmission=null;await release();return;}
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = (async () => {
       const exited = new Promise(resolve => this.child.once('exit',resolve));
       this.child.kill('SIGTERM');
       const timer = setTimeout(() => this.child.kill('SIGKILL'),1500);
-      await exited; clearTimeout(timer); this.lines?.close();
+      await exited; this.exited=true; this.promptAdmission=null; clearTimeout(timer); this.lines?.close();
       await release();
     })();
     return this.stopPromise;

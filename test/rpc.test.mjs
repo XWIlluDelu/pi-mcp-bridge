@@ -63,3 +63,42 @@ test('pool terminates an unusable old runtime before replacement',async()=>{
   pool.instances.set('s',{alive:false,stop:async()=>{await new Promise(r=>setImmediate(r));stopped=true;}});
   await pool.resolve({id:'s'});await pool.close();
 });
+
+test('unresolved prompt admission survives timeout, idle, malformed and old-generation replies',async()=>{
+ const rpc=new PiRpc({},{}),writes=[];rpc.alive=true;
+ rpc.child={stdin:{write:line=>writes.push(JSON.parse(line))}};
+ let late;
+ await assert.rejects(rpc.dispatch({type:'prompt',message:'first'},10,result=>{late=result;}),{code:'ACK_TIMEOUT',uncertain:true});
+ const first=writes[0],generation=rpc.generation;
+ const state=rpc.dispatch({type:'get_state'},1000);const stateRequest=writes.at(-1);
+ rpc.receiveResponse({type:'response',id:stateRequest.id,success:true,data:{isStreaming:false}},generation);await state;
+ for(const event of [
+  {type:'agent_settled'},
+  {type:'response',id:first.id,command:'get_state',success:true,data:{disposition:'started'}},
+  {type:'response',id:first.id,command:'prompt',success:true,data:{}},
+ ])rpc.receiveResponse(event,generation);
+ const ack={type:'response',id:first.id,command:'prompt',success:true,data:{disposition:'started'}};
+ rpc.receiveResponse(ack,'old-generation');
+ await assert.rejects(rpc.dispatch({type:'prompt',message:'second'}),{code:'PROMPT_ADMISSION_PENDING',uncertain:false});
+ assert.equal(writes.filter(x=>x.type==='prompt').length,1);
+ rpc.receiveResponse(ack,generation);assert.equal(late.data.disposition,'started');
+ const next=rpc.dispatch({type:'prompt',message:'next',streamingBehavior:'steer'},1000),nextRequest=writes.at(-1);
+ rpc.receiveResponse(ack,generation);assert.equal(rpc.promptAdmission.id,nextRequest.id);
+ rpc.receiveResponse({type:'response',id:nextRequest.id,command:'prompt',success:true,data:{disposition:'queued'}},generation);
+ assert.equal((await next).disposition,'queued');
+});
+test('write uncertainty retains admission; authoritative rejection or confirmed exit releases it',async()=>{
+ for(const failure of ['callback','throw']){
+  const rpc=new PiRpc({},{});rpc.alive=true;let written;
+  const child=new EventEmitter();child.stdin={write:(line,cb)=>{written=JSON.parse(line);if(failure==='throw')throw new Error('synthetic');cb(new Error('synthetic'));}};rpc.child=child;
+  await assert.rejects(rpc.dispatch({type:'prompt',message:'first'},1000),{code:'WRITE_UNKNOWN',uncertain:true});
+  assert.ok(rpc.promptAdmission);
+  await assert.rejects(rpc.dispatch({type:'prompt',message:'second'}),{code:'PROMPT_ADMISSION_PENDING'});
+  if(failure==='callback'){
+   rpc.receiveResponse({type:'response',id:written.id,command:'prompt',success:false},rpc.generation);assert.equal(rpc.promptAdmission,null);
+  }else{
+   child.kill=()=>{assert.ok(rpc.promptAdmission);setImmediate(()=>child.emit('exit',0));};
+   await rpc.stop();assert.equal(rpc.promptAdmission,null);assert.equal(rpc.exited,true);
+  }
+ }
+});
