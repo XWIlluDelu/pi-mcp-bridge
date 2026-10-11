@@ -1,3 +1,4 @@
+import { loadSavedSession } from '../src/data.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -80,7 +81,7 @@ test('real Pi SDK with faux provider sends, persists, reads and resumes (no real
     const sent2=await bridge.send({session_id:made.session_id,request_id:'prompt-2',text:'second',mode:'idle_only'});
     assert.equal(sent2.disposition,'started');await bridge.pool.get(made.session_id).done();
     assert.equal(created,2);assert.equal(faux.state.callCount,2);assert.equal(settled,2);
-    const saved=await bridge.session(made.session_id); assert.ok(saved.entries.some(e=>e.message?.role==='assistant'));
+    const saved=await loadSavedSession(await bridge.session(made.session_id)); assert.ok(saved.entries.some(e=>e.message?.role==='assistant'));
   } finally {await bridge.close();}
 });
 

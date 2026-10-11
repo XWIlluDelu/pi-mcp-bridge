@@ -8,6 +8,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { Bridge } from './bridge.mjs';
 import { makeServer } from './server.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { validateOwnerConfig } from './owner-config.mjs';
 
 export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
 export const TOKEN_HEADER = 'x-pi-bridge-token';
@@ -28,10 +29,12 @@ async function privateFile(file, limit) {
 }
 
 export async function loadHttpConfig(file) {
-  const config = JSON.parse(await privateFile(file, 1024 * 1024));
+  let config;
+  try { config = JSON.parse(await privateFile(file, 1024 * 1024)); }
+  catch (error) { if (error instanceof SyntaxError) throw new Error('INVALID_OWNER_CONFIG'); throw error; }
+  validateOwnerConfig(config);
   const settings = config.http;
-  if (!settings || !Number.isInteger(settings.port) || settings.port < 1 || settings.port > 65535 ||
-      Object.keys(settings).some(key => !['port', 'tokenFile'].includes(key))) throw new Error('INVALID_HTTP_CONFIG');
+  if (!settings) throw new Error('INVALID_HTTP_CONFIG');
   const token = (await privateFile(settings.tokenFile, 257)).replace(/\n$/, '');
   if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
   return { config, token, port: settings.port };

@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
+import { loadSavedSession } from '../src/data.mjs';
 import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
@@ -42,7 +43,7 @@ test('permissions: most specific, recent explicit field, unset inherits, final d
 test('create durable empty session; create allowed while send denied',async t=>{
   const f=await fixture(t,cwd=>[{folder:cwd,new_session:true,send:false}]);
   assert.equal(f.created.status,'created');
-  const [s]=await f.bridge.sessions(); assert.equal(s.entries.length,0);
+  const [s]=await f.bridge.sessions(); assert.equal((await loadSavedSession(s)).entries.length,0);
   assert.equal((await fs.readFile(s.file,'utf8')).trim().split('\n').length,1);
   assert.equal((await f.bridge.send({session_id:f.id,request_id:'deny',text:'hello'})).status,'rejected');
 });
@@ -172,11 +173,11 @@ test('delete stops active process, moves to recoverable trash, leaves project al
   const r=await f.bridge.delete({session_id:f.id,request_id:'delete'});
   assert.equal(r.status,'deleted');assert.equal(f.runtime.alive,false);assert.equal((await f.bridge.list()).sessions.length,0);
   assert.equal(await fs.readFile(path.join(f.cwd,'keep.txt'),'utf8'),'untouched');
-  assert.ok((await fs.stat(path.join(f.config.stateDir,'trash',`${r.restore_token}.jsonl`))).size>0);
-  assert.deepEqual(await f.bridge.delete({session_id:f.id,request_id:'delete'}),r);
   const metadata=JSON.parse(await fs.readFile(path.join(f.config.stateDir,'trash',`${r.restore_token}.restore.json`),'utf8'));
+  assert.ok((await fs.stat(metadata.trash_path)).size>0);
+  assert.deepEqual(await f.bridge.delete({session_id:f.id,request_id:'delete'}),r);
   assert.equal(metadata.session_id,f.id);
-  await fs.rename(path.join(f.config.stateDir,'trash',`${r.restore_token}.jsonl`),metadata.original_path);
+  await fs.rename(metadata.trash_path,metadata.original_path);
   assert.equal((await f.bridge.list()).sessions[0].session_id,f.id);
 });
 test('create idempotence persists across a bridge restart',async t=>{
@@ -216,16 +217,17 @@ test('project symlink cannot borrow lexical parent permissions',async t=>{
   assert.equal((await f.bridge.send({session_id:f.id,request_id:'symlink',text:'hello'})).status,'rejected');
 });
 
-test('cycles, duplicate IDs, malformed and unsupported files are not exposed',async t=>{
+test('invalid transcript trees retain identity but content reads reject',async t=>{
   const f=await fixture(t);const [s]=await f.bridge.sessions();
   await fs.appendFile(s.file,JSON.stringify({type:'message',id:'cycle',parentId:'cycle',message:{role:'user',content:'x'}})+'\n');
-  assert.equal((await f.bridge.list()).sessions.length,0);
-  await assert.rejects(f.bridge.read({session_id:f.id}),/NOT_FOUND_OR_DENIED/);
+  assert.equal((await f.bridge.list()).sessions[0].session_id,f.id);
+  await assert.rejects(f.bridge.read({session_id:f.id}),/INVALID_SESSION_TREE/);
 });
 
 test('oversized entry IDs cannot bypass read response bounds',async t=>{
   const f=await fixture(t);await append(f,[{type:'message',id:'x'.repeat(100000),parentId:null,message:{role:'user',content:'test'}}]);
-  assert.equal((await f.bridge.list()).sessions.length,0);
+  assert.equal((await f.bridge.list()).sessions[0].session_id,f.id);
+  await assert.rejects(f.bridge.read({session_id:f.id}),/INVALID_SESSION_TREE/);
 });
 
 test('overlapping bridge state and session storage is rejected',async t=>{
@@ -243,4 +245,40 @@ test('shutdown stops admission and drains sends before closing owned runtime',as
   await assert.rejects(f.bridge.send({session_id:f.id,request_id:'late',text:'no'}),/BRIDGE_CLOSING/);
   unblock();await sending;await closing;
   assert.equal(f.runtime.alive,false);assert.equal(f.runtime.resumes,1);
+});
+
+test('delete preparation failure leaves an owned runtime alive and creates no restore intent',async t=>{
+ const f=await fixture(t);await f.bridge.send({session_id:f.id,request_id:'start',text:'fixture'});
+ await fs.mkdir(path.join(f.config.stateDir,'trash'),{mode:0o755});await fs.chmod(path.join(f.config.stateDir,'trash'),0o755);
+ const result=await f.bridge.delete({session_id:f.id,request_id:'delete'});
+ assert.equal(result.status,'rejected');assert.equal(f.runtime.alive,true);
+ assert.deepEqual(await fs.readdir(path.join(f.config.stateDir,'trash')),[]);
+ assert.deepEqual(await fs.readdir(path.join(f.config.sessionRoots[0],'.pi-mcp-trash')),[]);
+ assert.equal((await f.bridge.list()).sessions.length,1);
+});
+
+test('delete rename failure cleans intents while post-move sync failure preserves recoverability',async t=>{
+ for(const phase of ['rename','sync']){
+  const f=await fixture(t),session=await f.bridge.session(f.id);let moved=false;
+  const rename=fs.rename,open=fs.open;
+  t.mock.method(fs,'rename',async(from,to)=>{
+   if(from===session.file){if(phase==='rename')throw Object.assign(new Error('fixture'),{code:'EXDEV'});await rename(from,to);moved=true;return;}
+   return rename(from,to);
+  });
+  t.mock.method(fs,'open',async(file,...args)=>{
+   const fd=await open(file,...args);
+   if(moved&&file===path.join(path.dirname(session.file),'.pi-mcp-trash'))fd.sync=async()=>{throw Object.assign(new Error('fixture'),{code:'EIO'});};
+   return fd;
+  });
+  let result;try{result=await f.bridge.delete({session_id:f.id,request_id:'delete'});}finally{t.mock.restoreAll();}
+  const intents=await fs.readdir(path.join(f.config.stateDir,'trash'));
+  if(phase==='rename'){
+   assert.equal(result.status,'rejected');assert.deepEqual(intents,[]);assert.ok(await fs.stat(session.file));
+  }else{
+   assert.equal(result.status,'unknown');assert.equal(intents.length,1);
+   const metadata=JSON.parse(await fs.readFile(path.join(f.config.stateDir,'trash',intents[0]),'utf8'));
+   assert.ok(await fs.stat(metadata.trash_path));assert.ok(await fs.stat(metadata.metadata_path));await assert.rejects(fs.stat(session.file),{code:'ENOENT'});
+   assert.deepEqual(await f.bridge.delete({session_id:f.id,request_id:'delete'}),result);
+  }
+ }
 });

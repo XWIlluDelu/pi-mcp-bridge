@@ -127,8 +127,9 @@ Returns discoverable opaque session IDs and creation-capable folders. Readable
 rows include bounded title/cwd, leaf and permissions; unreadable rows contain only
 the ID. Query searches readable title/cwd. Offset/limit paginate rows.
 
-Discovery parses configured native v3 histories, requires an existing project
-cwd, and omits invalid/in-progress files and files over 32 MiB.
+Discovery reads native identity separately from transcript bodies and execution
+cwd. Explicit session access can remain usable when its project directory is
+unavailable; cold start/create require a usable canonical cwd.
 
 ### read
 
@@ -163,6 +164,9 @@ address serialized JSON. Use source-linked context/raw reads for complete conten
 including on historical reads. Unknown values remain unknown; saved-history reads
 do not start a runtime.
 
+`overview_scope` reports pre-filter coverage on every page, including when
+filters exclude the manifest record.
+
 ### send
 
 Use a stable `request_id`, `session_id`, `text` and optional mode:
@@ -196,9 +200,10 @@ empty v3 session without a model call. Send an initial prompt separately if allo
 Delete requires its own permission and confirmed writer exit. It moves only the
 JSONL, preserving project files, and returns a replayable restore token.
 
-Trash and private `<restore_token>.restore.json` metadata live under the state
-directory. With Bridge stopped, restore to the recorded `original_path` without
-overwriting an existing file; older trash may lack metadata.
+Deleted files and restore metadata live in adjacent private `.pi-mcp-trash`,
+with an index under the state directory. With Bridge stopped, inspect original
+and trash paths, then restore to the recorded original path without overwriting
+an existing file. Older trash can reside in the state directory.
 
 Path/native identity determine public IDs and session grants. There is no
 permanent-delete or remote restore tool.

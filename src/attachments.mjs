@@ -2,6 +2,7 @@ import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
 import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -51,22 +52,34 @@ export async function registryTransaction(dir,action){
 }
 export async function readClaim(dir,session){
   await privateDirectory(dir);
+  return readOwnerRecord(dir,claimFile(dir,session),session);
+}
+export async function readOwnerRecord(dir,file,session){
+  let handle;
   try{
-    const file=claimFile(dir,session),stat=await fs.lstat(file);
-    if(!stat.isFile()||stat.isSymbolicLink()||stat.uid!==process.getuid()||(stat.mode&0o077)||stat.size>8192)throw new Error();
-    const record=JSON.parse(await fs.readFile(file,'utf8'));
-    if(record.file!==session.file||record.sessionId!==session.header.id||!['tui','rpc'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
+    // Validate the opened inode and bound the read itself, including growth after stat.
+    // NONBLOCK also prevents a replaced special file from hanging registry scans.
+    handle=await fs.open(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    const stat=await handle.stat();
+    if(!stat.isFile()||stat.uid!==process.getuid()||(stat.mode&0o077)||stat.size>8192)throw new Error();
+    const bytes=Buffer.alloc(8193);let length=0;
+    while(length<bytes.length){const {bytesRead}=await handle.read(bytes,length,bytes.length-length,null);if(!bytesRead)break;length+=bytesRead;}
+    if(length>8192)throw new Error();
+    const record=JSON.parse(bytes.subarray(0,length).toString('utf8'));
+    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
+    if(session&&(record.file!==session.file||record.sessionId!==session.header.id))throw new Error();
     if(record.kind==='tui'&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
     return record;
   }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');}
+  finally{await handle?.close();}
 }
 // Call while holding registryTransaction: a changed header must not bypass
 // an existing path owner merely because its claim has a different filename.
 export async function assertNoOtherLiveOwner(dir,session){
   for(const name of await fs.readdir(dir)){
     if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name))continue;
-    const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
-    if(other.file===session.file&&other.sessionId!==session.header.id&&await ownerAlive(other.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+    const other=await readOwnerRecord(dir,path.join(dir,name));
+    if(other&&other.file===session.file&&other.sessionId!==session.header.id&&await ownerAlive(other.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
   }
 }
 export async function reserveOwner(dir,session,kind,owner=undefined){
