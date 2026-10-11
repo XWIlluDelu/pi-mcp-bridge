@@ -1,14 +1,20 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { permitted, inside } from './permissions.mjs';
 import { discover, opaqueId, recordsFor, pageRecords, hash, syncDir } from './data.mjs';
 import { RuntimePool } from './rpc.mjs';
 import { Journal } from './journal.mjs';
+import { privateDirectory } from './attachments.mjs';
+import { readOwnerConfig, validateGrants } from './owner-config.mjs';
 export class Bridge {
-  constructor(config, factory) { this.config = config; this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); }
+  constructor(config, factory, {configFile}={}) { this.config = config; this.configFile=configFile;const {grants,...settings}=config;this.ownerSettings=structuredClone(settings);this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); }
   async init() {
     if (!this.config.principal || !path.isAbsolute(this.config.stateDir) || !Array.isArray(this.config.sessionRoots) || this.config.sessionRoots.length === 0) throw new Error('INVALID_OWNER_CONFIG');
+    validateGrants(this.config.grants);
+    if(this.config.attachmentExitTimeoutMs!==undefined&&(!Number.isInteger(this.config.attachmentExitTimeoutMs)||this.config.attachmentExitTimeoutMs<50||this.config.attachmentExitTimeoutMs>30000))throw new Error('INVALID_OWNER_CONFIG');
+    if(this.config.attachmentDir)await privateDirectory(this.config.attachmentDir);
     await fs.mkdir(this.config.stateDir,{recursive:true,mode:0o700});
     if (await fs.realpath(this.config.stateDir) !== path.resolve(this.config.stateDir)) throw new Error('SYMLINK_STATE_NOT_ALLOWED');
     for (const root of this.config.sessionRoots) {
@@ -36,10 +42,20 @@ export class Bridge {
     try { return await next; } finally { if (this.locks.get(id) === next) this.locks.delete(id); }
   }
   async sessions() { return discover(this.config); }
+  async refreshPermissions(){
+    if(!this.configFile)return;
+    const task=(this.permissionsReload??Promise.resolve()).catch(()=>{}).then(async()=>{
+      const {config}=await readOwnerConfig(this.configFile);const {grants,...settings}=config;
+      if(!isDeepStrictEqual(settings,this.ownerSettings))throw new Error('CONFIG_RESTART_REQUIRED');
+      this.config.grants=grants??[];
+    });
+    this.permissionsReload=task;
+    try{await task;}finally{if(this.permissionsReload===task)this.permissionsReload=null;}
+  }
   async session(id) { const s = (await this.sessions()).find(s=>s.id === id); if (!s) throw new Error('NOT_FOUND_OR_DENIED'); return s; }
   check(action,s) { if (!permitted(this.config,action,s)) throw new Error('NOT_FOUND_OR_DENIED'); }
   async list(args = {}) {
-    this.assertOpen();
+    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     const rows = [];
     for (const s of await this.sessions()) {
       if (!permitted(this.config,'read',s)) { if (!args.query) rows.push({session_id:s.id}); continue; }
@@ -52,9 +68,10 @@ export class Bridge {
       folders:this.config.folders.filter(f=>permitted(this.config,'new_session',{cwd:f.path})).map(f=>({folder_id:f.id}))};
   }
   async read(args) {
-    this.assertOpen();
+    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     const s = await this.session(args.session_id); this.check('read',s);
-    const runtime = this.pool.get(s.id);
+    const runtime = await this.pool.forRead(s);
+    if(runtime?.attached)return runtime.read(args);
     if (runtime) {
       const active = await runtime.entries();
       if (active.entries.some(e=>typeof e.id!=='string' || e.id.length>128) || (active.leafId!==null && (typeof active.leafId!=='string' || active.leafId.length>128))) throw new Error('INVALID_RUNTIME_ENTRIES');
@@ -67,12 +84,13 @@ export class Bridge {
     return {view,leaf_id:leaf,context_kind:view==='context'?'pi_session_projection_not_final_provider_payload':undefined,...pageRecords(records,{...args,view},s.revision)};
   }
   async send(args) {
-    this.assertOpen();
+    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     const body = args.text === undefined ? undefined : {text:args.text,mode:args.mode ?? 'native'};
     return this.journal.run(args.request_id,'send',args.session_id,body,save=>this.locked(args.session_id,async()=>{
       try {
         const s = await this.session(args.session_id); this.check('send',s);
         const runtime = await this.pool.resolve(s); // Resolve/resume first; saved is not busy.
+        if(runtime.attached)return save(await runtime.send({...args,...body}));
         if (body.mode === 'idle_only') {
           const state = await runtime.state();
           if (state.isStreaming || state.isCompacting) return save({status:'skipped',reason:'busy'});
@@ -87,7 +105,7 @@ export class Bridge {
     }));
   }
   async create(args) {
-    this.assertOpen();
+    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     return this.journal.run(args.request_id,'create',args.folder_id,{},save=>this.locked(`folder:${args.folder_id}`,async()=>{
       let changed = false;
       try {
@@ -103,12 +121,12 @@ export class Bridge {
     }));
   }
   async delete(args) {
-    this.assertOpen();
+    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     return this.journal.run(args.request_id,'delete',args.session_id,{},save=>this.locked(args.session_id,async()=>{
-      let changed = false;
+      let changed = false, release;
       try {
         const s = await this.session(args.session_id); this.check('delete',s);
-        await this.pool.stop(s.id); // Stop and confirm exit before moving persistent state.
+        release=await this.pool.stopForDelete(s); // Stop and confirm exit; hold ownership through the move.
         const trash = path.join(this.config.stateDir,'trash'); await fs.mkdir(trash,{recursive:true,mode:0o700});
         const token = randomUUID();
         const metadata = await fs.open(path.join(trash,`${token}.restore.json`),'wx',0o600);
@@ -118,6 +136,7 @@ export class Bridge {
         await syncDir(trash); await syncDir(path.dirname(s.file));
         return save({status:'deleted',recoverable:true,restore_token:token});
       } catch(e) { return save({status:changed?'unknown':'rejected',reason:safeReason(e)}); }
+      finally {await release?.();}
     }));
   }
   assertOpen() { if (this.closing) throw new Error('BRIDGE_CLOSING'); }
@@ -135,5 +154,5 @@ export class Bridge {
 }
 function safeReason(error) {
   const code = error.code ?? error.message;
-  return ['NOT_FOUND_OR_DENIED','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['NOT_FOUND_OR_DENIED','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }
