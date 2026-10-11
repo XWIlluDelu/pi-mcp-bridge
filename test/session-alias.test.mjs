@@ -72,6 +72,30 @@ test('initial attachment rejects a persisted file belonging to a different nativ
  }finally{await handlers.session_shutdown({});if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
 });
 
+test('large persisted histories do not prevent TUI registration or first-persistence identity checks',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const handlers={};let stopped=false;attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
+ try{
+  for(const timing of ['before-registration','after-registration']){
+   if(timing==='after-registration')await handlers.session_shutdown({reason:'new'});
+   const manager=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=manager.getSessionFile();
+   const persist=async()=>{
+    manager.appendMessage({role:'user',content:'large saved public fixture',timestamp:Date.now()});
+    // Keep the live fixture small: disk size must not enter ownership validation.
+    await fs.appendFile(file,JSON.stringify({type:'custom',id:'large-fixture',parentId:null,data:'x'.repeat(32*1024*1024)})+'\n');
+   };
+   if(timing==='before-registration')await persist();
+   await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+   if(timing==='after-registration'){await persist();await handlers.agent_settled();}
+   const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session);
+   assert.equal(claim.phase,'ready');assert.equal(stopped,false);
+   const runtime=new AttachedRuntime(f.config,session,claim);
+   assert.equal((await runtime.state()).sessionId,session.header.id);
+   assert.equal((await runtime.read({view:'raw'})).items.length,1);
+  }
+ }finally{await handlers.session_shutdown({});if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
+});
+
 test('persisted paths retain protection against a different live native owner claim',async t=>{
  const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
  const a={},b={};attachExtension({on:(name,fn)=>{a[name]=fn;}});attachExtension({on:(name,fn)=>{b[name]=fn;}});

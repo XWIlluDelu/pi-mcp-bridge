@@ -111,7 +111,9 @@ test('overview prioritizes current correction, labels initial task and pairs fai
  assert.deepEqual(tools.map(r=>r.result_source?.entry_id??null),[null,'ok','fail']);
  assert.ok(tools.every(r=>Number.isInteger(r.message_index)&&Number.isInteger(r.projection_index)));
  const huge=records.find(r=>r.entry_id==='fail'&&r.kind==='message');
- assert.equal(huge.payload.omitted_char_ranges[0][0],1000);
+ assert.equal(huge.payload.omitted_char_ranges[0][0],500);
+ assert.equal(huge.payload.json_tail_excerpt.length,500);
+ assert.equal(huge.payload_source.block_index,0);
  assert.ok(JSON.stringify(records).length<12000);assert.equal(JSON.stringify(records).includes('running'),false);
 });
 test('overview selection is stable across page budgets and filters, with UTF16 fragments and omitted ranges',()=>{

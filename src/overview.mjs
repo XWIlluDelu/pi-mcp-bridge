@@ -1,12 +1,40 @@
 // Deterministic extractive overview of Pi's public session projection.
 // No model calls, hook replay, semantic goal inference or runtime-state guesses.
 const MAX_RECORDS=19, MAX_CHARS=10000, EXCERPT_CHARS=1000;
+export const OVERVIEW_EXTRACTOR_VERSION='extractive_v2';
 function excerpt(value) {
   const json=JSON.stringify(value);
   return json.length<=EXCERPT_CHARS ? {value} : {
     json_excerpt:json.slice(0,EXCERPT_CHARS),total_chars:json.length,
     omitted_char_ranges:[[EXCERPT_CHARS,json.length]],
   };
+}
+// Breadth-first subdivision covers interior positions before nearby repeats.
+// This is positional coverage, not a judgment about semantic importance.
+function spreadIndices(length) {
+  if(!length)return [];
+  const result=[0];if(length>1)result.push(length-1);
+  const intervals=[[0,length-1]];
+  for(let i=0;i<intervals.length;i++){
+    const [a,b]=intervals[i];if(b-a<2)continue;
+    const middle=Math.floor((a+b)/2);result.push(middle);
+    intervals.push([a,middle],[middle,b]);
+  }
+  return result;
+}
+function textExcerpt(text,limit=EXCERPT_CHARS){
+  const json=JSON.stringify(text);
+  if(json.length<=limit)return {value:text};
+  const head=Math.ceil(limit/2),tail=limit-head;
+  return {json_excerpt:json.slice(0,head),json_tail_excerpt:json.slice(json.length-tail),
+    tail_char_offset:json.length-tail,total_chars:json.length,omitted_char_ranges:[[head,json.length-tail]]};
+}
+function omittedBlocks(length,selected){
+  const ranges=[];let start=0;
+  for(const index of [...selected].sort((a,b)=>a-b)){
+    if(index>start)ranges.push([start,index]);start=index+1;
+  }
+  if(start<length)ranges.push([start,length]);return ranges;
 }
 const source=r=>({entry_id:r.entry_id,message_index:r.message_index,projection_index:r.projection_index});
 function messageDetails(message) {
@@ -22,12 +50,22 @@ function messageDetails(message) {
   if(fieldOmissions.length)details.field_omissions=fieldOmissions;
   // Select only projected content. Keep the original block index even when
   // thinking precedes text; hidden source-entry bodies are never consulted.
-  const textIndex=message.role==='assistant'&&Array.isArray(message.content)?message.content.findIndex(b=>b.type==='text'&&typeof b.text==='string'):-1;
-  if(message.role==='assistant'&&Array.isArray(message.content)){
+  const textIndex=Array.isArray(message.content)?message.content.findIndex(b=>b.type==='text'&&typeof b.text==='string'):-1;
+  if(['user','assistant','toolResult'].includes(message.role)&&Array.isArray(message.content)){
     const selectedIndex=textIndex>=0?textIndex:message.content.findIndex(b=>b.type==='toolCall');
     if(textIndex>=0){
-      details.payload=excerpt(message.content[textIndex].text);
+      const textIndices=message.content.flatMap((block,index)=>block.type==='text'&&typeof block.text==='string'?[index]:[]);
+      // Three samples bound per-message provenance while covering both ends and
+      // an interior block. The text budget is shared, never multiplied.
+      const chosen=spreadIndices(textIndices.length).slice(0,3).map(index=>textIndices[index]);
+      const budget=Math.floor(EXCERPT_CHARS/chosen.length);
+      details.payload=textExcerpt(message.content[textIndex].text,budget);
       details.payload_source={field:'content',block_index:textIndex,block_field:'text'};
+      if(chosen.length>1)details.additional_text_blocks=chosen.slice(1).map(index=>({
+        payload:textExcerpt(message.content[index].text,budget),
+        payload_source:{field:'content',block_index:index,block_field:'text'},
+      }));
+      details.selected_text_blocks=chosen;
     }else if(selectedIndex>=0){
       // Opaque provider signatures and thinking metadata are not semantic
       // overview content. Do not recursively filter actual tool arguments.
@@ -38,11 +76,13 @@ function messageDetails(message) {
       details.payload=excerpt({role:message.role});
       details.payload_source={field:'message',fields:['role']};
     }
-    details.omitted_content_block_ranges=[];
-    if(selectedIndex>0)details.omitted_content_block_ranges.push([0,selectedIndex]);
-    if(selectedIndex+1<message.content.length)details.omitted_content_block_ranges.push([selectedIndex+1,message.content.length]);
-    details.omitted_content_block_count=message.content.length-(selectedIndex>=0?1:0);
+    const selected=details.selected_text_blocks??(selectedIndex>=0?[selectedIndex]:[]);
+    delete details.selected_text_blocks;
+    details.omitted_content_block_ranges=omittedBlocks(message.content.length,selected);
+    details.omitted_content_block_count=message.content.length-selected.length;
     details.omitted_message_fields=Object.keys(message).filter(k=>!['role','content','stopReason','isError','toolCallId','errorMessage'].includes(k));
+  }else if(['user','assistant','toolResult'].includes(message.role)&&typeof message.content==='string'){
+    details.payload=textExcerpt(message.content);details.payload_source={field:'content'};
   }else{details.payload=excerpt(message);details.payload_source={field:'message'};}
   return details;
 }
@@ -51,6 +91,9 @@ export function overviewRecords(projection) {
     entry_id:e.sourceEntry.id,message_index,message,type:e.sourceEntry.type,
   }))).map((r,projection_index)=>({...r,projection_index}));
   const users=rows.filter(r=>r.type==='message'&&r.message.role==='user');
+  const assistants=rows.filter(r=>r.message.role==='assistant'&&(
+    typeof r.message.content==='string'||Array.isArray(r.message.content)&&r.message.content.some(block=>block.type==='text'&&typeof block.text==='string')));
+  const assistantIndices=new Set(assistants.map(row=>row.projection_index));
   const latest=users.at(-1),previous=users.at(-2);
   const checkpoints=rows.filter(r=>r.type==='compaction');
   const checkpoint=checkpoints.at(-1);
@@ -100,8 +143,24 @@ export function overviewRecords(projection) {
   message(latest,'latest_user');
   message(rows.findLast(r=>r.message.role==='assistant'),'latest_assistant');
   if(checkpoint)candidates.push({...source(checkpoint),kind:'checkpoint',label:'active_compaction',payload:excerpt(checkpoint.message)});
-  tools(current,'current_group');
   if(!checkpoint)message(users[0],'initial_task');
+  message(previous,'previous_user');
+  message(prior.findLast(r=>assistantIndices.has(r.projection_index)),'previous_assistant');
+  const coverageStart=candidates.length;
+  for(const index of spreadIndices(users.length))message(users[index],'user_coverage');
+  const userCandidates=candidates.splice(coverageStart);
+  for(const index of spreadIndices(assistants.length))message(assistants[index],'assistant_coverage');
+  const assistantCandidates=candidates.splice(coverageStart);
+  tools(current,'current_group');
+  tools(prior,'previous_group');
+  const toolCandidates=candidates.splice(coverageStart);
+  // Interleave positional user and text-assistant coverage with recent tool
+  // evidence after fixed anchors; no one stream takes every remaining slot.
+  for(let i=0;i<Math.max(userCandidates.length,assistantCandidates.length,toolCandidates.length);i++){
+    if(userCandidates[i])candidates.push(userCandidates[i]);
+    if(toolCandidates[i])candidates.push(toolCandidates[i]);
+    if(assistantCandidates[i])candidates.push(assistantCandidates[i]);
+  }
   // A large tool body cannot consume the overview before the current request,
   // latest assistant, paired statuses and active checkpoint are considered.
   for(const row of current.toReversed())message(row,'current_group');
@@ -122,9 +181,13 @@ export function overviewRecords(projection) {
   for(let i=0;i<rows.length;i++)if(!covered.has(i)){
     if(omitted.at(-1)?.[1]===i)omitted.at(-1)[1]=i+1;else omitted.push([i,i+1]);
   }
-  return [{kind:'overview_manifest',selection:'extractive_v1',checkpoint:checkpoint?source(checkpoint):null,
+  return [{kind:'overview_manifest',selection:OVERVIEW_EXTRACTOR_VERSION,checkpoint:checkpoint?source(checkpoint):null,
     latest_user:latest?source(latest):null,initial_task:!checkpoint&&users[0]?source(users[0]):null,
     projection_messages:rows.length,omitted_projection_ranges:omitted,
+    user_coverage:{projected:users.length,selected:selected.filter(r=>r.kind==='message'&&r.role==='user').length,
+      policy:'anchors_then_interleave_breadth_first_users_recent_tools_and_text_assistants'},
+    assistant_text_coverage:{projected:assistants.length,selected:selected.filter(r=>r.kind==='message'&&assistantIndices.has(r.projection_index)).length},
+    text_sampling:'first_last_middle_blocks_with_head_tail_excerpts',
     omitted_candidate_records:candidates.length-selected.length,
     range_units:'half_open_utf16_for_chars_and_zero_based_projection_and_content_block_indices',
     selection_limits:{records:MAX_RECORDS,serialized_chars:MAX_CHARS,excerpt_chars:EXCERPT_CHARS}},...selected];

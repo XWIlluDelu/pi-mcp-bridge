@@ -4,9 +4,10 @@ import { spawn } from 'node:child_process';
 import { readLfLines } from './lf-lines.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { assertSingleSessionFile } from './data.mjs';
+import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
 import { rpcActivity } from './activity.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { validatePiRuntime } from './owner-config.mjs';
 import { reserveOwner, updateOwner, releaseOwner, processIdentity, readClaim, ownerAlive, AttachedRuntime, AttachmentFailure } from './attachments.mjs';
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) { super(code); this.code = code; this.uncertain = uncertain; }
@@ -15,9 +16,7 @@ export function launchProfile(config, hostEnv = process.env) {
   const profile = config.piRuntime ?? {};
   const inherit = profile.inheritEnv ?? [];
   const tools = profile.tools ?? [];
-  if (!Array.isArray(inherit) || inherit.some(name => typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) ||
-      !Array.isArray(tools) || tools.some(name => !['read','write','edit','bash','grep','find','ls'].includes(name)) ||
-      (profile.agentDir !== undefined && (typeof profile.agentDir !== 'string' || !path.isAbsolute(profile.agentDir)))) throw new Error('INVALID_PI_RUNTIME');
+  validatePiRuntime(profile);
   const home = path.join(config.stateDir, 'pi-home');
   const agentDir = profile.agentDir ?? path.join(home, '.pi', 'agent');
   const env = Object.fromEntries(inherit.filter(name => hostEnv[name] !== undefined).map(name => [name,hostEnv[name]]));
@@ -32,12 +31,19 @@ export class PiRpc {
     await fs.mkdir(agentDir, {recursive:true, mode:0o700});
     const cli = fileURLToPath(new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url));
     if(this.config.attachmentDir)this.ownerRecord=await reserveOwner(this.config.attachmentDir,this.session,'rpc');
-    // Deliberate clean environment: do not borrow host keys or subscriptions.
-    this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes',...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
+    try {
+      // Recheck at the actual launch boundary: content preflight and owner
+      // reservation may have taken time since discovery verified this path.
+      await validateExecutionCwd(this.session.cwd);
+      // Deliberate clean environment: do not borrow host keys or subscriptions.
+      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes',...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
+    } catch (error) {
+      if(this.ownerRecord)await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);
+      throw error;
+    }
     this.alive = true;
     const runtimeLog=diagnostics.capture();this.child.once('spawn',()=>runtimeLog('runtime.spawned',{kind:'rpc',generation:this.generation}));
-    this.stderr = '';
-    this.child.stderr.on('data', chunk => { this.stderr = (this.stderr + chunk.toString()).slice(-4000); });
+    this.child.stderr.resume(); // Drain diagnostics without retaining provider output.
     const fail = () => {
       this.alive = false;
       for (const req of this.pending.values()) { clearTimeout(req.timer); req.reject(new RpcFailure('RUNTIME_DISCONNECTED', req.written)); }

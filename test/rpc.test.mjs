@@ -142,3 +142,28 @@ test('entry read reuses its identity postcheck for activity without another RPC'
  rpc.dispatch=async command=>command.type==='get_entries'?{entries:[],leafId:null}:{sessionFile:rpc.session.file,sessionId:'a'};
  const missing=(await rpc.entries()).activity;assert.equal(missing.streaming,null);assert.equal(missing.pending_messages,null);assert.equal(missing.pending_message_count,null);
 });
+
+test('actual RPC launch rejects null, missing and symlink-replaced cwd without spawning',async t=>{
+ const fs=await import('node:fs/promises'),path=await import('node:path');
+ const dir=await fs.mkdtemp('/tmp/pi-cwd-launch-');t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ for(const kind of ['null','missing','symlink','after-reservation']){
+  const root=path.join(dir,kind),cwd=path.join(root,'project');await fs.mkdir(cwd,{recursive:true});
+  const file=path.join(root,'session.jsonl'),header={type:'session',version:3,id:kind,cwd};await fs.writeFile(file,JSON.stringify(header)+'\n');
+  const config={stateDir:path.join(root,'state'),attachmentDir:path.join(root,'ipc')};
+  const session={file,header,cwd:kind==='null'?null:cwd};
+  if(kind==='missing')await fs.rmdir(cwd);
+  if(kind==='symlink'){await fs.rename(cwd,cwd+'-moved');await fs.symlink(cwd+'-moved',cwd);}
+  const rename=fs.default.rename;let retargeted=false;
+  if(kind==='after-reservation')t.mock.method(fs.default,'rename',async(from,to)=>{
+   await rename(from,to);
+   if(to.endsWith('.owner.json')&&!retargeted){retargeted=true;await rename(cwd,cwd+'-moved');await fs.symlink(cwd+'-moved',cwd);}
+  });
+  const rpc=new PiRpc(config,session);
+  try {
+   await assert.rejects(rpc.start(),/EXECUTION_CWD_UNAVAILABLE/);
+   assert.equal(rpc.child,undefined);assert.equal(rpc.alive,false);
+   assert.deepEqual((await fs.readdir(config.attachmentDir)).filter(name=>name.endsWith('.owner.json')),[]);
+   if(kind==='after-reservation')assert.equal(retargeted,true);
+  } finally {t.mock.restoreAll();await rpc.stop();}
+ }
+});

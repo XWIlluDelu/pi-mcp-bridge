@@ -3,10 +3,10 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, hash, renderRead, assertSingleSessionFile, loadSession } from './data.mjs';
+import { atomicJson, hash, renderRead, assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { activityObservation } from './activity.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
-import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, claimFile, updateOwner, assertNoOtherLiveOwner, AttachmentFailure } from './attachments.mjs';
+import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, readOwnerRecord, claimFile, updateOwner, assertNoOtherLiveOwner, AttachmentFailure } from './attachments.mjs';
 
 export default function attachExtension(pi){
   const dir=process.env.PI_MCP_ATTACH_DIR;let active;
@@ -28,7 +28,7 @@ export default function attachExtension(pi){
       }
       if(!stat&&runtime.session.header.version!==3)throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
       if(stat&&!runtime.fileObserved){
-        const saved=await loadSession(runtime.session.file);
+        const saved=await readSessionIdentity(runtime.session.file);
         if(saved.header.id!==runtime.session.header.id)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
         runtime.fileObserved=true;
       }
@@ -124,8 +124,8 @@ export default function attachExtension(pi){
     await registryTransaction(dir,async()=>{
       for(const name of await fs.readdir(dir)){
         if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)||path.join(dir,name)===claimFile(dir,session))continue;
-        const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
-        if(other.kind==='tui'&&other.owner?.pid===owner.pid&&other.owner.start===owner.start&&other.owner.boot===owner.boot)await fs.unlink(path.join(dir,name));
+        const other=await readOwnerRecord(dir,path.join(dir,name));
+        if(other?.kind==='tui'&&other.owner.pid===owner.pid&&other.owner.start===owner.start&&other.owner.boot===owner.boot)await fs.unlink(path.join(dir,name));
       }
     });
     } catch(error) {

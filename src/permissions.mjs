@@ -20,7 +20,7 @@ export function resolvePermission(config, action, target) {
     const value = scopes.get(`session:${target.session_id}`);
     if (typeof value === 'boolean') return {allowed:value,explicit,sourceScope:{session_id:target.session_id}};
   }
-  const ancestors = [...scopes].filter(([key]) => key.startsWith('folder:') && inside(target.cwd??target.folder, key.slice(7)))
+  const ancestors = [...scopes].filter(([key]) => key.startsWith('folder:') && typeof (target.cwd??target.folder) === 'string' && inside(target.cwd??target.folder, key.slice(7)))
     .sort((a, b) => b[0].length - a[0].length);
   for (const [key, value] of ancestors) if (typeof value === 'boolean') return {allowed:value,explicit,sourceScope:{folder:key.slice(7)}};
   return {allowed:false,explicit,sourceScope:null};
