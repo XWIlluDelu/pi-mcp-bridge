@@ -39,7 +39,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   await until(async()=>{owner=await readClaim(config.attachmentDir,session);return owner?.phase==='ready';},'TUI registration');
   await screen('Permissions: Ctrl+Alt+P',0);
   await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),configFile],cwd:base,env:{PATH:process.env.PATH,HOME:dir,PI_OFFLINE:'1'},stderr:'pipe'}));
-  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['create','delete','list','read','send']);
+  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send']);
   const id=made.session_id;
   assert.equal((await ok('send',{session_id:id,request_id:'first',text:'PUBLIC_OWNER_SESSION_FIXTURE'})).status,'unknown');
   await until(async()=>(await ok('read',{session_id:id})).items.some(x=>x.message?.role==='assistant'),'actual TUI response');

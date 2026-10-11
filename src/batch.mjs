@@ -1,0 +1,47 @@
+import { batchSchema } from './tool-schemas.mjs';
+export const BATCH_RESPONSE_LIMIT=32768;
+const fail=(code,items=[],extra={})=>({status:'rejected',error:{code,items,...extra},results:[]});
+const publicError=error=>/^[A-Z][A-Z_]{2,60}$/.test(error.message)?error.message:'OPERATION_FAILED';
+export function preflightBatch(input){
+ const parsed=batchSchema.safeParse(input);
+ if(!parsed.success)return {error:fail('INVALID_BATCH',[...new Set(parsed.error.issues.map(x=>x.path[1]).filter(Number.isInteger))])};
+ const operations=parsed.data.operations;
+ if(JSON.stringify(parsed.data).length>200000)return {error:fail('BATCH_INPUT_TOO_LARGE')};
+ const sessions=new Map(),requests=new Map();
+ for(const [index,item]of operations.entries()){
+  const {op,args}=item;
+  if(args.session_id){const entries=sessions.get(args.session_id)??[];entries.push({index,op});sessions.set(args.session_id,entries);}
+  if(op==='read')continue;
+  const key=`${op}:${args.session_id??args.folder_id}`;
+  const body=op==='send'?(args.text===undefined?undefined:JSON.stringify({text:args.text,mode:args.mode??'native'})):'{}';
+  const previous=requests.get(args.request_id);
+  if(previous&&(previous.key!==key||(previous.body!==undefined&&body!==undefined&&previous.body!==body)))return {error:fail('REQUEST_ID_CONFLICT',[previous.index,index])};
+  if(!previous||previous.body===undefined)requests.set(args.request_id,{index,key,body});
+ }
+ for(const [session_id,entries]of sessions){
+  if(entries.some(x=>x.op==='delete')&&entries.some(x=>x.op!=='delete'))return {error:fail('DELETE_CONFLICT',entries.map(x=>x.index),{session_id})};
+ }
+ return {operations};
+}
+export async function executeBatch(bridge,input){
+ const {operations,error}=preflightBatch(input);if(error)return error;
+ const readCount=operations.filter(x=>x.op==='read').length;
+ // Reserve envelope/receipt space and account for JSON escaping of read fragments.
+ const readBudget=Math.max(256,Math.floor((BATCH_RESPONSE_LIMIT-1024-operations.length*1024)/(2*Math.max(1,readCount))));
+ const payload={status:'processed',response_max_chars:BATCH_RESPONSE_LIMIT,results:[]};
+ for(const [index,{op,args}]of operations.entries()){
+  const item={index,op};
+  const actual=op==='read'?{...args,max_chars:Math.min(args.max_chars??12000,readBudget)}:args;
+  if(op==='read')item.applied_max_chars=actual.max_chars;
+  try{item.result=await bridge[op](actual);}catch(e){item.error={code:publicError(e)};}
+  payload.results.push(item);
+ }
+ // Do not silently truncate a result or invent a continuation cursor. Normal receipts fit the reserve.
+ while(JSON.stringify(payload).length>BATCH_RESPONSE_LIMIT){
+  const largest=payload.results.filter(x=>x.result!==undefined).sort((a,b)=>JSON.stringify(b.result).length-JSON.stringify(a.result).length)[0];
+  if(!largest)throw new Error('BATCH_RESPONSE_LIMIT');
+  delete largest.result;
+  largest.error={code:'BATCH_RESULT_OMITTED',retry:largest.op==='read'?'READ_SEPARATELY':'SAME_REQUEST_ID'};
+ }
+ return payload;
+}

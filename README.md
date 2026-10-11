@@ -1,7 +1,7 @@
 # Pi MCP Bridge
 
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
-RPC workers. It exposes `list`, `read`, `send`, `create` and `delete` over stdio.
+RPC workers. It exposes `list`, `read`, `send`, `create`, `delete` and ordered `batch` over stdio.
 
 Cooperating Pi TUI processes share their existing runtime through a private
 Unix socket. Cooperative process identity and attachment require Linux.
@@ -179,6 +179,20 @@ overwriting an existing file; older trash may lack metadata.
 
 Path/native identity determine public IDs and session grants. There is no
 permanent-delete or remote restore tool.
+
+### batch and receipts
+
+Batch accepts 1–10 ordered `read|send|create|delete` items. Preflight checks shape
+and request-ID conflicts; results preserve input order with per-item errors.
+
+Combining deletion with a different operation on the same session is a
+preflight conflict. Targets must already be known; items cannot reference results
+from earlier creates.
+
+Input is capped at 200,000 serialized characters. The whole structured result
+is bounded to 32,768; `BATCH_RESULT_OMITTED` directs a separate read or same-ID
+mutation replay. This is not a transaction: replay repeats reads and recovers
+mutation receipts.
 
 ## Verification and recovery
 

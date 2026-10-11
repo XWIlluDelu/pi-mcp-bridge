@@ -246,13 +246,13 @@ test('official TUI session replacement registers a fresh identity and socket los
  const removed=await f.bridge.delete({session_id:replacement.id,request_id:'blocked-delete'});assert.equal(removed.status,'rejected');assert.ok(await fs.stat(replacement.file));
 });
 
-test('standard MCP client attaches to an existing offline TUI through the unchanged five tools',async t=>{
+test('standard MCP client attaches to an existing offline TUI through the single-operation tools alongside batch',async t=>{
  const f=await fixture(t);const launched=await tui(t,f);await f.bridge.close();
  const filename=path.join(f.dir,'config.json');await fs.writeFile(filename,JSON.stringify(f.config));
  const client=new Client({name:'attached-mcp-fixture',version:'1.0.0'});
  try{
   await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),filename],cwd:base,env:{PATH:process.env.PATH,HOME:f.dir,PI_OFFLINE:'1'},stderr:'pipe'}));
-  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['create','delete','list','read','send']);
+  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send']);
   const call=async(name,args)=>{const result=await client.callTool({name,arguments:args});assert.ok(!result.isError);return result.structuredContent;};
   assert.equal((await call('list',{})).sessions[0].session_id,f.id);
   const receipt=await call('send',{session_id:f.id,request_id:'mcp-send',text:'offline MCP TUI fixture'});
