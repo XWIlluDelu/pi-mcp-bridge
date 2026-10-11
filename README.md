@@ -115,6 +115,10 @@ owners without terminating them. Delete requires confirmed writer exit, not just
 socket closure. Registry/editor locks left by a crash require owner-confirmed
 recovery after the relevant processes stop.
 
+Session files must be canonical regular files with one hard link. Public IDs
+bind canonical path and native header ID, not inode. Fresh native sessions may
+reserve an uncreated path; once persisted, every attachment validates its storage.
+
 ## Tools
 
 ### list
@@ -168,6 +172,10 @@ redispatch; a fresh ID risks duplicate work. Keep receipt storage private.
 
 Companion sends return `unknown/PI_ACCEPTANCE_UNOBSERVABLE`: the public send API
 returns void. Its idle check is observational, not atomic against other inputs.
+
+An unresolved owned prompt ACK blocks another prompt with
+`PROMPT_ADMISSION_PENDING` until that ACK or exact child exit. Idle/settlement
+observations do not clear this fence.
 
 ### create and delete
 

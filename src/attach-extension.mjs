@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, hash, pageRecords, recordsFor } from './data.mjs';
+import { atomicJson, hash, pageRecords, recordsFor, assertSingleSessionFile, loadSession } from './data.mjs';
 import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, claimFile, updateOwner, AttachmentFailure } from './attachments.mjs';
 
 export default function attachExtension(pi){
@@ -15,6 +15,25 @@ export default function attachExtension(pi){
     for(const socket of runtime.connections)socket.destroy();
     await new Promise(resolve=>runtime.server.close(resolve));
   }
+  async function validateStorage(runtime) {
+    try {
+      const stat=await assertSingleSessionFile(runtime.session.file,{allowMissing:!runtime.fileObserved});
+      if(!stat&&runtime.ctx.sessionManager.getEntries().some(e=>e.type==='message'&&['user','assistant'].includes(e.message?.role)))throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      if(stat&&!runtime.fileObserved){
+        const saved=await loadSession(runtime.session.file);
+        if(saved.header.id!==runtime.session.header.id)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+        runtime.fileObserved=true;
+      }
+    }catch(error){
+      if(active===runtime){runtime.ready=false;try{runtime.ctx.shutdown();}catch{}}
+      throw error; // Retain the claim until exact process death/replacement.
+    }
+  }
+  // These events occur after the relevant persistence; every IPC request also
+  // validates, including the first request after a previously absent file appears.
+  for(const event of ['agent_settled','session_info_changed','session_compact'])pi.on(event,async()=>{
+    if(active?.ready)await validateStorage(active);
+  });
   pi.on('session_shutdown',async()=>{
     const runtime=active;if(!runtime)return;
     runtime.ready=false; // Retire captured callbacks before the first asynchronous lifecycle step.
@@ -31,7 +50,22 @@ export default function attachExtension(pi){
     const session={file,header},owner=await processIdentity();
     const record={kind:'tui',file,sessionId:header.id,generation:randomUUID(),owner,phase:'starting'};
     record.socket=path.join(dir,`${owner.pid}-${record.generation.slice(0,8)}.sock`);
+    let fileObserved;
     await registryTransaction(dir,async()=>{
+      const stat=await assertSingleSessionFile(file,{allowMissing:true});
+      fileObserved=Boolean(stat);
+      if(!stat){
+        // Only a native new/unflushed session may reserve an absent target.
+        const entries=ctx.sessionManager.getEntries();
+        if(header.version!==3||entries.some(e=>e.type==='message'&&['user','assistant'].includes(e.message?.role)))throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
+        // A pending path has no inode yet. Do not permit a different native ID
+        // to reserve that same path while another process still owns it.
+        for(const name of await fs.readdir(dir)){
+          if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name))continue;
+          const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
+          if(other.file===file&&other.sessionId!==header.id&&await ownerAlive(other.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+        }
+      }
       const old=await readClaim(dir,session);
       const sameProcess=old&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
       if(old&&await ownerAlive(old.owner)&&!sameProcess){ctx.shutdown();throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');}
@@ -40,7 +74,7 @@ export default function attachExtension(pi){
     // Publish blocking ownership before socket setup or any later fallible initialization.
     if(Buffer.byteLength(record.socket)>100)throw new AttachmentFailure('ATTACHMENT_SOCKET_PATH_TOO_LONG');
     const connections=new Set();
-    const runtime={session,record,connections,ready:false,server:null};
+    const runtime={session,record,connections,ready:false,server:null,ctx,fileObserved};
     function check(request){
       if(active!==runtime||!runtime.ready||request.generation!==record.generation||request.file!==file||request.sessionId!==header.id||ctx.sessionManager.getSessionFile()!==file||ctx.sessionManager.getSessionId()!==header.id)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
     }
@@ -48,12 +82,12 @@ export default function attachExtension(pi){
       if(connections.size>=16){socket.destroy();return;}
       connections.add(socket);socket.setEncoding('utf8');socket.setTimeout(5000,()=>socket.destroy());socket.on('error',()=>{});socket.on('close',()=>connections.delete(socket));
       let buffer='',handled=false;
-      socket.on('data',chunk=>{
+      socket.on('data',async chunk=>{
         if(handled)return;buffer+=chunk;
         if(Buffer.byteLength(buffer)>500000){socket.destroy();return;}
         const end=buffer.indexOf('\n');if(end<0)return;handled=true;
         try{
-          const request=JSON.parse(buffer.slice(0,end));check(request);let data;const args=request.body??{};
+          const request=JSON.parse(buffer.slice(0,end));check(request);await validateStorage(runtime);check(request);let data;const args=request.body??{};
           if(request.op==='state')data={sessionFile:file,sessionId:header.id,isStreaming:!ctx.isIdle(),generation:record.generation};
           else if(request.op==='read'){
             const entries=ctx.sessionManager.getEntries(),leafId=ctx.sessionManager.getLeafId();

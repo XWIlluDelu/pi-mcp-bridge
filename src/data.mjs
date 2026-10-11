@@ -16,8 +16,18 @@ export async function syncDir(dir) {
   const handle = await fs.open(dir,'r');
   try { await handle.sync(); } finally { await handle.close(); }
 }
+// Cooperative storage boundary: reject aliases instead of changing public IDs.
+// Checks do not exclude concurrent filesystem edits by the same Unix owner.
+export async function assertSingleSessionFile(file, {allowMissing=false}={}) {
+  if (typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file || await fs.realpath(path.dirname(file)) !== path.dirname(file)) throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  let stat;
+  try { stat = await fs.lstat(file); }
+  catch (error) { if (allowMissing && error.code === 'ENOENT') return null; throw error; }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || await fs.realpath(file) !== file) throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  return stat;
+}
 export async function loadSession(file) {
-  const stat = await fs.stat(file);
+  const stat = await assertSingleSessionFile(file);
   if (stat.size > 32 * 1024 * 1024) throw new Error('SESSION_TOO_LARGE');
   const text = await fs.readFile(file, 'utf8');
   const lines = text.split('\n');
