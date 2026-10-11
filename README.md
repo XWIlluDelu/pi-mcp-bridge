@@ -119,6 +119,10 @@ Session files must be canonical regular files with one hard link. Public IDs
 bind canonical path and native header ID, not inode. Fresh native sessions may
 reserve an uncreated path; once persisted, every attachment validates its storage.
 
+Existing SDK/RPC hosts can [reserve and publish public bindings](docs/host-adapter.md)
+before opening a session. Every host input and replacement path must participate
+in its admission and release coordination.
+
 ## Tools
 
 ### list

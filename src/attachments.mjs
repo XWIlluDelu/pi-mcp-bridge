@@ -66,9 +66,9 @@ export async function readOwnerRecord(dir,file,session){
     while(length<bytes.length){const {bytesRead}=await handle.read(bytes,length,bytes.length-length,null);if(!bytesRead)break;length+=bytesRead;}
     if(length>8192)throw new Error();
     const record=JSON.parse(bytes.subarray(0,length).toString('utf8'));
-    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
+    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc','host'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
     if(session&&(record.file!==session.file||record.sessionId!==session.header.id))throw new Error();
-    if(record.kind==='tui'&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
+    if(['tui','host'].includes(record.kind)&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
     return record;
   }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');}
   finally{await handle?.close();}
@@ -89,7 +89,7 @@ export async function reserveOwner(dir,session,kind,owner=undefined){
     const old=await readClaim(dir,session);
     if(old&&await ownerAlive(old.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     const record={kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};
-    if(kind==='tui')record.socket=path.join(dir,`${process.pid}-${record.generation.slice(0,8)}.sock`);
+    if(['tui','host'].includes(kind))record.socket=path.join(dir,`${process.pid}-${record.generation.slice(0,8)}.sock`);
     await atomicJson(claimFile(dir,session),record);return record;
   });
 }
@@ -136,7 +136,7 @@ export class AttachedRuntime {
         const newline=bytes.indexOf('\n');if(newline<0)return;
         try{const response=JSON.parse(bytes.slice(0,newline));
           if(response.generation!==this.record.generation)throw new Error();
-          if(response.error)return finish(new AttachmentFailure(['RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&op==='send'));
+          if(response.error)return finish(new AttachmentFailure(['RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&op==='send'));
           finish(null,response.data);
         }catch{finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&op==='send'));}
       });
@@ -148,6 +148,15 @@ export class AttachedRuntime {
   send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
   async stop(){this.alive=false;} // Disconnect only. Never shut down the user's TUI on bridge close.
   async stopForDelete(){
+    if(this.record.kind==='host'){
+      // A shared SDK host may keep other sessions alive. Only the host can
+      // close this session's admission and drain its own preparation work.
+      const result=await this.request('release',{},this.config.attachmentExitTimeoutMs??5000);
+      if(result?.released!==true)throw new AttachmentFailure('HOST_RELEASE_FAILED');
+      const current=await readClaim(this.config.attachmentDir,this.session);
+      if(current)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      this.alive=false;return;
+    }
     await this.request('shutdown');
     await waitOwnerExit(this.record.owner,this.config.attachmentExitTimeoutMs??5000);
     await releaseOwner(this.config.attachmentDir,this.session,this.record);this.alive=false;
