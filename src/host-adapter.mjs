@@ -1,0 +1,135 @@
+// Cooperative host integration. Reserve the actual writer before it opens the
+// saved target; this adapter never starts, stops or takes over a Pi process.
+import fs from 'node:fs/promises';
+import net from 'node:net';
+import {hash,renderRead,assertSingleSessionFile,readSessionIdentity} from './data.mjs';
+import {activityObservation} from './activity.mjs';
+import {MAX_ATTACHMENT_REQUEST_BYTES} from './attachment-protocol.mjs';
+import {reserveOwner,updateOwner,releaseOwner,readClaim,processIdentity,ownerAlive,AttachmentFailure} from './attachments.mjs';
+const fail=code=>{throw new AttachmentFailure(code);};
+function receipt(value){
+  if(value?.status==='accepted'&&['started','queued','handled'].includes(value.disposition))return {status:'accepted',disposition:value.disposition,completion:'not_tracked'};
+  if(value?.status==='skipped'&&value.reason==='busy')return {status:'skipped',reason:'busy'};
+  if(value?.status==='unknown')return {status:'unknown',dispatch:'submitted',reason:'PI_ACCEPTANCE_UNOBSERVABLE',completion:'not_tracked'};
+  if(value?.status==='rejected'&&['PI_REJECTED','PROMPT_ADMISSION_PENDING','HOST_ADMISSION_UNSUPPORTED'].includes(value.reason))return {status:'rejected',reason:value.reason};
+  fail('INVALID_HOST_RECEIPT');
+}
+export async function reserveHostSession({attachmentDir,session,owner}){
+  const target=structuredClone(session);
+  owner??=await processIdentity();
+  if(!owner||!await ownerAlive(owner))fail('PROCESS_IDENTITY_UNAVAILABLE');
+  const record=await reserveOwner(attachmentDir,target,'host',owner);
+  let callbacks,server,ready=false,closed=false,releasing,closing;
+  const sockets=new Set(),operations=new Set();
+  async function identity(value){
+    if(value!==undefined&&(value.sessionFile!==target.file||value.sessionId!==target.header.id))fail('RUNTIME_SESSION_CHANGED');
+    const current=await readClaim(attachmentDir,target);
+    if(current?.generation!==record.generation||!await ownerAlive(record.owner))fail('RUNTIME_SESSION_CHANGED');
+    await assertSingleSessionFile(target.file);
+    if((await readSessionIdentity(target.file)).header.id!==target.header.id)fail('RUNTIME_SESSION_CHANGED');
+  }
+  async function state(){const value=await callbacks.state();if(!value||typeof value!=='object')fail('RUNTIME_SESSION_CHANGED');await identity(value);return value;}
+  async function retire(){
+    ready=false;
+    if((await readClaim(attachmentDir,target))?.generation===record.generation)await updateOwner(attachmentDir,target,record,{phase:'transitioning'});
+  }
+  async function release(){
+    if(!callbacks?.release)fail('HOST_RELEASE_UNSUPPORTED');
+    if(releasing)return releasing;
+    ready=false; // Fence admissions before the first awaited lifecycle step.
+    releasing=(async()=>{
+      await retire();await Promise.allSettled([...operations]);
+      await identity();
+      const result=await callbacks.release();
+      if(result?.released!==true)fail('HOST_RELEASE_FAILED');
+      // A shared host may remain alive. The explicit host callback attests the
+      // target writer, including non-bridge work, has been drained and closed.
+      const current=await readClaim(attachmentDir,target);
+      if(current?.generation!==record.generation)fail('RUNTIME_SESSION_CHANGED');
+      await releaseOwner(attachmentDir,target,record);
+      // Stop accepting immediately, but let the current release socket flush
+      // its acknowledgment before the listener's close callback can complete.
+      server?.close(()=>{});
+      return {released:true,generation:record.generation};
+    })();
+    return releasing;
+  }
+  function validateRequest(request){
+    if(!ready||closed||request?.generation!==record.generation||request.file!==target.file||request.sessionId!==target.header.id)fail('RUNTIME_SESSION_CHANGED');
+  }
+  async function operate(request){
+    const observed=await state(),args=request.body??{};
+    let data;
+    if(request.op==='state')data={sessionFile:target.file,sessionId:target.header.id,generation:record.generation,
+      isIdle:typeof observed.isIdle==='boolean'?observed.isIdle:null,isStreaming:typeof observed.isStreaming==='boolean'?observed.isStreaming:null,
+      isCompacting:typeof observed.isCompacting==='boolean'?observed.isCompacting:null};
+    else if(request.op==='read'){
+      const snapshot=structuredClone(await callbacks.snapshot());await identity(snapshot);
+      if(!Array.isArray(snapshot?.entries)||!snapshot.entries.every(entry=>typeof entry?.id==='string'&&entry.id.length<=128)||
+        !(snapshot.leafId===null||typeof snapshot.leafId==='string'&&snapshot.leafId.length<=128))fail('INVALID_HOST_SNAPSHOT');
+      const revisionInput={entries:snapshot.entries,leaf:snapshot.leafId,generation:record.generation};
+      if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)fail('SESSION_TOO_LARGE');
+      const activity=activityObservation('host_context',{idle:observed.isIdle,streaming:observed.isStreaming,compacting:observed.isCompacting,
+        count:observed.pendingMessageCount,pending:Number.isInteger(observed.pendingMessageCount)?observed.pendingMessageCount>0:undefined});
+      data=renderRead({entries:snapshot.entries,leafId:snapshot.leafId,revision:hash(revisionInput),activity},args,{leafSource:'live',generation:record.generation});
+    }else if(request.op==='send'){
+      if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))fail('INVALID_ATTACHED_SEND');
+      // The host owns admission and idle observation. A transport-level idle
+      // check cannot replace its input/preparation coordination.
+      data=receipt(await callbacks.submit({text:args.text,mode:args.mode}));
+    }else fail('INVALID_ATTACHED_OPERATION');
+    await state();return data;
+  }
+  async function close(){
+    if(closing)return closing;
+    closed=true;ready=false;
+    closing=(async()=>{
+      await retire();await Promise.allSettled([...operations]);
+      for(const socket of sockets)socket.destroy();
+      if(server)await new Promise(resolve=>server.close(resolve));
+      // Controller disconnect is not proof the actual writer has exited.
+      if(!await ownerAlive(record.owner))await releaseOwner(attachmentDir,target,record);
+    })();return closing;
+  }
+  async function publish(value){
+    if(callbacks||closed)fail('HOST_ADAPTER_ALREADY_STARTED');
+    if(!value||!['state','snapshot','submit'].every(name=>typeof value[name]==='function')||(value.release!==undefined&&typeof value.release!=='function'))fail('INVALID_HOST_CALLBACKS');
+    callbacks=value;
+    try{
+    await state();if(closed||releasing)fail('RUNTIME_SESSION_CHANGED');
+    server=net.createServer(socket=>{
+      if(sockets.size>=16){socket.destroy();return;}
+      sockets.add(socket);socket.setEncoding('utf8');socket.setTimeout(5000,()=>socket.destroy());socket.on('error',()=>{});socket.on('close',()=>sockets.delete(socket));
+      let buffer='',handled=false;
+      socket.on('data',chunk=>{
+        if(handled)return;buffer+=chunk;
+        if(Buffer.byteLength(buffer)>MAX_ATTACHMENT_REQUEST_BYTES){socket.destroy();return;}
+        const end=buffer.indexOf('\n');if(end<0)return;handled=true;
+        const task=(async()=>{
+          try{
+            const request=JSON.parse(buffer.slice(0,end));validateRequest(request);
+            let data;
+            if(request.op==='release')data=await release();
+            else{
+              const operation=operate(request);operations.add(operation);
+              try{data=await operation;}finally{operations.delete(operation);}
+            }
+            socket.end(JSON.stringify({generation:record.generation,data})+'\n');
+          }catch(error){socket.end(JSON.stringify({generation:record.generation,error:/^[A-Z_]{3,64}$/.test(error.code??error.message)?error.code??error.message:'HOST_OPERATION_FAILED'})+'\n');}
+        })();task.catch(()=>socket.destroy());
+      });
+    });
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(record.socket,resolve);});
+    await fs.chmod(record.socket,0o600);await state();if(closed||releasing)fail('RUNTIME_SESSION_CHANGED');
+    await updateOwner(attachmentDir,target,record,{phase:'ready',releaseSupported:Boolean(callbacks.release)});if(closed||releasing){await retire();fail('RUNTIME_SESSION_CHANGED');}ready=true;
+    return controller;
+    }catch(error){
+      ready=false;
+      for(const socket of sockets)socket.destroy();
+      if(server)await new Promise(resolve=>server.close(resolve));
+      // Retain the blocking claim even when endpoint publication fails.
+      throw error;
+    }
+  }
+  const controller={record,ready:publish,release,close};return controller;
+}
