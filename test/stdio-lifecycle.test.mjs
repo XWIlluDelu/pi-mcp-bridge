@@ -22,8 +22,8 @@ async function fixture(t){
  t.after(()=>fs.rm(dir,{recursive:true,force:true,maxRetries:3,retryDelay:50}));
  return {dir,cwd,config,configFile,session,id:made.session_id,marker,lock:path.join(config.stateDir,'bridge.lock')};
 }
-function launch(t,f){
- const child=spawn(process.execPath,[path.join(base,'src/server.mjs'),f.configFile],{cwd:base,env:{PATH:process.env.PATH,HOME:f.dir,PI_OFFLINE:'1'},stdio:['pipe','pipe','pipe']});
+function launch(t,f,nodeArgs=[]){
+ const child=spawn(process.execPath,[...nodeArgs,path.join(base,'src/server.mjs'),f.configFile],{cwd:base,env:{PATH:process.env.PATH,HOME:f.dir,PI_OFFLINE:'1'},stdio:['pipe','pipe','pipe']});
  let stderr='',next=0;const pending=new Map();child.stderr.on('data',b=>{stderr+=b;});child.stdin.on('error',()=>{});
  const lines=createInterface({input:child.stdout});lines.on('line',line=>{const value=JSON.parse(line);const resolve=pending.get(value.id);if(resolve){pending.delete(value.id);resolve(value);}});
  const done=new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));
@@ -36,6 +36,15 @@ function launch(t,f){
 }
 async function stopped(f,owner){assert.equal(await exists(f.lock),false);if(owner)assert.equal(await ownerAlive(owner),false);assert.equal(await readClaim(f.config.attachmentDir,f.session),null);}
 async function ownClaim(f){return until(async()=>{const r=await readClaim(f.config.attachmentDir,f.session);return r?.phase==='ready'?r:null;});}
+
+for(const stage of ['before-open','after-open','write-failure'])test(`stop during initialization waits for ${stage} and releases only its acquired lock`,async t=>{
+ const f=await fixture(t),preload=path.join(f.dir,'pause-init.mjs'),reached=path.join(f.dir,'init-reached'),release=path.join(f.dir,'init-release');
+ await fs.writeFile(preload,`import fs from 'node:fs/promises';const open=fs.open.bind(fs);fs.open=async(file,...args)=>{if(file!==${JSON.stringify(f.lock)})return open(file,...args);let handle;if(${JSON.stringify(stage)}!=='before-open')handle=await open(file,...args);await fs.writeFile(${JSON.stringify(reached)},'ready');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));handle??=await open(file,...args);if(${JSON.stringify(stage)}==='write-failure')handle.writeFile=async()=>{throw new Error('FIXTURE_INIT_FAILURE');};return handle;};`);
+ const server=launch(t,f,['--import',preload]);await until(()=>exists(reached));server.child.kill('SIGTERM');await new Promise(r=>setTimeout(r,80));server.child.kill('SIGINT');
+ assert.equal(server.child.exitCode,null);assert.equal(server.child.signalCode,null,'Signal handlers must be active before init acquires resources');
+ await fs.writeFile(release,'continue');assert.equal(await server.exit(),stage==='write-failure'?1:0);await stopped(f);
+ const restarted=launch(t,f);await restarted.initialize();restarted.child.stdin.end();assert.equal(await restarted.exit(),0);await stopped(f);
+});
 
 test('stdin EOF without a runtime releases its lock and permits normal restart',async t=>{
  const f=await fixture(t),first=launch(t,f);await first.initialize();first.child.stdin.end();assert.equal(await first.exit(),0);await stopped(f);
