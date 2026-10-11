@@ -71,7 +71,9 @@ export function recordsFor(data, args) {
   else {
     if (args.leaf_id !== undefined && args.leaf_id !== null && !entries.some(e => e.id === args.leaf_id)) throw new Error('ENTRY_NOT_FOUND');
     const projection = buildSessionProjection(entries, args.leaf_id === undefined ? data.leafId : args.leaf_id);
-    if (args.view === 'summary') records = projection.entries.filter(e => ['compaction','branch_summary'].includes(e.sourceEntry.type)).map(e => ({entry_id:e.sourceEntry.id, type:e.sourceEntry.type, summary:e.sourceEntry.summary}));
+    // Retained raw ranges can contain superseded checkpoints or context-hidden
+    // summaries. Only entries contributing to this leaf's projection are active.
+    if (args.view === 'summary') records = projection.entries.filter(e => e.messages.length > 0 && ['compaction','branch_summary'].includes(e.sourceEntry.type)).map(e => ({entry_id:e.sourceEntry.id, type:e.sourceEntry.type, summary:e.sourceEntry.summary}));
     else records = projection.entries.flatMap(e => e.messages.map((message, i) => ({entry_id:e.sourceEntry.id, message_index:i, message})));
   }
   if (args.entry_id) records = records.filter(e => e.entry_id === args.entry_id);

@@ -103,6 +103,41 @@ test('compaction preserves checkpoint and kept context; existing summary only',a
   assert.equal(r.items[0].message.role,'system');assert.equal(JSON.stringify(r).includes('summarized-old'),false);assert.equal(JSON.stringify(r).includes('kept'),true);
   assert.equal((await f.bridge.read({session_id:f.id,view:'summary'})).items[0].summary,'existing summary');
 });
+test('summaries follow the selected leaf and exclude superseded checkpoints retained in the raw range',async t=>{
+  const f=await fixture(t);
+  const file=await append(f,[
+    {type:'message',id:'a',parentId:null,message:{role:'user',content:'old requirement'}},
+    {type:'compaction',id:'c1',parentId:'a',summary:'old checkpoint',firstKeptEntryId:'a',tokensBefore:10},
+    {type:'message',id:'b',parentId:'c1',message:{role:'user',content:'retained requirement'}},
+    {type:'compaction',id:'c2',parentId:'b',summary:'new checkpoint',firstKeptEntryId:'c1',tokensBefore:20},
+    {type:'message',id:'later',parentId:'c2',message:{role:'user',content:'newer decision after checkpoint'}},
+  ]);
+  const before=await fs.readFile(file,'utf8');
+  const current=await f.bridge.read({session_id:f.id,view:'summary'});
+  assert.deepEqual(current.items.map(x=>x.entry_id),['c2']);assert.equal(current.leaf_id,'later');
+  assert.equal(current.items[0].summary,'new checkpoint'); // Not regenerated with the later decision.
+  const context=await f.bridge.read({session_id:f.id,view:'context'});
+  assert.deepEqual([...new Set(context.items.map(x=>x.entry_id))],['c2','b','later']);
+  const earlier=await f.bridge.read({session_id:f.id,view:'summary',leaf_id:'b'});
+  assert.deepEqual(earlier.items.map(x=>x.entry_id),['c1']);assert.equal(earlier.leaf_id,'b');
+  assert.deepEqual((await f.bridge.read({session_id:f.id,view:'summary',leaf_id:null})).items,[]);
+  assert.deepEqual((await f.bridge.read({session_id:f.id,view:'summary',entry_id:'c1'})).items,[]);
+  const raw=await f.bridge.read({session_id:f.id,view:'raw',entry_id:'c2'});
+  assert.equal(raw.items[0].entry.firstKeptEntryId,'c1');
+  assert.equal((await f.bridge.read({session_id:f.id,view:'raw',entry_id:'c1'})).items[0].entry.summary,'old checkpoint');
+  assert.equal(await fs.readFile(file,'utf8'),before);assert.equal(f.runtime.calls.length,0);
+});
+test('summaries omit a context-hidden branch summary but retain its original raw source',async t=>{
+  const f=await fixture(t);
+  await append(f,[
+    {type:'message',id:'a',parentId:null,message:{role:'user',content:'public fixture'}},
+    {type:'branch_summary',id:'branch',parentId:'a',fromId:'a',summary:'branch checkpoint'},
+    {type:'context_edit',id:'hide',parentId:'branch',targetId:'branch',replacement:null},
+  ]);
+  assert.deepEqual((await f.bridge.read({session_id:f.id,view:'summary'})).items,[]);
+  assert.deepEqual((await f.bridge.read({session_id:f.id,view:'summary',leaf_id:'branch'})).items,[{entry_id:'branch',type:'branch_summary',summary:'branch checkpoint'}]);
+  assert.equal((await f.bridge.read({session_id:f.id,view:'raw',entry_id:'branch'})).items[0].entry.summary,'branch checkpoint');
+});
 test('selected context leaf metadata matches projected branch, including empty context',async t=>{
   const f=await fixture(t);
   await append(f,[{type:'message',id:'a',parentId:null,message:{role:'user',content:'branch-a'}},{type:'message',id:'b',parentId:null,message:{role:'user',content:'branch-b'}}]);
