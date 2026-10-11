@@ -1,12 +1,14 @@
 import { batchSchema } from './tool-schemas.mjs';
 export const BATCH_RESPONSE_LIMIT=32768;
+// Ten 100,000-code-unit prompts, worst-case JSON escaping, plus envelopes.
+export const BATCH_INPUT_LIMIT=6100000;
 const fail=(code,items=[],extra={})=>({status:'rejected',error:{code,items,...extra},results:[]});
 const publicError=error=>/^[A-Z][A-Z_]{2,60}$/.test(error.message)?error.message:'OPERATION_FAILED';
 export function preflightBatch(input){
  const parsed=batchSchema.safeParse(input);
  if(!parsed.success)return {error:fail('INVALID_BATCH',[...new Set(parsed.error.issues.map(x=>x.path[1]).filter(Number.isInteger))])};
  const operations=parsed.data.operations;
- if(JSON.stringify(parsed.data).length>200000)return {error:fail('BATCH_INPUT_TOO_LARGE')};
+ if(JSON.stringify(parsed.data).length>BATCH_INPUT_LIMIT)return {error:fail('BATCH_INPUT_TOO_LARGE')};
  const sessions=new Map(),requests=new Map();
  for(const [index,item]of operations.entries()){
   const {op,args}=item;

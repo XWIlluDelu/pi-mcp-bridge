@@ -1,7 +1,7 @@
 # Pi MCP Bridge
 
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
-RPC workers. It exposes `list`, `read`, `send`, `create`, `delete` and ordered `batch` over stdio.
+RPC workers. It exposes `list`, `read`, `send`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
 
 Cooperating Pi TUI processes share their existing runtime through a private
 Unix socket. Cooperative process identity and attachment require Linux.
@@ -28,6 +28,10 @@ existing demo configuration. The final command speaks MCP on stdin/stdout:
           "/absolute/path/pi-mcp-bridge/demo/owner-config.json"]
 }
 ```
+
+For independent background access, see [loopback HTTP](deploy/HTTP.md). The
+[stdio service kit](deploy/README.md) requires a client that owns the protocol
+pipe and waits for Bridge shutdown.
 
 ## Owner configuration
 
@@ -189,10 +193,12 @@ Combining deletion with a different operation on the same session is a
 preflight conflict. Targets must already be known; items cannot reference results
 from earlier creates.
 
-Input is capped at 200,000 serialized characters. The whole structured result
+Input is capped at 6,100,000 serialized characters. The whole structured result
 is bounded to 32,768; `BATCH_RESULT_OMITTED` directs a separate read or same-ID
 mutation replay. This is not a transaction: replay repeats reads and recovers
 mutation receipts.
+
+Once admitted, later mutations continue after HTTP disconnect.
 
 ## Verification and recovery
 

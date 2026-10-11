@@ -23,7 +23,7 @@ test('batch validates every item and delete conflicts before any effects',async(
   [item('create',{folder_id:'one',request_id:'duplicate'}),item('create',{folder_id:'two',request_id:'duplicate'})],
   [item('send',{session_id:'s',request_id:'duplicate',text:'first'}),item('send',{session_id:'s',request_id:'duplicate',text:'different'})],
   [item('send',{session_id:'s',request_id:'duplicate',text:'same',mode:'native'}),item('send',{session_id:'s',request_id:'duplicate',text:'same',mode:'queue'})],
-  Array.from({length:3},(_,index)=>item('send',{session_id:'s',request_id:`large-${index}`,text:'x'.repeat(100000)})),
+  [item('read',{session_id:'s',leaf_id:'x'.repeat(6100001)})],
   Array.from({length:11},()=>item('read',{session_id:'s'})),
   [],
  ]){const result=await executeBatch(bridge,{operations});assert.equal(result.status,'rejected');assert.deepEqual(result.results,[]);}

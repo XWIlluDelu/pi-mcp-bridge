@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Bridge } from '../src/bridge.mjs';
-import { AttachedRuntime, readClaim, reserveOwner, updateOwner, releaseOwner, processIdentity, ownerAlive, privateDirectory } from '../src/attachments.mjs';
+import { AttachedRuntime, readClaim, reserveOwner, updateOwner, releaseOwner, processIdentity, ownerAlive, privateDirectory, waitOwnerExit } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture(t){
@@ -114,6 +114,30 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
   await handlers.session_start({reason:'reload'},ctx);
   assert.notEqual((await readClaim(f.config.attachmentDir,f.session)).generation,record.generation);
  }finally{await handlers.session_shutdown({reason:'quit'},ctx);if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;}
+});
+
+test('same session continues headless after actual TUI exit with history, grants, profile and restart receipt intact',async t=>{
+ const f=await fixture(t),profile=path.join(f.dir,'headless-marker.mjs');
+ await fs.writeFile(profile,"export default function(pi){pi.on('session_start',()=>pi.appendEntry('headless-profile',{fixture:true}));}");
+ f.config.piArgs=['-e',path.join(base,'research/faux-extension.mjs'),'-e',profile,'--provider','bridge-fixture','--model','deterministic','--thinking','off'];
+ const launched=await tui(t,f);const first=await f.bridge.send({session_id:f.id,request_id:'tui-history',text:'PUBLIC_TUI_HISTORY'});assert.equal(first.dispatch,'submitted');
+ await until(async()=>{const r=await f.bridge.read({session_id:f.id});return r.items.some(x=>x.message?.role==='assistant')&&!(await f.bridge.pool.get(f.id).state()).isStreaming;});
+ process.kill(launched.record.owner.pid,'SIGTERM');await waitOwnerExit(launched.record.owner);
+ assert.equal((await f.bridge.session(f.id)).file,f.session.file);
+ f.config.grants.push({session_id:f.id,send:false});assert.equal((await f.bridge.send({session_id:f.id,request_id:'denied-after-tui',text:'MUST_NOT_DISPATCH'})).status,'rejected');
+ const afterDenial=await readClaim(f.config.attachmentDir,f.session);assert.ok(!afterDenial||!(await ownerAlive(afterDenial.owner)));
+ f.config.grants.push({session_id:f.id,send:true});
+ const second=await f.bridge.send({session_id:f.id,request_id:'headless-same-session',text:'PUBLIC_HEADLESS_CONTINUATION',mode:'idle_only'});assert.equal(second.status,'accepted');assert.equal(second.disposition,'started');
+ const claim=await readClaim(f.config.attachmentDir,f.session);assert.equal(claim.kind,'rpc');assert.equal(claim.sessionId,f.session.header.id);assert.equal(await ownerAlive(claim.owner),true);assert.notEqual(claim.generation,launched.record.generation);assert.equal(f.bridge.pool.instances.size,1);
+ await until(async()=>{const r=await f.bridge.read({session_id:f.id});return r.items.filter(x=>x.message?.role==='assistant').length===2;});
+ const raw=await f.bridge.read({session_id:f.id,view:'raw',limit:50,max_chars:32768});assert.ok(raw.items.some(x=>x.entry.customType==='headless-profile'));
+ const history=JSON.stringify(raw);assert.ok(history.includes('PUBLIC_TUI_HISTORY'));assert.ok(history.includes('PUBLIC_HEADLESS_CONTINUATION'));assert.ok(!history.includes('MUST_NOT_DISPATCH'));
+ await f.bridge.close();assert.equal(await ownerAlive(claim.owner),false);
+ const restarted=await new Bridge(f.config).init();try{
+  assert.deepEqual(await restarted.send({session_id:f.id,request_id:'headless-same-session'}),second);assert.deepEqual(await restarted.send({session_id:f.id,request_id:'denied-after-tui'}),{request_id:'denied-after-tui',operation:'send',status:'rejected',reason:'NOT_FOUND_OR_DENIED'});
+  assert.equal(restarted.pool.instances.size,0);assert.equal(await readClaim(f.config.attachmentDir,f.session),null);
+  const read=await restarted.read({session_id:f.id,view:'raw',limit:50,max_chars:32768});assert.deepEqual(read.items,raw.items);
+ }finally{await restarted.close();}
 });
 
 test('official offline Pi TUI attaches, sends all modes, reloads, resumes attachment and deletes after exit',async t=>{
