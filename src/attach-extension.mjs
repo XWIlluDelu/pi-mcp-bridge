@@ -1,0 +1,104 @@
+// Load explicitly in the owner's Pi TUI: -e /absolute/path/src/attach-extension.mjs
+import fs from 'node:fs/promises';
+import net from 'node:net';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { atomicJson, hash, pageRecords, recordsFor } from './data.mjs';
+import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, claimFile, updateOwner, AttachmentFailure } from './attachments.mjs';
+
+export default function attachExtension(pi){
+  const dir=process.env.PI_MCP_ATTACH_DIR;let active;
+  if(!dir)return;
+  async function closeServer(runtime){
+    if(!runtime)return;
+    runtime.ready=false;
+    for(const socket of runtime.connections)socket.destroy();
+    await new Promise(resolve=>runtime.server.close(resolve));
+  }
+  pi.on('session_shutdown',async()=>{
+    const runtime=active;if(!runtime)return;
+    runtime.ready=false; // Retire captured callbacks before the first asynchronous lifecycle step.
+    try {await updateOwner(dir,runtime.session,runtime.record,{phase:'transitioning'});}
+    finally {await closeServer(runtime);}
+    // Keep the claim through quit/reload/replacement until exact process death or a fresh session_start.
+  });
+  pi.on('session_start',async(_event,ctx)=>{
+    if(ctx.mode!=='tui')return;
+    try {
+    await privateDirectory(dir);
+    const file=ctx.sessionManager.getSessionFile(),header=ctx.sessionManager.getHeader();
+    if(!file||!header||!path.isAbsolute(file))throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
+    const session={file,header},owner=await processIdentity();
+    const record={kind:'tui',file,sessionId:header.id,generation:randomUUID(),owner,phase:'starting'};
+    record.socket=path.join(dir,`${owner.pid}-${record.generation.slice(0,8)}.sock`);
+    await registryTransaction(dir,async()=>{
+      const old=await readClaim(dir,session);
+      const sameProcess=old&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
+      if(old&&await ownerAlive(old.owner)&&!sameProcess){ctx.shutdown();throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');}
+      await atomicJson(claimFile(dir,session),record);
+    });
+    // Publish blocking ownership before socket setup or any later fallible initialization.
+    if(Buffer.byteLength(record.socket)>100)throw new AttachmentFailure('ATTACHMENT_SOCKET_PATH_TOO_LONG');
+    const connections=new Set();
+    const runtime={session,record,connections,ready:false,server:null};
+    function check(request){
+      if(active!==runtime||!runtime.ready||request.generation!==record.generation||request.file!==file||request.sessionId!==header.id||ctx.sessionManager.getSessionFile()!==file||ctx.sessionManager.getSessionId()!==header.id)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+    }
+    const server=net.createServer(socket=>{
+      if(connections.size>=16){socket.destroy();return;}
+      connections.add(socket);socket.setEncoding('utf8');socket.setTimeout(5000,()=>socket.destroy());socket.on('error',()=>{});socket.on('close',()=>connections.delete(socket));
+      let buffer='',handled=false;
+      socket.on('data',chunk=>{
+        if(handled)return;buffer+=chunk;
+        if(Buffer.byteLength(buffer)>500000){socket.destroy();return;}
+        const end=buffer.indexOf('\n');if(end<0)return;handled=true;
+        try{
+          const request=JSON.parse(buffer.slice(0,end));check(request);let data;const args=request.body??{};
+          if(request.op==='state')data={sessionFile:file,sessionId:header.id,isStreaming:!ctx.isIdle(),generation:record.generation};
+          else if(request.op==='read'){
+            const entries=ctx.sessionManager.getEntries(),leafId=ctx.sessionManager.getLeafId();
+            const revisionInput={entries,leaf:leafId,generation:record.generation};
+            if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)throw new AttachmentFailure('SESSION_TOO_LARGE');
+            const view=args.view??'context',records=recordsFor({entries,leafId},{...args,view});
+            data={view,leaf_id:view!=='raw'&&args.leaf_id!==undefined?args.leaf_id:leafId,generation:record.generation,context_kind:view==='context'?'pi_session_projection_not_final_provider_payload':undefined,...pageRecords(records,{...args,view},hash(revisionInput))};
+          }else if(request.op==='send'){
+            if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))throw new AttachmentFailure('INVALID_ATTACHED_SEND');
+            if(args.mode==='idle_only'&&!ctx.isIdle())data={status:'skipped',reason:'busy'};
+            else{
+              const options={expandPromptTemplates:true};
+              if(args.mode==='steer')options.deliverAs='steer';
+              if(args.mode==='queue')options.deliverAs='followUp';
+              pi.sendUserMessage(args.text,options);
+              data={status:'unknown',dispatch:'submitted',reason:'PI_ACCEPTANCE_UNOBSERVABLE',completion:'not_tracked'};
+            }
+          }else if(request.op==='shutdown'){
+            data={shutdown:'requested'};
+            socket.end(JSON.stringify({generation:record.generation,data})+'\n',()=>{
+              try {check(request);ctx.shutdown();}
+              catch { /* Reload/replacement may invalidate the captured context before the flush callback. */ }
+            });return;
+          }else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
+          socket.end(JSON.stringify({generation:record.generation,data})+'\n');
+        }catch(error){socket.end(JSON.stringify({generation:record.generation,error:/^[A-Z_]+$/.test(error.code??error.message)?(error.code??error.message):'ATTACHED_OPERATION_FAILED'})+'\n');}
+      });
+    });
+    runtime.server=server;active=runtime;
+    await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(record.socket,resolve);});
+    await fs.chmod(record.socket,0o600);runtime.ready=true;
+    await updateOwner(dir,session,record,{phase:'ready'});
+    // A successful replacement lifecycle conclusively releases this process's previous native identity.
+    await registryTransaction(dir,async()=>{
+      for(const name of await fs.readdir(dir)){
+        if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)||path.join(dir,name)===claimFile(dir,session))continue;
+        const other=JSON.parse(await fs.readFile(path.join(dir,name),'utf8'));
+        if(other.kind==='tui'&&other.owner?.pid===owner.pid&&other.owner.start===owner.start&&other.owner.boot===owner.boot)await fs.unlink(path.join(dir,name));
+      }
+    });
+    } catch(error) {
+      // Pi catches hook errors. Explicitly stop an instrumented TUI that could not establish ownership.
+      // A published starting claim is retained until its exact process exits.
+      try {ctx.shutdown();} catch { /* Context may already be invalidated by another lifecycle. */ }
+      throw error;
+    }
+  });
+}

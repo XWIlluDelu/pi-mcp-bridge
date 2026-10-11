@@ -1,0 +1,71 @@
+// Owner-side configuration edits only. Not exposed as an MCP operation.
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { ACTIONS, inside } from './permissions.mjs';
+import { hash, syncDir } from './data.mjs';
+export function validateGrants(grants=[]){
+  if(!Array.isArray(grants))throw new Error('INVALID_OWNER_CONFIG');
+  for(const rule of grants){
+    if(!rule||typeof rule!=='object'||Array.isArray(rule))throw new Error('INVALID_OWNER_CONFIG');
+    const session=Object.hasOwn(rule,'session_id'),folder=Object.hasOwn(rule,'folder');
+    if(session===folder)throw new Error('INVALID_OWNER_CONFIG');
+    if(session&&(typeof rule.session_id!=='string'||rule.session_id.length===0||rule.session_id.length>128))throw new Error('INVALID_OWNER_CONFIG');
+    if(folder&&(typeof rule.folder!=='string'||!path.isAbsolute(rule.folder)))throw new Error('INVALID_OWNER_CONFIG');
+    for(const action of ACTIONS)if(Object.hasOwn(rule,action)&&rule[action]!==null&&typeof rule[action]!=='boolean')throw new Error('INVALID_OWNER_CONFIG');
+  }
+  return grants;
+}
+export async function readOwnerConfig(file){
+  if(typeof file!=='string'||!path.isAbsolute(file))throw new Error('INVALID_OWNER_CONFIG_PATH');
+  const stat=await fs.lstat(file);
+  if(!stat.isFile()||stat.isSymbolicLink()||stat.size>1024*1024||await fs.realpath(file)!==file)throw new Error('INVALID_OWNER_CONFIG_PATH');
+  const raw=await fs.readFile(file,'utf8');let config;
+  try{config=JSON.parse(raw);}catch{throw new Error('INVALID_OWNER_CONFIG');}
+  if(!config||typeof config!=='object'||Array.isArray(config))throw new Error('INVALID_OWNER_CONFIG');
+  validateGrants(config.grants);
+  return {config,revision:hash(raw),mode:stat.mode&0o777};
+}
+export function permissionDetails(config,action,target){
+  const scopes=new Map();
+  for(const rule of config.grants??[]){
+    if(!Object.hasOwn(rule,action))continue;
+    const key=rule.session_id?`session:${rule.session_id}`:`folder:${path.resolve(rule.folder)}`;
+    scopes.set(key,rule[action]);
+  }
+  const ownKey=target.session_id?`session:${target.session_id}`:`folder:${target.folder}`;
+  const explicit=scopes.get(ownKey);
+  if(action!=='new_session'&&target.session_id){
+    const value=scopes.get(`session:${target.session_id}`);
+    if(typeof value==='boolean')return {allowed:value,explicit,source:'this session'};
+  }
+  const cwd=target.cwd??target.folder;
+  const folders=[...scopes].filter(([key])=>key.startsWith('folder:')&&inside(cwd,key.slice(7))).sort((a,b)=>b[0].length-a[0].length);
+  for(const [key,value]of folders)if(typeof value==='boolean')return {allowed:value,explicit,source:key===ownKey?'this project':`project ${key.slice(7)}`};
+  return {allowed:false,explicit,source:'default deny'};
+}
+export async function editPermission(file,revision,target,action,value){
+  if(!ACTIONS.includes(action)||![true,false,null].includes(value)||(target.session_id&&action==='new_session'))throw new Error('INVALID_PERMISSION_EDIT');
+  const scope=target.session_id?{session_id:target.session_id}:{folder:target.folder};validateGrants([{...scope,[action]:value}]);
+  if(scope.folder&&await fs.realpath(scope.folder)!==scope.folder)throw new Error('INVALID_PROJECT_FOLDER');
+  let lock;
+  try{lock=await fs.open(`${file}.permissions.lock`,'wx',0o600);}catch(e){if(e.code==='EEXIST')throw new Error('OWNER_CONFIG_BUSY');throw e;}
+  let temporary;
+  try{
+    const current=await readOwnerConfig(file);
+    if(current.revision!==revision)throw new Error('OWNER_CONFIG_CHANGED');
+    const config=structuredClone(current.config);config.grants??=[];
+    let rule=config.grants.findLast(r=>scope.session_id?r.session_id===scope.session_id:!r.session_id&&path.resolve(r.folder)===scope.folder);
+    if(!rule){rule={...scope};config.grants.push(rule);}rule[action]=value;
+    temporary=`${file}.${process.pid}.${randomUUID()}.tmp`;
+    const fd=await fs.open(temporary,'wx',current.mode);
+    try{await fd.writeFile(JSON.stringify(config,null,2)+'\n');await fd.sync();}finally{await fd.close();}
+    // Detect non-cooperating editor changes during preparation as well.
+    if((await readOwnerConfig(file)).revision!==revision)throw new Error('OWNER_CONFIG_CHANGED');
+    await fs.rename(temporary,file);temporary=null;await syncDir(path.dirname(file));
+    return await readOwnerConfig(file);
+  }finally{
+    if(temporary)await fs.unlink(temporary).catch(()=>{});
+    await lock.close();await fs.unlink(`${file}.permissions.lock`);
+  }
+}

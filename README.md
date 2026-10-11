@@ -3,8 +3,8 @@
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
 RPC workers. It exposes `list`, `read`, `send`, `create` and `delete` over stdio.
 
-Use exclusively owned session storage. Existing TUI attachment is not implemented;
-an independent writer does not participate in Bridge locking.
+Cooperating Pi TUI processes share their existing runtime through a private
+Unix socket. Cooperative process identity and attachment require Linux.
 
 ## Install and try
 
@@ -49,7 +49,9 @@ Each permission defaults to deny. An explicit session rule wins, then the neares
 project rule. Later entries replace the same permission at the same scope; `null`
 inherits. Project paths are canonicalized. Creation does not imply send access.
 
-Configuration is loaded at startup; restart Bridge after changing it.
+Entrypoints reload grants before requests. Other configuration changes require
+restart (`CONFIG_RESTART_REQUIRED`). An invalid config blocks new requests;
+already dispatched work may finish.
 
 This is API authorization, not an OS sandbox. Owner-enabled tools run with host
 privileges. Protect the owner file, receipts and state from untrusted local code.
@@ -78,6 +80,36 @@ configuration rather than copying credentials into Bridge configuration.
 
 HOME remains isolated even with a profile. Automatic extensions, skills, themes
 and prompt templates are disabled; explicit CLI options can load selected resources.
+
+### Local controls and shared sessions
+
+Launch ordinary Pi with the companion and permission menu, using the same private
+IPC directory and owner configuration as Bridge:
+
+```sh
+cd /absolute/path/to/authorized-project
+PI_MCP_OWNER_CONFIG=/absolute/path/to/owner.json \
+PI_MCP_ATTACH_DIR=/absolute/path/to/private-ipc \
+  pi --session /absolute/path/to/session.jsonl \
+  -e /absolute/path/pi-mcp-bridge/src/attach-extension.mjs \
+  -e /absolute/path/pi-mcp-bridge/src/owner-permissions-extension.mjs
+```
+
+Use a canonical private IPC directory owned by the same Unix user; new
+directories are created with mode 0700.
+Socket paths must fit within 100 bytes. Close the prior writer before opening
+its file; registration coordinates participating writers, not arbitrary processes.
+The TUI retains its native profile and credentials.
+
+**Ctrl+Alt+P** edits existing project/session permissions using Allow, Block and
+Inherit. It does not add roots, folders or callers. Edits preserve unrelated
+configuration and reject detected concurrent changes.
+
+Claims bind file, native ID, process identity and generation. A live unreachable
+or transitioning owner blocks fallback. Bridge shutdown disconnects external
+owners without terminating them. Delete requires confirmed writer exit, not just
+socket closure. Registry/editor locks left by a crash require owner-confirmed
+recovery after the relevant processes stop.
 
 ## Tools
 
@@ -130,6 +162,9 @@ Receipts persist before dispatch and survive restart. A lost ACK remains `unknow
 a verified late ACK can update it. Reusing the ID recovers the outcome without
 redispatch; a fresh ID risks duplicate work. Keep receipt storage private.
 
+Companion sends return `unknown/PI_ACCEPTANCE_UNOBSERVABLE`: the public send API
+returns void. Its idle check is observational, not atomic against other inputs.
+
 ### create and delete
 
 Create requires `folder_id`, `request_id` and `new_session`. It durably writes an
@@ -174,5 +209,6 @@ provider-side thinking.
 
 Preserve native session identity and mutation request IDs during recovery.
 
-Before removing a stale Bridge state lock, confirm its old process has stopped.
-A separate writer or Bridge with another state directory is outside this lock.
+Before removing a stale Bridge, registry or permission-editor lock, confirm the
+relevant processes have stopped. Unregistered writers remain outside cooperative
+coordination.
