@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ACTIONS, inside } from './permissions.mjs';
+import { ACTIONS, resolvePermission } from './permissions.mjs';
 import { hash, syncDir } from './data.mjs';
 export function validateGrants(grants=[]){
   if(!Array.isArray(grants))throw new Error('INVALID_OWNER_CONFIG');
@@ -27,22 +27,10 @@ export async function readOwnerConfig(file){
   return {config,revision:hash(raw),mode:stat.mode&0o777};
 }
 export function permissionDetails(config,action,target){
-  const scopes=new Map();
-  for(const rule of config.grants??[]){
-    if(!Object.hasOwn(rule,action))continue;
-    const key=rule.session_id?`session:${rule.session_id}`:`folder:${path.resolve(rule.folder)}`;
-    scopes.set(key,rule[action]);
-  }
-  const ownKey=target.session_id?`session:${target.session_id}`:`folder:${target.folder}`;
-  const explicit=scopes.get(ownKey);
-  if(action!=='new_session'&&target.session_id){
-    const value=scopes.get(`session:${target.session_id}`);
-    if(typeof value==='boolean')return {allowed:value,explicit,source:'this session'};
-  }
-  const cwd=target.cwd??target.folder;
-  const folders=[...scopes].filter(([key])=>key.startsWith('folder:')&&inside(cwd,key.slice(7))).sort((a,b)=>b[0].length-a[0].length);
-  for(const [key,value]of folders)if(typeof value==='boolean')return {allowed:value,explicit,source:key===ownKey?'this project':`project ${key.slice(7)}`};
-  return {allowed:false,explicit,source:'default deny'};
+  const {allowed,explicit,sourceScope}=resolvePermission(config,action,target);
+  const source=sourceScope?.session_id?'this session':sourceScope?.folder?
+    (!target.session_id&&sourceScope.folder===path.resolve(target.folder??target.cwd)?'this project':`project ${sourceScope.folder}`):'default deny';
+  return {allowed,explicit,source};
 }
 export async function editPermission(file,revision,target,action,value){
   if(!ACTIONS.includes(action)||![true,false,null].includes(value)||(target.session_id&&action==='new_session'))throw new Error('INVALID_PERMISSION_EDIT');

@@ -102,3 +102,43 @@ test('write uncertainty retains admission; authoritative rejection or confirmed 
   }
  }
 });
+
+test('silent live child does not retain expired read requests while prompt ACK recovery stays fenced',async()=>{
+ const rpc=new PiRpc({},{}),writes=[];rpc.alive=true;
+ rpc.child={stdin:{write:line=>writes.push(JSON.parse(line))}};
+ let lateReads=0;
+ for(let i=0;i<12;i++){
+  await assert.rejects(rpc.dispatch({type:i%2?'get_entries':'get_state'},1,()=>lateReads++),{code:'ACK_TIMEOUT'});
+  assert.equal(rpc.pending.size,0);assert.equal(rpc.promptAdmission,null);
+ }
+ for(const request of writes)rpc.receiveResponse({type:'response',id:request.id,success:true,data:{}},rpc.generation);
+ assert.equal(lateReads,0);
+ let latePrompt;
+ await assert.rejects(rpc.dispatch({type:'prompt',message:'held'},1,result=>{latePrompt=result;}),{code:'ACK_TIMEOUT'});
+ const prompt=writes.at(-1);assert.equal(rpc.pending.size,1);
+ for(const failure of ['callback','throw']){
+  rpc.child.stdin.write=(_line,cb)=>{if(failure==='throw')throw new Error('fixture');cb(new Error('fixture'));};
+  await assert.rejects(rpc.dispatch({type:'get_entries'},50),{code:'WRITE_UNKNOWN'});
+  assert.equal(rpc.pending.size,1);assert.equal(rpc.promptAdmission.id,prompt.id);
+ }
+ rpc.receiveResponse({type:'response',id:prompt.id,command:'prompt',success:true,data:{disposition:'started'}},rpc.generation);
+ assert.equal(latePrompt.ok,true);assert.equal(rpc.pending.size,0);assert.equal(rpc.promptAdmission,null);
+});
+
+test('entry read reuses its identity postcheck for activity without another RPC',async()=>{
+ const rpc=new PiRpc({},{file:'/sessions/a.jsonl',header:{id:'a'}}),calls=[];
+ rpc.promptAdmission={id:'unresolved',generation:rpc.generation};
+ rpc.dispatch=async command=>{
+  calls.push(command.type);
+  if(command.type==='get_entries')return {entries:[],leafId:null};
+  return {sessionFile:rpc.session.file,sessionId:'a',isStreaming:false,isCompacting:false,pendingMessageCount:2};
+ };
+ const result=await rpc.entries();
+ assert.deepEqual(calls,['get_state','get_entries','get_state']);
+ assert.equal(result.activity.source,'rpc_get_state');assert.equal(result.activity.streaming,false);
+ assert.equal(result.activity.idle,null);assert.equal(result.activity.preparing,null);
+ assert.equal(result.activity.pending_messages,true);assert.equal(result.activity.pending_message_count,2);
+ assert.equal(result.activity.bridge_admission.pending,true);assert.ok(Date.parse(result.activity.observed_at));
+ rpc.dispatch=async command=>command.type==='get_entries'?{entries:[],leafId:null}:{sessionFile:rpc.session.file,sessionId:'a'};
+ const missing=(await rpc.entries()).activity;assert.equal(missing.streaming,null);assert.equal(missing.pending_messages,null);assert.equal(missing.pending_message_count,null);
+});

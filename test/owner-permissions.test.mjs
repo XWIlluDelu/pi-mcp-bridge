@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { permitted } from '../src/permissions.mjs';
+import { permitted, resolvePermission } from '../src/permissions.mjs';
 import { readOwnerConfig,editPermission,permissionDetails,validateGrants } from '../src/owner-config.mjs';
 import ownerPermissions from '../src/owner-permissions-extension.mjs';
 import { Bridge } from '../src/bridge.mjs';
@@ -79,4 +79,32 @@ test('shutdown prevents dispatch after an asynchronous permission reload',async 
  const made=await bridge.create({folder_id:'project',request_id:'create'});
  const send=bridge.send({session_id:made.session_id,request_id:'closing',text:'must not dispatch'});const closed=bridge.close();
  await assert.rejects(send,/BRIDGE_CLOSING/);await closed;assert.equal(bridge.pool.instances.size,0);
+});
+
+test('shared permission resolver preserves effective values, explicit inheritance and source scope',()=>{
+ const config={grants:[
+  {folder:'/project',read:true,send:true,new_session:false},
+  {folder:'/project/child',read:false,send:false},
+  {folder:'/project/child',read:null},
+  {session_id:'s',read:false,new_session:true},
+  {session_id:'s',read:null,send:true},
+  {folder:'/project',delete:true},
+  {folder:'/project',delete:false},
+ ]},before=structuredClone(config);
+ const cases=[
+  {action:'read',target:{session_id:'s',cwd:'/project/child'},allowed:true,explicit:null,scope:{folder:'/project'},label:'project /project'},
+  {action:'send',target:{session_id:'s',cwd:'/project/child'},allowed:true,explicit:true,scope:{session_id:'s'},label:'this session'},
+  {action:'send',target:{session_id:'other',cwd:'/project/child'},allowed:false,explicit:undefined,scope:{folder:'/project/child'},label:'project /project/child'},
+  {action:'new_session',target:{session_id:'s',cwd:'/project/child'},allowed:false,explicit:true,scope:{folder:'/project'},label:'project /project'},
+  {action:'read',target:{folder:'/project/child'},allowed:true,explicit:null,scope:{folder:'/project'},label:'project /project'},
+  {action:'send',target:{folder:'/project/child'},allowed:false,explicit:false,scope:{folder:'/project/child'},label:'this project'},
+  {action:'delete',target:{folder:'/project'},allowed:false,explicit:false,scope:{folder:'/project'},label:'this project'},
+  {action:'read',target:{folder:'/project2'},allowed:false,explicit:undefined,scope:null,label:'default deny'},
+ ];
+ for(const c of cases){
+  assert.deepEqual(resolvePermission(config,c.action,c.target),{allowed:c.allowed,explicit:c.explicit,sourceScope:c.scope});
+  assert.equal(permitted(config,c.action,{id:c.target.session_id,cwd:c.target.cwd??c.target.folder}),c.allowed);
+  assert.deepEqual(permissionDetails(config,c.action,c.target),{allowed:c.allowed,explicit:c.explicit,source:c.label});
+ }
+ assert.deepEqual(config,before);
 });

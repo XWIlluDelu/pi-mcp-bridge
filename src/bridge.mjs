@@ -3,11 +3,12 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted, inside } from './permissions.mjs';
-import { discover, opaqueId, recordsFor, pageRecords, hash, syncDir } from './data.mjs';
+import { discover, opaqueId, renderRead, hash, syncDir } from './data.mjs';
 import { RuntimePool } from './rpc.mjs';
 import { Journal } from './journal.mjs';
 import { privateDirectory } from './attachments.mjs';
 import { readOwnerConfig, validateGrants } from './owner-config.mjs';
+import { diagnostics } from './diagnostics.mjs';
 export class Bridge {
   constructor(config, factory, {configFile}={}) { this.config = config; this.configFile=configFile;const {grants,...settings}=config;this.ownerSettings=structuredClone(settings);this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); }
   async init() {
@@ -41,25 +42,26 @@ export class Bridge {
     const next = prior.catch(()=>{}).then(fn); this.locks.set(id,next);
     try { return await next; } finally { if (this.locks.get(id) === next) this.locks.delete(id); }
   }
-  async sessions() { return discover(this.config); }
+  async sessions() { return diagnostics.measure('session.discover',{},()=>discover(this.config)); }
   async refreshPermissions(){
     if(!this.configFile)return;
-    const task=(this.permissionsReload??Promise.resolve()).catch(()=>{}).then(async()=>{
+    const task=diagnostics.measure('permission.reload',{},()=>(this.permissionsReload??Promise.resolve()).catch(()=>{}).then(async()=>{
       const {config}=await readOwnerConfig(this.configFile);const {grants,...settings}=config;
       if(!isDeepStrictEqual(settings,this.ownerSettings))throw new Error('CONFIG_RESTART_REQUIRED');
       this.config.grants=grants??[];
-    });
+    }));
     this.permissionsReload=task;
     try{await task;}finally{if(this.permissionsReload===task)this.permissionsReload=null;}
   }
   async session(id) { const s = (await this.sessions()).find(s=>s.id === id); if (!s) throw new Error('NOT_FOUND_OR_DENIED'); return s; }
-  check(action,s) { if (!permitted(this.config,action,s)) throw new Error('NOT_FOUND_OR_DENIED'); }
+  check(action,s) { const allowed=permitted(this.config,action,s);diagnostics.emit('permission.check',{op:action,allowed});if (!allowed) throw new Error('NOT_FOUND_OR_DENIED'); }
   async list(args = {}) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     const rows = [];
     for (const s of await this.sessions()) {
       if (!permitted(this.config,'read',s)) { if (!args.query) rows.push({session_id:s.id}); continue; }
-      const title = [...s.entries].reverse().find(e=>e.type==='session_info' && e.name)?.name ?? null;
+      const name = s.entries.findLast(e=>e.type==='session_info')?.name;
+      const title = typeof name==='string' ? name.trim() || null : null;
       if (args.query && !JSON.stringify({title,cwd:s.cwd}).toLowerCase().includes(args.query.toLowerCase())) continue;
       rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.cwd.slice(0,1024),leaf_id:s.leafId,permissions:{read:true,send:permitted(this.config,'send',s),delete:permitted(this.config,'delete',s)}});
     }
@@ -71,17 +73,16 @@ export class Bridge {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     const s = await this.session(args.session_id); this.check('read',s);
     const runtime = await this.pool.forRead(s);
+    diagnostics.emit('read.source',{kind:runtime?(runtime.attached?'attached':'rpc'):'saved',view:args.view??'context'});
     if(runtime?.attached)return runtime.read(args);
     if (runtime) {
       const active = await runtime.entries();
       if (active.entries.some(e=>typeof e.id!=='string' || e.id.length>128) || (active.leafId!==null && (typeof active.leafId!=='string' || active.leafId.length>128))) throw new Error('INVALID_RUNTIME_ENTRIES');
       s.entries = active.entries; s.leafId = active.leafId;
+      s.activity = active.activity;
       s.revision = hash({entries:s.entries,leaf:s.leafId});
     }
-    const view = args.view ?? 'context';
-    const records = recordsFor(s,{...args,view});
-    const leaf = view !== 'raw' && args.leaf_id !== undefined ? args.leaf_id : s.leafId;
-    return {view,leaf_id:leaf,context_kind:view==='context'?'pi_session_projection_not_final_provider_payload':undefined,...pageRecords(records,{...args,view},s.revision)};
+    return renderRead(s,args,{leafSource:runtime?'live':'saved_resume'});
   }
   async send(args) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
@@ -154,5 +155,5 @@ export class Bridge {
 }
 function safeReason(error) {
   const code = error.code ?? error.message;
-  return ['NOT_FOUND_OR_DENIED','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }

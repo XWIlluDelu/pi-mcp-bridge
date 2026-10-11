@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { buildSessionProjection, migrateSessionEntries } from '@earendil-works/pi-coding-agent';
+import { overviewRecords } from './overview.mjs';
+import { activityObservation } from './activity.mjs';
 export const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export const opaqueId = value => `ps_${hash(value).slice(0, 32)}`;
 export async function atomicJson(file, value) {
@@ -83,12 +85,21 @@ export function recordsFor(data, args) {
     const projection = buildSessionProjection(entries, args.leaf_id === undefined ? data.leafId : args.leaf_id);
     // Retained raw ranges can contain superseded checkpoints or context-hidden
     // summaries. Only entries contributing to this leaf's projection are active.
-    if (args.view === 'summary') records = projection.entries.filter(e => e.messages.length > 0 && ['compaction','branch_summary'].includes(e.sourceEntry.type)).map(e => ({entry_id:e.sourceEntry.id, type:e.sourceEntry.type, summary:e.sourceEntry.summary}));
+    if (args.view === 'overview') records = overviewRecords(projection);
+    else if (args.view === 'summary') records = projection.entries.filter(e => e.messages.length > 0 && ['compaction','branch_summary'].includes(e.sourceEntry.type)).map(e => ({entry_id:e.sourceEntry.id, type:e.sourceEntry.type, summary:e.sourceEntry.summary}));
     else records = projection.entries.flatMap(e => e.messages.map((message, i) => ({entry_id:e.sourceEntry.id, message_index:i, message})));
   }
   if (args.entry_id) records = records.filter(e => e.entry_id === args.entry_id);
   if (args.query) records = records.filter(e => JSON.stringify(e).toLowerCase().includes(args.query.toLowerCase()));
   return records;
+}
+// One selector and renderer for saved files, RPC snapshots and attachments.
+export function renderRead(data,args,{leafSource='saved_resume',generation}={}) {
+  const view=args.view??'context',leaf=view!=='raw'&&args.leaf_id!==undefined?args.leaf_id:data.leafId;
+  return {view,leaf_id:leaf,activity:data.activity??activityObservation(),...(generation===undefined?{}:{generation}),
+    context_kind:['context','overview'].includes(view)?'pi_session_projection_not_final_provider_payload':undefined,
+    ...(view==='overview'?{leaf_source:leafSource,leaf_selection:args.leaf_id===undefined?'current':'explicit',append_tail:data.entries.at(-1)?.id??null}:{}),
+    ...pageRecords(recordsFor(data,{...args,view}),{...args,view},data.revision)};
 }
 // Pagination also handles a single enormous record. No hidden truncation.
 export function pageRecords(records, args, revision) {

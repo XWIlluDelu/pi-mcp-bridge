@@ -158,6 +158,10 @@ export default function(pi){
    const runtime=bridge.pool.get(session_id);
    await until(async()=> (await rows()).length===1);
    assert.equal((await runtime.state()).isStreaming,false); // Pi has not published busy during preparation.
+   const preparationRead=await bridge.read({session_id});
+   assert.equal(preparationRead.activity.source,'rpc_get_state');assert.equal(preparationRead.activity.streaming,false);
+   assert.equal(preparationRead.activity.idle,null);assert.equal(preparationRead.activity.preparing,null);assert.equal(preparationRead.activity.bridge_admission.pending,true);
+   assert.ok(preparationRead.activity.limitations.includes('idle_not_task_completion'));
    assert.deepEqual(await bridge.send({session_id,request_id:'first'}),first);
    for(const mode of ['native','idle_only','steer','queue']){
     const receipt=await bridge.send({session_id,request_id:'blocked-'+mode,text:'BLOCKED '+mode,mode});
@@ -190,4 +194,18 @@ export default function(pi){
    assert.equal(next.status,'accepted');assert.equal(next.disposition,'started');
    assert.notEqual(bridge.pool.get(session_id).generation,oldGeneration);
   }finally{await bridge.close();}
+});
+
+test('official Pi RPC preserves Unicode line separators in native session messages',async t=>{
+ const f=await configFixture(t),bridge=await new Bridge(f.config).init();
+ try{
+  const made=await bridge.create({folder_id:'project',request_id:'unicode'}),saved=await bridge.session(made.session_id);
+  const manager=SessionManager.open(saved.file),content='Before\u2028between\u2029after 😀 汉字';
+  manager.appendMessage({role:'user',content,timestamp:Date.now()});
+  assert.equal((await bridge.read({session_id:made.session_id})).items[0].message.content,content);
+  const runtime=await bridge.pool.resolve(await bridge.session(made.session_id));
+  assert.equal((await runtime.state()).sessionId,saved.header.id);
+  const live=await bridge.read({session_id:made.session_id});
+  assert.equal(live.items[0].message.content,content);assert.equal(live.activity.source,'rpc_get_state');
+ }finally{await bridge.close();}
 });

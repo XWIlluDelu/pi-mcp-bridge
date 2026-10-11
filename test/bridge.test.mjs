@@ -6,6 +6,17 @@ import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
 import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
+import { SessionManager } from '@earendil-works/pi-coding-agent';
+
+test('listing respects the latest native title including an explicit clear',async t=>{
+ const f=await fixture(t),saved=await f.bridge.session(f.id),manager=SessionManager.open(saved.file);
+ manager.appendSessionInfo(' OLD_TITLE ');
+ assert.equal((await f.bridge.list()).sessions[0].title,manager.getSessionName());
+ manager.appendSessionInfo('  ');
+ assert.equal(manager.getSessionName(),undefined);
+ assert.equal((await f.bridge.list()).sessions[0].title,null);
+ assert.deepEqual((await f.bridge.list({query:'OLD_TITLE'})).sessions,[]);
+});
 
 async function fixture(t,grants,factory) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(),'pi-bridge-test-'));

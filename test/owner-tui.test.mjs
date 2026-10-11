@@ -19,21 +19,32 @@ test('human Pi menu changes live session/project permissions enforced by actual 
  const configFile=path.join(dir,'owner.json');await fs.writeFile(configFile,JSON.stringify(config));
  const setup=await new Bridge(config).init();const made=await setup.create({folder_id:'project',request_id:'seed'});const session=await setup.session(made.session_id);await setup.close();
  const agentDir=path.join(dir,'agent');await fs.mkdir(agentDir);await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarming:'off',retry:{enabled:false},compaction:{enabled:false}}));
- const args=[process.execPath,path.join(base,'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),'--session',session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes','--no-tools','-e',path.join(base,'research/faux-extension.mjs'),'-e',path.join(base,'src/attach-extension.mjs'),'-e',path.join(base,'src/owner-permissions-extension.mjs'),'--provider','bridge-fixture','--model','deterministic','--thinking','off'];
+ // Observe completion of our own shortcut handler through public registration;
+ // do not replace Pi methods or treat a terminal redraw as callback completion.
+ const menuObserver=path.join(dir,'menu-observer.mjs'),menuClosed=path.join(dir,'menu-closed.json');
+ await fs.writeFile(menuObserver,`import fs from 'node:fs/promises';import ownerPermissions from ${JSON.stringify(path.join(base,'src/owner-permissions-extension.mjs'))};export default function(pi){let sequence=0;ownerPermissions({on:(...args)=>pi.on(...args),registerShortcut:(key,options)=>pi.registerShortcut(key,{...options,handler:async ctx=>{const invocation=++sequence;await options.handler(ctx);const file=${JSON.stringify(menuClosed)};await fs.writeFile(file+'.tmp',JSON.stringify({invocation}));await fs.rename(file+'.tmp',file);}})});}`);
+ const args=[process.execPath,path.join(base,'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),'--session',session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes','--no-tools','-e',path.join(base,'research/faux-extension.mjs'),'-e',path.join(base,'src/attach-extension.mjs'),'-e',menuObserver,'--provider','bridge-fixture','--model','deterministic','--thinking','off'];
  const tui=spawn('script',['-qefc',args.map(quote).join(' '),'/dev/null'],{cwd,env:{PATH:process.env.PATH,HOME:dir,PI_CODING_AGENT_DIR:agentDir,PI_MCP_ATTACH_DIR:config.attachmentDir,PI_MCP_OWNER_CONFIG:configFile,PI_OFFLINE:'1',TERM:'xterm-256color',LANG:'C.UTF-8'},stdio:['pipe','pipe','pipe']});
+ const events=[];let failure,menuInvocation=0;
  const chunks=[];tui.stdout.on('data',chunk=>chunks.push(chunk.toString()));tui.stderr.on('data',chunk=>chunks.push(chunk.toString()));
  const client=new Client({name:'owner-ui-permission-fixture',version:'1.0.0'});let owner;
  const call=async(name,args)=>{const result=await client.callTool({name,arguments:args});return result;};
  const ok=async(name,args)=>{const result=await call(name,args);assert.ok(!result.isError,`MCP ${name} failed`);return result.structuredContent;};
- const key=async value=>{tui.stdin.write(value);await delay(35);};
- async function screen(text,offset){await until(()=>chunks.slice(offset).join('').includes(text),'UI '+text);}
+ const key=async value=>{events.push({type:'key',time:Date.now(),value});tui.stdin.write(value);await delay(35);};
+ async function screen(text,offset){await until(()=>chunks.slice(offset).join('').includes(text),'UI '+text);events.push({type:'screen',time:Date.now(),text,offset});}
  async function selectIndex(index){for(let i=0;i<index;i++)await key('\x1b[B');await key('\r');}
  async function edit(scope,action,value,expected,projectIndex=0){
+  const invocation=++menuInvocation;events.push({type:'edit',time:Date.now(),invocation,scope,action,value});
   let offset=chunks.length;await key('\x1b\x10');await screen('MCP permissions',offset);offset=chunks.length;await selectIndex(scope);
   if(scope===2){await screen('Choose project',offset);offset=chunks.length;await selectIndex(projectIndex);}
   await screen('Read:',offset);offset=chunks.length;await selectIndex(action);await screen('Inherit',offset);
-  await selectIndex(value);await until(async()=>expected(JSON.parse(await fs.readFile(configFile,'utf8'))),'permission file edit');
-  await selectIndex(scope===0?3:4); // Done from the refreshed action list.
+  offset=chunks.length;await selectIndex(value);await until(async()=>expected(JSON.parse(await fs.readFile(configFile,'utf8'))),'permission file edit');
+  events.push({type:'config-visible',time:Date.now(),invocation});
+  // Rename visibility is earlier than save completion and the next selector.
+  await screen('Read:',offset);
+  await selectIndex(scope===0?3:4);
+  await until(async()=>{try{return JSON.parse(await fs.readFile(menuClosed,'utf8')).invocation===invocation;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'permission handler closed');
+  events.push({type:'closed',time:Date.now(),invocation});
  }
  try{
   await until(async()=>{owner=await readClaim(config.attachmentDir,session);return owner?.phase==='ready';},'TUI registration');
@@ -78,7 +89,10 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   assert.equal((await ok('send',{session_id:headless.session_id,request_id:'headless-send',text:'public background fixture'})).status,'accepted');
   await until(async()=>(await ok('read',{session_id:headless.session_id})).items.some(x=>x.message?.role==='assistant'),'headless response after TUI exit');
   assert.equal((await ok('delete',{session_id:headless.session_id,request_id:'headless-delete'})).status,'deleted');
+ }catch(error){
+  failure=error;await fs.writeFile(path.join(dir,'terminal.txt'),chunks.join(''));await fs.writeFile(path.join(dir,'events.json'),JSON.stringify(events,null,2));
+  error.message+='; fixture and terminal evidence retained at '+dir;throw error;
  }finally{
-  await client.close();if(owner&&await ownerAlive(owner.owner))process.kill(owner.owner.pid,'SIGTERM');if(owner)await waitOwnerExit(owner.owner);tui.stdin.destroy();if(tui.exitCode===null)tui.kill('SIGTERM');await fs.rm(dir,{recursive:true,force:true,maxRetries:3,retryDelay:100});
+  await client.close();if(owner&&await ownerAlive(owner.owner))process.kill(owner.owner.pid,'SIGTERM');if(owner)await waitOwnerExit(owner.owner);tui.stdin.destroy();if(tui.exitCode===null)tui.kill('SIGTERM');if(!failure)await fs.rm(dir,{recursive:true,force:true,maxRetries:3,retryDelay:100});
  }
 });

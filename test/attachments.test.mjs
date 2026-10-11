@@ -12,6 +12,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { Bridge } from '../src/bridge.mjs';
 import { AttachedRuntime, readClaim, reserveOwner, updateOwner, releaseOwner, processIdentity, ownerAlive, privateDirectory, waitOwnerExit } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
+import { operationSchemas } from '../src/tool-schemas.mjs';
 const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture(t){
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-at-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
@@ -105,6 +106,15 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
   }
   assert.deepEqual(calls.map(x=>x.options),[{expandPromptTemplates:true},{expandPromptTemplates:true},{expandPromptTemplates:true,deliverAs:'steer'},{expandPromptTemplates:true,deliverAs:'followUp'}]);
   idle=false;assert.equal((await runtime.send({text:'compacting',mode:'idle_only'})).status,'skipped');assert.equal(calls.length,4);
+  const escaped={session_id:f.id,request_id:'escaped',text:'\0'.repeat(100000),mode:'native'};
+  assert.equal(operationSchemas.send.safeParse(escaped).success,true);
+  assert.equal((await runtime.send(escaped)).dispatch,'submitted');assert.equal(calls.at(-1).text,escaped.text);
+  f.bridge.pool.instances.set(f.id,runtime);
+  const connect=t.mock.method(net,'createConnection',()=>{throw new Error('oversized requests must not connect');});
+  try{
+   const rejected=await f.bridge.send({...escaped,request_id:'oversized',text:'\0'.repeat(200000)});
+   assert.equal(rejected.status,'rejected');assert.equal(rejected.reason,'ATTACHMENT_REQUEST_TOO_LARGE');assert.equal(connect.mock.calls.length,0);
+  }finally{connect.mock.restore();}
   const page=await runtime.read({session_id:f.id,max_chars:256});assert.ok(page.next_cursor);leaf='a';
   await assert.rejects(runtime.read({session_id:f.id,max_chars:256,cursor:page.next_cursor}),/STALE_CURSOR/);
   await runtime.stop();assert.equal(shutdown,false);
@@ -253,15 +263,18 @@ test('official TUI session replacement registers a fresh identity and socket los
  assert.equal((await f.bridge.send({session_id:f.id,request_id:'fork',text:'/fixture-fork'})).status,'unknown');
  const fork=await until(async()=>(await f.bridge.sessions()).find(s=>s.id!==f.id));
  const forkClaim=await until(async()=>{const r=await readClaim(f.config.attachmentDir,fork);return r?.phase==='ready'?r:null;});
- assert.notEqual(forkClaim.generation,launched.record.generation);assert.equal(await readClaim(f.config.attachmentDir,f.session),null);
+ assert.notEqual(forkClaim.generation,launched.record.generation);
+ // Ready publication precedes asynchronous old-claim cleanup. Await both
+ // lifecycle conditions instead of assuming they are a single transaction.
+ await until(async()=>await readClaim(f.config.attachmentDir,f.session)===null);
  assert.equal((await f.bridge.send({session_id:fork.id,request_id:'resume',text:'/fixture-resume '+f.session.file})).status,'unknown');
  const resumed=await until(async()=>{const r=await readClaim(f.config.attachmentDir,f.session);return r?.phase==='ready'&&r.generation!==launched.record.generation?r:null;});
- assert.notEqual(resumed.generation,forkClaim.generation);assert.equal(await readClaim(f.config.attachmentDir,fork),null);
+ assert.notEqual(resumed.generation,forkClaim.generation);await until(async()=>await readClaim(f.config.attachmentDir,fork)===null);
  const sent=await f.bridge.send({session_id:f.id,request_id:'switch',text:'/fixture-switch'});assert.equal(sent.status,'unknown');
  const replacement=await until(async()=>{const sessions=await f.bridge.sessions();return sessions.find(s=>s.id!==f.id&&s.id!==fork.id);});
  const claim=await until(async()=>{const r=await readClaim(f.config.attachmentDir,replacement);return r?.phase==='ready'?r:null;});
  assert.notEqual(claim.generation,launched.record.generation);assert.notEqual(claim.sessionId,f.session.header.id);
- assert.equal(await readClaim(f.config.attachmentDir,f.session),null);
+ await until(async()=>await readClaim(f.config.attachmentDir,f.session)===null);
  const read=await f.bridge.read({session_id:replacement.id});assert.ok(JSON.stringify(read).includes('replacement public fixture'));
  await fs.unlink(claim.socket);
  const result=await f.bridge.send({session_id:replacement.id,request_id:'unreachable',text:'do not start a second process',timeout_ms:100});
