@@ -26,6 +26,10 @@ its idle observations and timed teardown have separate limits.
 A live but unreachable registered owner blocks fallback; socket loss does not
 release a writer. Generic host reservation must precede native session open.
 
+An external owner caches its loaded adapter/renderer. Updating Bridge does not
+reload that owner. `OWNER_READ_REFRESH_REQUIRED` means its loaded code cannot
+honor a precise text selector; coordinate writer closure before reopening.
+
 ## Admission and settlement
 
 Owned RPC prompt ACKs report `started`, `queued` or `handled`. The companion's

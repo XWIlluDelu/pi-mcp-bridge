@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { activityObservation, rpcActivity } from './activity.mjs';
-import { readSchema } from './tool-schemas.mjs';
+import { readSchema, hasTextSelector } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
 import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd, atomicJson } from './data.mjs';
@@ -70,6 +70,7 @@ export class Bridge {
   async read(args,{signal}={}) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     let s = await this.session(args.session_id); this.check('read',s);
+    if(hasTextSelector(args)&&!readSchema.safeParse(args).success)throw new Error('INVALID_TEXT_SELECTOR');
     if(args.view==='status'){
       if(!readSchema.safeParse(args).success)throw new Error('INVALID_STATUS_ARGS');
       return this.readStatus(s,args,signal);

@@ -174,6 +174,25 @@ do not start a runtime.
 `overview_scope` reports pre-filter coverage on every page, including when
 filters exclude the manifest record.
 
+#### Precise projected text
+
+```json
+{"session_id":"ps_...","view":"context","entry_id":"native-entry-id",
+ "message_index":0,"block_index":1,"text_offset":0,"max_chars":512}
+```
+
+String content needs no block index; array content requires an exact text block.
+For a system section, replace `block_index` with
+`"field":"sections","section":"project_context"`. Only an own string-valued
+section is readable. Native hidden/replacement semantics and empty text are preserved.
+
+The response uses `format:"projected_text"` and `offset_unit:"utf16_code_units"`.
+Offsets address decoded text; pages do not split surrogate pairs. Continue with
+identical selectors, including the initial offset. Selection is context-only and
+excludes `query`/`since`. Invalid or nontext selections return errors.
+`OWNER_READ_REFRESH_REQUIRED` identifies an owner whose loaded reader cannot honor
+the selector; update that owner, not just Bridge. Ordinary JSON cursors are separate.
+
 #### Status and wait
 
 Capture `activity.settlement` before sending, then wait for a later session event:

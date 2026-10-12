@@ -1,4 +1,4 @@
-import { cursorSignature } from './data.mjs';
+import { cursorSignature, textCursor, fitDecodedText } from './data.mjs';
 
 // Resize only an already-authorized, captured page. No history is reread after
 // later batch operations, and its activity/revision/selection remain unchanged.
@@ -6,6 +6,18 @@ export function rebudgetRead(result,args,maxChars){
   const size=value=>JSON.stringify(value).length;
   if(size(result)<=maxChars)return result;
   if(!Array.isArray(result.items))return null;
+  if(result.format==='projected_text'){
+    const item=result.items[0];
+    const build=text=>{
+      const end=item.text_offset+text.length;
+      return {...result,items:[{...item,text}],
+        next_cursor:end<item.total_text_units?textCursor(args,result.revision,result.leaf_id,end):null};
+    };
+    const length=fitDecodedText(item.text,maxChars,build);
+    if(item.text.length&&!length)return null;
+    const reduced=build(item.text.slice(0,length));
+    return size(reduced)<=maxChars?reduced:null;
+  }
   const start=args.cursor?JSON.parse(Buffer.from(args.cursor,'base64url').toString()):{index:0,offset:0};
   let index=start.index,offset=start.offset;
   const signature=cursorSignature({...args,view:args.view??'context'}),items=[];

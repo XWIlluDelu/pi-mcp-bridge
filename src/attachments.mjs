@@ -6,7 +6,7 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, opaqueId, assertSingleSessionFile } from './data.mjs';
+import { atomicJson, opaqueId, assertSingleSessionFile, assertProjectedTextResponse } from './data.mjs';
 export class AttachmentFailure extends Error {
   constructor(code,uncertain=false,options){super(code,options);this.code=code;this.uncertain=uncertain;}
 }
@@ -152,7 +152,7 @@ export class AttachedRuntime {
         const newline=bytes.indexOf('\n');if(newline<0)return;
         try{const response=JSON.parse(bytes.slice(0,newline));
           if(response.generation!==this.record.generation)throw new Error();
-          if(response.error)return finish(new AttachmentFailure(['RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&op==='send'));
+          if(response.error)return finish(new AttachmentFailure(['RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','INVALID_TEXT_SELECTOR','PROJECTED_MESSAGE_NOT_FOUND','TEXT_BLOCK_NOT_FOUND','TEXT_SECTION_NOT_FOUND','OWNER_READ_REFRESH_REQUIRED','NON_TEXT_CONTENT','INVALID_TEXT_OFFSET','TEXT_BUDGET_TOO_SMALL','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&op==='send'));
           finish(null,response.data);
         }catch{finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&op==='send'));}
       });
@@ -160,7 +160,7 @@ export class AttachedRuntime {
   }
   async start(){await this.state();return this;}
   state(timeout=5000){return this.request('state',{},timeout);}
-  read(args){return this.request('read',args);}
+  async read(args){const result=await this.request('read',args);assertProjectedTextResponse(result,args);return result;}
   send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
   async stop(){this.alive=false;} // Disconnect only. Never shut down external Pi on bridge close.
   async stopForDelete(){

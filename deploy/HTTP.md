@@ -79,6 +79,19 @@ There is no server session ID or persistent GET/SSE stream. See the
 Use an owner-private token reference. Verify that selected client's loopback policy,
 backend Host, token forwarding and protocol negotiation before deployment.
 
+## Client and owner refresh
+
+Compare actual backend `tools/list` with the client's callable schema after
+updating selectors. A connector can retain an older schema across reconnection;
+refresh that client rather than changing grants or repeatedly restarting Bridge.
+
+An external owner caches its loaded adapter/renderer. `OWNER_READ_REFRESH_REQUIRED`
+means it cannot honor a precise selector; ordinary reads remain available.
+Updating Bridge does not reload that owner. Use the
+[handoff procedure](../docs/runtime-handoff.md), or stop Bridge during an
+owner-managed reopen. Initial Pi startup opens the target before extensions load,
+so post-open registration cannot make that initial opening safe.
+
 ## Verification
 
 Offline SDK/loopback tests cover authentication, Host/Origin, body limits,

@@ -55,6 +55,20 @@ test('ordinary RPC plus remote MCP shares one extension owner, settlement, permi
   let entries=(await local.getEntries()).entries;
   assert.equal(entries.filter(entry=>text(entry)==='REMOTE_ORDINARY_RPC').length,1);
   assert.ok((await ok('read',{session_id:made.session_id})).items.some(item=>item.message?.role==='assistant'));
+  const system=entries.find(entry=>entry.message?.role==='system'&&Object.values(entry.message.sections??{}).some(value=>typeof value==='string'&&value.length));
+  assert.ok(system,'native RPC persists typed system sections');
+  const section=Object.keys(system.message.sections).find(key=>typeof system.message.sections[key]==='string'&&system.message.sections[key].length);
+  const systemSelector={session_id:made.session_id,entry_id:system.id,message_index:0,field:'sections',section,max_chars:256};
+  let cursor,systemText='';
+  do{
+    const selected=await ok('read',{...systemSelector,cursor});assert.equal(selected.items[0].field,'sections');assert.equal(selected.items[0].section,section);
+    assert.ok(JSON.stringify(selected.items[0]).length<=256);systemText+=selected.items[0].text;cursor=selected.next_cursor;
+  }while(cursor);
+  assert.equal(systemText,system.message.sections[section]);
+  const reply=entries.find(entry=>entry.message?.role==='assistant'),block=reply.message.content.findIndex(part=>part.type==='text');
+  const selector={session_id:made.session_id,entry_id:reply.id,message_index:0,block_index:block,max_chars:256};
+  const decoded=await ok('read',selector);assert.equal(decoded.format,'projected_text');assert.equal(decoded.items[0].text,reply.message.content[block].text);
+  const missingBlock=await call('read',{...selector,block_index:99});assert.equal(missingBlock.isError,true);assert.equal(missingBlock.content[0].text,'TEXT_BLOCK_NOT_FOUND');
   assert.equal(await local.prompt('LOCAL_ORDINARY_RPC'),'started');
   await until(async()=>{const value=await status();return value.activity.settlement.sequence===2&&value.activity.idle;});
   entries=(await local.getEntries()).entries;

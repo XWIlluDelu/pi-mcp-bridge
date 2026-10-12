@@ -2,6 +2,7 @@ node_modules/
 .npm-cache/
 upstream-pi/
 demo/state/
+demo/agent/
 demo/sessions/
 demo/owner-config.json
 
