@@ -1,5 +1,6 @@
 // Bind existing owners through Pi 1.1 public APIs. These helpers never open a
 // session, spawn a process, read stdio, or access private admission hooks.
+import {nativeBashResult} from './bash-execution.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown=()=>({status:'unknown',dispatch:'submitted',reason:'PI_ACCEPTANCE_UNOBSERVABLE',completion:'not_tracked'});
 const options=mode=>mode==='steer'?{streamingBehavior:'steer'}:mode==='queue'?{streamingBehavior:'followUp'}:{};
@@ -48,6 +49,18 @@ export function createSdkHostBinding(session,{release,onError}={}){
       try{tracked.track(session.prompt(text,options(mode)));}catch(error){try{onError?.(error);}catch{}}
       return unknown();
     },
+    bash:async({command,onResult,beforeDispatch,...expected})=>{
+      if(typeof onResult!=='function'||!['executeBash','recordBashResult','clearQueue','abort','abortBash'].every(name=>typeof session[name]==='function')||
+         typeof session.extensionRunner?.emitUserBash!=='function')throw new Error('BASH_UNSUPPORTED');
+      const before=identity(session);assertIdentity(expected,before);beforeDispatch?.();
+      const handled=await session.extensionRunner.emitUserBash({type:'user_bash',command,excludeFromContext:false,cwd:session.sessionManager.getCwd()});
+      assertIdentity(before,identity(session));beforeDispatch?.();
+      let result;
+      if(handled?.result){result=handled.result;session.recordBashResult(command,result,{excludeFromContext:false});}
+      else result=await tracked.track(session.executeBash(command,undefined,{excludeFromContext:false,operations:handled?.operations}));
+      assertIdentity(before,identity(session));await onResult(nativeBashResult(result));
+      return {completed:true};
+    },
     stop:async({onWithdraw,...expected}={})=>{
       if(typeof onWithdraw!=='function'||!['clearQueue','abort','abortBash'].every(name=>typeof session[name]==='function'))throw new Error('STOP_UNSUPPORTED');
       const before=identity(session);assertIdentity(expected,before);
@@ -90,6 +103,12 @@ export function createRpcHostBinding(client,{release,onError}={}){
         // as plain Errors. Never infer rejection by parsing a raw error string.
         return unknown();
       }
+    },
+    bash:async({command,onResult,beforeDispatch,...expected})=>{
+      if(typeof onResult!=='function'||!['bash','clearQueue','abort','abortBash'].every(name=>typeof client[name]==='function'))throw new Error('BASH_UNSUPPORTED');
+      const before=await state();assertIdentity(expected,before);beforeDispatch?.();
+      const result=await tracked.track(client.bash(command));
+      assertIdentity(before,await state());await onResult(nativeBashResult(result));return {completed:true};
     },
     stop:async({onWithdraw,...expected}={})=>{
       if(typeof onWithdraw!=='function'||!['clearQueue','abort','abortBash'].every(name=>typeof client[name]==='function'))throw new Error('STOP_UNSUPPORTED');

@@ -3,6 +3,7 @@
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import {hash,renderRead,assertSingleSessionFile,readSessionIdentity} from './data.mjs';
+import {bashCapture} from './bash-execution.mjs';
 import { stopReceipt, withdrawalCapture } from './stop-execution.mjs';
 import {activityObservation} from './activity.mjs';
 import {MAX_ATTACHMENT_REQUEST_BYTES} from './attachment-protocol.mjs';
@@ -20,7 +21,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   owner??=await processIdentity();
   if(!owner||!await ownerAlive(owner))fail('PROCESS_IDENTITY_UNAVAILABLE');
   const record=await reserveOwner(attachmentDir,target,'host',owner);
-  let callbacks,server,ready=false,closed=false,stopping=false,releasing,closing;
+  let callbacks,server,ready=false,closed=false,stopping=false,bashing=false,releasing,closing;
   const sockets=new Set(),operations=new Set();
   async function identity(value){
     if(value!==undefined&&(value.sessionFile!==target.file||value.sessionId!==target.header.id))fail('RUNTIME_SESSION_CHANGED');
@@ -80,6 +81,18 @@ export async function reserveHostSession({attachmentDir,session,owner}){
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
       data=receipt(await callbacks.submit({text:args.text,mode:args.mode}));
+    }else if(request.op==='bash'){
+      if(typeof callbacks.bash!=='function'||typeof callbacks.stop!=='function')fail('BASH_UNSUPPORTED');
+      if(typeof args.command!=='string'||!args.command.length||args.command.length>100000)fail('INVALID_ATTACHED_BASH');
+      if(stopping)fail('STOP_IN_PROGRESS');if(bashing)fail('BASH_IN_PROGRESS');
+      const capture=bashCapture(attachmentDir,target,record.generation,args.recovery_id);let captured=false;
+      bashing=true;
+      try{
+        const result=await callbacks.bash({command:args.command,sessionFile:target.file,sessionId:target.header.id,
+          beforeDispatch:()=>{if(stopping||!ready||closed)fail(stopping?'STOP_IN_PROGRESS':'RUNTIME_SESSION_CHANGED');},
+          onResult:async value=>{await state();await capture(value);captured=true;}});
+        if(result?.completed!==true||!captured)fail('INVALID_BASH_RESULT');data={completed:true};
+      }finally{bashing=false;}
     }else if(request.op==='stop'){
       if(typeof callbacks.stop!=='function')fail('STOP_UNSUPPORTED');
       if(stopping)fail('STOP_IN_PROGRESS');
@@ -107,7 +120,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   }
   async function publish(value){
     if(callbacks||closed)fail('HOST_ADAPTER_ALREADY_STARTED');
-    if(!value||!['state','snapshot','submit'].every(name=>typeof value[name]==='function')||['release','stop'].some(name=>value[name]!==undefined&&typeof value[name]!=='function'))fail('INVALID_HOST_CALLBACKS');
+    if(!value||!['state','snapshot','submit'].every(name=>typeof value[name]==='function')||['release','stop','bash'].some(name=>value[name]!==undefined&&typeof value[name]!=='function'))fail('INVALID_HOST_CALLBACKS');
     callbacks=value;
     try{
     await state();if(closed||releasing)fail('RUNTIME_SESSION_CHANGED');
@@ -122,7 +135,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
         const task=(async()=>{
           try{
             const request=JSON.parse(buffer.slice(0,end));validateRequest(request);
-            if(request.op==='stop'&&Number.isInteger(request.body?.timeout_ms))socket.setTimeout(Math.min(30000,Math.max(50,request.body.timeout_ms)));
+            if(['stop','bash'].includes(request.op)&&Number.isInteger(request.body?.timeout_ms))socket.setTimeout(Math.min(30000,Math.max(50,request.body.timeout_ms)));
             let data;
             if(request.op==='release')data=await release();
             else{

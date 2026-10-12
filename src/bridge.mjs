@@ -3,11 +3,12 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { activityObservation, rpcActivity } from './activity.mjs';
-import { readSchema, hasTextSelector, stopSchema } from './tool-schemas.mjs';
+import { readSchema, hasTextSelector, stopSchema, bashSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
 import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd, atomicJson } from './data.mjs';
 import { stopReceipt, recoveredWithdrawal, withdrawalPage } from './stop-execution.mjs';
+import {bashOutputPage,recoveredBash} from './bash-execution.mjs';
 import { PiRpc, RuntimePool } from './rpc.mjs';
 import { Journal } from './journal.mjs';
 import { privateDirectory, readClaim, ownerAlive, registryTransaction, updateOwner, claimFile } from './attachments.mjs';
@@ -62,7 +63,7 @@ export class Bridge {
       const name = saved?.entries.findLast(e=>e.type==='session_info')?.name;
       const title = typeof name==='string' ? name.trim() || null : null;
       if (args.query && !JSON.stringify({title,cwd:s.header.cwd}).toLowerCase().includes(args.query.toLowerCase())) continue;
-      rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),command:permitted(this.config,'command',s),delete:permitted(this.config,'delete',s)}});
+      rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),command:permitted(this.config,'command',s),bash:permitted(this.config,'bash',s),delete:permitted(this.config,'delete',s)}});
     }
     const offset = args.offset ?? 0, limit = Math.min(100,args.limit ?? 30);
     return {sessions:rows.slice(offset,offset+limit),next_offset:offset+limit < rows.length ? offset+limit:null,
@@ -162,6 +163,40 @@ export class Bridge {
         return save({status:'accepted',disposition:result.disposition,completion:'not_tracked'});
       } catch(e) { return save({status:e.uncertain?'unknown':'rejected',reason:safeReason(e)}); }
     }));
+  }
+  async bash(args){
+    this.assertOpen();
+    if(!bashSchema.safeParse(args).success)throw new Error('INVALID_BASH_ARGS');
+    if(this.configFile)await this.refreshPermissions();
+    const session=await this.session(args.session_id);this.check('bash',session);
+    const recovery_id=hash({principal:this.config.principal,session:session.id,request:args.request_id});
+    const body=args.command===undefined?undefined:{command:args.command};
+    const receipt=await this.journal.run(args.request_id,'bash',session.id,body,async save=>{
+      if(this.locks.has(`bash:${session.id}`))return save({status:'rejected',reason:'BASH_IN_PROGRESS'});
+      return this.locked(`bash:${session.id}`,async()=>{
+        let generation;
+        try{
+          const beforeDispatch=()=>{
+            this.assertOpen();this.check('bash',session);
+            if(this.locks.has(`stop:${session.id}`))throw new Error('STOP_IN_PROGRESS');
+          };
+          beforeDispatch();
+          let runtime=await this.pool.forRead(session);
+          if(!runtime){await validateExecutionCwd(session.cwd);await loadSavedSession(session);runtime=await this.pool.resolve(session);}
+          if(this.configFile)await this.refreshPermissions();beforeDispatch();
+          if(typeof runtime.executeBash!=='function')throw new Error('BASH_UNSUPPORTED');
+          generation=runtime.generation??runtime.record?.generation??null;
+          await save({status:'unknown',generation});
+          await runtime.executeBash({...args,recovery_id,beforeDispatch,onLate:()=>save({status:'accepted',completion:'native_bash_result',generation})});
+          return save({status:'accepted',completion:'native_bash_result',generation});
+        }catch(error){return save({status:error.uncertain?'unknown':'rejected',reason:safeReason(error),...(generation?{generation}:{})});}
+      });
+    });
+    if(this.configFile)await this.refreshPermissions();
+    this.assertOpen();this.check('bash',session);
+    const result=receipt.generation?await recoveredBash(this.pool.attachmentDir,session,receipt.generation,recovery_id):null;
+    if(!result){if(receipt.status==='accepted')throw new Error('BASH_RECOVERY_MISSING');return {...receipt,output_available:false};}
+    return bashOutputPage(receipt,result,args);
   }
   async stop(args) {
     this.assertOpen();
@@ -284,5 +319,5 @@ export class Bridge {
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure',{code,uncertain:error.uncertain===true});
-  return ['STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','ATTACHED_OPERATION_FAILED','COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['BASH_IN_PROGRESS','BASH_UNSUPPORTED','INVALID_BASH_RESULT','STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','ATTACHED_OPERATION_FAILED','COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }

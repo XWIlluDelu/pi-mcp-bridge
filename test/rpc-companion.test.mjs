@@ -22,7 +22,7 @@ test('ordinary RPC plus remote MCP shares one extension owner, settlement, permi
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-companion-')),cwd=path.join(dir,'project'),agentDir=path.join(dir,'agent');
   await fs.mkdir(cwd);await fs.mkdir(agentDir);
   await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarm:'off',compaction:{enabled:false},retry:{enabled:false}}));
-  const config={principal:'rpc-companion',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,command:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc')};
+  const config={principal:'rpc-companion',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,command:true,bash:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc')};
   const configFile=path.join(dir,'owner.json');await fs.writeFile(configFile,JSON.stringify(config));
   const setup=await new Bridge(config).init(),made=await setup.create({folder_id:'project',request_id:'seed'}),saved=await setup.session(made.session_id);
   await setup.close();
@@ -40,7 +40,9 @@ test('ordinary RPC plus remote MCP shares one extension owner, settlement, permi
   const call=async(name,args)=>remote.callTool({name,arguments:args});
   const ok=async(name,args)=>{const response=await call(name,args);assert.ok(!response.isError,JSON.stringify(response));return response.structuredContent;};
   const status=()=>ok('read',{session_id:made.session_id,view:'status'});
-  assert.equal((await remote.listTools()).tools.length,7);
+  assert.equal((await remote.listTools()).tools.length,8);
+  const unsupportedBash=await ok('bash',{session_id:made.session_id,request_id:'companion-bash-gap',command:'MUST_NOT_EXECUTE'});
+  assert.equal(unsupportedBash.reason,'BASH_UNSUPPORTED');assert.equal(unsupportedBash.status,'rejected');
   const unsupportedStop=await ok('stop',{session_id:made.session_id,request_id:'companion-stop-gap'});
   assert.equal(unsupportedStop.status,'rejected');assert.equal(unsupportedStop.reason,'STOP_UNSUPPORTED');
   assert.equal(unsupportedStop.withdrawn_available,false);await local.getState();

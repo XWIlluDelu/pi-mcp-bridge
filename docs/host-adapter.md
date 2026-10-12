@@ -84,6 +84,15 @@ SDK/RPC bindings provide it when the public cancellation/queue methods exist;
 other hosts must cover any extra queues. It requires `command` plus `read`;
 missing capability returns `STOP_UNSUPPORTED`. See [stop](stop.md).
 
+## Native shell commands
+
+Optional `bash({command,sessionFile,sessionId,beforeDispatch,onResult})` runs
+through native execution/hooks/recording. Check admission immediately before
+execution, await complete result capture, then return `{completed:true}`.
+Hosts exposing bash must also provide stop. SDK/RPC bindings supply both;
+ordinary companion lacks this seam. Independent default-denied `bash` grants
+control this capability. See [native bash](bash.md).
+
 ## Executable examples
 
 ```sh

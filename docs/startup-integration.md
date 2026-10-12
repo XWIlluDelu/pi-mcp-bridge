@@ -59,6 +59,8 @@ Full stop requires native queue withdrawal and agent/bash cancellation. The
 ordinary companion lacks the required public APIs; capable SDK/RPC hosts provide
 the [stop callback](stop.md).
 
+[Native bash](bash.md) similarly requires a host callback and its own grant.
+
 ## Verification
 
 ```sh

@@ -24,6 +24,7 @@ async function fixture(t,owned=false){
    const faux=fauxProvider({provider:'stop-native-fixture',models:[{id:'slow'}],tokensPerSecond:40,tokenSize:{min:4,max:4}});
    faux.setResponses(Array.from({length:20},(_,i)=>fauxAssistantMessage(i%2===0?'slow response '.repeat(1000):'AFTER_STOP_REPLY')));
    pi.registerProvider(faux.provider);
+   pi.on('user_bash',event=>{if(event.command==='HOOK_ONLY')return {result:{output:'HOOK_NATIVE_RESULT',exitCode:0,cancelled:false,truncated:false}};});
  };`);
  const config={principal:'native-stop',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],
    grants:[{folder:cwd,read:true,send:true,command:true,new_session:true}],...isolatedRuntime(dir)};
@@ -35,6 +36,36 @@ async function fixture(t,owned=false){
  const cleanups=[];
  t.after(async()=>{for(const cleanup of cleanups)await cleanup();await bridge.close();await fs.rm(dir,{recursive:true,force:true});});
  return {dir,cwd,config,bridge,saved,extension,pidFile,cleanups};
+}
+async function exerciseBash(f,native){
+ const id=f.saved.id,rule=f.config.grants[0];
+ rule.send=false;rule.command=false;rule.read=false;
+ await assert.rejects(f.bridge.bash({session_id:id,request_id:'default-deny',command:'echo MUST_NOT_RUN'}),/NOT_FOUND_OR_DENIED/);
+ rule.bash=true;
+ const text='native direct 😀 "\\n'.repeat(1200),command="printf '%s' '"+text.replaceAll("'","'\\''")+"'";
+ const first=await f.bridge.bash({session_id:id,request_id:'direct',command,max_chars:512});
+ assert.equal(first.status,'accepted');assert.equal(first.truncated,false);assert.equal(first.exitCode,0);
+ let output=first.output,cursor=first.next_cursor;
+ assert.ok(cursor);
+ while(cursor){const page=await f.bridge.bash({session_id:id,request_id:'direct',cursor,max_chars:32768});output+=page.output;cursor=page.next_cursor;}
+ assert.equal(output,text);
+ assert.equal((await f.bridge.bash({session_id:id,request_id:'direct'})).total_text_units,text.length);
+ await assert.rejects(f.bridge.bash({session_id:id,request_id:'direct',command:'different'}),/REQUEST_ID_CONFLICT/);
+ rule.bash=false;await assert.rejects(f.bridge.bash({session_id:id,request_id:'direct'}),/NOT_FOUND_OR_DENIED/);rule.bash=true;
+ const entries=(await native.getEntries()).entries;
+ assert.equal(entries.filter(entry=>entry.message?.role==='bashExecution'&&entry.message.command===command).length,1);
+ assert.ok(!entries.some(entry=>entry.message?.role==='user'));
+ const hook=await f.bridge.bash({session_id:id,request_id:'native-hook',command:'HOOK_ONLY'});
+ assert.equal(hook.output,'HOOK_NATIVE_RESULT');
+ const failing=await f.bridge.bash({session_id:id,request_id:'nonzero',command:'printf nonzero; exit 7'});
+ assert.equal(failing.exitCode,7);assert.equal(failing.output,'nonzero');
+ Object.assign(rule,{read:true,send:true,command:true});
+ const started=path.join(f.dir,'direct-bash-started');
+ const bash=f.bridge.bash({session_id:id,request_id:'direct-stop',command:"printf started > '"+started+"'; sleep 30",timeout_ms:10000});
+ await until(async()=>{try{return (await fs.readFile(started,'utf8'))==='started';}catch{return false;}});
+ assert.equal((await f.bridge.stop({session_id:id,request_id:'stop-direct'})).status,'accepted');
+ const cancelled=await bash;assert.equal(cancelled.status,'accepted');assert.equal(cancelled.cancelled,true);
+ assert.equal((await native.getState()).sessionId,f.saved.header.id);
 }
 async function exercise(f,native){
  const first=await f.bridge.send({session_id:f.saved.id,request_id:'run',text:'START_SLOW'});
@@ -70,7 +101,8 @@ async function exercise(f,native){
 
 test('Bridge-owned actual offline Pi cancels agent and independent bash, returns all queued text, continues same process',{timeout:30000},async t=>{
  const f=await fixture(t,true);
- // Seed starts this owned runtime through the ordinary native prompt path.
+ await exerciseBash(f,{getEntries:()=>f.bridge.pool.get(f.saved.id).entries(),getState:()=>f.bridge.pool.get(f.saved.id).command({type:'get_state'})});
+ // A later prompt starts normally in the same owned runtime.
  const seed=await f.bridge.send({session_id:f.saved.id,request_id:'run',text:'START_SLOW'});assert.equal(seed.status,'accepted');
  const runtime=f.bridge.pool.get(f.saved.id),pid=runtime.child.pid;
  const native={getState:()=>runtime.command({type:'get_state'}),getEntries:()=>runtime.entries(),
@@ -87,7 +119,7 @@ test('public RPC host binding uses existing child and returns all withdrawal thr
  f.cleanups.push(async()=>{await client.stop();await controller.close();});
  await client.start();await client.getState();
  await controller.ready(createRpcHostBinding(client),{owner:await processIdentity(JSON.parse(await fs.readFile(f.pidFile,'utf8')))});
- await exercise(f,client);
+ await exerciseBash(f,client);await exercise(f,client);
 });
 
 test('public SDK host cancels agent, retry, compaction, branch summary and bash without disposal',{timeout:30000},async t=>{
@@ -96,10 +128,11 @@ test('public SDK host cancels agent, retry, compaction, branch summary and bash 
  faux.setResponses([fauxAssistantMessage('slow reply '.repeat(1000)),fauxAssistantMessage('SDK_CONTINUES'),fauxAssistantMessage('slow summary '.repeat(1000))]);
  const modelRuntime=await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,refreshOnCreate:false,allowModelNetwork:false});modelRuntime.registerNativeProvider(faux.provider);
  const settingsManager=SettingsManager.inMemory({cacheWarming:'off',compaction:{enabled:false,keepRecentTokens:1,reserveTokens:128},retry:{enabled:false,maxRetries:1,baseDelayMs:10000,maxDelayMs:10000}});
- const resourceLoader=new DefaultResourceLoader({cwd:f.cwd,agentDir:f.config.piRuntime.agentDir,settingsManager,noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,systemPrompt:'Offline stop fixture.'});await resourceLoader.reload();
+ const resourceLoader=new DefaultResourceLoader({cwd:f.cwd,agentDir:f.config.piRuntime.agentDir,settingsManager,extensionFactories:[pi=>pi.on('user_bash',event=>event.command==='HOOK_ONLY'?{result:{output:'HOOK_NATIVE_RESULT',exitCode:0,cancelled:false,truncated:false}}:undefined)],noExtensions:true,noSkills:true,noPromptTemplates:true,noThemes:true,systemPrompt:'Offline stop fixture.'});await resourceLoader.reload();
  const {session}=await createAgentSession({cwd:f.cwd,agentDir:f.config.piRuntime.agentDir,modelRuntime,model:faux.getModel(),thinkingLevel:'off',tools:[],resourceLoader,settingsManager,sessionManager:SessionManager.open(f.saved.file)});
  f.cleanups.push(async()=>{await session.abort();session.dispose();await controller.close();});
  await controller.ready(createSdkHostBinding(session));
+ await exerciseBash(f,{getEntries:async()=>({entries:session.sessionManager.getEntries()}),getState:async()=>({sessionId:session.sessionId})});assert.equal(faux.state.callCount,0);
  const run=session.prompt('SDK_SLOW');await until(()=>session.isStreaming&&faux.state.callCount===1);
  await session.steer('SDK_STEERING');await session.followUp('SDK_FOLLOW_UP');
  const stopped=await f.bridge.stop({session_id:f.saved.id,request_id:'sdk-stop'});
