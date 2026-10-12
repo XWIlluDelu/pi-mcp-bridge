@@ -32,6 +32,26 @@ test('batch validates every item and delete conflicts before any effects',async(
  assert.deepEqual(conflict.error,{code:'DELETE_CONFLICT',items:[0,1],session_id:'s'});
 });
 
+test('batch permits read-before-delete, captures it once, and keeps contradictory orders fenced',async t=>{
+ const f=await fixture(t),made=await f.bridge.create({folder_id:'project',request_id:'ordered-seed'});
+ const saved=await f.bridge.session(made.session_id);
+ await fs.appendFile(saved.file,JSON.stringify({type:'message',id:'before-delete',parentId:null,message:{role:'user',content:'captured before delete'}})+'\n');
+ const operations=[item('read',{session_id:made.session_id,view:'raw'}),item('delete',{session_id:made.session_id,request_id:'ordered-delete'})];
+ const result=await executeBatch(f.bridge,{operations});
+ assert.equal(result.status,'processed');assert.equal(result.results[0].result.items[0].entry_id,'before-delete');
+ assert.equal(result.results[1].result.status,'deleted');
+ assert.equal((await f.bridge.sessions()).length,0);
+ const replay=await executeBatch(f.bridge,{operations});
+ assert.equal(replay.results[0].error.code,'NOT_FOUND_OR_DENIED');
+ assert.deepEqual(replay.results[1].result,result.results[1].result);
+ const calls=[],bridge={read:async()=>calls.push('read'),send:async()=>calls.push('send'),delete:async()=>calls.push('delete')};
+ const read=item('read',{session_id:'s'}),send=item('send',{session_id:'s',request_id:'s-send',text:'work'}),remove=item('delete',{session_id:'s',request_id:'s-delete'});
+ for(const operations of [[remove,read],[remove,send],[send,remove],[read,remove,read]]){
+  assert.equal((await executeBatch(bridge,{operations})).error.code,'DELETE_CONFLICT');
+ }
+ assert.deepEqual(calls,[]);
+});
+
 test('batch runs in order, continues failures and never infers send completion',async()=>{
  const calls=[];let complete=false;
  const bridge={send:async()=>{calls.push('send');return {status:'accepted',disposition:'started',completion:'not_tracked'};},read:async()=>{calls.push('read');return {complete};},delete:async()=>{calls.push('delete');throw new Error('NOT_FOUND_OR_DENIED');},create:async()=>{calls.push('create');return {status:'created',session_id:'new'};}};
@@ -43,8 +63,11 @@ test('batch uses normal per-item permissions and durable request-ID replay',asyn
  const f=await fixture(t);const first=await f.bridge.create({folder_id:'project',request_id:'seed'});
  f.config.grants.push({session_id:first.session_id,read:false,delete:false});
  const operations=[item('read',{session_id:first.session_id}),item('delete',{session_id:first.session_id,request_id:'forbidden-delete'})];
- // Destructive conflict is rejected before either permission check or receipt write.
- assert.equal((await executeBatch(f.bridge,{operations})).status,'rejected');assert.equal(await f.bridge.journal.get('forbidden-delete'),null);
+ // Ordered reads/deletes independently check their grants; neither is allowed here.
+ const denied=await executeBatch(f.bridge,{operations});
+ assert.equal(denied.status,'processed');assert.equal(denied.results[0].error.code,'NOT_FOUND_OR_DENIED');
+ assert.equal(denied.results[1].result.status,'rejected');assert.equal(denied.results[1].result.reason,'NOT_FOUND_OR_DENIED');
+ assert.equal((await f.bridge.journal.get('forbidden-delete')).receipt.status,'rejected');
  const allowed=[item('create',{folder_id:'project',request_id:'new'}),item('read',{session_id:first.session_id}),item('create',{folder_id:'missing',request_id:'denied'}),item('create',{folder_id:'project',request_id:'new'})];
  const result=await executeBatch(f.bridge,{operations:allowed});assert.equal(result.results[0].result.status,'created');assert.equal(result.results[1].error.code,'NOT_FOUND_OR_DENIED');assert.equal(result.results[2].result.status,'rejected');assert.deepEqual(result.results[0].result,result.results[3].result);
  assert.deepEqual((await executeBatch(f.bridge,{operations:allowed})).results,result.results);

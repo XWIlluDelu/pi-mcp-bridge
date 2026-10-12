@@ -1,7 +1,7 @@
 // Deterministic extractive overview of Pi's public session projection.
 // No model calls, hook replay, semantic goal inference or runtime-state guesses.
 const MAX_RECORDS=19, MAX_CHARS=10000, EXCERPT_CHARS=1000;
-export const OVERVIEW_EXTRACTOR_VERSION='extractive_v2';
+export const OVERVIEW_EXTRACTOR_VERSION='extractive_v3';
 function excerpt(value) {
   const json=JSON.stringify(value);
   return json.length<=EXCERPT_CHARS ? {value} : {
@@ -28,6 +28,20 @@ function textExcerpt(text,limit=EXCERPT_CHARS){
   const head=Math.ceil(limit/2),tail=limit-head;
   return {json_excerpt:json.slice(0,head),json_tail_excerpt:json.slice(json.length-tail),
     tail_char_offset:json.length-tail,total_chars:json.length,omitted_char_ranges:[[head,json.length-tail]]};
+}
+// Reuse short blocks' spare capacity without changing which blocks are sampled.
+function textBudgets(texts){
+  const sizes=texts.map(text=>JSON.stringify(text).length),budgets=sizes.map(()=>0);
+  let remaining=EXCERPT_CHARS,active=sizes.map((_,index)=>index);
+  while(remaining&&active.length){
+    const share=Math.max(1,Math.floor(remaining/active.length));
+    for(const index of active){
+      const added=Math.min(share,sizes[index]-budgets[index],remaining);
+      budgets[index]+=added;remaining-=added;
+    }
+    active=active.filter(index=>budgets[index]<sizes[index]);
+  }
+  return budgets;
 }
 function omittedBlocks(length,selected){
   const ranges=[];let start=0;
@@ -58,11 +72,11 @@ function messageDetails(message) {
       // Three samples bound per-message provenance while covering both ends and
       // an interior block. The text budget is shared, never multiplied.
       const chosen=spreadIndices(textIndices.length).slice(0,3).map(index=>textIndices[index]);
-      const budget=Math.floor(EXCERPT_CHARS/chosen.length);
-      details.payload=textExcerpt(message.content[textIndex].text,budget);
+      const budgets=textBudgets(chosen.map(index=>message.content[index].text));
+      details.payload=textExcerpt(message.content[textIndex].text,budgets[0]);
       details.payload_source={field:'content',block_index:textIndex,block_field:'text'};
-      if(chosen.length>1)details.additional_text_blocks=chosen.slice(1).map(index=>({
-        payload:textExcerpt(message.content[index].text,budget),
+      if(chosen.length>1)details.additional_text_blocks=chosen.slice(1).map((index,offset)=>({
+        payload:textExcerpt(message.content[index].text,budgets[offset+1]),
         payload_source:{field:'content',block_index:index,block_field:'text'},
       }));
       details.selected_text_blocks=chosen;

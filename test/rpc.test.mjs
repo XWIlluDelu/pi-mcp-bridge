@@ -14,7 +14,13 @@ test('launcher defaults isolate credentials; owner profile inherits only named v
   assert.equal(selected.env.OPENAI_API_KEY,'synthetic-key');
   assert.equal(selected.env.HTTPS_PROXY,'http://synthetic-proxy');
   assert.equal(selected.env.OTHER_KEY,undefined);
-  assert.equal(selected.env.HOME,'/tmp/state/pi-home');
+  assert.equal(selected.env.HOME,'/owner');
+  assert.deepEqual(selected.resourceArgs,[]);
+  assert.deepEqual(isolated.resourceArgs,['--no-extensions','--no-skills','--no-prompt-templates','--no-themes']);
+  const homeOnly=launchProfile({...config,piRuntime:{inheritEnv:['HOME']}},host);
+  assert.equal(homeOnly.env.HOME,'/owner');
+  assert.equal(homeOnly.env.PI_CODING_AGENT_DIR,'/tmp/state/pi-home/.pi/agent');
+  assert.deepEqual(homeOnly.resourceArgs,isolated.resourceArgs);
   assert.equal(selected.env.PI_CODING_AGENT_DIR,'/tmp/pi-profile');
   assert.deepEqual(selected.toolArgs,['--tools','read,write']);
   assert.throws(()=>launchProfile({...config,piRuntime:{agentDir:'relative'}}),/INVALID_PI_RUNTIME/);
@@ -73,7 +79,7 @@ test('unresolved prompt admission survives timeout, idle, malformed and old-gene
  const state=rpc.dispatch({type:'get_state'},1000);const stateRequest=writes.at(-1);
  rpc.receiveResponse({type:'response',id:stateRequest.id,success:true,data:{isStreaming:false}},generation);await state;
  for(const event of [
-  {type:'agent_settled'},
+  {type:'agent_settled',aborted:false},
   {type:'response',id:first.id,command:'get_state',success:true,data:{disposition:'started'}},
   {type:'response',id:first.id,command:'prompt',success:true,data:{}},
  ])rpc.receiveResponse(event,generation);

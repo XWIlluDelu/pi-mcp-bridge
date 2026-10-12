@@ -98,7 +98,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
  const pi={on:(name,fn)=>{handlers[name]=fn;},sendUserMessage:(text,options)=>calls.push({text,options})};
  attachExtension(pi);
  const entries=[{type:'message',id:'a',parentId:null,message:{role:'user',content:'a'.repeat(600)}},{type:'message',id:'b',parentId:null,message:{role:'user',content:'b'.repeat(600)}}];
- const ctx={mode:'tui',sessionManager:{getSessionFile:()=>f.session.file,getHeader:()=>f.session.header,getSessionId:()=>f.session.header.id,getEntries:()=>entries,getLeafId:()=>leaf},isIdle:()=>idle,shutdown:()=>{shutdown=true;}};
+ const ctx={mode:'tui',sessionManager:{getSessionFile:()=>f.session.file,getHeader:()=>f.session.header,getSessionId:()=>f.session.header.id,getEntries:()=>entries,getLeafId:()=>leaf},isIdle:()=>idle,hasPendingMessages:()=>false,shutdown:()=>{shutdown=true;}};
  try{
   await handlers.session_start({reason:'startup'},ctx);const record=await readClaim(f.config.attachmentDir,f.session);const runtime=new AttachedRuntime(f.config,f.session,record);
   for(const mode of ['native','idle_only','steer','queue']){

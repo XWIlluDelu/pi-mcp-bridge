@@ -1,6 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { activityObservation, rpcActivity } from './activity.mjs';
+import { readSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
 import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd } from './data.mjs';
@@ -62,9 +65,14 @@ export class Bridge {
     return {sessions:rows.slice(offset,offset+limit),next_offset:offset+limit < rows.length ? offset+limit:null,
       folders:this.config.folders.filter(f=>permitted(this.config,'new_session',{cwd:f.path})).map(f=>({folder_id:f.id}))};
   }
-  async read(args) {
+  async read(args,{signal}={}) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
     let s = await this.session(args.session_id); this.check('read',s);
+    if(args.view==='status'){
+      if(!readSchema.safeParse(args).success)throw new Error('INVALID_STATUS_ARGS');
+      return this.readStatus(s,args,signal);
+    }
+    if(args.after_settlement!==undefined||args.wait_ms!==undefined)throw new Error('INVALID_STATUS_ARGS');
     const runtime = await this.pool.forRead(s);
     diagnostics.emit('read.source',{kind:runtime?(runtime.attached?'attached':'rpc'):'saved',view:args.view??'context'});
     if(runtime?.attached)return runtime.read(args);
@@ -77,6 +85,48 @@ export class Bridge {
     }
     if (!runtime) s = await loadSavedSession(s);
     return renderRead(s,args,{leafSource:runtime?'live':'saved_resume'});
+  }
+  async readStatus(session,args,signal){
+    const deadline=Date.now()+(args.wait_ms??0),baseline=args.after_settlement;
+    let activity=activityObservation(),generation=null,observed=false;
+    for(;;){
+      this.assertOpen();
+      if(signal?.aborted)throw new Error('READ_CANCELLED');
+      // Always take an initial snapshot. The deadline limits polling, not
+      // an observation's normal bounded command timeout.
+      if(!observed||Date.now()<deadline){
+        const runtime=await this.pool.forRead(session); // Never start a writer for status.
+        if(!observed||Date.now()<deadline){ // Ownership resolution may exhaust the poll budget.
+          activity=activityObservation();generation=null;
+          if(runtime){
+            const state=await runtime.state();
+            generation=runtime.generation??runtime.record?.generation??null;
+            activity=runtime.attached
+              ? state.activity??activityObservation(runtime.record.kind==='host'?'host_state':'attached_state',{
+                idle:state.isIdle,streaming:state.isStreaming,compacting:state.isCompacting,
+                count:state.pendingMessageCount,pending:typeof state.pendingMessageCount==='number'?state.pendingMessageCount>0:undefined})
+              : rpcActivity(state,Boolean(runtime.promptAdmission),runtime.settlement);
+          }
+          observed=true;
+        }
+      }
+      // A permission edit while waiting must not expose even a status snapshot.
+      if(this.configFile)await this.refreshPermissions();
+      this.assertOpen();this.check('read',session);
+      if(signal?.aborted)throw new Error('READ_CANCELLED');
+      const settled=activity.settlement;
+      let outcome='not_requested';
+      if(baseline){
+        if(!generation||!settled)outcome='unavailable';
+        else if(generation!==baseline.generation)outcome='generation_changed';
+        else if(settled.sequence>baseline.sequence)outcome='settled';
+        else outcome='timeout';
+      }
+      if(!baseline||outcome!=='timeout'||Date.now()>=deadline)
+        return {session_id:session.id,view:'status',generation,activity,wait:{status:outcome}};
+      try{await delay(Math.min(100,Math.max(1,deadline-Date.now())),undefined,{signal});}
+      catch(error){if(signal?.aborted)throw new Error('READ_CANCELLED');throw error;}
+    }
   }
   async send(args) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}

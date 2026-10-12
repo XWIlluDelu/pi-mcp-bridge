@@ -23,21 +23,27 @@ export function preflightBatch(input){
   if(!previous||previous.body===undefined)requests.set(args.request_id,{index,key,body});
  }
  for(const [session_id,entries]of sessions){
-  if(entries.some(x=>x.op==='delete')&&entries.some(x=>x.op!=='delete'))return {error:fail('DELETE_CONFLICT',entries.map(x=>x.index),{session_id})};
+  const firstDelete=entries.find(x=>x.op==='delete');
+  // Reads may capture the session before deletion. Reads after it contradict
+  // the batch; send/delete is conflicting in either order, since send ACKs
+  // do not mean model work has settled.
+  if(firstDelete&&entries.some(x=>x.op==='send'||(x.op==='read'&&x.index>firstDelete.index)))return {error:fail('DELETE_CONFLICT',entries.map(x=>x.index),{session_id})};
  }
  return {operations};
 }
-export async function executeBatch(bridge,input){
+export async function executeBatch(bridge,input,{signal}={}){
  const {operations,error}=preflightBatch(input);if(error)return error;
  const payload={status:'processed',response_max_chars:BATCH_RESPONSE_LIMIT,results:[]};
  const captures=[];
  for(const [index,{op,args}]of operations.entries()){
+  // SDK close aborts the response handler, not the admitted ordered batch.
+  // Forward cancellation to status reads; their item error never stops mutations.
   const item={index,op};
-  const actual=op==='read'?{...args,max_chars:args.max_chars??12000}:args;
+  const actual=op==='read'&&args.view!=='status'?{...args,max_chars:args.max_chars??12000}:args;
   // Upper bound on returned item content, not an exact measurement or the
   // original I/O budget: later snapshot resizing may lower this bound.
-  if(op==='read')item.applied_max_chars=actual.max_chars;
-  try{item.result=await diagnostics.measure('batch.item',{op,index,mutation_ref:diagnosticRef(args.request_id),session_ref:diagnosticRef(args.session_id)},()=>bridge[op](actual));}catch(e){item.error={code:publicError(e)};}
+  if(op==='read'&&actual.max_chars!==undefined)item.applied_max_chars=actual.max_chars;
+  try{item.result=await diagnostics.measure('batch.item',{op,index,mutation_ref:diagnosticRef(args.request_id),session_ref:diagnosticRef(args.session_id)},()=>bridge[op](actual,{signal}));}catch(e){item.error={code:publicError(e)};}
   payload.results.push(item);
   if(op==='read'&&item.result!==undefined){item.result=structuredClone(item.result);captures.push({item,args:actual,result:item.result});}
  }
@@ -52,7 +58,7 @@ export async function executeBatch(bridge,input){
   for(const capture of captures){
    const budget=Math.min(size(capture.result),low);
    const resized=rebudgetRead(capture.result,capture.args,budget);
-   if(resized){capture.item.result=resized;capture.item.applied_max_chars=Math.min(capture.args.max_chars,budget);}
+   if(resized){capture.item.result=resized;if(capture.args.max_chars!==undefined)capture.item.applied_max_chars=Math.min(capture.args.max_chars,budget);}
    else {delete capture.item.result;capture.item.error={code:'BATCH_RESULT_OMITTED',retry:'READ_SEPARATELY'};}
   }
   // Complete-record pagination can leave spare capacity. Try larger prefixes
@@ -63,7 +69,7 @@ export async function executeBatch(bridge,input){
    const resized=rebudgetRead(capture.result,capture.args,oldSize+spare);
    if(resized&&size(resized)>oldSize){
     const previous={...capture.item};capture.item.result=resized;delete capture.item.error;
-    capture.item.applied_max_chars=Math.min(capture.args.max_chars,oldSize+spare);
+    if(capture.args.max_chars!==undefined)capture.item.applied_max_chars=Math.min(capture.args.max_chars,oldSize+spare);
     if(size(payload)>BATCH_RESPONSE_LIMIT){for(const key of Object.keys(capture.item))delete capture.item[key];Object.assign(capture.item,previous);}
    }
   }

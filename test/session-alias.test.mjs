@@ -53,7 +53,7 @@ test('initial attachment rechecks first persistence after a missing-file snapsho
   }
  });
  try{
-  await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+  await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{stopped=true;}});
   assert.equal(raced,true);assert.equal(stopped,false);
   const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session);
   assert.equal(claim.phase,'ready');assert.equal((await new AttachedRuntime(f.config,session,claim).state()).sessionId,session.header.id);
@@ -85,8 +85,8 @@ test('large persisted histories do not prevent TUI registration or first-persist
     await fs.appendFile(file,JSON.stringify({type:'custom',id:'large-fixture',parentId:null,data:'x'.repeat(32*1024*1024)})+'\n');
    };
    if(timing==='before-registration')await persist();
-   await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
-   if(timing==='after-registration'){await persist();await handlers.agent_settled();}
+   await handlers.session_start({},{mode:'tui',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{stopped=true;}});
+   if(timing==='after-registration'){await persist();await handlers.agent_settled({aborted:false});}
    const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session);
    assert.equal(claim.phase,'ready');assert.equal(stopped,false);
    const runtime=new AttachedRuntime(f.config,session,claim);
@@ -164,7 +164,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
  const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
  const handlers={};let stopped=false;
  attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
- const context=manager=>({mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+ const context=manager=>({mode:'tui',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{stopped=true;}});
  try{
   for(const reason of ['startup','new']){
    if(reason==='new')await handlers.session_shutdown({reason:'new'});
@@ -175,7 +175,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
    assert.equal(claim.phase,'ready');
    const runtime=new AttachedRuntime(f.config,session,claim);assert.equal((await runtime.state()).sessionId,session.header.id);
    manager.appendMessage({role:'user',content:'native persistence fixture',timestamp:Date.now()});
-   await handlers.agent_settled();
+   await handlers.agent_settled({aborted:false});
    assert.equal((await runtime.read({session_id:'fixture',view:'raw'})).items.length,1);
    await assert.rejects(reserveOwner(f.config.attachmentDir,session,'rpc'),/LIVE_OWNER_UNREACHABLE/);
    if(reason==='new'){
@@ -196,13 +196,32 @@ test('missing targets do not bypass canonical parent or observed-file checks',as
  const parentAlias=path.join(f.dir,'root-alias');await fs.symlink(f.config.sessionRoots[0],parentAlias);
  try{
   await assert.rejects(handlers.session_start({reason:'startup'},{mode:'tui',sessionManager:{getSessionFile:()=>path.join(parentAlias,path.basename(file)),getHeader:()=>manager.getHeader()},shutdown:()=>{}}),/SESSION_FILE_ALIAS_NOT_ALLOWED/);
-  const ctx={mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}};
+  const ctx={mode:'tui',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{stopped=true;}};
   await handlers.session_start({reason:'startup'},ctx);
-  manager.appendMessage({role:'user',content:'persist then remove fixture',timestamp:Date.now()});await handlers.agent_settled();
+  manager.appendMessage({role:'user',content:'persist then remove fixture',timestamp:Date.now()});await handlers.agent_settled({aborted:false});
   await fs.unlink(file);
-  await assert.rejects(handlers.agent_settled(),{code:'ENOENT'});assert.equal(stopped,true);
+  await assert.rejects(handlers.agent_settled({aborted:false}),{code:'ENOENT'});assert.equal(stopped,true);
  }finally{
   await handlers.session_shutdown({reason:'quit'});
+  if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;
+ }
+});
+
+test('RPC extension storage failure retains ownership without shutting down its external host',async t=>{
+ const f=await fixture(t),original=process.env.PI_MCP_ATTACH_DIR;process.env.PI_MCP_ATTACH_DIR=f.config.attachmentDir;
+ const handlers={};let shutdowns=0;attachExtension({on:(name,fn)=>{handlers[name]=fn;}});
+ const manager=SessionManager.open(f.session.file),ctx={mode:'rpc',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{shutdowns++;}};
+ const alias=path.join(f.dir,'rpc-alias.jsonl');
+ try{
+  await handlers.session_start({},ctx);const claim=await readClaim(f.config.attachmentDir,f.session);
+  await fs.link(f.session.file,alias);
+  await assert.rejects(handlers.agent_settled({aborted:false}),/SESSION_FILE_ALIAS_NOT_ALLOWED/);
+  assert.equal(shutdowns,0);assert.equal((await readClaim(f.config.attachmentDir,f.session)).generation,claim.generation);
+  await fs.unlink(alias);
+  await assert.rejects(new AttachedRuntime(f.config,f.session,claim).state(),/RUNTIME_SESSION_CHANGED/);
+  await assert.rejects(reserveOwner(f.config.attachmentDir,f.session,'rpc'),/LIVE_OWNER_UNREACHABLE/);
+ }finally{
+  await handlers.session_shutdown({});
   if(original===undefined)delete process.env.PI_MCP_ATTACH_DIR;else process.env.PI_MCP_ATTACH_DIR=original;
  }
 });
@@ -216,7 +235,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
    if(mutation!=='valid')await handlers.session_shutdown({reason:'new'});
    stopped=false;
    const manager=SessionManager.create(f.dir,f.config.sessionRoots[0]),file=manager.getSessionFile();
-   await handlers.session_start({reason:'new'},{mode:'tui',sessionManager:manager,isIdle:()=>true,shutdown:()=>{stopped=true;}});
+   await handlers.session_start({reason:'new'},{mode:'tui',sessionManager:manager,isIdle:()=>true,hasPendingMessages:()=>false,shutdown:()=>{stopped=true;}});
    const session={file,header:manager.getHeader()},claim=await readClaim(f.config.attachmentDir,session),runtime=new AttachedRuntime(f.config,session,claim);
    let raced=false;
    t.mock.method(fs,'lstat',async function(target,...args){

@@ -5,6 +5,28 @@ function projection(messages){return {entries:messages.map((message,index)=>({so
 const user=content=>({role:'user',content});
 const text=content=>({role:'assistant',content:[{type:'text',text:content}]});
 
+test('short selected blocks donate their unused excerpt capacity to longer blocks',()=>{
+  for(const texts of [['brief','x'.repeat(4000),'done'],['x'.repeat(4000),'brief','y'.repeat(4000)]]){
+    const content=texts.map(text=>({type:'text',text}));
+    const row=overviewRecords(projection([{role:'assistant',content}])).find(row=>row.label==='latest_assistant');
+    const blocks=[row,...row.additional_text_blocks];
+    assert.deepEqual(blocks.map(block=>block.payload_source.block_index),[0,2,1]);
+    let used=0;
+    for(const {payload,payload_source} of blocks){
+      const json=JSON.stringify(texts[payload_source.block_index]);
+      if(payload.value!==undefined){used+=JSON.stringify(payload.value).length;assert.equal(payload.value,texts[payload_source.block_index]);}
+      else{
+        used+=payload.json_excerpt.length+payload.json_tail_excerpt.length;
+        assert.equal(payload.json_excerpt,json.slice(0,payload.omitted_char_ranges[0][0]));
+        assert.equal(payload.json_tail_excerpt,json.slice(payload.tail_char_offset));
+        assert.deepEqual(payload.omitted_char_ranges,[[payload.json_excerpt.length,payload.tail_char_offset]]);
+      }
+    }
+    assert.equal(used,1000);
+    assert.deepEqual(overviewRecords(projection([{role:'assistant',content}])).find(row=>row.label==='latest_assistant'),row);
+  }
+});
+
 test('interior instruction and correction survive a tool flood and final continue',t=>{
   const messages=[user('PUBLIC_INITIAL_DIRECTION'),text('initial response'),user('PUBLIC_INTERIOR_INSTRUCTION'),text('interior response'),user('PUBLIC_LATER_CORRECTION')];
   for(let i=0;i<100;i++)messages.push({role:'assistant',content:[{type:'toolCall',id:`t${i}`,name:'bash',arguments:{command:`PUBLIC_TOOL_${i}`}}]},
@@ -12,7 +34,7 @@ test('interior instruction and correction survive a tool flood and final continu
   messages.push(user('continue'),text('PUBLIC_FINAL_CONCLUSION'));
   const rows=overviewRecords(projection(messages)),serialized=JSON.stringify(rows);
   for(const marker of ['PUBLIC_INITIAL_DIRECTION','PUBLIC_INTERIOR_INSTRUCTION','PUBLIC_LATER_CORRECTION','PUBLIC_FINAL_CONCLUSION'])assert.ok(serialized.includes(marker),marker);
-  assert.equal(rows[0].selection,'extractive_v2');assert.equal(rows[0].user_coverage.selected,4);
+  assert.equal(rows[0].selection,'extractive_v3');assert.equal(rows[0].user_coverage.selected,4);
   assert.ok(rows.some(row=>row.kind==='tool_observation'));
   assert.ok(rows.length<=20);assert.ok(JSON.stringify(rows.slice(1)).length<=10000+rows.length);
   t.diagnostic(`Recovered 4/4 user messages plus final assistant; ${rows.length-1} selected records; ${serialized.length} serialized UTF-16 chars including manifest.`);
