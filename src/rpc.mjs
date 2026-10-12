@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
 import { rpcActivity } from './activity.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { requestRpcStop, withdrawalCapture } from './stop-execution.mjs';
 import { validatePiRuntime } from './owner-config.mjs';
 import { reserveOwner, updateOwner, releaseOwner, processIdentity, readClaim, ownerAlive, AttachedRuntime, AttachmentFailure } from './attachments.mjs';
 export class RpcFailure extends Error {
@@ -84,6 +85,7 @@ export class PiRpc {
     // timers, unrelated events and malformed responses cannot clear uncertainty.
     if (req.commandType === 'prompt' && (event.command !== 'prompt' ||
         (event.success !== false && !(event.success === true && ['started','queued','handled'].includes(event.data?.disposition))))) return;
+    if (['clear_queue','abort','abort_bash'].includes(req.commandType) && (event.command!==req.commandType || typeof event.success!=='boolean')) return;
     this.pending.delete(event.id); clearTimeout(req.timer);
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation) this.promptAdmission = null;
     const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
@@ -148,6 +150,26 @@ export class PiRpc {
     return state;
   }
   entries() { return this.command({type:'get_entries'}); }
+  async stopExecution({timeout_ms=5000,recovery_id}={}){
+    // Cancellation identity failures must not use state()'s process teardown.
+    const check=async()=>{
+      const state=await this.dispatch({type:'get_state'});
+      if(state.sessionFile!==this.session.file||state.sessionId!==this.session.header.id)throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    };
+    try{await check();}catch(error){error.uncertain=false;throw error;}
+    try{
+      const capture=withdrawalCapture(this.config.attachmentDir,this.session,this.generation,recovery_id);
+      const result=await requestRpcStop({
+        clearQueue:()=>this.dispatch({type:'clear_queue'},timeout_ms,result=>{
+          // Existing late-ACK recovery must not discard withdrawn text.
+          if(result.ok)void check().then(()=>capture(result.data)).catch(error=>diagnostics.emit('operation.failure',{code:error.code??error.message,uncertain:true}));
+        }),
+        abort:()=>this.dispatch({type:'abort'},timeout_ms),
+        abortBash:()=>this.dispatch({type:'abort_bash'},timeout_ms),
+      },async value=>{await check();await capture(value);});
+      await check();return result;
+    }catch(error){error.uncertain=true;throw error;}
+  }
   async assertReleasable(){
     if(this.promptAdmission)throw new RpcFailure('PROMPT_ADMISSION_PENDING');
     const state=await this.dispatch({type:'get_state'});

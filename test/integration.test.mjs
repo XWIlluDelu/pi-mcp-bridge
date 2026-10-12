@@ -93,7 +93,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
   const client=new Client({name:'bridge-protocol-test',version:'1.0.0'});
   try {
     await client.connect(transport);
-    assert.deepEqual((await client.listTools()).tools.map(t=>t.name).sort(),['batch','create','delete','list','read','send']);
+    assert.deepEqual((await client.listTools()).tools.map(t=>t.name).sort(),['batch','create','delete','list','read','send','stop']);
     const call=async(name,args)=>{const result=await client.callTool({name,arguments:args});assert.ok(!result.isError);return result.structuredContent;};
     const made=await call('create',{folder_id:'project',request_id:'mcp-create'});assert.equal(made.status,'created');
     assert.equal((await call('list',{})).sessions.length,1);

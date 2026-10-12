@@ -55,6 +55,10 @@ delete/shutdown with `HOST_RELEASE_UNSUPPORTED`; Bridge disconnect leaves that
 owner running. Registration/storage failure retires access without requesting
 RPC shutdown. TUI release uses graceful native exit and waits for the exact owner.
 
+Full stop requires native queue withdrawal and agent/bash cancellation. The
+ordinary companion lacks the required public APIs; capable SDK/RPC hosts provide
+the [stop callback](stop.md).
+
 ## Verification
 
 ```sh

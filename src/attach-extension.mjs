@@ -111,6 +111,11 @@ export default function attachExtension(pi){
               pi.sendUserMessage(args.text,options);
               data={status:'unknown',dispatch:'submitted',reason:'PI_ACCEPTANCE_UNOBSERVABLE',completion:'not_tracked'};
             }
+          }else if(request.op==='stop'){
+            // TUI ctx.abort + getEditorText can recover joined text (including
+            // prior draft), but no public context API aborts independent bash.
+            // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
+            throw new AttachmentFailure('STOP_UNSUPPORTED');
           }else if(request.op==='shutdown'){
             if(ctx.mode==='rpc')throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
             data={shutdown:'requested'};

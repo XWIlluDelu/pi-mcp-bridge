@@ -1,7 +1,7 @@
 # Pi MCP Bridge
 
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
-RPC workers. It exposes `list`, `read`, `send`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
+RPC workers. It exposes `list`, `read`, `send`, `stop`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
 
 Cooperating Pi TUI/RPC processes share their existing runtime through a private
 Unix socket. Cooperative process identity and attachment require Linux.
@@ -52,6 +52,9 @@ folder-only `new_session` grants.
 Each permission defaults to deny. An explicit session rule wins, then the nearest
 project rule. Later entries replace the same permission at the same scope; `null`
 inherits. Project paths are canonicalized. Creation does not imply send access.
+
+The independent `command` grant authorizes [stop](docs/stop.md), which also
+requires `read` to return withdrawn text.
 
 Entrypoints reload grants before requests. Other configuration changes require
 restart (`CONFIG_RESTART_REQUIRED`). An invalid config blocks new requests;
@@ -236,6 +239,14 @@ returns void. Its idle check is observational, not atomic against other inputs.
 An unresolved owned prompt ACK blocks another prompt with
 `PROMPT_ADMISSION_PENDING` until that ACK or exact child exit. Idle/settlement
 observations do not clear this fence.
+
+### stop
+
+[Stop](docs/stop.md) cancels native execution and withdraws all queued text while
+keeping process, history and ownership. It is live-only and requires `command`
+plus `read`. Follow the same request ID's cursor until `withdrawn_complete`.
+Owned RPC and capable hosts support it; ordinary companion returns
+`STOP_UNSUPPORTED`. Stop is not a batch item.
 
 ### create and delete
 

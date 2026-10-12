@@ -76,6 +76,14 @@ Deletion releases the exact generation, then reserves a deletion claim before
 moving the file. Another owner winning that interval leaves the file in place.
 A surviving RPC child retains its own process identity even if its controller dies.
 
+## Stop without release
+
+Optional `stop({sessionFile,sessionId,onWithdraw})` cancels native agent and
+independent bash execution, recovers complete queued text and keeps the writer.
+SDK/RPC bindings provide it when the public cancellation/queue methods exist;
+other hosts must cover any extra queues. It requires `command` plus `read`;
+missing capability returns `STOP_UNSUPPORTED`. See [stop](stop.md).
+
 ## Executable examples
 
 ```sh

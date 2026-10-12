@@ -3,6 +3,7 @@
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import {hash,renderRead,assertSingleSessionFile,readSessionIdentity} from './data.mjs';
+import { stopReceipt, withdrawalCapture } from './stop-execution.mjs';
 import {activityObservation} from './activity.mjs';
 import {MAX_ATTACHMENT_REQUEST_BYTES} from './attachment-protocol.mjs';
 import {reserveOwner,updateOwner,releaseOwner,readClaim,processIdentity,ownerAlive,isReleasedOwner,AttachmentFailure} from './attachments.mjs';
@@ -19,7 +20,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   owner??=await processIdentity();
   if(!owner||!await ownerAlive(owner))fail('PROCESS_IDENTITY_UNAVAILABLE');
   const record=await reserveOwner(attachmentDir,target,'host',owner);
-  let callbacks,server,ready=false,closed=false,releasing,closing;
+  let callbacks,server,ready=false,closed=false,stopping=false,releasing,closing;
   const sockets=new Set(),operations=new Set();
   async function identity(value){
     if(value!==undefined&&(value.sessionFile!==target.file||value.sessionId!==target.header.id))fail('RUNTIME_SESSION_CHANGED');
@@ -74,10 +75,22 @@ export async function reserveHostSession({attachmentDir,session,owner}){
         count:pendingMessageCount,pending:pendingMessageCount===null?null:pendingMessageCount>0});
       data=renderRead({entries:snapshot.entries,leafId:snapshot.leafId,revision:hash(revisionInput),activity},args,{leafSource:'live',generation:record.generation});
     }else if(request.op==='send'){
+      if(stopping)fail('STOP_IN_PROGRESS');
       if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))fail('INVALID_ATTACHED_SEND');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
       data=receipt(await callbacks.submit({text:args.text,mode:args.mode}));
+    }else if(request.op==='stop'){
+      if(typeof callbacks.stop!=='function')fail('STOP_UNSUPPORTED');
+      if(stopping)fail('STOP_IN_PROGRESS');
+      const capture=withdrawalCapture(attachmentDir,target,record.generation,args.recovery_id);let captured=false;
+      stopping=true;
+      try{
+        data=stopReceipt(await callbacks.stop({sessionFile:target.file,sessionId:target.header.id,onWithdraw:async value=>{
+          await state();await capture(value);captured=true;
+        }}));
+        if(!captured)fail('INVALID_STOP_RECEIPT');
+      }finally{stopping=false;}
     }else fail('INVALID_ATTACHED_OPERATION');
     await state();return data;
   }
@@ -94,7 +107,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   }
   async function publish(value){
     if(callbacks||closed)fail('HOST_ADAPTER_ALREADY_STARTED');
-    if(!value||!['state','snapshot','submit'].every(name=>typeof value[name]==='function')||(value.release!==undefined&&typeof value.release!=='function'))fail('INVALID_HOST_CALLBACKS');
+    if(!value||!['state','snapshot','submit'].every(name=>typeof value[name]==='function')||['release','stop'].some(name=>value[name]!==undefined&&typeof value[name]!=='function'))fail('INVALID_HOST_CALLBACKS');
     callbacks=value;
     try{
     await state();if(closed||releasing)fail('RUNTIME_SESSION_CHANGED');
@@ -109,6 +122,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
         const task=(async()=>{
           try{
             const request=JSON.parse(buffer.slice(0,end));validateRequest(request);
+            if(request.op==='stop'&&Number.isInteger(request.body?.timeout_ms))socket.setTimeout(Math.min(30000,Math.max(50,request.body.timeout_ms)));
             let data;
             if(request.op==='release')data=await release();
             else{
