@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -10,7 +11,7 @@ import { PiRpc } from '../src/rpc.mjs';
 
 async function fixture(t){
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-ext-read-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'extension-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}]};
+ const config={...isolatedRuntime(dir),principal:'extension-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}]};
  const bridge=await new Bridge(config).init();const made=await bridge.create({folder_id:'project',request_id:'seed'}),saved=await bridge.session(made.session_id);
  t.after(async()=>{await bridge.close();await fs.rm(dir,{recursive:true,force:true});});return {dir,cwd,config,bridge,saved,id:made.session_id};
 }
@@ -68,12 +69,12 @@ test('selected agentDir discovers extensions; an explicit disable flag remains a
  const f=await fixture(t),agentDir=path.join(f.dir,'owner-agent'),extensions=path.join(agentDir,'extensions');await fs.mkdir(extensions,{recursive:true});
  await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarming:'off',compaction:{enabled:false},retry:{enabled:false}}));
  const extension=path.join(extensions,'original-fixture.js');await fs.writeFile(extension,"export default function(pi){pi.on('session_start',()=>pi.appendEntry('profile-marker',{loaded:true}));}");
- f.config.piRuntime={agentDir};let rpc;
+ f.config.piRuntime={agentDir,inheritEnv:[]};let rpc;
  try{
   rpc=await new PiRpc(f.config,f.saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
   // Use a new native file so a previous persisted marker cannot mask discovery.
   const made=await f.bridge.create({folder_id:'project',request_id:'disabled-profile'}),saved=await f.bridge.session(made.session_id);
-  f.config.piArgs=['--no-extensions'];rpc=await new PiRpc(f.config,saved).start();assert.ok(!(await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
-  f.config.piArgs=['--no-extensions','-e',extension];rpc=await new PiRpc(f.config,saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));
+  f.config.piArgs=['--offline','--no-extensions'];rpc=await new PiRpc(f.config,saved).start();assert.ok(!(await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
+  f.config.piArgs=['--offline','--no-extensions','-e',extension];rpc=await new PiRpc(f.config,saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));
  }finally{await rpc?.stop();}
 });

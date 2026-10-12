@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -16,7 +17,7 @@ import { operationSchemas } from '../src/tool-schemas.mjs';
 const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture(t){
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-at-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'attached-test',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),attachmentExitTimeoutMs:4000};
+ const config={...isolatedRuntime(dir),principal:'attached-test',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),attachmentExitTimeoutMs:4000};
  const bridge=await new Bridge(config).init();const made=await bridge.create({folder_id:'project',request_id:'create'});const session=await bridge.session(made.session_id);
  t.after(async()=>{await bridge.close();await fs.rm(dir,{recursive:true,force:true});});return {dir,cwd,config,bridge,session,id:made.session_id};
 }
@@ -129,7 +130,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
 test('same session continues headless after actual TUI exit with history, grants, profile and restart receipt intact',async t=>{
  const f=await fixture(t),profile=path.join(f.dir,'headless-marker.mjs');
  await fs.writeFile(profile,"export default function(pi){pi.on('session_start',()=>pi.appendEntry('headless-profile',{fixture:true}));}");
- f.config.piArgs=['-e',path.join(base,'research/faux-extension.mjs'),'-e',profile,'--provider','bridge-fixture','--model','deterministic','--thinking','off'];
+ f.config.piArgs=['--offline','-e',path.join(base,'research/faux-extension.mjs'),'-e',profile,'--provider','bridge-fixture','--model','deterministic','--thinking','off'];
  const launched=await tui(t,f);const first=await f.bridge.send({session_id:f.id,request_id:'tui-history',text:'PUBLIC_TUI_HISTORY'});assert.equal(first.dispatch,'submitted');
  await until(async()=>{const r=await f.bridge.read({session_id:f.id});return r.items.some(x=>x.message?.role==='assistant')&&!(await f.bridge.pool.get(f.id).state()).isStreaming;});
  process.kill(launched.record.owner.pid,'SIGTERM');await waitOwnerExit(launched.record.owner);
@@ -137,7 +138,7 @@ test('same session continues headless after actual TUI exit with history, grants
  f.config.grants.push({session_id:f.id,send:false});assert.equal((await f.bridge.send({session_id:f.id,request_id:'denied-after-tui',text:'MUST_NOT_DISPATCH'})).status,'rejected');
  const afterDenial=await readClaim(f.config.attachmentDir,f.session);assert.ok(!afterDenial||!(await ownerAlive(afterDenial.owner)));
  f.config.grants.push({session_id:f.id,send:true});
- const second=await f.bridge.send({session_id:f.id,request_id:'headless-same-session',text:'PUBLIC_HEADLESS_CONTINUATION',mode:'idle_only'});assert.equal(second.status,'accepted');assert.equal(second.disposition,'started');
+ const second=await f.bridge.send({session_id:f.id,request_id:'headless-same-session',text:'PUBLIC_HEADLESS_CONTINUATION',mode:'idle_only'});assert.equal(second.status,'accepted',JSON.stringify(second));assert.equal(second.disposition,'started');
  const claim=await readClaim(f.config.attachmentDir,f.session);assert.equal(claim.kind,'rpc');assert.equal(claim.sessionId,f.session.header.id);assert.equal(await ownerAlive(claim.owner),true);assert.notEqual(claim.generation,launched.record.generation);assert.equal(f.bridge.pool.instances.size,1);
  await until(async()=>{const r=await f.bridge.read({session_id:f.id});return r.items.filter(x=>x.message?.role==='assistant').length===2;});
  const raw=await f.bridge.read({session_id:f.id,view:'raw',limit:50,max_chars:32768});assert.ok(raw.items.some(x=>x.entry.customType==='headless-profile'));
@@ -151,7 +152,9 @@ test('same session continues headless after actual TUI exit with history, grants
 });
 
 test('official offline Pi TUI attaches, sends all modes, reloads, resumes attachment and deletes after exit',async t=>{
- const f=await fixture(t);const launched=await tui(t,f);
+ const f=await fixture(t);const owned=await f.bridge.pool.resolve(f.session),old=owned.ownerRecord.owner;
+ await f.bridge.releaseForLocal({session_id:f.id});assert.equal(await ownerAlive(old),false);
+ const launched=await tui(t,f);
  const receipt=await f.bridge.send({session_id:f.id,request_id:'native',text:'first public fixture',mode:'native'});
  assert.equal(receipt.status,'unknown');assert.equal(receipt.dispatch,'submitted');
  assert.equal((await f.bridge.send({session_id:f.id,request_id:'idle-skip',text:'must skip',mode:'idle_only'})).status,'skipped');

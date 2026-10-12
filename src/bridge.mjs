@@ -6,10 +6,11 @@ import { activityObservation, rpcActivity } from './activity.mjs';
 import { readSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
-import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd } from './data.mjs';
-import { RuntimePool } from './rpc.mjs';
+import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd, atomicJson } from './data.mjs';
+import { PiRpc, RuntimePool } from './rpc.mjs';
 import { Journal } from './journal.mjs';
-import { privateDirectory } from './attachments.mjs';
+import { privateDirectory, readClaim, ownerAlive, registryTransaction, updateOwner, claimFile } from './attachments.mjs';
+import { serveOwnerControl } from './owner-runtime.mjs';
 import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { prepareTrash } from './trash.mjs';
@@ -17,7 +18,7 @@ export class Bridge {
   constructor(config, factory, {configFile}={}) { this.config = config; this.configFile=configFile;const {grants,...settings}=config;this.ownerSettings=structuredClone(settings);this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); }
   async init() {
     validateOwnerConfig(this.config);
-    if(this.config.attachmentDir)await privateDirectory(this.config.attachmentDir);
+    await privateDirectory(this.pool.attachmentDir);
     await fs.mkdir(this.config.stateDir,{recursive:true,mode:0o700});
     if (await fs.realpath(this.config.stateDir) !== path.resolve(this.config.stateDir)) throw new Error('SYMLINK_STATE_NOT_ALLOWED');
     for (const root of this.config.sessionRoots) {
@@ -29,6 +30,7 @@ export class Bridge {
     // One bridge process per state directory. Do not automatically steal stale locks.
     this.lockPath = path.join(this.config.stateDir,'bridge.lock');
     this.lock = await fs.open(this.lockPath,'wx',0o600); await this.lock.writeFile(`${process.pid}\n`);
+    try{this.ownerControl=await serveOwnerControl(this);}catch(error){await this.lock.close();await fs.unlink(this.lockPath);this.lock=null;throw error;}
     return this;
   }
   async locked(id,fn) {
@@ -188,11 +190,48 @@ export class Bridge {
       finally {await trash?.cancel().catch(()=>{});await release?.();}
     }));
   }
+  async releaseForLocal({session_id}){
+    this.assertOpen();
+    return this.locked(session_id,async()=>{
+      this.assertOpen();
+      const session=await this.session(session_id),dir=this.pool.attachmentDir;
+      if(this.pool.starting.has(session_id))throw new Error('RUNTIME_IDLE_UNCONFIRMED');
+      const runtime=await this.pool.forRead(session);
+      if(runtime?.attached)throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
+      if(runtime){
+        if(!(runtime instanceof PiRpc))throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
+        await runtime.assertReleasable();
+        await updateOwner(dir,session,runtime.ownerRecord,{noColdReacquire:true});
+        await this.pool.stop(session_id); // Wait exact child exit; stop never targets external owners.
+      }else await registryTransaction(dir,async()=>{
+        const current=await readClaim(dir,session);
+        if(current&&await ownerAlive(current.owner))throw new Error('LIVE_OWNER_UNREACHABLE');
+        await atomicJson(claimFile(dir,session),{kind:'rpc',file:session.file,sessionId:session.header.id,
+          generation:current?.generation??randomUUID(),owner:null,phase:'released',noColdReacquire:true});
+      });
+      return {session_id,status:'released',no_cold_reacquire:true};
+    });
+  }
+  async resetColdResume({session_id,confirm_local_closed}){
+    this.assertOpen();
+    if(confirm_local_closed!==true)throw new Error('LOCAL_CLOSE_CONFIRMATION_REQUIRED');
+    return this.locked(session_id,async()=>{
+      this.assertOpen();const session=await this.session(session_id),dir=this.pool.attachmentDir;
+      await registryTransaction(dir,async()=>{
+        const current=await readClaim(dir,session);
+        if(current&&await ownerAlive(current.owner))throw new Error('OWNER_STILL_ALIVE');
+        // This confirms cooperative owners only; caller must close unregistered Pi too.
+        if(current?.noColdReacquire)await fs.unlink(claimFile(dir,session));
+      });
+      return {session_id,status:'reset',no_cold_reacquire:false};
+    });
+  }
   assertOpen() { if (this.closing) throw new Error('BRIDGE_CLOSING'); }
   async close() {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     this.closePromise = (async () => {
+      await this.ownerControl?.close();
       await Promise.allSettled([...this.journal.running.values()]);
       await this.pool.close();
       await Promise.allSettled([...this.journal.transitions.values()]);
@@ -205,5 +244,5 @@ export class Bridge {
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure',{code,uncertain:error.uncertain===true});
-  return ['HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }

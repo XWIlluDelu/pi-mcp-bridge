@@ -1,5 +1,6 @@
 import { loadSavedSession } from '../src/data.mjs';
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -16,7 +17,7 @@ const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function configFixture(t) {
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-mcp-integration-'));
   const cwd=path.join(dir,'project');await fs.mkdir(cwd);
-  const config={principal:'isolated-test',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}]};
+  const config={...isolatedRuntime(dir),principal:'isolated-test',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}]};
   t.after(()=>fs.rm(dir,{recursive:true,force:true})); return {config,dir,cwd};
 }
 function loader() {return {
@@ -42,7 +43,7 @@ test('official Pi extension session switch is stopped and cannot be read under o
   const f=await configFixture(t);
   const extension=path.join(f.dir,'switch.mjs');
   await fs.writeFile(extension,`export default function(pi) { pi.registerCommand('switch-fixture', {handler: async (_args, ctx) => { await ctx.newSession(); }}); }`);
-  f.config.piArgs=['-e',extension];
+  f.config.piArgs=['--offline','-e',extension];
   const bridge=await new Bridge(f.config).init();let runtime;
   try {
     const made=await bridge.create({folder_id:'project',request_id:'switch-create'});
@@ -104,7 +105,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
 
 test('MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and content read',async t=>{
   const f=await configFixture(t);
-  f.config.piArgs=['-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'];
+  f.config.piArgs=['--offline','-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'];
   const filename=path.join(f.dir,'owner-config.json');await fs.writeFile(filename,JSON.stringify(f.config));
   const transport=new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),filename],cwd:base,env:{PATH:process.env.PATH,HOME:f.dir,PI_OFFLINE:'1'},stderr:'pipe'});
   const client=new Client({name:'bridge-e2e-faux-test',version:'1.0.0'});
@@ -148,7 +149,7 @@ export default function(pi){
   if(event.prompt.startsWith('HOLD'))while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,5));
  });
 }`);
-  f.config.piArgs=['-e',extension,'--provider','admission-fixture','--model','slow','--thinking','off'];
+  f.config.piArgs=['--offline','-e',extension,'--provider','admission-fixture','--model','slow','--thinking','off'];
   const bridge=await new Bridge(f.config).init();
   const rows=async()=>{try{return (await fs.readFile(entered,'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse);}catch(e){if(e.code==='ENOENT')return [];throw e;}};
   const until=async predicate=>{const end=Date.now()+10000;while(Date.now()<end){if(await predicate())return;await new Promise(r=>setTimeout(r,10));}throw new Error('ADMISSION_FIXTURE_DEADLINE');};

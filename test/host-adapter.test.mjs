@@ -34,6 +34,18 @@ test('two-phase host reservation blocks another writer before ready and exposes 
  assert.equal((await request(f,'send',{text:'fixture',mode:'native'})).data.status,'accepted');
  assert.equal((await request(f,'send',{text:'fixture',mode:'native'},{generation:'stale'})).error,'RUNTIME_SESSION_CHANGED');
 });
+test('host state forwards only validated nonnegative integer pending counts',async t=>{
+ const f=await fixture(t),state=f.callbacks.state;let count;
+ f.callbacks.state=()=>({...state(),...(count===undefined?{}:{pendingMessageCount:count})});
+ await f.controller.ready(f.callbacks);
+ for(const [input,expected] of [[0,0],[3,3],[undefined,null],[-1,null],[1.5,null],['3',null],[null,null],[NaN,null],[Infinity,null],[Number.MAX_SAFE_INTEGER+1,null]]){
+  count=input;
+  assert.equal((await request(f,'state')).data.pendingMessageCount,expected);
+  const {activity}=(await request(f,'read',{view:'context'})).data;
+  assert.equal(activity.pending_message_count,expected);
+  assert.equal(activity.pending_messages,expected===null?null:expected>0);
+ }
+});
 test('host release waits for admitted preparation, fences new input, and releases shared PID without killing it',async t=>{
  const f=await fixture(t),entered=gate(),finish=gate();let released=false;
  f.callbacks.submit=async()=>{entered.resolve();await finish.promise;assert.equal(released,false);return {status:'unknown'};};

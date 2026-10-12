@@ -63,28 +63,20 @@ Callers cannot override identity, roots, grants or runtime settings through tool
 arguments. One Bridge holds each state directory; overlapping configured storage
 and state directories are rejected.
 
-### Runtime profile
+### Native runtime defaults
 
-Cold resume defaults to an isolated agent directory, no inherited provider
-credentials and no tools. Explicit owner options select another profile:
+Cold resume inherits the service environment, Pi agent directory and native
+settings, saved model/thinking selection, tools, resources and authentication.
+The service environment may differ from the interactive shell.
 
 ```json
-{
-  "piRuntime": {
-    "agentDir":"/absolute/path/to/pi-agent",
-    "inheritEnv":["OPENAI_API_KEY","HTTPS_PROXY"],
-    "tools":["read","write","edit"]
-  },
-  "piArgs":["--provider","approved-provider","--model","approved-model"]
-}
+{"piRuntime":{"tools":["read","bash"]},"piArgs":["--thinking","high"]}
 ```
 
-Pi resolves its models and authentication. Use environment interpolation in Pi
-configuration rather than copying credentials into Bridge configuration.
-
-Explicitly inherited HOME is respected. An explicit `agentDir` enables native
-resource discovery; without it, the isolated profile and resource-disable flags
-remain. Tools and environment inheritance still require explicit selection.
+Omitted/null `tools` and `inheritEnv` retain native defaults. `tools:[]` disables
+tools; an explicit environment list filters inheritance while retaining PATH.
+`agentDir` selects another profile. Environment filtering does not isolate
+file-based credentials. Tests and the demo select isolation explicitly.
 
 ### Local controls and shared sessions
 
@@ -127,6 +119,11 @@ shutdown does not confirm process exit. See [startup integration](docs/startup-i
 Existing SDK/RPC hosts can [reserve and publish public bindings](docs/host-adapter.md)
 before opening a session. Every host input and replacement path must participate
 in its admission and release coordination.
+
+Use [owner-local release/reset](docs/runtime-handoff.md) for Bridge-owned writers.
+Release persists a no-cold-reacquire restriction until explicit reset; valid
+attachments and saved reads remain usable. Its observed-idle checks and timed
+teardown are not a graceful quiescence barrier.
 
 ## Tools
 

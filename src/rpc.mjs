@@ -14,30 +14,34 @@ export class RpcFailure extends Error {
 }
 export function launchProfile(config, hostEnv = process.env) {
   const profile = config.piRuntime ?? {};
-  const inherit = profile.inheritEnv ?? [];
-  const tools = profile.tools ?? [];
   validatePiRuntime(profile);
-  const home = path.join(config.stateDir, 'pi-home');
-  const agentDir = profile.agentDir ?? path.join(home, '.pi', 'agent');
-  const env = Object.fromEntries(inherit.filter(name => hostEnv[name] !== undefined).map(name => [name,hostEnv[name]]));
-  Object.assign(env, {PATH:hostEnv.PATH ?? '/usr/bin:/bin', HOME:env.HOME ?? home, LANG:'C.UTF-8', TERM:'dumb', PI_OFFLINE:'1', PI_CODING_AGENT_DIR:agentDir});
-  const resourceArgs = profile.agentDir ? [] : ['--no-extensions','--no-skills','--no-prompt-templates','--no-themes'];
-  return {agentDir,env,resourceArgs,toolArgs:tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
+  const inheritEnv=profile.inheritEnv??undefined,tools=profile.tools??undefined;
+  const env = inheritEnv === undefined ? {...hostEnv}
+    : Object.fromEntries(inheritEnv.filter(name => hostEnv[name] !== undefined).map(name => [name,hostEnv[name]]));
+  if (inheritEnv !== undefined) env.PATH ??= hostEnv.PATH ?? '/usr/bin:/bin';
+  if (profile.agentDir !== undefined) env.PI_CODING_AGENT_DIR = profile.agentDir;
+  // Pi resolves HOME, its native agent directory and resource/settings defaults.
+  return {env,resourceArgs:[],toolArgs:tools === undefined ? []
+    : tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
 }
 export class PiRpc {
   constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; this.settlement = {generation:this.generation,sequence:0,observed_at:null,aborted:null}; }
   async start() {
     await assertSingleSessionFile(this.session.file);
-    const {agentDir,env,toolArgs,resourceArgs} = launchProfile(this.config);
-    await fs.mkdir(agentDir, {recursive:true, mode:0o700});
+    const {env,toolArgs,resourceArgs} = launchProfile(this.config);
+    if(this.config.piRuntime?.agentDir)await fs.mkdir(this.config.piRuntime.agentDir,{recursive:true,mode:0o700});
     const cli = fileURLToPath(new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url));
-    if(this.config.attachmentDir)this.ownerRecord=await reserveOwner(this.config.attachmentDir,this.session,'rpc');
     try {
+      if(this.config.attachmentDir){
+      this.ownerRecord=await reserveOwner(this.config.attachmentDir,this.session,'rpc');
+      await updateOwner(this.config.attachmentDir,this.session,this.ownerRecord,{socket:path.join(this.config.attachmentDir,`${process.pid}-${this.ownerRecord.generation.slice(0,8)}.sock`)});
+      env.PI_MCP_RPC_OBSERVER=JSON.stringify({socket:this.ownerRecord.socket,generation:this.ownerRecord.generation});
+      }
       // Recheck at the actual launch boundary: content preflight and owner
       // reservation may have taken time since discovery verified this path.
       await validateExecutionCwd(this.session.cwd);
-      // Deliberate clean environment: do not borrow host keys or subscriptions.
-      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,...resourceArgs,...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
+      // Native environment/settings by default; only owner-selected overrides apply.
+      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,...resourceArgs,...toolArgs, ...(this.config.piArgs ?? []), ...(this.ownerRecord ? ['-e',fileURLToPath(new URL('./rpc-observer.mjs',import.meta.url))] : [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
     } catch (error) {
       if(this.ownerRecord)await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);
       throw error;
@@ -144,6 +148,19 @@ export class PiRpc {
     return state;
   }
   entries() { return this.command({type:'get_entries'}); }
+  async assertReleasable(){
+    if(this.promptAdmission)throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    const state=await this.dispatch({type:'get_state'});
+    if(state.sessionFile!==this.session.file||state.sessionId!==this.session.header.id)throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    if(this.promptAdmission)throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    if(state.isStreaming===true||state.isCompacting===true||state.pendingMessageCount>0)throw new RpcFailure('RUNTIME_BUSY');
+    if(state.isStreaming!==false||state.isCompacting!==false||state.pendingMessageCount!==0||!this.ownerRecord?.socket)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+    const observed=await new AttachedRuntime(this.config,this.session,this.ownerRecord).state();
+    if(observed.preparingUnconfirmed)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+    if(observed.isIdle===false||observed.hasPendingMessages===true)throw new RpcFailure('RUNTIME_BUSY');
+    if(observed.isIdle!==true||observed.hasPendingMessages!==false)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+    if(this.promptAdmission)throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+  }
   async stop() {
     const release=async()=>{if(this.ownerRecord){await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);this.ownerRecord=null;}};
     if (!this.child || this.exited) {this.promptAdmission=null;await release();return;}
@@ -153,17 +170,22 @@ export class PiRpc {
       this.child.kill('SIGTERM');
       const timer = setTimeout(() => this.child.kill('SIGKILL'),1500);
       await exited; this.exited=true; this.promptAdmission=null; clearTimeout(timer); this.lines?.close();
+      if(this.ownerRecord?.socket)await fs.unlink(this.ownerRecord.socket).catch(error=>{if(error.code!=='ENOENT')throw error;});
       await release();
     })();
     return this.stopPromise;
   }
 }
 export class RuntimePool {
-  constructor(config, factory = async session => new PiRpc(config,session).start()) { this.config=config;this.factory = factory; this.instances = new Map(); this.starting = new Map(); }
+  constructor(config, factory) {
+    this.config=config;this.attachmentDir=config.attachmentDir??(config.stateDir?path.join(config.stateDir,'ipc'):undefined);
+    this.factory=factory??(session=>new PiRpc({...config,attachmentDir:this.attachmentDir},session).start());
+    this.instances=new Map();this.starting=new Map();
+  }
   async forRead(session){
     const existing=this.instances.get(session.id);
-    if(!this.config.attachmentDir)return existing?.alive?existing:null;
-    const claim=await readClaim(this.config.attachmentDir,session);
+    if(!this.attachmentDir)return existing?.alive?existing:null;
+    const claim=await readClaim(this.attachmentDir,session);
     if(claim&&await ownerAlive(claim.owner)){
       if(claim.kind==='rpc'){
         if(existing?.alive&&existing.ownerRecord?.generation===claim.generation)return existing;
@@ -172,7 +194,7 @@ export class RuntimePool {
       if(claim.phase!=='ready')throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
       if(existing?.attached&&existing.alive&&existing.record.generation===claim.generation)return existing;
       if(existing)await existing.stop();
-      const attached=await diagnostics.measure('runtime.attach',{kind:'attached',generation:claim.generation},()=>new AttachedRuntime(this.config,session,claim).start());this.instances.set(session.id,attached);return attached;
+      const attached=await diagnostics.measure('runtime.attach',{kind:'attached',generation:claim.generation},()=>new AttachedRuntime({...this.config,attachmentDir:this.attachmentDir},session,claim).start());this.instances.set(session.id,attached);return attached;
     }
     if(existing?.attached){diagnostics.emit('runtime.detached',{kind:'attached',generation:existing.record.generation});await existing.stop();this.instances.delete(session.id);return null;}
     return existing?.alive?existing:null;
@@ -180,6 +202,7 @@ export class RuntimePool {
   async resolve(session) {
     if(this.starting.has(session.id))return this.starting.get(session.id);
     const attached=await this.forRead(session);if(attached){diagnostics.emit('runtime.reused',{kind:attached.attached?'attached':'rpc',generation:attached.generation??attached.record?.generation});return attached;}
+    if(this.attachmentDir&&(await readClaim(this.attachmentDir,session))?.noColdReacquire)throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
     const existing = this.instances.get(session.id);
     if (existing?.alive) return existing;
     if (existing) await existing.stop();
@@ -193,10 +216,10 @@ export class RuntimePool {
     const runtime=await this.forRead(session);
     if(runtime?.attached){await runtime.stopForDelete();this.instances.delete(session.id);}
     else await this.stop(session.id);
-    if(this.config.attachmentDir){
+    if(this.attachmentDir){
       // Keep a cooperative owner claim across the filesystem move, including saved-session deletes.
-      const deletion=await reserveOwner(this.config.attachmentDir,session,'rpc');
-      return ()=>releaseOwner(this.config.attachmentDir,session,deletion);
+      const deletion=await reserveOwner(this.attachmentDir,session,'delete');
+      return ()=>releaseOwner(this.attachmentDir,session,deletion);
     }
   }
   async stop(id) { const pending = this.starting.get(id); if (pending) await pending.catch(()=>{}); await this.instances.get(id)?.stop(); this.instances.delete(id); }
