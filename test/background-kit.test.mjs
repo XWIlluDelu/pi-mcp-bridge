@@ -14,6 +14,27 @@ async function fixture(){
  const config={...isolatedRuntime(dir),principal:'offline-service-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,new_session:true}]},file=path.join(dir,'owner.json');
  await fs.writeFile(file,JSON.stringify(config),{mode:0o600});return {dir,config,file};
 }
+test('generated demo explicitly isolates direct launch and preserves an existing owner config',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-demo-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ await fs.mkdir(path.join(dir,'research'));
+ for(const name of ['init-demo.mjs','demo-client.mjs','faux-extension.mjs'])
+  await fs.copyFile(path.join(base,'research',name),path.join(dir,'research',name));
+ await fs.cp(path.join(base,'src'),path.join(dir,'src'),{recursive:true});
+ await fs.symlink(path.join(base,'node_modules'),path.join(dir,'node_modules'));
+ const init=path.join(dir,'research/init-demo.mjs'),file=path.join(dir,'demo/owner-config.json');
+ await exec(process.execPath,[init]);
+ const config=JSON.parse(await fs.readFile(file,'utf8'));
+ assert.deepEqual(config.piRuntime,{agentDir:path.join(dir,'demo/agent'),inheritEnv:[],tools:[]});
+ for(const flag of ['--offline','--no-context-files','--no-skills','--no-prompt-templates','--no-themes'])
+  assert.ok(config.piArgs.includes(flag));
+ const demo=await exec(process.execPath,[path.join(dir,'research/demo-client.mjs')],{timeout:20000});
+ assert.ok(demo.stdout.includes('Synthetic response 1.'));assert.ok(demo.stdout.includes("status: 'deleted'"));
+ assert.deepEqual(await fs.readdir(path.join(dir,'demo/state')).then(names=>names.filter(name=>name==='bridge.lock')),[]);
+ config.intentionalOverride='preserve';
+ await fs.writeFile(file,JSON.stringify(config));const before=await fs.readFile(file,'utf8');
+ await exec(process.execPath,[init]);assert.equal(await fs.readFile(file,'utf8'),before);
+});
+
 test('service preflight is read-only and refuses unsafe config or existing locks without repairing them',async t=>{
  const f=await fixture();t.after(()=>fs.rm(f.dir,{recursive:true,force:true}));
  assert.deepEqual(await checkOwner(f.file),{owner_config_checked:true,network_checked:false,client_checked:false,model_checked:false});

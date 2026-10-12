@@ -7,14 +7,13 @@ test('launcher uses native defaults and only explicit owner overrides',()=>{
   const host={PATH:'/bin',OPENAI_API_KEY:'synthetic-key',HTTPS_PROXY:'http://synthetic-proxy',HOME:'/owner',PI_CODING_AGENT_DIR:'/native-agent',LANG:'test-locale'};
   const config={stateDir:'/tmp/state'},native=launchProfile(config,host);
   assert.deepEqual(native.env,host);assert.notEqual(native.env,host);
-  assert.deepEqual(native.toolArgs,[]);assert.deepEqual(native.resourceArgs,[]);
+  assert.deepEqual(native.toolArgs,[]);
   const selected=launchProfile({...config,piRuntime:{agentDir:'/tmp/pi-profile',inheritEnv:['HOME'],tools:['read','write']}},host);
   assert.equal(selected.env.OPENAI_API_KEY,undefined);assert.equal(selected.env.HOME,'/owner');
   assert.equal(selected.env.PI_CODING_AGENT_DIR,'/tmp/pi-profile');assert.deepEqual(selected.toolArgs,['--tools','read,write']);
   assert.deepEqual(launchProfile({...config,piRuntime:{tools:[]}},host).toolArgs,['--no-tools']);
   const homeOnly=launchProfile({...config,piRuntime:{inheritEnv:['HOME']}},host);
   assert.equal(homeOnly.env.PI_CODING_AGENT_DIR,undefined);assert.equal(homeOnly.env.HOME,'/owner');
-  assert.deepEqual(homeOnly.resourceArgs,[]);
   assert.throws(()=>launchProfile({...config,piRuntime:{agentDir:'relative'}}),/INVALID_PI_RUNTIME/);
 });
 

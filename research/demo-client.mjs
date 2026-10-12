@@ -25,6 +25,7 @@ try {
     if(result.items.some(item=>item.message?.role==='assistant'))break;
     await new Promise(r=>setTimeout(r,100));
   }while(Date.now()<deadline);
+  if(!result.items.some(item=>item.message?.role==='assistant'))throw new Error('No synthetic assistant reply observed');
   console.log('Observed context:',JSON.stringify(result,null,2));
   console.log('Recoverable delete:',await call('delete',{session_id,request_id:randomUUID()}));
 } finally {await client.close();}

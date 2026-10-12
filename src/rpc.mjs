@@ -21,14 +21,14 @@ export function launchProfile(config, hostEnv = process.env) {
   if (inheritEnv !== undefined) env.PATH ??= hostEnv.PATH ?? '/usr/bin:/bin';
   if (profile.agentDir !== undefined) env.PI_CODING_AGENT_DIR = profile.agentDir;
   // Pi resolves HOME, its native agent directory and resource/settings defaults.
-  return {env,resourceArgs:[],toolArgs:tools === undefined ? []
+  return {env,toolArgs:tools === undefined ? []
     : tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
 }
 export class PiRpc {
   constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; this.settlement = {generation:this.generation,sequence:0,observed_at:null,aborted:null}; }
   async start() {
     await assertSingleSessionFile(this.session.file);
-    const {env,toolArgs,resourceArgs} = launchProfile(this.config);
+    const {env,toolArgs} = launchProfile(this.config);
     if(this.config.piRuntime?.agentDir)await fs.mkdir(this.config.piRuntime.agentDir,{recursive:true,mode:0o700});
     const cli = fileURLToPath(new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url));
     try {
@@ -41,7 +41,7 @@ export class PiRpc {
       // reservation may have taken time since discovery verified this path.
       await validateExecutionCwd(this.session.cwd);
       // Native environment/settings by default; only owner-selected overrides apply.
-      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,...resourceArgs,...toolArgs, ...(this.config.piArgs ?? []), ...(this.ownerRecord ? ['-e',fileURLToPath(new URL('./rpc-observer.mjs',import.meta.url))] : [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
+      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,...toolArgs, ...(this.config.piArgs ?? []), ...(this.ownerRecord ? ['-e',fileURLToPath(new URL('./rpc-observer.mjs',import.meta.url))] : [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
     } catch (error) {
       if(this.ownerRecord)await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);
       throw error;

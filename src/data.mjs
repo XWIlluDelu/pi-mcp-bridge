@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
 import { overviewRecords, OVERVIEW_EXTRACTOR_VERSION } from './overview.mjs';
 import { activityObservation } from './activity.mjs';
+import { hasTextSelector, readSchema } from './tool-schemas.mjs';
 export const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export const opaqueId = value => `ps_${hash(value).slice(0, 32)}`;
 export async function atomicJson(file, value) {
@@ -147,16 +148,104 @@ export function recordsFor(data,args) { return selectRecords(data,args).records;
 export function cursorSignature(args) {
   const view = args.view ?? 'context';
   return hash({session_id:args.session_id,view,entry_id:args.entry_id,since:args.since,query:args.query,leaf_id:args.leaf_id,
-    ...(view==='overview'?{extractor:OVERVIEW_EXTRACTOR_VERSION}:{})});
+    ...(view==='overview'?{extractor:OVERVIEW_EXTRACTOR_VERSION}:{}),
+    ...(hasTextSelector(args)?{message_index:args.message_index,block_index:args.block_index,text_offset:args.text_offset,field:args.field,section:args.section}:{})});
+}
+// Text cursors are distinct from the existing JSON-record cursors.
+export function textCursor(args,revision,leaf,offset) {
+  return Buffer.from(JSON.stringify({kind:'projected_text',signature:cursorSignature(args),revision,leaf_id:leaf,offset})).toString('base64url');
+}
+const textBoundary=(text,offset)=>!(offset>0&&offset<text.length&&
+  text.charCodeAt(offset-1)>=0xd800&&text.charCodeAt(offset-1)<=0xdbff&&
+  text.charCodeAt(offset)>=0xdc00&&text.charCodeAt(offset)<=0xdfff);
+export function fitDecodedText(text,maxChars,render) {
+  let low=0,high=Math.min(text.length,maxChars);
+  while(low<high){
+    const mid=Math.ceil((low+high)/2),end=textBoundary(text,mid)?mid:mid-1;
+    if(JSON.stringify(render(text.slice(0,end))).length<=maxChars)low=mid;else high=mid-1;
+  }
+  return textBoundary(text,low)?low:low-1;
+}
+function pageProjectedText(records,args,revision,leaf) {
+  let offset=args.text_offset??0;
+  if(args.cursor){
+    let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
+    if(!cursor||cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(args)||cursor.revision!==revision||cursor.leaf_id!==leaf)throw new Error('STALE_CURSOR');
+    if(!Number.isSafeInteger(cursor.offset)||cursor.offset<0)throw new Error('INVALID_CURSOR');
+    offset=cursor.offset;
+  }
+  const row=records.find(record=>record.message_index===args.message_index);
+  if(!row)throw new Error('PROJECTED_MESSAGE_NOT_FOUND');
+  const field=args.field??'content';
+  let text=row.message.content;
+  if(field==='sections'){
+    const sections=row.message.sections;
+    if(row.message.role!=='system'||!sections||typeof sections!=='object'||Array.isArray(sections))throw new Error('NON_TEXT_CONTENT');
+    if(!Object.hasOwn(sections,args.section))throw new Error('TEXT_SECTION_NOT_FOUND');
+    text=sections[args.section];
+    if(typeof text!=='string')throw new Error('NON_TEXT_CONTENT');
+  }else if(args.block_index!==undefined){
+    if(!Array.isArray(text))throw new Error('INVALID_TEXT_SELECTOR');
+    const block=text[args.block_index];
+    if(!block)throw new Error('TEXT_BLOCK_NOT_FOUND');
+    if(block.type!=='text'||typeof block.text!=='string')throw new Error('NON_TEXT_CONTENT');
+    text=block.text;
+  }else if(typeof text!=='string')throw new Error('NON_TEXT_CONTENT');
+  if(args.cursor&&offset>text.length)throw new Error('INVALID_CURSOR');
+  if(offset>text.length||!textBoundary(text,offset))throw new Error('INVALID_TEXT_OFFSET');
+  const item=value=>({entry_id:row.entry_id,message_index:row.message_index,field,
+    ...(field==='sections'?{section:args.section}:{}),
+    ...(args.block_index!==undefined?{block_index:args.block_index}:{}),
+    text_offset:offset,total_text_units:text.length,text:value});
+  const budget=Math.max(256,Math.min(args.max_chars??12000,32768)),remaining=text.slice(offset);
+  const length=fitDecodedText(remaining,budget,item);
+  if(JSON.stringify(item('')).length>budget||(remaining.length&&!length))throw new Error('TEXT_BUDGET_TOO_SMALL');
+  return {format:'projected_text',offset_unit:'utf16_code_units',revision,leaf_id:leaf,
+    items:[item(remaining.slice(0,length))],total_items:1,
+    next_cursor:offset+length<text.length?textCursor(args,revision,leaf,offset+length):null};
+}
+// An older owner can ignore new selectors while still returning a successful
+// ordinary read. Validate this request's shape/locator, not an owner version.
+export function assertProjectedTextResponse(result,args) {
+  if(!hasTextSelector(args))return;
+  const reject=()=>{throw new Error('OWNER_READ_REFRESH_REQUIRED');};
+  const item=result?.items?.[0],field=args.field??'content';
+  if(result?.format!=='projected_text'||result.view!=='context'||result.offset_unit!=='utf16_code_units'||
+    !Array.isArray(result.items)||result.items.length!==1||typeof result.revision!=='string'||!result.revision||
+    !(result.leaf_id===null||typeof result.leaf_id==='string')||
+    (args.leaf_id!==undefined&&result.leaf_id!==args.leaf_id)||
+    item?.entry_id!==args.entry_id||item.message_index!==args.message_index||
+    (item.field??'content')!==field||item.section!==args.section||item.block_index!==args.block_index||
+    typeof item.text!=='string'||!Number.isSafeInteger(item.text_offset)||item.text_offset<0||
+    !Number.isSafeInteger(item.total_text_units)||item.total_text_units<item.text_offset+item.text.length)reject();
+  let offset=args.text_offset??0;
+  if(args.cursor){
+    let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
+    if(!cursor||cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(args)||
+      cursor.revision!==result.revision||cursor.leaf_id!==result.leaf_id)reject();
+    offset=cursor.offset;
+  }
+  if(item.text_offset!==offset)reject();
+  const end=offset+item.text.length;
+  if(result.next_cursor===null){if(end!==item.total_text_units)reject();}
+  else{
+    let cursor;try{cursor=JSON.parse(Buffer.from(result.next_cursor,'base64url').toString());}catch{reject();}
+    if(!cursor||cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(args)||
+      cursor.revision!==result.revision||cursor.leaf_id!==result.leaf_id||cursor.offset!==end||
+      end>=item.total_text_units||!item.text.length)reject();
+  }
 }
 // One selector and renderer for saved files, RPC snapshots and attachments.
 export function renderRead(data,args,{leafSource='saved_resume',generation}={}) {
-  const view=args.view??'context',leaf=view!=='raw'&&args.leaf_id!==undefined?args.leaf_id:data.leafId;
+  const view=args.view??'context',leaf=view!=='raw'&&args.leaf_id!==undefined?args.leaf_id:
+    (hasTextSelector(args)&&data.leafId===undefined?data.entries.at(-1)?.id??null:data.leafId);
+  const textRead=hasTextSelector(args);
+  if(textRead&&!readSchema.safeParse(args).success)throw new Error('INVALID_TEXT_SELECTOR');
   const selected=selectRecords(data,{...args,view});
   return {view,leaf_id:leaf,activity:data.activity??activityObservation(),...(generation===undefined?{}:{generation}),
     context_kind:['context','overview'].includes(view)?'pi_session_projection_not_final_provider_payload':undefined,
     ...(view==='overview'?{overview_scope:{...selected.overview,filter_scope:'selected_overview_records_only'},leaf_source:leafSource,leaf_selection:args.leaf_id===undefined?'current':'explicit',append_tail:data.entries.at(-1)?.id??null}:{}),
-    ...pageRecords(selected.records,{...args,view},data.revision)};
+    ...(textRead?pageProjectedText(selected.records,{...args,view},data.revision,leaf):pageRecords(selected.records,{...args,view},data.revision))};
 }
 // Pagination also handles a single enormous record. No hidden truncation.
 export function pageRecords(records, args, revision) {

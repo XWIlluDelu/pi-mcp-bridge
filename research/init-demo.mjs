@@ -15,7 +15,10 @@ const config={
     {folder:path.join(demo,'project-a','child'),read:false,send:true},
     {folder:path.join(demo,'project-b'),read:false,send:false,delete:false,new_session:true},
   ],
-  piArgs:['-e',path.join(root,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'],
+  // The generated demo opts into isolation even when server.mjs is launched directly.
+  piRuntime:{agentDir:path.join(demo,'agent'),inheritEnv:[],tools:[]},
+  piArgs:['--offline','--no-context-files','--no-skills','--no-prompt-templates','--no-themes',
+    '-e',path.join(root,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'],
 };
 const destination=path.join(demo,'owner-config.json');
 try { await fs.writeFile(destination,JSON.stringify(config,null,2)+'\n',{flag:'wx',mode:0o600}); }
