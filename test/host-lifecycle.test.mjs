@@ -2,11 +2,14 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import net from 'node:net';
+import {randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {Bridge} from '../src/bridge.mjs';
+import {atomicJson} from '../src/data.mjs';
 import {reserveHostSession} from '../src/host-adapter.mjs';
-import {reserveOwner,releaseOwner,readClaim,ownerAlive} from '../src/attachments.mjs';
+import {reserveOwner,releaseOwner,readClaim,ownerAlive,updateOwner,AttachedRuntime,registryTransaction,claimFile} from '../src/attachments.mjs';
 async function fixture(t){
  const dir=await fs.mkdtemp('/tmp/pi-host-life-'),cwd=path.join(dir,'project');await fs.mkdir(cwd);
  const config={principal:'fixture',stateDir:path.join(dir,'state'),attachmentDir:path.join(dir,'ipc'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'p',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}]};
@@ -31,6 +34,60 @@ test('a new owner in the release/reclaim gap blocks deletion without moving the 
   assert.ok(await fs.stat(f.session.file));assert.equal((await readClaim(f.config.attachmentDir,f.session)).generation,competitor.generation);
   assert.deepEqual(await fs.readdir(path.join(f.config.stateDir,'trash')),[]);assert.equal(f.spawns(),0);
  }finally{if(competitor)await releaseOwner(f.config.attachmentDir,f.session,competitor);await host.close();}
+});
+
+test('released-for-local host deletion accepts only the terminal generation and never resurrects its owner',async t=>{
+ const f=await fixture(t);
+ await f.bridge.releaseForLocal({session_id:f.session.id});
+ const host=await reserveHostSession({attachmentDir:f.config.attachmentDir,session:f.session}),id=identity(f.session);
+ try{
+  await host.ready({state:async()=>id,snapshot:async()=>({...id,entries:[],leafId:null}),submit:async()=>({status:'unknown'}),release:async()=>({released:true})});
+  assert.equal(host.record.noColdReacquire,true);
+  const result=await f.bridge.delete({session_id:f.session.id,request_id:'delete-released-host'});
+  assert.equal(result.status,'deleted',JSON.stringify(result));
+  const terminal=await readClaim(f.config.attachmentDir,f.session);
+  assert.equal(terminal.phase,'released');assert.equal(terminal.owner,null);assert.equal(terminal.noColdReacquire,true);
+  await host.close();
+  assert.deepEqual(await readClaim(f.config.attachmentDir,f.session),terminal);
+  await assert.rejects(fs.stat(f.session.file),{code:'ENOENT'});assert.equal(f.spawns(),0);
+ }finally{await host.close();}
+});
+
+test('host close after release preserves its tombstone and rejects live republishing',async t=>{
+ const f=await fixture(t);await f.bridge.releaseForLocal({session_id:f.session.id});
+ const host=await reserveHostSession({attachmentDir:f.config.attachmentDir,session:f.session}),id=identity(f.session);
+ try{
+  await host.ready({state:async()=>id,snapshot:async()=>({...id,entries:[],leafId:null}),submit:async()=>({status:'unknown'}),release:async()=>({released:true})});
+  await host.release();const terminal=await readClaim(f.config.attachmentDir,f.session);
+  assert.equal(terminal.generation,host.record.generation);assert.equal(terminal.owner,null);
+  await host.close();assert.deepEqual(await readClaim(f.config.attachmentDir,f.session),terminal);
+  await assert.rejects(updateOwner(f.config.attachmentDir,f.session,host.record,{phase:'ready'}),/RUNTIME_SESSION_CHANGED/);
+  assert.deepEqual(await readClaim(f.config.attachmentDir,f.session),terminal);
+  assert.equal(await ownerAlive(terminal.owner),false);
+ }finally{await host.close();}
+});
+
+for(const replacement of ['different-terminal-generation','live-same-generation','live-different-generation'])
+test('host release receipt rejects '+replacement,async t=>{
+ const f=await fixture(t);await f.bridge.releaseForLocal({session_id:f.session.id});
+ const record=await reserveOwner(f.config.attachmentDir,f.session,'host');
+ await updateOwner(f.config.attachmentDir,f.session,record,{phase:'ready'});
+ const next={...record,generation:replacement==='live-same-generation'?record.generation:randomUUID(),
+   ...(replacement==='different-terminal-generation'?{phase:'released',owner:null}:{phase:'ready'})};
+ const server=net.createServer(socket=>{
+  socket.on('error',()=>{});
+  socket.once('data',()=>{void (async()=>{
+    await registryTransaction(f.config.attachmentDir,()=>atomicJson(claimFile(f.config.attachmentDir,f.session),next));
+    socket.end(JSON.stringify({generation:record.generation,data:{released:true}})+'\n');
+  })().catch(error=>socket.destroy(error));});
+ });
+ await new Promise(resolve=>server.listen(record.socket,resolve));
+ try{
+  const runtime=new AttachedRuntime(f.config,f.session,record);
+  await assert.rejects(runtime.stopForDelete(),/RUNTIME_SESSION_CHANGED/);
+  assert.deepEqual(await readClaim(f.config.attachmentDir,f.session),next);
+  assert.ok(await fs.stat(f.session.file));assert.equal(f.spawns(),0);
+ }finally{await new Promise(resolve=>server.close(resolve));}
 });
 
 test('controller death preserves the surviving writer claim and prevents bridge fallback',async t=>{

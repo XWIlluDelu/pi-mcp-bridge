@@ -3,27 +3,28 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PiRpc, RpcFailure, RuntimePool, launchProfile } from '../src/rpc.mjs';
 
-test('launcher defaults isolate credentials; owner profile inherits only named variables',()=>{
-  const host={PATH:'/bin',OPENAI_API_KEY:'synthetic-key',HTTPS_PROXY:'http://synthetic-proxy',OTHER_KEY:'private',HOME:'/owner'};
-  const config={stateDir:'/tmp/state'};
-  const isolated=launchProfile(config,host);
-  assert.equal(isolated.env.OPENAI_API_KEY,undefined);
-  assert.equal(isolated.env.HTTPS_PROXY,undefined);
-  assert.deepEqual(isolated.toolArgs,['--no-tools']);
-  const selected=launchProfile({...config,piRuntime:{agentDir:'/tmp/pi-profile',inheritEnv:['OPENAI_API_KEY','HTTPS_PROXY','HOME'],tools:['read','write']}},host);
-  assert.equal(selected.env.OPENAI_API_KEY,'synthetic-key');
-  assert.equal(selected.env.HTTPS_PROXY,'http://synthetic-proxy');
-  assert.equal(selected.env.OTHER_KEY,undefined);
-  assert.equal(selected.env.HOME,'/owner');
-  assert.deepEqual(selected.resourceArgs,[]);
-  assert.deepEqual(isolated.resourceArgs,['--no-extensions','--no-skills','--no-prompt-templates','--no-themes']);
+test('launcher uses native defaults and only explicit owner overrides',()=>{
+  const host={PATH:'/bin',OPENAI_API_KEY:'synthetic-key',HTTPS_PROXY:'http://synthetic-proxy',HOME:'/owner',PI_CODING_AGENT_DIR:'/native-agent',LANG:'test-locale'};
+  const config={stateDir:'/tmp/state'},native=launchProfile(config,host);
+  assert.deepEqual(native.env,host);assert.notEqual(native.env,host);
+  assert.deepEqual(native.toolArgs,[]);assert.deepEqual(native.resourceArgs,[]);
+  const selected=launchProfile({...config,piRuntime:{agentDir:'/tmp/pi-profile',inheritEnv:['HOME'],tools:['read','write']}},host);
+  assert.equal(selected.env.OPENAI_API_KEY,undefined);assert.equal(selected.env.HOME,'/owner');
+  assert.equal(selected.env.PI_CODING_AGENT_DIR,'/tmp/pi-profile');assert.deepEqual(selected.toolArgs,['--tools','read,write']);
+  assert.deepEqual(launchProfile({...config,piRuntime:{tools:[]}},host).toolArgs,['--no-tools']);
   const homeOnly=launchProfile({...config,piRuntime:{inheritEnv:['HOME']}},host);
-  assert.equal(homeOnly.env.HOME,'/owner');
-  assert.equal(homeOnly.env.PI_CODING_AGENT_DIR,'/tmp/state/pi-home/.pi/agent');
-  assert.deepEqual(homeOnly.resourceArgs,isolated.resourceArgs);
-  assert.equal(selected.env.PI_CODING_AGENT_DIR,'/tmp/pi-profile');
-  assert.deepEqual(selected.toolArgs,['--tools','read,write']);
+  assert.equal(homeOnly.env.PI_CODING_AGENT_DIR,undefined);assert.equal(homeOnly.env.HOME,'/owner');
+  assert.deepEqual(homeOnly.resourceArgs,[]);
   assert.throws(()=>launchProfile({...config,piRuntime:{agentDir:'relative'}}),/INVALID_PI_RUNTIME/);
+});
+
+for(const field of ['inheritEnv','tools'])
+test(`null ${field} uses the same native launch defaults as omission`,()=>{
+  for(const host of [{HOME:'/synthetic-home',NATIVE_VALUE:'inherited'},{PATH:'/bin',HOME:'/synthetic-home',NATIVE_VALUE:'inherited'}]){
+    const omitted=launchProfile({},host),config={piRuntime:{[field]:null}};
+    assert.deepEqual(launchProfile(config,host),omitted);
+    assert.deepEqual(config,{piRuntime:{[field]:null}});
+  }
 });
 
 test('switched Pi runtime stops before reading or sending under original identity',async()=>{

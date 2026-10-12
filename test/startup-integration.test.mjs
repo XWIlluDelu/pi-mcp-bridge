@@ -120,11 +120,11 @@ test('ordinary RPC startup supports a public companion, native RPC, settlement a
   await client.stop();
 
   // The Bridge launcher must honor a selected profile's ordinary discovery too.
-  // HOME and credentials remain isolated unless separately, explicitly selected.
+  // This test explicitly selects a disposable profile and filtered environment.
   const owned = await new PiRpc({
     stateDir: path.join(dir, 'bridge-state'),
-    piRuntime: { agentDir, tools: ['read', 'bash', 'edit', 'write'] },
-    piArgs: ['-e', path.resolve('research/faux-extension.mjs'), '--provider', 'bridge-fixture', '--model', 'deterministic'],
+    piRuntime: { agentDir, inheritEnv: [], tools: ['read', 'bash', 'edit', 'write'] },
+    piArgs: ['--offline', '-e', path.resolve('research/faux-extension.mjs'), '--provider', 'bridge-fixture', '--model', 'deterministic'],
   }, { file, cwd, header: { id: before.sessionId } }).start();
   try {
     const initial = await owned.entries();

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { isolatedRuntime } from './isolated-runtime.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,7 @@ import { PiRpc } from '../../src/rpc.mjs';
 import { createHttpService, TOKEN_HEADER } from '../../src/http-server.mjs';
 import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
 const dir=await fs.mkdtemp(path.join(os.tmpdir(),'PRIVATE_PATH-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
-const config={principal:'fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}]};
+const config={...isolatedRuntime(dir),principal:'fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}]};
 const configFile=path.join(dir,'config.json');await fs.writeFile(configFile,JSON.stringify(config));
 const bridge=await new Bridge(config,undefined,{configFile}).init(),token='PRIVATE_TOKEN_'+'x'.repeat(32);
 const service=createHttpService(bridge,{token}),url=await service.listen();

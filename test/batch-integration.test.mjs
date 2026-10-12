@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -10,7 +11,7 @@ const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const item=(op,args)=>({op,args});
 test('mixed MCP batches operate on official Pi sessions, preserve restart receipts and isolate item permissions',async()=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-batch-rpc-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'real-pi-faux-batch',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],piArgs:['-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic']};
+ const config={...isolatedRuntime(dir),principal:'real-pi-faux-batch',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],piArgs:['--offline','-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic']};
  const filename=path.join(dir,'config.json');await fs.writeFile(filename,JSON.stringify(config));let client;
  async function connect(){client=new Client({name:'mixed-batch-fixture',version:'1.0.0'});await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),filename],cwd:base,env:{PATH:process.env.PATH,HOME:dir,PI_OFFLINE:'1'},stderr:'pipe'}));}
  async function call(name,args){const result=await client.callTool({name,arguments:args});assert.ok(!result.isError,`MCP ${name} failed`);return result.structuredContent;}

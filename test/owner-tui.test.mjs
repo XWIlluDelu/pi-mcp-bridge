@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -15,7 +16,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(fn,label){const deadline=Date.now()+12000;while(Date.now()<deadline){if(await fn())return;await delay(25);}throw new Error('Deadline: '+label);}
 test('human Pi menu changes live session/project permissions enforced by actual MCP and Pi runtimes',async()=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-ui-'));const cwd=path.join(dir,'project'),childFolder=path.join(cwd,'child'),denied=path.join(dir,'denied');await fs.mkdir(childFolder,{recursive:true});await fs.mkdir(denied);
- const config={principal:'fixture-agent',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd},{id:'child',path:childFolder},{id:'denied',path:denied}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),piArgs:['-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'],unrelated:{preserve:true}};
+ const config={...isolatedRuntime(dir),principal:'fixture-agent',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd},{id:'child',path:childFolder},{id:'denied',path:denied}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),piArgs:['--offline','-e',path.join(base,'research/faux-extension.mjs'),'--provider','bridge-fixture','--model','deterministic'],unrelated:{preserve:true}};
  const configFile=path.join(dir,'owner.json');await fs.writeFile(configFile,JSON.stringify(config));
  const setup=await new Bridge(config).init();const made=await setup.create({folder_id:'project',request_id:'seed'});const session=await setup.session(made.session_id);await setup.close();
  const agentDir=path.join(dir,'agent');await fs.mkdir(agentDir);await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarming:'off',retry:{enabled:false},compaction:{enabled:false}}));

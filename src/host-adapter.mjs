@@ -5,7 +5,7 @@ import net from 'node:net';
 import {hash,renderRead,assertSingleSessionFile,readSessionIdentity} from './data.mjs';
 import {activityObservation} from './activity.mjs';
 import {MAX_ATTACHMENT_REQUEST_BYTES} from './attachment-protocol.mjs';
-import {reserveOwner,updateOwner,releaseOwner,readClaim,processIdentity,ownerAlive,AttachmentFailure} from './attachments.mjs';
+import {reserveOwner,updateOwner,releaseOwner,readClaim,processIdentity,ownerAlive,isReleasedOwner,AttachmentFailure} from './attachments.mjs';
 const fail=code=>{throw new AttachmentFailure(code);};
 function receipt(value){
   if(value?.status==='accepted'&&['started','queued','handled'].includes(value.disposition))return {status:'accepted',disposition:value.disposition,completion:'not_tracked'};
@@ -24,7 +24,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   async function identity(value){
     if(value!==undefined&&(value.sessionFile!==target.file||value.sessionId!==target.header.id))fail('RUNTIME_SESSION_CHANGED');
     const current=await readClaim(attachmentDir,target);
-    if(current?.generation!==record.generation||!await ownerAlive(record.owner))fail('RUNTIME_SESSION_CHANGED');
+    if(current?.generation!==record.generation||isReleasedOwner(current)||!await ownerAlive(record.owner))fail('RUNTIME_SESSION_CHANGED');
     await assertSingleSessionFile(target.file);
     if((await readSessionIdentity(target.file)).header.id!==target.header.id)fail('RUNTIME_SESSION_CHANGED');
   }
@@ -59,10 +59,11 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   }
   async function operate(request){
     const observed=await state(),args=request.body??{};
+    const pendingMessageCount=Number.isSafeInteger(observed.pendingMessageCount)&&observed.pendingMessageCount>=0?observed.pendingMessageCount:null;
     let data;
     if(request.op==='state')data={sessionFile:target.file,sessionId:target.header.id,generation:record.generation,
       isIdle:typeof observed.isIdle==='boolean'?observed.isIdle:null,isStreaming:typeof observed.isStreaming==='boolean'?observed.isStreaming:null,
-      isCompacting:typeof observed.isCompacting==='boolean'?observed.isCompacting:null};
+      isCompacting:typeof observed.isCompacting==='boolean'?observed.isCompacting:null,pendingMessageCount};
     else if(request.op==='read'){
       const snapshot=structuredClone(await callbacks.snapshot());await identity(snapshot);
       if(!Array.isArray(snapshot?.entries)||!snapshot.entries.every(entry=>typeof entry?.id==='string'&&entry.id.length<=128)||
@@ -70,7 +71,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
       const revisionInput={entries:snapshot.entries,leaf:snapshot.leafId,generation:record.generation};
       if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)fail('SESSION_TOO_LARGE');
       const activity=activityObservation('host_context',{idle:observed.isIdle,streaming:observed.isStreaming,compacting:observed.isCompacting,
-        count:observed.pendingMessageCount,pending:Number.isInteger(observed.pendingMessageCount)?observed.pendingMessageCount>0:undefined});
+        count:pendingMessageCount,pending:pendingMessageCount===null?null:pendingMessageCount>0});
       data=renderRead({entries:snapshot.entries,leafId:snapshot.leafId,revision:hash(revisionInput),activity},args,{leafSource:'live',generation:record.generation});
     }else if(request.op==='send'){
       if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))fail('INVALID_ATTACHED_SEND');

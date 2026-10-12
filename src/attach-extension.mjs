@@ -72,8 +72,9 @@ export default function attachExtension(pi){
       // whether first persistence has happened yet or not.
       await assertNoOtherLiveOwner(dir,session);
       const old=await readClaim(dir,session);
-      const sameProcess=old&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
+      const sameProcess=old?.owner&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
       if(old&&await ownerAlive(old.owner)&&!sameProcess){if(ctx.mode==='tui')ctx.shutdown();throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');}
+      if(old?.noColdReacquire)record.noColdReacquire=true;
       await atomicJson(claimFile(dir,session),record);
     });
     // Publish blocking ownership before socket setup or any later fallible initialization.
@@ -131,7 +132,10 @@ export default function attachExtension(pi){
       for(const name of await fs.readdir(dir)){
         if(!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)||path.join(dir,name)===claimFile(dir,session))continue;
         const other=await readOwnerRecord(dir,path.join(dir,name));
-        if(['tui','extension'].includes(other?.kind)&&other.owner.pid===owner.pid&&other.owner.start===owner.start&&other.owner.boot===owner.boot)await fs.unlink(path.join(dir,name));
+        if(['tui','extension'].includes(other?.kind)&&other.owner?.pid===owner.pid&&other.owner.start===owner.start&&other.owner.boot===owner.boot){
+          if(other.noColdReacquire)await atomicJson(path.join(dir,name),{...other,phase:'released',owner:null});
+          else await fs.unlink(path.join(dir,name));
+        }
       }
     });
     } catch(error) {

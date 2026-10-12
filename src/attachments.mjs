@@ -27,7 +27,11 @@ export async function processIdentity(pid=process.pid){
     return {pid,start:fields[19],boot:boot.trim(),state:fields[0]};
   }catch(cause){throw new AttachmentFailure('PROCESS_IDENTITY_UNAVAILABLE',false,{cause});}
 }
+export function isReleasedOwner(record){
+  return record?.owner===null&&record.phase==='released'&&record.noColdReacquire===true;
+}
 export async function ownerAlive(owner){
+  if(owner===null)return false;
   const current=await processIdentity(owner.pid);
   return Boolean(current&&current.start===owner.start&&current.boot===owner.boot&&!['Z','X'].includes(current.state));
 }
@@ -66,9 +70,12 @@ export async function readOwnerRecord(dir,file,session){
     while(length<bytes.length){const {bytesRead}=await handle.read(bytes,length,bytes.length-length,null);if(!bytesRead)break;length+=bytesRead;}
     if(length>8192)throw new Error();
     const record=JSON.parse(bytes.subarray(0,length).toString('utf8'));
-    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc','host','extension'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
+    const released=isReleasedOwner(record);
+    const identified=Number.isSafeInteger(record?.owner?.pid)&&record.owner.pid>0&&typeof record.owner.start==='string'&&typeof record.owner.boot==='string';
+    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc','host','extension','delete'].includes(record.kind)||typeof record.generation!=='string'||(!released&&!identified))throw new Error();
     if(session&&(record.file!==session.file||record.sessionId!==session.header.id))throw new Error();
-    if(['tui','host','extension'].includes(record.kind)&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
+    if((['tui','host','extension'].includes(record.kind)||record.socket!==undefined)&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
+    if(record.noColdReacquire!==undefined&&typeof record.noColdReacquire!=='boolean')throw new Error();
     return record;
   }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');}
   finally{await handle?.close();}
@@ -88,7 +95,8 @@ export async function reserveOwner(dir,session,kind,owner=undefined){
     await assertNoOtherLiveOwner(dir,session);
     const old=await readClaim(dir,session);
     if(old&&await ownerAlive(old.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-    const record={kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};
+    if(kind==='rpc'&&old?.noColdReacquire)throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
+    const record={...(old?.noColdReacquire?{noColdReacquire:true}:{}),kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};
     if(['tui','host','extension'].includes(kind))record.socket=path.join(dir,`${process.pid}-${record.generation.slice(0,8)}.sock`);
     await atomicJson(claimFile(dir,session),record);return record;
   });
@@ -97,13 +105,21 @@ export async function updateOwner(dir,session,record,changes){
   return registryTransaction(dir,async()=>{
     const current=await readClaim(dir,session);
     if(current?.generation!==record.generation)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-    Object.assign(record,changes);await atomicJson(claimFile(dir,session),record);return record;
+    if(isReleasedOwner(current)){
+      // Late teardown is idempotent; never republish its cached live owner.
+      if(changes.phase==='transitioning'&&Object.keys(changes).length===1)return current;
+      throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+    }
+    Object.assign(record,current.noColdReacquire?{noColdReacquire:true}:{},changes);await atomicJson(claimFile(dir,session),record);return record;
   });
 }
 export async function releaseOwner(dir,session,record){
   return registryTransaction(dir,async()=>{
     const current=await readClaim(dir,session);
-    if(current?.generation===record.generation)await fs.unlink(claimFile(dir,session));
+    if(current?.generation===record.generation){
+      if(current.noColdReacquire)await atomicJson(claimFile(dir,session),{...current,phase:'released',owner:null});
+      else await fs.unlink(claimFile(dir,session));
+    }
   });
 }
 export async function waitOwnerExit(owner,timeout=5000){
@@ -157,7 +173,7 @@ export class AttachedRuntime {
       const result=await this.request('release',{},this.config.attachmentExitTimeoutMs??5000);
       if(result?.released!==true)throw new AttachmentFailure('HOST_RELEASE_FAILED');
       const current=await readClaim(this.config.attachmentDir,this.session);
-      if(current)throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      if(current&&!(isReleasedOwner(current)&&current.generation===this.record.generation))throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
       this.alive=false;return;
     }
     await this.request('shutdown');

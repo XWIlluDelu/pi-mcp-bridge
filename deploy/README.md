@@ -22,14 +22,14 @@ and state/session/attachment directories mode 0700 under the same Unix user.
 Bridge/registry locks prior to launch. Bridge performs dynamic runtime validation
 for directories created during startup.
 
-Cold resume defaults to an isolated Pi profile without inherited provider
-credentials or enabled tools. Select `piRuntime.agentDir`, `inheritEnv`, `tools`
-and `piArgs` explicitly for the service. A TUI's own environment is not recovered
-when it closes; see the [runtime profile](../README.md#runtime-profile).
+Cold resume inherits the service environment and native Pi settings, tools,
+resources and authentication. It cannot recover another terminal's environment.
+Explicit `piRuntime` and `piArgs` override selected aspects; see the
+[configuration contract](../README.md#native-runtime-defaults).
 
-A live unreachable owner blocks a second writer. Stop the service and confirm
-its owned workers have exited before manually opening shared storage in an
-uninstrumented writer.
+A live unreachable owner blocks a second writer. Use the
+[handoff procedure](../docs/runtime-handoff.md) for controlled writers; stop the
+service before manually opening shared storage in an uninstrumented writer.
 
 ## Configure the access client
 

@@ -6,10 +6,10 @@ instead [reserve and publish their own binding](host-adapter.md).
 
 ## Configuration and ownership
 
-The launcher defaults to an isolated profile with tools/environment inheritance
-selected explicitly. An inherited HOME is respected; an explicit
-`piRuntime.agentDir` enables that profile's native resource discovery. Without
-it, resource-disable flags remain.
+The launcher inherits native environment, settings, tools, authentication and
+resource discovery. Explicit `piRuntime.agentDir`, `inheritEnv`, `tools` and
+`piArgs` override their respective settings. Environment filtering does not
+isolate file-based credentials; offline tests use disposable profiles.
 
 Ordinary Pi keeps its existing configuration and input lifecycle. Load the
 companion with the same private IPC directory as Bridge:
@@ -20,7 +20,9 @@ PI_MCP_ATTACH_DIR=/path/to/private/ipc \
 # Add --mode rpc for an ordinary RPC process with its owner's stdin/stdout.
 ```
 
-Pi opens an initial `--session` file before loading extensions. Only open a target after its current writer has closed.
+Pi opens an initial `--session` file before loading extensions. For Bridge-owned targets, use [owner-local release/reset](runtime-handoff.md)
+before opening the file. Release persists a cold-resume restriction until reset;
+its idle observations and timed teardown have separate limits.
 A live but unreachable registered owner blocks fallback; socket loss does not
 release a writer. Generic host reservation must precede native session open.
 
@@ -53,7 +55,7 @@ RPC shutdown. TUI release uses graceful native exit and waits for the exact owne
 
 ```sh
 node --test test/startup-integration.test.mjs test/rpc-companion.test.mjs \
-  test/host-integration.test.mjs test/host-lifecycle.test.mjs
+  test/host-integration.test.mjs test/host-lifecycle.test.mjs test/native-startup.test.mjs
 ```
 
 Offline fixtures exercise native profile discovery, public RPC/SDK behavior,

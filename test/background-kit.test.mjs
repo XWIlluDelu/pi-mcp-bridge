@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -10,7 +11,7 @@ import { checkOwner } from '../deploy/check-owner.mjs';
 const exec=promisify(execFile),base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture(){
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-service-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'offline-service-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,new_session:true}]},file=path.join(dir,'owner.json');
+ const config={...isolatedRuntime(dir),principal:'offline-service-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,new_session:true}]},file=path.join(dir,'owner.json');
  await fs.writeFile(file,JSON.stringify(config),{mode:0o600});return {dir,config,file};
 }
 test('service preflight is read-only and refuses unsafe config or existing locks without repairing them',async t=>{

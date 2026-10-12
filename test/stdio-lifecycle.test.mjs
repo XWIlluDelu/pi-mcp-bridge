@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -16,7 +17,7 @@ async function fixture(t){
  const marker=path.join(dir,'dispatch'),extension=path.join(dir,'command.mjs');
  // Official RPC command dispatch exercises an in-flight receipt without a model call.
  await fs.writeFile(extension,`import fs from 'node:fs/promises'; export default function(pi){pi.registerCommand('lifecycle-fixture',{handler:async()=>{await fs.writeFile(${JSON.stringify(marker)},'started');await new Promise(r=>setTimeout(r,300));}});}`);
- const config={principal:'lifecycle-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),piArgs:['-e',extension]};
+ const config={...isolatedRuntime(dir),principal:'lifecycle-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),piArgs:['--offline','-e',extension]};
  const bridge=await new Bridge(config).init();const made=await bridge.create({folder_id:'project',request_id:'seed'});const session=await bridge.session(made.session_id);await bridge.close();
  const configFile=path.join(dir,'owner.json');await fs.writeFile(configFile,JSON.stringify(config));
  t.after(()=>fs.rm(dir,{recursive:true,force:true,maxRetries:3,retryDelay:50}));
