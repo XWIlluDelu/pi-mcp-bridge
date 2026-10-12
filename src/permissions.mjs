@@ -1,5 +1,5 @@
 import path from 'node:path';
-export const ACTIONS = ['read', 'send', 'command', 'delete', 'new_session'];
+export const ACTIONS = ['read', 'send', 'command', 'delete', 'new_session', 'bash'];
 export function inside(file, folder) {
   const rel = path.relative(path.resolve(folder), path.resolve(file));
   return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));

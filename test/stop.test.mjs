@@ -118,7 +118,7 @@ test('generic host IPC and actual MCP return joined editor recovery; missing cal
  const client=new Client({name:'stop-test',version:'1'}),server=makeServer(f.bridge),[a,b]=InMemoryTransport.createLinkedPair();
  await server.connect(a);await client.connect(b);
  t.after(async()=>{await client.close();await server.close();});
- const tools=await client.listTools();assert.ok(tools.tools.find(tool=>tool.name==='stop'));assert.equal(tools.tools.length,7);
+ const tools=await client.listTools();assert.ok(tools.tools.find(tool=>tool.name==='stop'));assert.equal(tools.tools.length,8);
  const call=async(request_id,extra={})=>(await client.callTool({name:'stop',arguments:{session_id:f.id,request_id,...extra}})).structuredContent;
  assert.equal((await call('unsupported')).reason,'STOP_UNSUPPORTED');assert.equal(f.spawned(),0);
  callbacks.stop=async({onWithdraw})=>{

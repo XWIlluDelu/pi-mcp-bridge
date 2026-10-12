@@ -136,7 +136,7 @@ export class AttachedRuntime {
     return diagnostics.measure('attached.request',{op,generation:this.record.generation},()=>this.requestOnce(op,body,timeout));
   }
   async requestOnce(op,body={},timeout=5000){
-    const mutating=op==='send'||op==='stop';
+    const mutating=['send','stop','bash'].includes(op);
     const serialized=JSON.stringify({op,body,generation:this.record.generation,file:this.record.file,sessionId:this.record.sessionId})+'\n';
     if(Buffer.byteLength(serialized)>MAX_ATTACHMENT_REQUEST_BYTES)throw new AttachmentFailure('ATTACHMENT_REQUEST_TOO_LARGE');
     const current=await readClaim(this.config.attachmentDir,this.session);
@@ -154,9 +154,10 @@ export class AttachedRuntime {
         const newline=bytes.indexOf('\n');if(newline<0)return;
         try{const response=JSON.parse(bytes.slice(0,newline));
           if(response.generation!==this.record.generation)throw new Error();
-          if(mutating&&response.error==='STOP_IN_PROGRESS')return finish(new AttachmentFailure('STOP_IN_PROGRESS'));
+          if(mutating&&['STOP_IN_PROGRESS','BASH_IN_PROGRESS'].includes(response.error))return finish(new AttachmentFailure(response.error));
+          if(op==='bash'&&['BASH_UNSUPPORTED','INVALID_ATTACHED_OPERATION'].includes(response.error))return finish(new AttachmentFailure('BASH_UNSUPPORTED'));
           if(op==='stop'&&['STOP_UNSUPPORTED','INVALID_ATTACHED_OPERATION'].includes(response.error))return finish(new AttachmentFailure('STOP_UNSUPPORTED'));
-          if(response.error)return finish(new AttachmentFailure(['STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','INVALID_TEXT_SELECTOR','PROJECTED_MESSAGE_NOT_FOUND','TEXT_BLOCK_NOT_FOUND','TEXT_SECTION_NOT_FOUND','OWNER_READ_REFRESH_REQUIRED','NON_TEXT_CONTENT','INVALID_TEXT_OFFSET','TEXT_BUDGET_TOO_SMALL','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&mutating));
+          if(response.error)return finish(new AttachmentFailure(['BASH_UNSUPPORTED','INVALID_BASH_RESULT','STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','INVALID_TEXT_SELECTOR','PROJECTED_MESSAGE_NOT_FOUND','TEXT_BLOCK_NOT_FOUND','TEXT_SECTION_NOT_FOUND','OWNER_READ_REFRESH_REQUIRED','NON_TEXT_CONTENT','INVALID_TEXT_OFFSET','TEXT_BUDGET_TOO_SMALL','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&mutating));
           finish(null,response.data);
         }catch{finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&mutating));}
       });
@@ -166,6 +167,11 @@ export class AttachedRuntime {
   state(timeout=5000){return this.request('state',{},timeout);}
   async read(args){const result=await this.request('read',args);assertProjectedTextResponse(result,args);return result;}
   send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
+  async executeBash({command,recovery_id,timeout_ms=5000,beforeDispatch}){
+    beforeDispatch?.();
+    const result=await this.request('bash',{command,recovery_id,timeout_ms},timeout_ms);
+    if(result?.completed!==true)throw new AttachmentFailure('INVALID_BASH_RESULT',true);
+  }
   async stopExecution({recovery_id,timeout_ms=5000}){
     const result=await this.request('stop',{recovery_id,timeout_ms},timeout_ms);
     try{return stopReceipt(result);}catch(error){error.uncertain=true;throw error;}

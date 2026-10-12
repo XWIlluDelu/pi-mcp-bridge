@@ -1,7 +1,7 @@
 # Pi MCP Bridge
 
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
-RPC workers. It exposes `list`, `read`, `send`, `stop`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
+RPC workers. It exposes `list`, `read`, `send`, `stop`, `bash`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
 
 Cooperating Pi TUI/RPC processes share their existing runtime through a private
 Unix socket. Cooperative process identity and attachment require Linux.
@@ -55,6 +55,9 @@ inherits. Project paths are canonicalized. Creation does not imply send access.
 
 The independent `command` grant authorizes [stop](docs/stop.md), which also
 requires `read` to return withdrawn text.
+
+The separate `bash` grant authorizes [native shell commands](docs/bash.md) and
+their own results. Neither send nor stop permission enables shell.
 
 Entrypoints reload grants before requests. Other configuration changes require
 restart (`CONFIG_RESTART_REQUIRED`). An invalid config blocks new requests;
@@ -247,6 +250,14 @@ keeping process, history and ownership. It is live-only and requires `command`
 plus `read`. Follow the same request ID's cursor until `withdrawn_complete`.
 Owned RPC and capable hosts support it; ordinary companion returns
 `STOP_UNSUPPORTED`. Stop is not a batch item.
+
+### bash
+
+[Native bash](docs/bash.md) executes `!command` without a model prompt. Independent
+`bash` permission authorizes execution and its result. It can cold-resume or reuse
+a capable host; ordinary companion returns `BASH_UNSUPPORTED`. Native exit code,
+cancellation, truncation and spill-file facts are retained. Replay/output pages
+use the same ID. ACK timeout does not kill the command. Bash is not a batch item.
 
 ### create and delete
 

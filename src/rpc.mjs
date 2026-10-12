@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
 import { rpcActivity } from './activity.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import {bashCapture,nativeBashResult} from './bash-execution.mjs';
 import { requestRpcStop, withdrawalCapture } from './stop-execution.mjs';
 import { validatePiRuntime } from './owner-config.mjs';
 import { reserveOwner, updateOwner, releaseOwner, processIdentity, readClaim, ownerAlive, AttachedRuntime, AttachmentFailure } from './attachments.mjs';
@@ -85,7 +86,7 @@ export class PiRpc {
     // timers, unrelated events and malformed responses cannot clear uncertainty.
     if (req.commandType === 'prompt' && (event.command !== 'prompt' ||
         (event.success !== false && !(event.success === true && ['started','queued','handled'].includes(event.data?.disposition))))) return;
-    if (['clear_queue','abort','abort_bash'].includes(req.commandType) && (event.command!==req.commandType || typeof event.success!=='boolean')) return;
+    if (['bash','clear_queue','abort','abort_bash'].includes(req.commandType) && (event.command!==req.commandType || typeof event.success!=='boolean')) return;
     this.pending.delete(event.id); clearTimeout(req.timer);
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation) this.promptAdmission = null;
     const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
@@ -150,6 +151,22 @@ export class PiRpc {
     return state;
   }
   entries() { return this.command({type:'get_entries'}); }
+  async executeBash({command,timeout_ms=5000,recovery_id,beforeDispatch,onLate}){
+    const check=async()=>{
+      const state=await this.dispatch({type:'get_state'});
+      if(state.sessionFile!==this.session.file||state.sessionId!==this.session.header.id)throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    };
+    try{await check();}catch(error){error.uncertain=false;throw error;}
+    beforeDispatch?.();
+    const capture=bashCapture(this.config.attachmentDir,this.session,this.generation,recovery_id);
+    const keep=async result=>{await check();await capture(nativeBashResult(result));};
+    try{
+      const result=await this.dispatch({type:'bash',command},timeout_ms,response=>{
+        if(response.ok)void keep(response.data).then(()=>onLate?.()).catch(error=>diagnostics.emit('operation.failure',{code:error.code??error.message,uncertain:true}));
+      });
+      await keep(result);
+    }catch(error){error.uncertain=true;throw error;}
+  }
   async stopExecution({timeout_ms=5000,recovery_id}={}){
     // Cancellation identity failures must not use state()'s process teardown.
     const check=async()=>{

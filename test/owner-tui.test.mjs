@@ -43,7 +43,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   events.push({type:'config-visible',time:Date.now(),invocation});
   // Rename visibility is earlier than save completion and the next selector.
   await screen('Read:',offset);
-  await selectIndex(scope===0?4:5);
+  await selectIndex(scope===0?5:6);
   await until(async()=>{try{return JSON.parse(await fs.readFile(menuClosed,'utf8')).invocation===invocation;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'permission handler closed');
   events.push({type:'closed',time:Date.now(),invocation});
  }
@@ -51,11 +51,15 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   await until(async()=>{owner=await readClaim(config.attachmentDir,session);return owner?.phase==='ready';},'TUI registration');
   await screen('Permissions: Ctrl+Alt+P',0);
   await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),configFile],cwd:base,env:{PATH:process.env.PATH,HOME:dir,PI_OFFLINE:'1'},stderr:'pipe'}));
-  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send','stop']);
+  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['bash','batch','create','delete','list','read','send','stop']);
   const id=made.session_id;
   assert.equal((await ok('send',{session_id:id,request_id:'first',text:'PUBLIC_OWNER_SESSION_FIXTURE'})).status,'unknown');
   await until(async()=>(await ok('read',{session_id:id})).items.some(x=>x.message?.role==='assistant'),'actual TUI response');
   const sessionRule=c=>c.grants.findLast(r=>r.session_id===id);
+  await edit(0,4,0,c=>sessionRule(c)?.bash===true);
+  assert.equal((await ok('bash',{session_id:id,request_id:'unsupported-tui-bash',command:'MUST_NOT_EXECUTE'})).reason,'BASH_UNSUPPORTED');
+  await edit(0,4,1,c=>sessionRule(c)?.bash===false);
+  assert.equal((await call('bash',{session_id:id,request_id:'bash-denied',command:'MUST_NOT_EXECUTE'})).isError,true);
   await edit(0,2,0,c=>sessionRule(c)?.command===true);
   assert.equal((await ok('stop',{session_id:id,request_id:'unsupported-tui-stop'})).reason,'STOP_UNSUPPORTED');
   await edit(0,2,1,c=>sessionRule(c)?.command===false);
