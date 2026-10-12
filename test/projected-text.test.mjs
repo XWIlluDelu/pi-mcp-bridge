@@ -164,7 +164,7 @@ test('MCP reads a later text block directly without expanding an opaque first bl
   message('reply','request',[{type:'thinking',thinking:'synthetic thought',thinkingSignature:opaque},{type:'text',text:'SHORT_LATER_ANSWER'}])];
  const f=await fixture(t,entries),before=await fs.readFile(f.saved.file,'utf8');
  const tools=(await f.client.listTools()).tools;
- assert.equal(tools.length,6);
+ assert.equal(tools.length,7);
  for(const key of ['message_index','block_index','text_offset','field','section'])assert.ok(tools.find(tool=>tool.name==='read').inputSchema.properties[key]);
  const overview=await f.ok({view:'overview'}),locator=overview.items.find(item=>item.label==='latest_assistant');
  assert.deepEqual(locator.payload_source,{field:'content',block_index:1,block_field:'text'});

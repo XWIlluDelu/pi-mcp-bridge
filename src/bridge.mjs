@@ -3,10 +3,11 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { activityObservation, rpcActivity } from './activity.mjs';
-import { readSchema, hasTextSelector } from './tool-schemas.mjs';
+import { readSchema, hasTextSelector, stopSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
 import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd, atomicJson } from './data.mjs';
+import { stopReceipt, recoveredWithdrawal, withdrawalPage } from './stop-execution.mjs';
 import { PiRpc, RuntimePool } from './rpc.mjs';
 import { Journal } from './journal.mjs';
 import { privateDirectory, readClaim, ownerAlive, registryTransaction, updateOwner, claimFile } from './attachments.mjs';
@@ -61,7 +62,7 @@ export class Bridge {
       const name = saved?.entries.findLast(e=>e.type==='session_info')?.name;
       const title = typeof name==='string' ? name.trim() || null : null;
       if (args.query && !JSON.stringify({title,cwd:s.header.cwd}).toLowerCase().includes(args.query.toLowerCase())) continue;
-      rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),delete:permitted(this.config,'delete',s)}});
+      rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),command:permitted(this.config,'command',s),delete:permitted(this.config,'delete',s)}});
     }
     const offset = args.offset ?? 0, limit = Math.min(100,args.limit ?? 30);
     return {sessions:rows.slice(offset,offset+limit),next_offset:offset+limit < rows.length ? offset+limit:null,
@@ -136,6 +137,7 @@ export class Bridge {
     const body = args.text === undefined ? undefined : {text:args.text,mode:args.mode ?? 'native'};
     return this.journal.run(args.request_id,'send',args.session_id,body,save=>this.locked(args.session_id,async()=>{
       try {
+        if(this.locks.has(`stop:${args.session_id}`))throw new Error('STOP_IN_PROGRESS');
         const s = await this.session(args.session_id); this.check('send',s);
         // Existing owners remain readable/controllable independently of whether
         // their original working directory still exists. Only a new execution
@@ -146,6 +148,7 @@ export class Bridge {
           await loadSavedSession(s);
           runtime = await this.pool.resolve(s);
         }
+        if(this.locks.has(`stop:${args.session_id}`))throw new Error('STOP_IN_PROGRESS');
         if(runtime.attached)return save(await runtime.send({...args,...body}));
         if (body.mode === 'idle_only') {
           const state = await runtime.state();
@@ -159,6 +162,42 @@ export class Bridge {
         return save({status:'accepted',disposition:result.disposition,completion:'not_tracked'});
       } catch(e) { return save({status:e.uncertain?'unknown':'rejected',reason:safeReason(e)}); }
     }));
+  }
+  async stop(args) {
+    this.assertOpen();
+    if(!stopSchema.safeParse(args).success)throw new Error('INVALID_STOP_ARGS');
+    if(this.configFile)await this.refreshPermissions();
+    const session=await this.session(args.session_id);
+    this.check('command',session);
+    if(!permitted(this.config,'read',session))throw new Error('STOP_REQUIRES_READ');
+    const recovery_id=hash({principal:this.config.principal,session:session.id,request:args.request_id});
+    const receipt=await this.journal.run(args.request_id,'stop',session.id,args.cursor?undefined:{},save=>this.locked(`stop:${session.id}`,async()=>{
+      let generation;
+      try {
+        this.assertOpen();
+        // Independent of prompt admission's lock; never start a writer.
+        const runtime=await this.pool.forRead(session);
+        this.assertOpen();
+        if(this.configFile)await this.refreshPermissions();
+        this.check('command',session);this.check('read',session);
+        if(!runtime)return save({status:'skipped',reason:'not_running'});
+        if(typeof runtime.stopExecution!=='function')throw new Error('STOP_UNSUPPORTED');
+        generation=runtime.generation??runtime.record?.generation??null;
+        await save({status:'unknown',generation});
+        const result=stopReceipt(await runtime.stopExecution({...args,recovery_id}));
+        return save({...result,generation});
+      }catch(error){return save({status:error.uncertain?'unknown':'rejected',reason:safeReason(error),...(generation?{generation}:{})});}
+    }));
+    // Returning/replaying withdrawn content always rechecks current ACLs.
+    if(this.configFile)await this.refreshPermissions();
+    this.assertOpen();this.check('command',session);this.check('read',session);
+    const withdrawn=receipt.generation?await recoveredWithdrawal(this.pool.attachmentDir,session,receipt.generation,recovery_id):null;
+    if(withdrawn===null){
+      if(receipt.status==='skipped')return withdrawalPage(receipt,{generation:null,text:'',includesEditorDraft:false},args);
+      if(receipt.status==='accepted')throw new Error('WITHDRAWAL_RECOVERY_MISSING');
+      return {...receipt,withdrawn_available:false};
+    }
+    return withdrawalPage(receipt,withdrawn,args);
   }
   async create(args) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
@@ -245,5 +284,5 @@ export class Bridge {
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure',{code,uncertain:error.uncertain===true});
-  return ['COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','ATTACHED_OPERATION_FAILED','COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }

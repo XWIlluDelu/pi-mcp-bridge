@@ -4,7 +4,7 @@ import path from 'node:path';
 import { inside } from './permissions.mjs';
 import { opaqueId } from './data.mjs';
 import { readOwnerConfig, editPermission, permissionDetails } from './owner-config.mjs';
-const labels={read:'Read',send:'Send',delete:'Delete',new_session:'Create sessions'};
+const labels={read:'Read',send:'Send',command:'Commands',delete:'Delete',new_session:'Create sessions'};
 export default function ownerPermissions(pi){
   const file=process.env.PI_MCP_OWNER_CONFIG;let generation=0,dialog;
   pi.on('session_start',(_event,ctx)=>{generation++;if(ctx.mode==='tui'&&file)ctx.ui.setStatus('mcp-permissions','Permissions: Ctrl+Alt+P');});
@@ -31,7 +31,7 @@ export default function ownerPermissions(pi){
         if(!snapshot.config.folders.some(f=>f.path===folder)){ctx.ui.notify('Choose a project from the configured folder list.','warning');return;}
         target={folder:await fs.realpath(folder)};title=`Project: ${target.folder}`;
       }
-      const actions=target.session_id?['read','send','delete']:['read','send','delete','new_session'];
+      const actions=target.session_id?['read','send','command','delete']:['read','send','command','delete','new_session'];
       while(true){
         current();const rows=actions.map(action=>{const info=permissionDetails(snapshot.config,action,target);return `${labels[action]}: ${info.allowed?'Allowed':'Blocked'} — ${typeof info.explicit==='boolean'?'explicit':'inherited'} (${info.source})`;});
         const selected=await ctx.ui.select(title,[...rows,'Done'],options);current();if(!selected||selected==='Done')return;

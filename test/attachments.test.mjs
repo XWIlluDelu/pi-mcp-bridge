@@ -292,7 +292,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
  const client=new Client({name:'attached-mcp-fixture',version:'1.0.0'});
  try{
   await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),filename],cwd:base,env:{PATH:process.env.PATH,HOME:f.dir,PI_OFFLINE:'1'},stderr:'pipe'}));
-  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send']);
+  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send','stop']);
   const call=async(name,args)=>{const result=await client.callTool({name,arguments:args});assert.ok(!result.isError);return result.structuredContent;};
   assert.equal((await call('list',{})).sessions[0].session_id,f.id);
   const receipt=await call('send',{session_id:f.id,request_id:'mcp-send',text:'offline MCP TUI fixture'});

@@ -1,5 +1,6 @@
 // Bind existing owners through Pi 1.1 public APIs. These helpers never open a
 // session, spawn a process, read stdio, or access private admission hooks.
+import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown=()=>({status:'unknown',dispatch:'submitted',reason:'PI_ACCEPTANCE_UNOBSERVABLE',completion:'not_tracked'});
 const options=mode=>mode==='steer'?{streamingBehavior:'steer'}:mode==='queue'?{streamingBehavior:'followUp'}:{};
 const identity=state=>({sessionFile:state.sessionFile,sessionId:state.sessionId});
@@ -47,6 +48,16 @@ export function createSdkHostBinding(session,{release,onError}={}){
       try{tracked.track(session.prompt(text,options(mode)));}catch(error){try{onError?.(error);}catch{}}
       return unknown();
     },
+    stop:async({onWithdraw,...expected}={})=>{
+      if(typeof onWithdraw!=='function'||!['clearQueue','abort','abortBash'].every(name=>typeof session[name]==='function'))throw new Error('STOP_UNSUPPORTED');
+      const before=identity(session);assertIdentity(expected,before);
+      const withdrawn=session.clearQueue(),cancellation=tracked.track(session.abort());
+      session.abortBash();
+      await onWithdraw(withdrawn);await cancellation;
+      assertIdentity(before,identity(session));
+      await onWithdraw(session.clearQueue());
+      return stopReceipt({acknowledgement:'native_ack',coverage:'agent_and_bash'});
+    },
     ...(tracked.release?{release:tracked.release}:{}),
   };
 }
@@ -79,6 +90,14 @@ export function createRpcHostBinding(client,{release,onError}={}){
         // as plain Errors. Never infer rejection by parsing a raw error string.
         return unknown();
       }
+    },
+    stop:async({onWithdraw,...expected}={})=>{
+      if(typeof onWithdraw!=='function'||!['clearQueue','abort','abortBash'].every(name=>typeof client[name]==='function'))throw new Error('STOP_UNSUPPORTED');
+      const before=await state();assertIdentity(expected,before);
+      const result=await tracked.track(requestRpcStop(client,async value=>{
+        assertIdentity(before,await state());await onWithdraw(value);
+      }));
+      assertIdentity(before,await state());return result;
     },
     ...(tracked.release?{release:tracked.release}:{}),
   };

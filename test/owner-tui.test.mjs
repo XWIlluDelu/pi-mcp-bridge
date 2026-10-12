@@ -43,7 +43,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   events.push({type:'config-visible',time:Date.now(),invocation});
   // Rename visibility is earlier than save completion and the next selector.
   await screen('Read:',offset);
-  await selectIndex(scope===0?3:4);
+  await selectIndex(scope===0?4:5);
   await until(async()=>{try{return JSON.parse(await fs.readFile(menuClosed,'utf8')).invocation===invocation;}catch(e){if(e.code==='ENOENT')return false;throw e;}},'permission handler closed');
   events.push({type:'closed',time:Date.now(),invocation});
  }
@@ -51,17 +51,21 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   await until(async()=>{owner=await readClaim(config.attachmentDir,session);return owner?.phase==='ready';},'TUI registration');
   await screen('Permissions: Ctrl+Alt+P',0);
   await client.connect(new StdioClientTransport({command:process.execPath,args:[path.join(base,'src/server.mjs'),configFile],cwd:base,env:{PATH:process.env.PATH,HOME:dir,PI_OFFLINE:'1'},stderr:'pipe'}));
-  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send']);
+  assert.deepEqual((await client.listTools()).tools.map(x=>x.name).sort(),['batch','create','delete','list','read','send','stop']);
   const id=made.session_id;
   assert.equal((await ok('send',{session_id:id,request_id:'first',text:'PUBLIC_OWNER_SESSION_FIXTURE'})).status,'unknown');
   await until(async()=>(await ok('read',{session_id:id})).items.some(x=>x.message?.role==='assistant'),'actual TUI response');
   const sessionRule=c=>c.grants.findLast(r=>r.session_id===id);
+  await edit(0,2,0,c=>sessionRule(c)?.command===true);
+  assert.equal((await ok('stop',{session_id:id,request_id:'unsupported-tui-stop'})).reason,'STOP_UNSUPPORTED');
+  await edit(0,2,1,c=>sessionRule(c)?.command===false);
+  assert.equal((await call('stop',{session_id:id,request_id:'command-denied'})).isError,true);
   await edit(0,0,1,c=>sessionRule(c)?.read===false);
   assert.deepEqual((await ok('list',{})).sessions.find(x=>x.session_id===id),{session_id:id});
   assert.equal((await call('read',{session_id:id})).isError,true);
   assert.equal((await ok('list',{query:'PUBLIC_OWNER_SESSION_FIXTURE'})).sessions.length,0);
   const sendOnly=await ok('send',{session_id:id,request_id:'send-only',text:'PRIVATE_TO_CALLER_FIXTURE'});assert.equal(sendOnly.status,'unknown');assert.equal(sendOnly.dispatch,'submitted');assert.ok(!JSON.stringify(sendOnly).includes('PRIVATE_TO_CALLER_FIXTURE'));assert.ok(!JSON.stringify(sendOnly).includes(cwd));
-  await edit(0,2,1,c=>sessionRule(c)?.delete===false);
+  await edit(0,3,1,c=>sessionRule(c)?.delete===false);
   assert.equal((await ok('delete',{session_id:id,request_id:'deny-delete'})).status,'rejected');assert.equal(await ownerAlive(owner.owner),true);assert.ok(await fs.stat(session.file));
   await edit(0,1,1,c=>sessionRule(c)?.send===false);
   assert.equal((await ok('send',{session_id:id,request_id:'deny-send',text:'MUST_NOT_ENTER_SESSION'})).status,'rejected');
@@ -71,9 +75,9 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   await edit(1,1,1,c=>c.grants.findLast(r=>r.folder===cwd)?.send===false);
   await edit(0,1,2,c=>sessionRule(c)?.send===null);
   assert.equal((await ok('send',{session_id:id,request_id:'inherited-deny',text:'blocked by project'})).status,'rejected');
-  await edit(1,3,1,c=>c.grants.findLast(r=>r.folder===cwd)?.new_session===false);
+  await edit(1,4,1,c=>c.grants.findLast(r=>r.folder===cwd)?.new_session===false);
   assert.equal((await ok('create',{folder_id:'child',request_id:'new-session-denied'})).status,'rejected');
-  await edit(1,3,0,c=>c.grants.findLast(r=>r.folder===cwd)?.new_session===true);
+  await edit(1,4,0,c=>c.grants.findLast(r=>r.folder===cwd)?.new_session===true);
   const created=await ok('create',{folder_id:'child',request_id:'child-create'});assert.equal(created.status,'created');
   assert.equal((await ok('send',{session_id:created.session_id,request_id:'child-deny',text:'blocked inherited send'})).status,'rejected');
   assert.equal((await ok('create',{folder_id:'denied',request_id:'default-deny'})).status,'rejected');

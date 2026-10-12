@@ -1,4 +1,5 @@
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import { stopReceipt } from './stop-execution.mjs';
 import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
@@ -135,6 +136,7 @@ export class AttachedRuntime {
     return diagnostics.measure('attached.request',{op,generation:this.record.generation},()=>this.requestOnce(op,body,timeout));
   }
   async requestOnce(op,body={},timeout=5000){
+    const mutating=op==='send'||op==='stop';
     const serialized=JSON.stringify({op,body,generation:this.record.generation,file:this.record.file,sessionId:this.record.sessionId})+'\n';
     if(Buffer.byteLength(serialized)>MAX_ATTACHMENT_REQUEST_BYTES)throw new AttachmentFailure('ATTACHMENT_REQUEST_TOO_LARGE');
     const current=await readClaim(this.config.attachmentDir,this.session);
@@ -143,18 +145,20 @@ export class AttachedRuntime {
     return new Promise((resolve,reject)=>{
       const socket=net.createConnection(this.record.socket);socket.setEncoding('utf8');let bytes='',written=false,done=false;
       const finish=(error,value)=>{if(done)return;done=true;clearTimeout(timer);socket.destroy();error?reject(error):resolve(value);};
-      const timer=setTimeout(()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')),timeout);
-      socket.on('error',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')));
-      socket.on('end',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&op==='send')));
+      const timer=setTimeout(()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)),timeout);
+      socket.on('error',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)));
+      socket.on('end',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)));
       socket.on('connect',()=>{written=true;socket.write(serialized);});
       socket.on('data',chunk=>{
-        bytes+=chunk.toString();if(Buffer.byteLength(bytes)>100000)return finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&op==='send'));
+        bytes+=chunk.toString();if(Buffer.byteLength(bytes)>100000)return finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&mutating));
         const newline=bytes.indexOf('\n');if(newline<0)return;
         try{const response=JSON.parse(bytes.slice(0,newline));
           if(response.generation!==this.record.generation)throw new Error();
-          if(response.error)return finish(new AttachmentFailure(['RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','INVALID_TEXT_SELECTOR','PROJECTED_MESSAGE_NOT_FOUND','TEXT_BLOCK_NOT_FOUND','TEXT_SECTION_NOT_FOUND','OWNER_READ_REFRESH_REQUIRED','NON_TEXT_CONTENT','INVALID_TEXT_OFFSET','TEXT_BUDGET_TOO_SMALL','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&op==='send'));
+          if(mutating&&response.error==='STOP_IN_PROGRESS')return finish(new AttachmentFailure('STOP_IN_PROGRESS'));
+          if(op==='stop'&&['STOP_UNSUPPORTED','INVALID_ATTACHED_OPERATION'].includes(response.error))return finish(new AttachmentFailure('STOP_UNSUPPORTED'));
+          if(response.error)return finish(new AttachmentFailure(['STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','RUNTIME_SESSION_CHANGED','SESSION_TOO_LARGE','ENTRY_NOT_FOUND','STALE_CURSOR','INVALID_CURSOR','SINCE_REQUIRES_RAW','INVALID_TEXT_SELECTOR','PROJECTED_MESSAGE_NOT_FOUND','TEXT_BLOCK_NOT_FOUND','TEXT_SECTION_NOT_FOUND','OWNER_READ_REFRESH_REQUIRED','NON_TEXT_CONTENT','INVALID_TEXT_OFFSET','TEXT_BUDGET_TOO_SMALL','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN'].includes(response.error)?response.error:'ATTACHED_OPERATION_FAILED',written&&mutating));
           finish(null,response.data);
-        }catch{finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&op==='send'));}
+        }catch{finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&mutating));}
       });
     });
   }
@@ -162,6 +166,10 @@ export class AttachedRuntime {
   state(timeout=5000){return this.request('state',{},timeout);}
   async read(args){const result=await this.request('read',args);assertProjectedTextResponse(result,args);return result;}
   send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
+  async stopExecution({recovery_id,timeout_ms=5000}){
+    const result=await this.request('stop',{recovery_id,timeout_ms},timeout_ms);
+    try{return stopReceipt(result);}catch(error){error.uncertain=true;throw error;}
+  }
   async stop(){this.alive=false;} // Disconnect only. Never shut down external Pi on bridge close.
   async stopForDelete(){
     // Public RPC extension shutdown is deferred, and this child is not ours.
