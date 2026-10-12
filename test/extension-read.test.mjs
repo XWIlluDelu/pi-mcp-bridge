@@ -64,13 +64,16 @@ test('request-time filtering differs from saved projection; reads neither replay
  const readAfter=await f.bridge.read({session_id:f.id});assert.ok(JSON.stringify(readAfter).includes('PUBLIC_OLD_PLAN'));assert.equal(readAfter.context_kind,'pi_session_projection_not_final_provider_payload');assert.ok(!JSON.stringify(readAfter).includes('PUBLIC_FORCED_MEMORY'));assert.equal(await fs.readFile(f.saved.file,'utf8'),afterPrompt);
  assert.equal(contextCalls,1);assert.equal(beforeCalls,1);
 });
-test('configured agentDir does not discover extensions but explicit -e loads an owner-selected extension',async t=>{
+test('selected agentDir discovers extensions; an explicit disable flag remains authoritative',async t=>{
  const f=await fixture(t),agentDir=path.join(f.dir,'owner-agent'),extensions=path.join(agentDir,'extensions');await fs.mkdir(extensions,{recursive:true});
  await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarming:'off',compaction:{enabled:false},retry:{enabled:false}}));
- const extension=path.join(extensions,'original-fixture.mjs');await fs.writeFile(extension,"export default function(pi){pi.on('session_start',()=>pi.appendEntry('profile-marker',{loaded:true}));}");
+ const extension=path.join(extensions,'original-fixture.js');await fs.writeFile(extension,"export default function(pi){pi.on('session_start',()=>pi.appendEntry('profile-marker',{loaded:true}));}");
  f.config.piRuntime={agentDir};let rpc;
  try{
-  rpc=await new PiRpc(f.config,f.saved).start();assert.ok(!(await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
-  f.config.piArgs=['-e',extension];rpc=await new PiRpc(f.config,f.saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));
+  rpc=await new PiRpc(f.config,f.saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
+  // Use a new native file so a previous persisted marker cannot mask discovery.
+  const made=await f.bridge.create({folder_id:'project',request_id:'disabled-profile'}),saved=await f.bridge.session(made.session_id);
+  f.config.piArgs=['--no-extensions'];rpc=await new PiRpc(f.config,saved).start();assert.ok(!(await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));await rpc.stop();
+  f.config.piArgs=['--no-extensions','-e',extension];rpc=await new PiRpc(f.config,saved).start();assert.ok((await rpc.entries()).entries.some(x=>x.customType==='profile-marker'));
  }finally{await rpc?.stop();}
 });

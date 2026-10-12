@@ -3,7 +3,7 @@
 A local, vendor-independent MCP server for saved Pi sessions and Bridge-owned
 RPC workers. It exposes `list`, `read`, `send`, `create`, `delete` and ordered `batch` over stdio and authenticated loopback Streamable HTTP.
 
-Cooperating Pi TUI processes share their existing runtime through a private
+Cooperating Pi TUI/RPC processes share their existing runtime through a private
 Unix socket. Cooperative process identity and attachment require Linux.
 
 ## Install and try
@@ -82,8 +82,9 @@ credentials and no tools. Explicit owner options select another profile:
 Pi resolves its models and authentication. Use environment interpolation in Pi
 configuration rather than copying credentials into Bridge configuration.
 
-HOME remains isolated even with a profile. Automatic extensions, skills, themes
-and prompt templates are disabled; explicit CLI options can load selected resources.
+Explicitly inherited HOME is respected. An explicit `agentDir` enables native
+resource discovery; without it, the isolated profile and resource-disable flags
+remain. Tools and environment inheritance still require explicit selection.
 
 ### Local controls and shared sessions
 
@@ -119,6 +120,10 @@ Session files must be canonical regular files with one hard link. Public IDs
 bind canonical path and native header ID, not inode. Fresh native sessions may
 reserve an uncreated path; once persisted, every attachment validates its storage.
 
+Add `--mode rpc` for ordinary RPC; its caller retains stdin/stdout. The companion
+uses a separate socket. RPC release/delete is unsupported because extension
+shutdown does not confirm process exit. See [startup integration](docs/startup-integration.md).
+
 Existing SDK/RPC hosts can [reserve and publish public bindings](docs/host-adapter.md)
 before opening a session. Every host input and replacement path must participate
 in its admission and release coordination.
@@ -145,6 +150,7 @@ unavailable; cold start/create require a usable canonical cwd.
 | `raw` | Stored entries, including hidden originals and other branches |
 | `summary` | Compaction/branch-summary records in the selected projection |
 | `overview` | Extractive source locators, excerpts and tool observations |
+| `status` | Current runtime state and settlement observation without transcript retrieval |
 
 Live reads use the owner's entries/leaf; saved reads use the persisted resume
 leaf. `leaf_id` selects ancestry, `entry_id` selects a source and `query` filters
@@ -170,6 +176,25 @@ do not start a runtime.
 
 `overview_scope` reports pre-filter coverage on every page, including when
 filters exclude the manifest record.
+
+#### Status and wait
+
+Capture `activity.settlement` before sending, then wait for a later session event:
+
+```json
+{"session_id":"ps_...","view":"status",
+ "after_settlement":{"generation":"observed-generation","sequence":0},
+ "wait_ms":10000}
+```
+
+Wait is 0–10000 ms; nonzero wait requires a baseline. Outcomes distinguish
+`settled`, `timeout`, `generation_changed`, `unavailable` and `not_requested`.
+Generation replacement resets sequence. Settlement is session-wide, not exclusive
+send completion or proof of current idle. It cannot clear an uncertain ACK.
+An initial observation always runs; the deadline bounds polling while in-flight
+state/ownership I/O retains its own timeout. Permissions are rechecked on return.
+Stdio cancellation stops the wait; stateless HTTP requires disconnecting the
+original request rather than a separate cancellation notification.
 
 ### send
 
@@ -217,16 +242,17 @@ permanent-delete or remote restore tool.
 Batch accepts 1–10 ordered `read|send|create|delete` items. Preflight checks shape
 and request-ID conflicts; results preserve input order with per-item errors.
 
-Combining deletion with a different operation on the same session is a
-preflight conflict. Targets must already be known; items cannot reference results
-from earlier creates.
+Read-before-delete is valid; delete-before-read and same-session send/delete
+are contradictions. Reads are captured once and resized without rereading after
+later mutations. Small reads release response capacity to larger reads.
 
 Input is capped at 6,100,000 serialized characters. The whole structured result
 is bounded to 32,768; `BATCH_RESULT_OMITTED` directs a separate read or same-ID
 mutation replay. This is not a transaction: replay repeats reads and recovers
 mutation receipts.
 
-Once admitted, later mutations continue after HTTP disconnect.
+Once admitted, later mutations continue after HTTP disconnect. A cancelled
+status wait may produce an item error without stopping the batch.
 
 ## Verification and recovery
 
@@ -247,9 +273,9 @@ node research/real-client.mjs
 Supply the matching credential through protected environment. Destination and
 acknowledgement must match; the harness uses an isolated, tool-disabled profile.
 
-The optional `PI_REAL_REVIEW=1` source-review path requires the Git revision
-configured in `research/real-client.mjs` to be available locally.
-`PI_REAL_REVIEW_ONLY=1` skips lifecycle prompts. Review output is untrusted.
+`PI_REAL_REVIEW=1` reviews public HEAD source; `PI_REAL_REVIEW_ONLY=1` skips
+lifecycle prompts. Feedback is untrusted and output stays local. Reusable
+long-session measurements are described in [research notes](research/long-session-reading.md).
 
 For compatible provider endpoints, `PI_REAL_THINKING_FORMAT=deepseek` requests
 native thinking-disable serialization; `reasoning:false` alone does not disable

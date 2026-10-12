@@ -79,10 +79,10 @@ try{
  const deleted=await call('delete',{session_id,request_id:'delete'});assert.equal(deleted.status,'deleted');assert.deepEqual(await call('delete',{session_id,request_id:'delete'}),deleted);assert.equal((await call('list',{})).sessions.length,0);assert.equal(await fs.readFile(path.join(cwd,'keep.txt'),'utf8'),'public fixture');evidence.delete_preserves_project=true;
  }
  if(process.env.PI_REAL_REVIEW==='1'){
-  const reviewedCommit='b24070d';
+  const reviewedCommit=execFileSync('git',['rev-parse','HEAD'],{cwd:base,encoding:'utf8'}).trim();
   const files=['src/bridge.mjs','src/rpc.mjs'];
   const publicSource=files.map(file=>`FILE ${file}\n${execFileSync('git',['show',`${reviewedCommit}:${file}`],{cwd:base,encoding:'utf8'})}`).join('\n');
-  const prompt=`Review the following public Pi MCP bridge source at ${reviewedCommit}. Focus only on session read/write correctness and runtime/session identity boundaries. Owner configuration, extensions, and enabled Pi tools are trusted; the bridge is explicitly not an OS sandbox, uses exclusively owned storage, and does not attach existing TUIs. Give at most two actionable findings with severity, file/function, concrete trigger, and minimal fix. Distinguish code-proven defects from hypotheses requiring Pi behavior evidence. Do not claim to have run tests. Stay under 400 words.\n\n${publicSource}`;
+  const prompt=`Review the following public Pi MCP bridge source at ${reviewedCommit}. Focus only on session read/write correctness and runtime/session identity boundaries. Owner configuration, extensions, and enabled Pi tools are trusted; the bridge is explicitly not an OS sandbox, uses exclusively owned storage, and supports explicitly cooperating Pi owners rather than arbitrary uninstrumented writers. Give at most two actionable findings with severity, file/function, concrete trigger, and minimal fix. Distinguish code-proven defects from hypotheses requiring Pi behavior evidence. Do not claim to have run tests. Stay under 400 words.\n\n${publicSource}`;
   const madeReview=await call('create',{folder_id:'project',request_id:'review-create'});
   const reviewId=madeReview.session_id;
   const sent=await call('send',{session_id:reviewId,request_id:'review',mode:'native',text:prompt});assert.equal(sent.disposition,'started');
@@ -90,7 +90,9 @@ try{
   const completed=await waitFor(reviewId,null);
   const answer=completed.items.find(x=>x.message?.role==='assistant').message;
   const text=answer.content.filter(x=>x.type==='text').map(x=>x.text).join('\n');
-  await fs.writeFile(path.join(base,'research/DEEPSEEK_REVIEW.txt'),`UNTRUSTED MODEL REVIEW — validate all suggestions independently\nModel: ${model}\nReviewed commit: ${reviewedCommit}\nInput: public source only (${files.join(', ')}); no tools, private owner context, environment values, or generated config supplied.\nNo claim of independent test execution by reviewer.\nStop reason: ${answer.stopReason}\n\n${text}\n`);
+  const reviewFile=path.join(base,'.local','research','model-review.txt');
+  await fs.mkdir(path.dirname(reviewFile),{recursive:true,mode:0o700});
+  await fs.writeFile(reviewFile,`UNTRUSTED MODEL REVIEW — validate all suggestions independently\nModel: ${model}\nReviewed commit: ${reviewedCommit}\nInput: public source only (${files.join(', ')}); no tools, private owner context, environment values, or generated config supplied.\nNo claim of independent test execution by reviewer.\nStop reason: ${answer.stopReason}\n\n${text}\n`,{mode:0o600});
   assert.notEqual(answer.stopReason,'length');assert.ok(text.trim());
   const current=await readAll(reviewId,'context'),rawReview=await readAll(reviewId,'raw');
   assert.ok(current.pages>1&&rawReview.pages>1&&current.fragments>0&&rawReview.fragments>0);

@@ -22,6 +22,7 @@ test('both direct lookup and cross-identity scan reject unsafe owner records',as
     'missing owner':async f=>fs.writeFile(f.file,JSON.stringify({...f.record,owner:null})),
     'invalid kind':async f=>fs.writeFile(f.file,JSON.stringify({...f.record,kind:'foreign'})),
     'outside TUI socket':async f=>fs.writeFile(f.file,JSON.stringify({...f.record,kind:'tui',socket:'/tmp/outside.sock'})),
+    'outside extension socket':async f=>fs.writeFile(f.file,JSON.stringify({...f.record,kind:'extension',socket:'/tmp/outside.sock'})),
     'oversized record':async f=>fs.writeFile(f.file,JSON.stringify({...f.record,padding:'x'.repeat(8192)})),
     'group-readable record':async f=>fs.chmod(f.file,0o640),
     'symbolic link':async f=>{const target=path.join(f.dir,'target');await fs.rename(f.file,target);await fs.symlink(target,f.file);},
@@ -36,8 +37,8 @@ test('both direct lookup and cross-identity scan reject unsafe owner records',as
 
 test('validated scans preserve exact process identity and all ownership phases',async t=>{
   const f=await fixture(t);
-  for(const kind of ['rpc','tui'])for(const phase of ['starting','ready','transitioning']){
-    const record={...f.record,kind,phase,...(kind==='tui'?{socket:path.join(f.dir,'fixture.sock')}:{})};
+  for(const kind of ['rpc','tui','host','extension'])for(const phase of ['starting','ready','transitioning']){
+    const record={...f.record,kind,phase,...(kind!=='rpc'?{socket:path.join(f.dir,'fixture.sock')}:{})};
     await fs.writeFile(f.file,JSON.stringify(record));
     assert.deepEqual(await readClaim(f.dir,f.session),record);
     await assert.rejects(assertNoOtherLiveOwner(f.dir,f.replacement),{code:'LIVE_OWNER_UNREACHABLE'});

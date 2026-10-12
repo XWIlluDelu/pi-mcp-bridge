@@ -136,6 +136,44 @@ test('lost HTTP response recovers same request_id without resend or closing Brid
   assert.equal((await f.call('list')).sessions.length, 1);
 });
 
+for (const first of ['send', 'status']) test(`HTTP disconnect during pending ${first} preserves later admitted batch mutations`, async t => {
+  const f = await fixture(t), entered = deferred(), release = deferred();
+  let signal, readError;
+  f.cleanup.push(() => release.resolve());
+  const method = first === 'send' ? 'send' : 'read', original = f.bridge[method].bind(f.bridge);
+  f.bridge[method] = async (args, options) => {
+    signal = options.signal;
+    try { return await original(args, options); }
+    catch (error) { readError = error; throw error; }
+  };
+  let initial;
+  if (first === 'send') {
+    f.runtime.command = async command => { f.runtime.calls.push(command); entered.resolve(); await release.promise; return { disposition: 'started' }; };
+    initial = { op: 'send', args: { session_id: f.id, request_id: 'disconnect-send', text: 'fixture' } };
+  } else {
+    f.runtime.generation = 'disconnect-generation';
+    f.runtime.settlement = { generation: f.runtime.generation, sequence: 0, observed_at: null, aborted: null };
+    f.runtime.state = async () => { entered.resolve(); return { isStreaming: false, pendingMessageCount: 0 }; };
+    f.bridge.pool.instances.set(f.id, f.runtime);
+    initial = { op: 'read', args: { session_id: f.id, view: 'status', after_settlement: { generation: f.runtime.generation, sequence: 0 }, wait_ms: 10000 } };
+  }
+  const batch = request(f.url, rpc('batch', { operations: [initial,
+    { op: 'create', args: { folder_id: 'project', request_id: 'disconnect-create' } },
+  ] }));
+  const lost = batch.response.catch(() => null);
+  await entered.promise;
+  assert.equal(signal.aborted, false);
+  const aborted = new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+  batch.req.destroy(); await lost; await aborted;
+  release.resolve();
+  await f.service.close(); // Drain the admitted tool before inspecting durable receipts.
+  assert.equal((await f.bridge.journal.get('disconnect-create'))?.receipt.status, 'created');
+  if (first === 'send') {
+    assert.equal((await f.bridge.journal.get('disconnect-send')).receipt.status, 'accepted');
+    assert.equal(f.runtime.calls.length, 1);
+  } else assert.equal(readError?.message, 'READ_CANCELLED');
+});
+
 test('HTTP shutdown drains admitted batch and receipt before releasing owner lock', async t => {
   const f = await fixture(t), entered = deferred(), release = deferred();
   f.runtime.command = async command => { f.runtime.calls.push(command); entered.resolve(); await release.promise; return { disposition: 'started' }; };

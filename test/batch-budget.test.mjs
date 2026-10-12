@@ -8,6 +8,25 @@ const read=session_id=>({op:'read',args:{session_id,view:'raw',max_chars:32768}}
 const records=text=>[{entry_id:'entry',text}];
 const render=(rows,args)=>({view:args.view??'raw',activity:{state:'idle',source:'fixture'},...pageRecords(rows,args,'public-revision')});
 
+test('batch status remains intact beside oversized history without a page budget or reread',async()=>{
+ const status={view:'status',generation:'fixture',activity:{settlement:{generation:'fixture',sequence:2,observed_at:'observed',aborted:false}},wait:{status:'not_requested'}},calls=[];
+ const bridge={read:async args=>{calls.push(args);return args.view==='status'?status:render(records('x'.repeat(60000)),args);}};
+ const operations=[{op:'read',args:{session_id:'live',view:'status'}},read('large-a'),read('large-b')];
+ const result=await executeBatch(bridge,{operations});
+ assert.equal(calls.length,3);assert.ok(!('max_chars' in calls[0]));
+ assert.deepEqual(result.results[0].result,status);assert.ok(!('applied_max_chars' in result.results[0]));
+ assert.ok(JSON.stringify(result).length<=BATCH_RESPONSE_LIMIT);
+});
+
+test('cancelled status is an item error without cancelling later admitted mutations',async()=>{
+ const controller=new AbortController(),calls=[],receipt={status:'created',request_id:'admitted-create'};
+ const bridge={read:async(_args,{signal})=>{calls.push('read');controller.abort();assert.equal(signal.aborted,true);throw new Error('READ_CANCELLED');},create:async()=>{calls.push('create');return receipt;}};
+ const result=await executeBatch(bridge,{operations:[{op:'read',args:{session_id:'s',view:'status'}},{op:'create',args:{folder_id:'project',request_id:'admitted-create'}}]},{signal:controller.signal});
+ assert.equal(result.status,'processed');assert.deepEqual(calls,['read','create']);
+ assert.deepEqual(result.results[0].error,{code:'READ_CANCELLED'});
+ assert.deepEqual(result.results[1].result,receipt);
+});
+
 test('ten modest reads retain complete records instead of rigid per-read fragments',async()=>{
  const rows=records('x'.repeat(1075)),calls=[];
  const result=await executeBatch({read:async args=>{calls.push(args);return render(rows,args);}},{operations:Array.from({length:10},(_,i)=>read(`s${i}`))});

@@ -14,6 +14,30 @@ const data=entries=>({entries,leafId:entries.at(-1)?.id??null,revision:hash(entr
 const overview=entries=>recordsFor(data(entries),{view:'overview'});
 const payloadText=r=>JSON.stringify(r.payload);
 
+test('native context edit samples replacement text blocks without resurrecting original markers',()=>{
+ const content=[{type:'thinking',thinking:'OMIT_REPLACEMENT_THINKING'},
+  {type:'text',text:'PUBLIC_REPLACEMENT_FIRST'},
+  {type:'text',text:'PUBLIC_REPLACEMENT_MIDDLE '+ 'x'.repeat(4000)+' PUBLIC_REPLACEMENT_TAIL'},
+  {type:'text',text:'PUBLIC_REPLACEMENT_LAST'}];
+ const entries=[message('u',null,'user','public request'),message('a','u','assistant',[
+  {type:'text',text:'HIDDEN_ORIGINAL_FIRST'},{type:'text',text:'HIDDEN_ORIGINAL_LAST'}]),
+  {type:'context_edit',id:'edit',parentId:'a',targetId:'a',replacement:{content}}];
+ const rows=overview(entries),row=rows.find(r=>r.label==='latest_assistant'),serialized=JSON.stringify(rows);
+ assert.equal(row.entry_id,'a');
+ const blocks=[row,...row.additional_text_blocks];
+ assert.deepEqual(blocks.map(block=>block.payload_source.block_index),[1,3,2]);
+ for(const marker of ['PUBLIC_REPLACEMENT_FIRST','PUBLIC_REPLACEMENT_MIDDLE','PUBLIC_REPLACEMENT_TAIL','PUBLIC_REPLACEMENT_LAST'])assert.ok(serialized.includes(marker),marker);
+ assert.ok(!serialized.includes('HIDDEN_ORIGINAL'));assert.ok(!serialized.includes('OMIT_REPLACEMENT_THINKING'));
+ assert.deepEqual(row.omitted_content_block_ranges,[[0,1]]);
+ const middle=blocks[2].payload,json=JSON.stringify(content[2].text);
+ assert.equal(middle.json_excerpt,json.slice(0,middle.omitted_char_ranges[0][0]));
+ assert.equal(middle.json_tail_excerpt,json.slice(middle.tail_char_offset));
+ assert.equal(middle.json_excerpt.length+middle.json_tail_excerpt.length,
+  1000-JSON.stringify(content[1].text).length-JSON.stringify(content[3].text).length);
+ assert.ok(JSON.stringify(recordsFor(data(entries),{view:'raw',entry_id:'a'})).includes('HIDDEN_ORIGINAL_FIRST'));
+ assert.ok(JSON.stringify(recordsFor(data(entries),{view:'overview',leaf_id:'a'})).includes('HIDDEN_ORIGINAL_FIRST'));
+});
+
 test('tool-use overview omits synthetic opaque thinking metadata and preserves raw expansion',()=>{
  const signature=JSON.stringify({encrypted_content:'SYNTHETIC_OPAQUE_'.repeat(800)});
  const entries=[message('u',null,'user','public request'),message('call','u','assistant',[

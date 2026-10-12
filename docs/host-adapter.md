@@ -1,7 +1,7 @@
 # Cooperating Pi hosts
 
 A host can share an existing SDK session or RPC child through private per-session
-IPC. Ordinary Pi TUI uses the companion instead. Each route uses the owner's
+IPC. Ordinary Pi TUI/RPC uses the companion instead. Each route uses the owner's
 configured attachment directory and grants.
 
 ## Reserve before opening

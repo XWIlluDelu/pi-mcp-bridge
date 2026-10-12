@@ -66,9 +66,9 @@ export async function readOwnerRecord(dir,file,session){
     while(length<bytes.length){const {bytesRead}=await handle.read(bytes,length,bytes.length-length,null);if(!bytesRead)break;length+=bytesRead;}
     if(length>8192)throw new Error();
     const record=JSON.parse(bytes.subarray(0,length).toString('utf8'));
-    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc','host'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
+    if(typeof record?.file!=='string'||typeof record.sessionId!=='string'||!['tui','rpc','host','extension'].includes(record.kind)||typeof record.generation!=='string'||!Number.isSafeInteger(record.owner?.pid)||record.owner.pid<1||typeof record.owner.start!=='string'||typeof record.owner.boot!=='string')throw new Error();
     if(session&&(record.file!==session.file||record.sessionId!==session.header.id))throw new Error();
-    if(['tui','host'].includes(record.kind)&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
+    if(['tui','host','extension'].includes(record.kind)&&(typeof record.socket!=='string'||path.dirname(record.socket)!==dir))throw new Error();
     return record;
   }catch(e){if(e.code==='ENOENT')return null;throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');}
   finally{await handle?.close();}
@@ -89,7 +89,7 @@ export async function reserveOwner(dir,session,kind,owner=undefined){
     const old=await readClaim(dir,session);
     if(old&&await ownerAlive(old.owner))throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     const record={kind,file:session.file,sessionId:session.header.id,generation:randomUUID(),owner:owner??await processIdentity(),phase:'starting'};
-    if(['tui','host'].includes(kind))record.socket=path.join(dir,`${process.pid}-${record.generation.slice(0,8)}.sock`);
+    if(['tui','host','extension'].includes(kind))record.socket=path.join(dir,`${process.pid}-${record.generation.slice(0,8)}.sock`);
     await atomicJson(claimFile(dir,session),record);return record;
   });
 }
@@ -143,11 +143,14 @@ export class AttachedRuntime {
     });
   }
   async start(){await this.state();return this;}
-  state(){return this.request('state');}
+  state(timeout=5000){return this.request('state',{},timeout);}
   read(args){return this.request('read',args);}
   send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
-  async stop(){this.alive=false;} // Disconnect only. Never shut down the user's TUI on bridge close.
+  async stop(){this.alive=false;} // Disconnect only. Never shut down external Pi on bridge close.
   async stopForDelete(){
+    // Public RPC extension shutdown is deferred, and this child is not ours.
+    // Keep its read/send endpoint alive; never request host exit or kill it.
+    if(this.record.kind==='extension')throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
     if(this.record.kind==='host'){
       // A shared SDK host may keep other sessions alive. Only the host can
       // close this session's admission and drain its own preparation work.

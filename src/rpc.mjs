@@ -20,14 +20,15 @@ export function launchProfile(config, hostEnv = process.env) {
   const home = path.join(config.stateDir, 'pi-home');
   const agentDir = profile.agentDir ?? path.join(home, '.pi', 'agent');
   const env = Object.fromEntries(inherit.filter(name => hostEnv[name] !== undefined).map(name => [name,hostEnv[name]]));
-  Object.assign(env, {PATH:hostEnv.PATH ?? '/usr/bin:/bin', HOME:home, LANG:'C.UTF-8', TERM:'dumb', PI_OFFLINE:'1', PI_CODING_AGENT_DIR:agentDir});
-  return {agentDir,env,toolArgs:tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
+  Object.assign(env, {PATH:hostEnv.PATH ?? '/usr/bin:/bin', HOME:env.HOME ?? home, LANG:'C.UTF-8', TERM:'dumb', PI_OFFLINE:'1', PI_CODING_AGENT_DIR:agentDir});
+  const resourceArgs = profile.agentDir ? [] : ['--no-extensions','--no-skills','--no-prompt-templates','--no-themes'];
+  return {agentDir,env,resourceArgs,toolArgs:tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
 }
 export class PiRpc {
-  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; }
+  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; this.settlement = {generation:this.generation,sequence:0,observed_at:null,aborted:null}; }
   async start() {
     await assertSingleSessionFile(this.session.file);
-    const {agentDir,env,toolArgs} = launchProfile(this.config);
+    const {agentDir,env,toolArgs,resourceArgs} = launchProfile(this.config);
     await fs.mkdir(agentDir, {recursive:true, mode:0o700});
     const cli = fileURLToPath(new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url));
     if(this.config.attachmentDir)this.ownerRecord=await reserveOwner(this.config.attachmentDir,this.session,'rpc');
@@ -36,7 +37,7 @@ export class PiRpc {
       // reservation may have taken time since discovery verified this path.
       await validateExecutionCwd(this.session.cwd);
       // Deliberate clean environment: do not borrow host keys or subscriptions.
-      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,'--no-extensions','--no-skills','--no-prompt-templates','--no-themes',...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
+      this.child = spawn(process.execPath, [cli, '--mode','rpc','--session',this.session.file,...resourceArgs,...toolArgs, ...(this.config.piArgs ?? [])], {cwd:this.session.cwd, env, stdio:['pipe','pipe','pipe']});
     } catch (error) {
       if(this.ownerRecord)await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);
       throw error;
@@ -67,7 +68,12 @@ export class PiRpc {
     }
   }
   receiveResponse(event, generation) {
-    if (generation !== this.generation || !event || event.type !== 'response') return;
+    if (generation !== this.generation || !event) return;
+    if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
+      this.settlement = {generation,sequence:this.settlement.sequence+1,observed_at:new Date().toISOString(),aborted:event.aborted};
+      return; // Session observation only; never release an unresolved prompt ACK fence.
+    }
+    if (event.type !== 'response') return;
     const req = this.pending.get(event.id);
     if (!req || req.generation !== generation) return;
     // Only the matching prompt ACK is evidence of completed admission. State,
@@ -92,7 +98,7 @@ export class PiRpc {
     let checkedState;
     try { checkedState = await this.state(); } catch (error) { if (command.type === 'prompt') error.uncertain = true; throw error; }
     if (rejection) throw rejection;
-    if (command.type === 'get_entries') return {...result,activity:rpcActivity(checkedState,Boolean(this.promptAdmission))};
+    if (command.type === 'get_entries') return {...result,activity:rpcActivity(checkedState,Boolean(this.promptAdmission),this.settlement)};
     return result;
   }
   dispatch(command, timeout = 5000, onLate) {
