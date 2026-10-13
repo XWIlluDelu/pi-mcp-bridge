@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { inside } from './permissions.mjs';
-import { opaqueId } from './data.mjs';
+import { opaqueId } from './storage.mjs';
 import { readOwnerConfig, editPermission, permissionDetails } from './owner-config.mjs';
 const labels={read:'Read',send:'Send',command:'Stop execution',delete:'Delete',new_session:'Create sessions',bash:'Direct bash'};
 export default function ownerPermissions(pi){

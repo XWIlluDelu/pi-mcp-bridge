@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { hash, atomicJson } from './data.mjs';
+import { hash, atomicJson } from './storage.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 export class Journal {
   constructor(config) { this.config = config; this.running = new Map(); this.writes = new Map(); this.transitions = new Map(); this.writeFailures = new Map(); }

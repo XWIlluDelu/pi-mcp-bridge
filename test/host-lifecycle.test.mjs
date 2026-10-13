@@ -7,7 +7,7 @@ import {randomUUID} from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {Bridge} from '../src/bridge.mjs';
-import {atomicJson} from '../src/data.mjs';
+import { atomicJson } from '../src/storage.mjs';
 import {reserveHostSession} from '../src/host-adapter.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 import {reserveOwner,releaseOwner,readClaim,ownerAlive,updateOwner,AttachedRuntime,registryTransaction,claimFile} from '../src/attachments.mjs';

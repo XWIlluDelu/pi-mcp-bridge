@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
-import { hash, syncDir } from './data.mjs';
+import { hash, syncDir } from './storage.mjs';
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 const absolute=value=>typeof value==='string'&&path.isAbsolute(value)&&!value.includes('\0');
 export function validatePiRuntime(profile={}){

@@ -1,7 +1,8 @@
 // Native cancellation and recoverable withdrawal, never process teardown.
 import { Journal } from './journal.mjs';
 import path from 'node:path';
-import { hash, textCursorOffset, textBoundary, textCursor, fitDecodedText } from './data.mjs';
+import { textCursorOffset, textBoundary, textCursor, fitDecodedText } from './data.mjs';
+import { hash } from './storage.mjs';
 
 const withdrawals=dir=>new Journal({stateDir:path.join(dir,'stop'),principal:'withdrawn-inputs'});
 export function withdrawalCapture(dir,session,generation,id) {

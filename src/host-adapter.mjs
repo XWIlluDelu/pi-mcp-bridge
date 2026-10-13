@@ -2,7 +2,8 @@
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import fs from 'node:fs/promises';
 import net from 'node:net';
-import {hash,renderRead,assertSingleSessionFile,readSessionIdentity} from './data.mjs';
+import { renderRead, assertSingleSessionFile, readSessionIdentity } from './data.mjs';
+import { hash } from './storage.mjs';
 import {bashCapture} from './bash-execution.mjs';
 import { stopReceipt, withdrawalCapture } from './stop-execution.mjs';
 import {activityObservation} from './activity.mjs';

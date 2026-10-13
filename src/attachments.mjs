@@ -7,7 +7,8 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { atomicJson, opaqueId, assertSingleSessionFile, assertProjectedTextResponse } from './data.mjs';
+import { assertSingleSessionFile, assertProjectedTextResponse } from './data.mjs';
+import { atomicJson, opaqueId } from './storage.mjs';
 export class AttachmentFailure extends Error {
   constructor(code,uncertain=false,options){super(code,options);this.code=code;this.uncertain=uncertain;}
 }

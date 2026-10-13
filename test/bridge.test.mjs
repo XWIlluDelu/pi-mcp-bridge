@@ -291,6 +291,32 @@ test('delete rename failure cleans intents while post-move sync failure preserve
 });
 
 
+test('filtered list stops after its page and one extra readable match',async t=>{
+ const f=await fixture(t);
+ for(let i=1;i<6;i++)await f.bridge.create({folder_id:'project',request_id:`query-session-${i}`});
+ const sessions=await f.bridge.sessions(),files=new Set(sessions.map(s=>s.file)),seen=[];
+ for(const [i,s] of sessions.entries())await fs.appendFile(s.file,JSON.stringify({
+  type:'session_info',id:'title',parentId:null,name:i===2?'unrelated':`needle ${i}`,
+ })+'\n');
+ f.config.grants.push({session_id:sessions[1].id,read:false});
+ const original=fsSync.createReadStream;
+ t.mock.method(fsSync,'createReadStream',(...args)=>{if(files.has(args[0]))seen.push(args[0]);return original(...args);});
+ syncBuiltinESMExports();
+ const check=async(args,expectedRows,expectedReads,next)=>{
+  seen.length=0;const result=await f.bridge.list({query:'needle',limit:1,...args});
+  assert.deepEqual(result.sessions.map(s=>s.session_id),expectedRows.map(i=>sessions[i].id));
+  assert.equal(result.next_offset,next);
+  assert.deepEqual(seen,expectedReads.map(i=>sessions[i].file));
+ };
+ try{
+  await check({},[0],[0,2,3],1); // One nonmatch; unreadable title is never parsed.
+  await check({offset:1},[3],[0,2,3,4],2);
+  await check({offset:3},[5],[0,2,3,4,5],null);
+  await check({offset:4},[],[0,2,3,4,5],null);
+  await check({query:'absent'},[],[0,2,3,4,5],null);
+ }finally{t.mock.restoreAll();syncBuiltinESMExports();}
+});
+
 test('list bounds unfiltered transcript work to its page and searches only readable histories',async t=>{
  const f=await fixture(t);await f.bridge.create({folder_id:'project',request_id:'second'});
  const sessions=await f.bridge.sessions(),files=new Set(sessions.map(s=>s.file)),seen=[];
