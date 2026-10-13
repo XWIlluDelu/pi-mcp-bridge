@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { prepareTrash } from '../src/trash.mjs';
-import { opaqueId, syncDir } from '../src/data.mjs';
+import { opaqueId, syncDir } from '../src/storage.mjs';
 
 async function fixture(t, sessionBase=os.tmpdir()) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-trash-state-'));

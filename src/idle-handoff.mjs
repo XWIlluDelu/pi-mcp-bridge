@@ -1,7 +1,7 @@
 // Owner-local transfer using the existing session lock and ownership registry.
 import { randomUUID } from 'node:crypto';
 import { PiRpc } from './rpc.mjs';
-import { atomicJson } from './data.mjs';
+import { atomicJson } from './storage.mjs';
 import { ownerAlive, readClaim, registryTransaction, updateOwner, claimFile, assertNoOtherLiveOwner } from './attachments.mjs';
 
 function validate(request){

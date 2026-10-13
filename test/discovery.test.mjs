@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { loadSession, readSessionIdentity, discover } from '../src/data.mjs';
+import { hash } from '../src/storage.mjs';
 
 async function fixture(t) {
  const dir=await fs.mkdtemp('/tmp/pi-discovery-'),cwd=path.join(dir,'project');await fs.mkdir(cwd);
@@ -64,10 +65,32 @@ test('create freshly rejects a directory replaced by file or symlink',async t=>{
  assert.equal((await f.bridge.create({folder_id:'p',request_id:'link'})).reason,'EXECUTION_CWD_UNAVAILABLE');
  assert.equal((await fs.readdir(f.config.sessionRoots[0])).length,1);
 });
+test('identity discovery reads a small header prefix and still supports bounded longer headers',async t=>{
+ const f=await fixture(t),header=f.session.header,open=fs.open;let bytes=0,reads=0;
+ t.mock.method(fs,'open',async(file,...args)=>{
+  const handle=await open(file,...args);
+  if(file===f.session.file){
+   const read=handle.read.bind(handle);
+   t.mock.method(handle,'read',async(...args)=>{const result=await read(...args);bytes+=result.bytesRead;reads++;return result;});
+  }
+  return handle;
+ });
+ await fs.appendFile(f.session.file,'x'.repeat(128*1024)); // Body need not parse during discovery.
+ assert.deepEqual((await readSessionIdentity(f.session.file)).header,header);
+ assert.ok(bytes<=4096,`small header read ${bytes} bytes`);assert.equal(reads,1);
+ // A public control header may span chunks, including split UTF-8 characters.
+ const longer={...header,fixture:'漢😀'.repeat(2400)};
+ await fs.writeFile(f.session.file,JSON.stringify(longer)+'\n'+'x'.repeat(128*1024));
+ bytes=0;reads=0;
+ assert.deepEqual((await readSessionIdentity(f.session.file)).header,longer);
+ assert.ok(reads>1);assert.ok(bytes<=Buffer.byteLength(JSON.stringify(longer))+4096);
+ await fs.writeFile(f.session.file,JSON.stringify(header)); // A single-header file need not end in LF.
+ assert.deepEqual((await readSessionIdentity(f.session.file)).header,header);
+});
 test('stream parser preserves LF framing, exact revisions and validates header independently',async t=>{
  const f=await fixture(t);await fs.appendFile(f.session.file,JSON.stringify({type:'message',id:'u',parentId:null,message:{role:'user',content:'line\u2028paragraph\u2029ok'}})+'\n');
  const loaded=await loadSession(f.session.file);assert.equal(loaded.entries[0].message.content,'line\u2028paragraph\u2029ok');
- const {hash}=await import('../src/data.mjs');assert.equal(loaded.revision,hash(await fs.readFile(f.session.file,'utf8')));
+ assert.equal(loaded.revision,hash(await fs.readFile(f.session.file,'utf8')));
  await fs.writeFile(f.session.file,'{"type":"session","id":"oversized-header","cwd":"'+ 'x'.repeat(65536));
  await assert.rejects(readSessionIdentity(f.session.file),/INVALID_SESSION_HEADER/);assert.deepEqual(await discover(f.config),[]);
 });

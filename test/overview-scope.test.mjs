@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderRead, recordsFor, hash, cursorSignature } from '../src/data.mjs';
+import { renderRead, recordsFor, cursorSignature } from '../src/data.mjs';
+import { hash } from '../src/storage.mjs';
 import { OVERVIEW_EXTRACTOR_VERSION } from '../src/overview.mjs';
 const entries=Array.from({length:30},(_,index)=>({type:'message',id:`u${index}`,parentId:index?`u${index-1}`:null,message:{role:'user',content:`public instruction ${index} `+'x'.repeat(300)}}));
 const data={entries,leafId:'u29',revision:hash(entries)};

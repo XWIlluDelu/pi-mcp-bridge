@@ -1,7 +1,8 @@
 // Native Pi bash results, not a second shell executor.
 import path from 'node:path';
 import {Journal} from './journal.mjs';
-import {hash,textCursorOffset,textBoundary,textCursor,fitDecodedText} from './data.mjs';
+import { textCursorOffset, textBoundary, textCursor, fitDecodedText } from './data.mjs';
+import { hash } from './storage.mjs';
 const results=dir=>new Journal({stateDir:path.join(dir,'bash'),principal:'native-bash-results'});
 export function nativeBashResult(value){
  if(!value||typeof value.output!=='string'||typeof value.cancelled!=='boolean'||typeof value.truncated!=='boolean'||

@@ -157,9 +157,11 @@ Details and observed startup/preflight limits are in the handoff document.
 Returns discoverable opaque session IDs. Readable rows also include bounded
 native title, cwd, leaf and effective permissions; unreadable rows contain only
 the ID. Query searches readable title/cwd, never hidden metadata. Offset/limit
-paginate rows; without query, only that page's readable histories are parsed.
-Query matches are filtered from all readable histories before pagination.
-Creation-capable folders appear separately.
+paginate rows. Discovery reads bounded header chunks; without query, only the
+page's readable histories are parsed. A query scans until the page and one further
+match establish `next_offset`, or until readable histories are exhausted. A
+no-match query can still parse all readable histories. Creation-capable folders
+appear separately.
 
 ### read
 

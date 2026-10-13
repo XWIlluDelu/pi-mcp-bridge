@@ -6,7 +6,8 @@ import { activityObservation, rpcActivity } from './activity.mjs';
 import { readSchema, hasTextSelector, stopSchema, bashSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted } from './permissions.mjs';
-import { discover, opaqueId, renderRead, hash, syncDir, loadSavedSession, validateExecutionCwd, atomicJson } from './data.mjs';
+import { discover, renderRead, loadSavedSession, validateExecutionCwd } from './data.mjs';
+import { opaqueId, hash, syncDir, atomicJson } from './storage.mjs';
 import { stopReceipt, recoveredWithdrawal, withdrawalPage } from './stop-execution.mjs';
 import {bashOutputPage,recoveredBash} from './bash-execution.mjs';
 import { PiRpc, RuntimePool } from './rpc.mjs';
@@ -90,6 +91,9 @@ export class Bridge {
       const title = typeof name==='string' ? name.trim() || null : null;
       if (args.query && !JSON.stringify({title,cwd:s.header.cwd}).toLowerCase().includes(args.query.toLowerCase())) continue;
       rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),command:permitted(this.config,'command',s),bash:permitted(this.config,'bash',s),delete:permitted(this.config,'delete',s)}});
+      // One extra matching row establishes next_offset; later histories cannot
+      // affect this page. A no-match search still needs the full readable scan.
+      if(args.query&&rows.length>offset+limit)break;
     }
     return {sessions:args.query?rows.slice(offset,offset+limit):rows,
       next_offset:offset+limit < (args.query?rows.length:sessions.length) ? offset+limit:null,

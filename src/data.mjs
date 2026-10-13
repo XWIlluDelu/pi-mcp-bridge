@@ -1,25 +1,12 @@
 import fs from 'node:fs/promises';
 import { createReadStream, constants } from 'node:fs';
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
 import { overviewRecords, OVERVIEW_EXTRACTOR_VERSION } from './overview.mjs';
 import { activityObservation } from './activity.mjs';
 import { hasTextSelector, readSchema } from './tool-schemas.mjs';
-export const hash = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
-export const opaqueId = value => `ps_${hash(value).slice(0, 32)}`;
-export async function atomicJson(file, value) {
-  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const h = await fs.open(tmp, 'w', 0o600);
-  try { await h.writeFile(JSON.stringify(value, null, 2)); await h.sync(); } finally { await h.close(); }
-  await fs.rename(tmp, file);
-  await syncDir(path.dirname(file));
-}
-export async function syncDir(dir) {
-  const handle = await fs.open(dir,'r');
-  try { await handle.sync(); } finally { await handle.close(); }
-}
+import { hash, opaqueId } from './storage.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
 export async function assertSingleSessionFile(file, {allowMissing=false}={}) {
@@ -47,7 +34,8 @@ export async function readSessionIdentity(file) {
     const bytes = Buffer.alloc(65537);
     let length = 0;
     while (length < bytes.length) {
-      const {bytesRead} = await fd.read(bytes,length,bytes.length-length,null);
+      // Most headers fit in one small read; extend only while looking for LF.
+      const {bytesRead} = await fd.read(bytes,length,Math.min(4096,bytes.length-length),null);
       if (!bytesRead) break;
       length += bytesRead;
       if (bytes.subarray(0,length).includes(10)) break;

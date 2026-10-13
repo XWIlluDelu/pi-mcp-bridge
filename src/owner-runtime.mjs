@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { opaqueId } from './data.mjs';
+import { opaqueId } from './storage.mjs';
 import { privateDirectory } from './attachments.mjs';
 import { readOwnerConfig } from './owner-config.mjs';
 export function ownerSocket(config){

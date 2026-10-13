@@ -1,7 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { assertSingleSessionFile, readSessionIdentity, syncDir } from './data.mjs';
+import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
+import { syncDir } from './storage.mjs';
 
 async function privateTrashDirectory(dir, io) {
   await io.mkdir(dir, {recursive:true, mode:0o700});
