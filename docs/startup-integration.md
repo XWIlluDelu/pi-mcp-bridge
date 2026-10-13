@@ -1,74 +1,90 @@
 # Generic Pi startup integration
 
-Bridge uses Pi 1.1.0 public APIs through two paths: an owned RPC child, or an
-ordinary TUI/RPC process loaded with the companion. Existing SDK/RPC hosts can
-instead [reserve and publish their own binding](host-adapter.md).
+Bridge targets Pi 1.1.0 public APIs. It can own an RPC child or attach to an
+ordinary Pi process loaded with the companion.
 
-## Configuration and ownership
+## Choose a runtime path
 
-The launcher inherits native environment, settings, tools, authentication and
-resource discovery. Explicit `piRuntime.agentDir`, `inheritEnv`, `tools` and
-`piArgs` override their respective settings. Environment filtering does not
-isolate file-based credentials; offline tests use disposable profiles.
+| Path | Startup and ownership | Remote capabilities |
+| --- | --- | --- |
+| Bridge-owned RPC | An authorized send cold-resumes a saved session using native Pi configuration. Bridge owns the child and its stdin/stdout. | Read, send, status, stop, bash and confirmed-exit deletion, subject to grants. |
+| Ordinary Pi TUI/RPC companion | The owner loads the extension at startup. It registers the existing process with Bridge. | Read, send and status. RPC live release/delete and full stop/bash are unsupported. |
+| Existing SDK/RPC host | The host reserves before opening a writer, then publishes public API bindings. | Callback-dependent; see [host integration](host-adapter.md). |
 
-Ordinary Pi keeps its existing configuration and input lifecycle. Load the
-companion with the same private IPC directory as Bridge:
+There is one registered controller per writer. If a normal profile loads the
+companion inside a process already registered for the same native file/session
+by Bridge RPC or a host adapter, the companion leaves that claim and its
+lifecycle with the existing controller. Ordinary Pi still registers normally.
+A live owner with a missing endpoint blocks fallback cold resume.
+
+## Native configuration and installation
+
+The launcher inherits the owner's environment and native settings, tools,
+authentication and resource discovery. Explicit `piRuntime.agentDir`,
+`inheritEnv`, `tools` and `piArgs` override their respective settings.
+Filtering environment variables alone does not isolate file-based credentials;
+offline tests use disposable profiles.
+
+For an ordinary Pi process, use the same private IPC directory as Bridge:
+the configured `attachmentDir`, or `stateDir/ipc`.
 
 ```sh
 PI_MCP_ATTACH_DIR=/path/to/private/ipc \
   pi --session /path/to/session.jsonl -e /path/to/src/attach-extension.mjs
-# Add --mode rpc for an ordinary RPC process with its owner's stdin/stdout.
+# Add --mode rpc for an ordinary RPC process managed by its existing owner.
 ```
 
-Pi opens an initial `--session` file before loading extensions. For Bridge-owned targets, use [owner-local release/reset](runtime-handoff.md)
-before opening the file. Release persists a cold-resume restriction until reset;
-its idle observations and timed teardown have separate limits.
-A live but unreachable registered owner blocks fallback; socket loss does not
-release a writer. Generic host reservation must precede native session open.
+Only open a session with no existing writer. Pi opens an initial `--session`
+file before loading extensions. For a Bridge-owned target, use
+[owner-local handoff](runtime-handoff.md): `/bridge-join` starts from a fresh or
+different local session, or release explicitly before launching the target.
 
-An external owner caches its loaded adapter/renderer. Updating Bridge does not
-reload that owner. `OWNER_READ_REFRESH_REQUIRED` means its loaded code cannot
-honor a precise text selector; coordinate writer closure before reopening.
+Configuration and extension updates take effect at normal startup/reload.
+Updating the Bridge service alone does not replace code loaded in an external
+owner. `OWNER_READ_REFRESH_REQUIRED` means that owner's read implementation
+cannot satisfy the requested selector; ordinary reads may remain usable.
 
 ## Admission and settlement
 
-Owned RPC prompt ACKs report `started`, `queued` or `handled`. The companion's
-public `sendUserMessage` returns void, so its receipt reports `unknown/submitted`.
-Model completion is observed separately.
+Native RPC prompt ACKs report `started`, `queued` or `handled`. Because the
+companion's public `sendUserMessage` returns void, its receipt reports
+`unknown / submitted`. Observe subsequent session activity separately through
+status/context reads.
 
 `read(view:"status")` observes runtime state without loading transcript bodies.
-Settlement uses `{generation, sequence, observed_at, aborted}`; a replacement
-generation starts at zero. It is session-wide, not exclusive send completion or
-proof of current idle, and cannot clear an unresolved prompt ACK.
+Settlement records `{generation, sequence, observed_at, aborted}`, with replacement
+generations resetting sequence to zero. Settlement reflects session-wide turn
+completion rather than individual request attribution, and does not clear pending
+prompt ACKs.
 
-`after_settlement` and `wait_ms` (0–10000) poll for a later observation. Nonzero
-wait requires a baseline; an initial observation always runs. The deadline bounds polling; in-flight state/ownership
-I/O retains its own timeout. Results distinguish settlement, timeout, generation
-change and unavailable observation. Permissions, cancellation and genuine errors
-remain visible. Status also works in ordered batches.
+`after_settlement` and `wait_ms` (0–10000) poll for a new observation.
+Nonzero wait requires a baseline; an initial observation always runs. The deadline bounds polling, while an
+in-flight state/ownership observation retains its normal bounded I/O timeout.
+Results distinguish settlement, timeout, generation change and unavailable
+observation; permission revocation, cancellation and runtime errors remain visible.
 
-## External lifecycle
+## External process lifecycle
 
 An RPC extension's `ctx.shutdown()` sets a flag checked by a later command or
-settlement. It does not confirm exit. The companion therefore refuses RPC live
-delete/shutdown with `HOST_RELEASE_UNSUPPORTED`; Bridge disconnect leaves that
-owner running. Registration/storage failure retires access without requesting
-RPC shutdown. TUI release uses graceful native exit and waits for the exact owner.
+settlement; it does not confirm process exit. The companion therefore rejects
+RPC live deletion and direct socket shutdown with `HOST_RELEASE_UNSUPPORTED`.
+Bridge disconnect leaves the external owner running. In RPC mode, registration
+or storage failure retires access without requesting host shutdown. TUI release
+uses native graceful exit and waits for the owner to exit.
 
-Full stop requires native queue withdrawal and agent/bash cancellation. The
-ordinary companion lacks the required public APIs; capable SDK/RPC hosts provide
-the [stop callback](stop.md).
-
-[Native bash](bash.md) similarly requires a host callback and its own grant.
+Companion full stop/bash support is limited by public APIs, as described in
+[stop](stop.md) and [bash](bash.md). Existing SDK/RPC hosts can supply those
+operations through the generic bindings.
 
 ## Verification
 
 ```sh
-node --test test/startup-integration.test.mjs test/rpc-companion.test.mjs \
-  test/host-integration.test.mjs test/host-lifecycle.test.mjs test/native-startup.test.mjs
+node --test test/native-startup.test.mjs test/rpc-companion.test.mjs \
+  test/host-integration.test.mjs test/host-lifecycle.test.mjs
 ```
 
-Offline fixtures exercise native profile discovery, public RPC/SDK behavior,
-ordinary companion plus MCP read/send/status, generation replacement, permissions,
-receipt replay and unsupported external release. The native RPC bash probe tests
-Pi's own command path, not an additional companion capability.
+These offline fixtures exercise production code: native profile/tools and saved
+selection, installed companion/controller coexistence, startup/switch ordering,
+ordinary RPC plus MCP read/send/status, callback-based SDK/RPC hosts, generation
+replacement, permissions and owner retirement. They use synthetic sessions and
+providers. General batching behavior is documented in the [tool reference](../README.md#batch-and-receipts).

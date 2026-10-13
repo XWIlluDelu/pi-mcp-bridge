@@ -41,7 +41,15 @@ test('service preflight is read-only and refuses unsafe config or existing locks
  assert.deepEqual((await fs.readdir(f.dir)).sort(),['owner.json','project']);
  await fs.chmod(f.file,0o644);await assert.rejects(checkOwner(f.file),/OWNER_CONFIG_NOT_PRIVATE/);await fs.chmod(f.file,0o600);
  await fs.mkdir(f.config.stateDir,{mode:0o700});const lock=path.join(f.config.stateDir,'bridge.lock');await fs.writeFile(lock,'public stale fixture');await assert.rejects(checkOwner(f.file),/BRIDGE_LOCK_REQUIRES_OWNER_CHECK/);assert.equal(await fs.readFile(lock,'utf8'),'public stale fixture');await fs.unlink(lock);
- f.config.attachmentDir=path.join(f.dir,'ipc');await fs.mkdir(f.config.attachmentDir,{mode:0o700});await fs.writeFile(f.file,JSON.stringify(f.config));const registry=path.join(f.config.attachmentDir,'registry.lock');await fs.writeFile(registry,'public fixture');await assert.rejects(checkOwner(f.file),/REGISTRY_LOCK_REQUIRES_OWNER_CHECK/);assert.equal(await fs.readFile(registry,'utf8'),'public fixture');
+ for(const attachmentDir of [path.join(f.config.stateDir,'ipc'),path.join(f.dir,'ipc')]){
+  await fs.mkdir(attachmentDir,{mode:0o700});
+  if(attachmentDir===path.join(f.dir,'ipc'))f.config.attachmentDir=attachmentDir;
+  await fs.writeFile(f.file,JSON.stringify(f.config));
+  const registry=path.join(attachmentDir,'registry.lock');await fs.writeFile(registry,'public fixture');
+  await assert.rejects(checkOwner(f.file),/REGISTRY_LOCK_REQUIRES_OWNER_CHECK/);
+  assert.equal(await fs.readFile(registry,'utf8'),'public fixture');
+  await fs.unlink(registry);
+ }
 });
 test('user-service template parses with systemd without installing or starting a service',async t=>{
  try{await exec('systemd-analyze',['--version']);}catch(e){if(e.code==='ENOENT'){t.skip('systemd-analyze unavailable');return;}throw e;}

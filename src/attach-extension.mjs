@@ -6,11 +6,13 @@ import { randomUUID } from 'node:crypto';
 import { atomicJson, hash, renderRead, assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { activityObservation } from './activity.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import joinExtension from './join-extension.mjs';
 import { privateDirectory, processIdentity, ownerAlive, registryTransaction, readClaim, readOwnerRecord, claimFile, updateOwner, assertNoOtherLiveOwner, AttachmentFailure } from './attachments.mjs';
 
 export default function attachExtension(pi){
   const dir=process.env.PI_MCP_ATTACH_DIR;let active;
   if(!dir)return;
+  joinExtension(pi);
   async function closeServer(runtime){
     if(!runtime)return;
     runtime.ready=false;
@@ -48,7 +50,7 @@ export default function attachExtension(pi){
     if(active?.ready)await validateStorage(active);
   });
   pi.on('session_shutdown',async()=>{
-    const runtime=active;if(!runtime)return;
+    const runtime=active;active=undefined;if(!runtime)return;
     runtime.ready=false; // Retire captured callbacks before the first asynchronous lifecycle step.
     try {await updateOwner(dir,runtime.session,runtime.record,{phase:'transitioning'});}
     finally {await closeServer(runtime);}
@@ -64,7 +66,7 @@ export default function attachExtension(pi){
     const record={kind:ctx.mode==='tui'?'tui':'extension',mode:ctx.mode,file,sessionId:header.id,generation:randomUUID(),owner,phase:'starting'};
     record.socket=path.join(dir,`${owner.pid}-${record.generation.slice(0,8)}.sock`);
     let fileObserved;
-    await registryTransaction(dir,async()=>{
+    const registered=await registryTransaction(dir,async()=>{
       const observation={session,ctx,fileObserved:false};
       await validateStorage(observation);
       fileObserved=observation.fileObserved;
@@ -74,9 +76,13 @@ export default function attachExtension(pi){
       const old=await readClaim(dir,session);
       const sameProcess=old?.owner&&old.owner.pid===owner.pid&&old.owner.start===owner.start&&old.owner.boot===owner.boot;
       if(old&&await ownerAlive(old.owner)&&!sameProcess){if(ctx.mode==='tui')ctx.shutdown();throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');}
+      // An installed companion must not replace this writer's existing RPC/host
+      // controller. Its endpoint and lifecycle remain with that controller.
+      if(sameProcess&&['rpc','host'].includes(old.kind))return false;
       if(old?.noColdReacquire)record.noColdReacquire=true;
-      await atomicJson(claimFile(dir,session),record);
+      await atomicJson(claimFile(dir,session),record);return true;
     });
+    if(!registered)return;
     // Publish blocking ownership before socket setup or any later fallible initialization.
     if(Buffer.byteLength(record.socket)>100)throw new AttachmentFailure('ATTACHMENT_SOCKET_PATH_TOO_LONG');
     const connections=new Set();
@@ -98,12 +104,16 @@ export default function attachExtension(pi){
           if(request.op==='state')data={sessionFile:file,sessionId:header.id,isStreaming:!ctx.isIdle(),generation:record.generation,activity:activity()};
           else if(request.op==='read'){
             const entries=ctx.sessionManager.getEntries(),leafId=ctx.sessionManager.getLeafId();
-            const revisionInput={entries,leaf:leafId,generation:record.generation};
-            if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)throw new AttachmentFailure('SESSION_TOO_LARGE');
+            const revisionInput=JSON.stringify({entries,leaf:leafId,generation:record.generation});
+            if(Buffer.byteLength(revisionInput)>32*1024*1024)throw new AttachmentFailure('SESSION_TOO_LARGE');
             data=renderRead({entries,leafId,revision:hash(revisionInput),activity:activity()},args,{leafSource:'live',generation:record.generation});
           }else if(request.op==='send'){
             if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))throw new AttachmentFailure('INVALID_ATTACHED_SEND');
-            if(args.mode==='idle_only'&&!ctx.isIdle())data={status:'skipped',reason:'busy'};
+            // This command reaches owner-local control, outside MCP grants.
+            // Pi dispatches slash commands before input events, so refuse them
+            // at this remote admission boundary, including collision suffixes.
+            if(/^\/bridge-join(?::\d+)?(?:\s|$)/.test(args.text))data={status:'rejected',reason:'OWNER_LOCAL_COMMAND_REQUIRED'};
+            else if(args.mode==='idle_only'&&!ctx.isIdle())data={status:'skipped',reason:'busy'};
             else{
               const options={expandPromptTemplates:true};
               if(args.mode==='steer')options.deliverAs='steer';

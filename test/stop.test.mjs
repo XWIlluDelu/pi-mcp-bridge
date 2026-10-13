@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {Bridge} from '../src/bridge.mjs';
+import {PiRpc} from '../src/rpc.mjs';
 import {withdrawalCapture,requestRpcStop} from '../src/stop-execution.mjs';
 import {createSdkHostBinding,createRpcHostBinding} from '../src/host-bindings.mjs';
 import {reserveHostSession} from '../src/host-adapter.mjs';
@@ -26,8 +27,12 @@ async function fixture(t){
    stops++;await withdrawalCapture(bridge.pool.attachmentDir,saved,runtime.generation,recovery_id)({steering:['one'],followUp:['two']});
    return {acknowledgement:'native_ack',coverage:'agent_and_bash'};
  };
- t.after(async()=>{await bridge.close();await fs.rm(dir,{recursive:true,force:true});});
- return {bridge,config,runtime,saved,id:saved.id,spawned:()=>spawned,stops:()=>stops,dir};
+ const cleanup=[];
+ t.after(async()=>{
+   for(const close of cleanup.reverse())await close();
+   await bridge.close();await fs.rm(dir,{recursive:true,force:true});
+ });
+ return {bridge,config,runtime,saved,id:saved.id,spawned:()=>spawned,stops:()=>stops,dir,cleanup};
 }
 test('stop is independently authorized, live-only, replay-safe and retains session/process',async t=>{
  const f=await fixture(t);
@@ -49,9 +54,10 @@ test('stop is independently authorized, live-only, replay-safe and retains sessi
  assert.throws(()=>validateGrants([{folder:f.saved.cwd,command:'yes'}]),/INVALID_OWNER_CONFIG/);
 });
 test('stop pages complete native joined text without truncation and replays after Bridge restart',async t=>{
- const f=await fixture(t),text=('Unicode 😀 quote " slash \\ newline\n').repeat(2500),tail='later prompt';
+ const f=await fixture(t),text=('Unicode 😀 quote " slash \\ newline\n').repeat(2500),tail='later prompt';let stops=0;
  f.bridge.pool.instances.set(f.id,f.runtime);
  f.runtime.stopExecution=async({recovery_id})=>{
+   stops++;
    await withdrawalCapture(f.bridge.pool.attachmentDir,f.saved,f.runtime.generation,recovery_id)({steering:[text],followUp:[tail]});
    return {acknowledgement:'native_ack',coverage:'agent_and_bash'};
  };
@@ -63,7 +69,11 @@ test('stop pages complete native joined text without truncation and replays afte
  }while(cursor);
  assert.equal(out,text+'\n\n'+tail);
  const first=await f.bridge.stop(args);
- await assert.rejects(f.bridge.stop({...args,request_id:'wrong',cursor:first.next_cursor}),/RECEIPT_NOT_FOUND/);
+ for(const cursor of [first.next_cursor,'']){
+  await assert.rejects(f.bridge.stop({...args,request_id:'wrong',cursor}),/RECEIPT_NOT_FOUND/);
+  assert.equal(stops,1,'Continuation cannot issue another cancellation');
+  assert.equal(await f.bridge.journal.get('wrong'),null);
+ }
  await f.bridge.stop({...args,request_id:'other'});
  await assert.rejects(f.bridge.stop({...args,request_id:'other',cursor:first.next_cursor}),/STALE_CURSOR/);
  const broken=JSON.parse(Buffer.from(first.next_cursor,'base64url'));broken.revision='stale';
@@ -73,6 +83,7 @@ test('stop pages complete native joined text without truncation and replays afte
 });
 test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK, never retries control',async t=>{
  const f=await fixture(t),entered=gate(),finish=gate();f.bridge.pool.instances.set(f.id,f.runtime);
+ f.cleanup.push(()=>finish.resolve());
  let calls=0;
  f.runtime.stopExecution=async({recovery_id})=>{
    calls++;await withdrawalCapture(f.bridge.pool.attachmentDir,f.saved,f.runtime.generation,recovery_id)({steering:['recover me'],followUp:[]});
@@ -83,6 +94,107 @@ test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK,
  finish.resolve();const receipt=await pending;
  assert.equal(receipt.status,'unknown');assert.equal(receipt.withdrawn_text,'recover me');
  assert.deepEqual(await f.bridge.stop(args),receipt);assert.equal(calls,1);assert.equal(f.runtime.alive,true);
+});
+test('stop rejects sends arriving behind an earlier prompt lock instead of deferring them past stop',async t=>{
+ const f=await fixture(t),admitted=gate(),finishPrompt=gate(),stopping=gate(),finishStop=gate(),queued=gate();
+ f.cleanup.push(()=>{finishPrompt.resolve();finishStop.resolve();});
+ f.bridge.pool.instances.set(f.id,f.runtime);
+ let sends=0;
+ f.runtime.command=async()=>{if(++sends===1){admitted.resolve();await finishPrompt.promise;}return {disposition:'started'};};
+ const stop=f.runtime.stopExecution;
+ f.runtime.stopExecution=async args=>{stopping.resolve();await finishStop.promise;return stop(args);};
+ const lock=f.bridge.mutationLock;
+ t.mock.method(f.bridge,'mutationLock',function(id,action,...rest){
+   const result=lock.call(this,id,action,...rest);
+   if(action==='send'&&sends===1)queued.resolve();
+   return result;
+ });
+ const first=f.bridge.send({session_id:f.id,request_id:'first',text:'already entering Pi'});
+ await admitted.promise;
+ const cancel=f.bridge.stop({session_id:f.id,request_id:'stop'});await stopping.promise;
+ const later=f.bridge.send({session_id:f.id,request_id:'later',text:'must not run after stop'});
+ await queued.promise;finishStop.resolve();await cancel;finishPrompt.resolve();await first;
+ const refusal=await later;assert.equal(refusal.reason,'STOP_IN_PROGRESS');assert.equal(sends,1);
+ assert.deepEqual(await f.bridge.send({session_id:f.id,request_id:'later'}),refusal);assert.equal(sends,1);
+ assert.equal((await f.bridge.send({session_id:f.id,request_id:'after-stop',text:'explicit new prompt'})).status,'accepted');
+ assert.equal(sends,2);
+});
+test('input arriving during stop stays rejected when receipt persistence outlasts cancellation',async t=>{
+ const f=await fixture(t),stopping=gate(),finishStop=gate(),writing=gate(),finishWrite=gate();
+ f.cleanup.push(()=>{finishStop.resolve();finishWrite.resolve();});
+ f.bridge.pool.instances.set(f.id,f.runtime);
+ let sends=0;f.runtime.command=async()=>{sends++;return {disposition:'started'};};
+ const stop=f.runtime.stopExecution;
+ f.runtime.stopExecution=async args=>{stopping.resolve();await finishStop.promise;return stop(args);};
+ const put=f.bridge.journal.put.bind(f.bridge.journal);
+ t.mock.method(f.bridge.journal,'put',async(id,value)=>{
+   if(id==='during-stop'){writing.resolve();await finishWrite.promise;}
+   return put(id,value);
+ });
+ const cancel=f.bridge.stop({session_id:f.id,request_id:'stop'});await stopping.promise;
+ const input=f.bridge.send({session_id:f.id,request_id:'during-stop',text:'must stay with caller'});
+ await writing.promise;finishStop.resolve();await cancel;finishWrite.resolve();
+ const result=await input;assert.equal(result.reason,'STOP_IN_PROGRESS');assert.equal(sends,0);
+ assert.deepEqual(await f.bridge.send({session_id:f.id,request_id:'during-stop'}),result);
+ assert.equal((await f.bridge.send({session_id:f.id,request_id:'after-stop',text:'new input'})).status,'accepted');
+ assert.equal(sends,1);
+});
+for(const op of ['send','bash'])for(const stopFirst of [false,true])
+test(`owned ${op} refuses delayed dispatch ${stopFirst?'after':'during'} stop`,async t=>{
+ const f=await fixture(t),observing=gate(),finishState=gate(),stopping=gate(),finishStop=gate();
+ f.cleanup.push(()=>{finishState.resolve();finishStop.resolve();});
+ f.config.grants[0].bash=true;f.bridge.pool.instances.set(f.id,f.runtime);
+ Object.assign(f.runtime,{command:PiRpc.prototype.command,executeBash:PiRpc.prototype.executeBash,
+   config:{attachmentDir:f.bridge.pool.attachmentDir},session:f.saved});
+ let reads=0,dispatches=0;
+ f.runtime.state=async()=>{
+   if(++reads===1){observing.resolve();await finishState.promise;}
+   return {sessionFile:f.saved.file,sessionId:f.saved.header.id,isStreaming:false};
+ };
+ f.runtime.dispatch=async command=>{
+   if(command.type==='get_state')return f.runtime.state();
+   dispatches++;return op==='send'?{disposition:'started'}:{output:'done',exitCode:0,cancelled:false,truncated:false};
+ };
+ const stop=f.runtime.stopExecution;
+ f.runtime.stopExecution=async args=>{stopping.resolve();await finishStop.promise;return stop(args);};
+ const args={session_id:f.id,request_id:'pending',...(op==='send'?{text:'not dispatched'}:{command:'not dispatched'})};
+ const input=f.bridge[op](args);await observing.promise;
+ const cancel=f.bridge.stop({session_id:f.id,request_id:'stop'});await stopping.promise;
+ if(stopFirst){finishStop.resolve();await cancel;}
+ finishState.resolve();const result=await input;finishStop.resolve();await cancel;
+ assert.equal(result.reason,'STOP_IN_PROGRESS');assert.equal(dispatches,0);
+ assert.deepEqual(await f.bridge[op]({session_id:f.id,request_id:'pending'}),result);
+ assert.equal((await f.bridge[op]({...args,request_id:'after-stop'})).status,'accepted');
+ assert.equal(dispatches,1);
+});
+for(const op of ['send','bash'])for(const stopFirst of [false,true])
+test(`host ${op} refuses delayed dispatch ${stopFirst?'after':'during'} stop`,async t=>{
+ const f=await fixture(t),observing=gate(),finishState=gate(),stopping=gate(),finishStop=gate();
+ f.config.grants[0].bash=true;
+ const controller=await reserveHostSession({attachmentDir:f.bridge.pool.attachmentDir,session:f.saved});
+ f.cleanup.push(()=>controller.close(),()=>{finishState.resolve();finishStop.resolve();});
+ let dispatches=0;
+ const state={sessionFile:f.saved.file,sessionId:f.saved.header.id,isIdle:true,isStreaming:false,isCompacting:false};
+ const binding=createRpcHostBinding({
+   getState:async()=>{observing.resolve();await finishState.promise;return state;},
+   prompt:async()=>{dispatches++;return 'started';},
+   bash:async()=>{dispatches++;return {output:'done',exitCode:0,cancelled:false,truncated:false};},
+   clearQueue:async()=>({steering:[],followUp:[]}),abort:async()=>{},abortBash:async()=>{}
+ });
+ await controller.ready({state:()=>state,snapshot:()=>({...state,entries:[],leafId:null}),submit:binding.submit,bash:binding.bash,
+   stop:async({onWithdraw})=>{
+     await onWithdraw({steering:[],followUp:[]});stopping.resolve();await finishStop.promise;
+     return {acknowledgement:'native_ack',coverage:'agent_and_bash'};
+   }});
+ const args={session_id:f.id,request_id:'pending',...(op==='send'?{text:'not dispatched',mode:'idle_only'}:{command:'not dispatched'})};
+ const input=f.bridge[op](args);await observing.promise;
+ const cancel=f.bridge.stop({session_id:f.id,request_id:'stop'});await stopping.promise;
+ if(stopFirst){finishStop.resolve();await cancel;}
+ finishState.resolve();const result=await input;finishStop.resolve();await cancel;
+ assert.equal(result.reason,'STOP_IN_PROGRESS');assert.equal(dispatches,0);
+ assert.deepEqual(await f.bridge[op]({session_id:f.id,request_id:'pending'}),result);
+ assert.equal((await f.bridge[op]({...args,request_id:'after-stop'})).status,'accepted');
+ assert.equal(dispatches,1);
 });
 test('native RPC withdrawal and both cancellation requests are submitted before waiting; settling inputs recovered',async()=>{
  const calls=[],finish=gate(),snapshots=[];
@@ -111,13 +223,13 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
 });
 test('generic host IPC and actual MCP return joined editor recovery; missing callback is explicitly unsupported',async t=>{
  const f=await fixture(t),controller=await reserveHostSession({attachmentDir:f.bridge.pool.attachmentDir,session:f.saved});
- t.after(()=>controller.close());
+ f.cleanup.push(()=>controller.close());
  const state=()=>({sessionFile:f.saved.file,sessionId:f.saved.header.id,isIdle:true});
  const callbacks={state,snapshot:()=>({...state(),entries:[],leafId:null}),submit:async()=>({status:'accepted'})};
  await controller.ready(callbacks);
  const client=new Client({name:'stop-test',version:'1'}),server=makeServer(f.bridge),[a,b]=InMemoryTransport.createLinkedPair();
  await server.connect(a);await client.connect(b);
- t.after(async()=>{await client.close();await server.close();});
+ f.cleanup.push(async()=>{await client.close();await server.close();});
  const tools=await client.listTools();assert.ok(tools.tools.find(tool=>tool.name==='stop'));assert.equal(tools.tools.length,8);
  const call=async(request_id,extra={})=>(await client.callTool({name:'stop',arguments:{session_id:f.id,request_id,...extra}})).structuredContent;
  assert.equal((await call('unsupported')).reason,'STOP_UNSUPPORTED');assert.equal(f.spawned(),0);
@@ -128,7 +240,7 @@ test('generic host IPC and actual MCP return joined editor recovery; missing cal
  const result=await call('host-stop');assert.equal(result.withdrawn_text,'first\n\nsecond\n\nexisting draft');
  assert.equal(result.includes_editor_draft,true);assert.equal(result.acknowledgement,'requested');
  assert.equal(result.completion,'not_tracked');assert.equal(f.spawned(),0);
- const finished=gate();let calls=0;t.after(()=>finished.resolve());
+ const finished=gate();let calls=0;f.cleanup.push(()=>finished.resolve());
  callbacks.stop=async({onWithdraw})=>{
    calls++;await onWithdraw({steering:['withdrawn before socket timeout'],followUp:[]});
    await finished.promise;return {acknowledgement:'native_ack',coverage:'agent_and_bash'};

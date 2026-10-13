@@ -17,7 +17,9 @@ export async function checkOwner(file){
  // Execution directories are checked on create/cold resume; unavailable
  // projects must not prevent authorized saved-history access.
  if(await statOrMissing(path.join(config.stateDir,'bridge.lock')))fail('BRIDGE_LOCK_REQUIRES_OWNER_CHECK');
- if(config.attachmentDir){await storage(config.attachmentDir);if(await statOrMissing(path.join(config.attachmentDir,'registry.lock')))fail('REGISTRY_LOCK_REQUIRES_OWNER_CHECK');}
+ const attachmentDir=config.attachmentDir??path.join(config.stateDir,'ipc');
+ await storage(attachmentDir);
+ if(await statOrMissing(path.join(attachmentDir,'registry.lock')))fail('REGISTRY_LOCK_REQUIRES_OWNER_CHECK');
  return {owner_config_checked:true,network_checked:false,client_checked:false,model_checked:false};
 }
 if(process.argv[1]&&import.meta.url===pathToFileURL(process.argv[1]).href){

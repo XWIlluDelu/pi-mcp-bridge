@@ -21,7 +21,7 @@ const text=entry=>entry.type==='message'&&entry.message?.role==='user'
 test('ordinary RPC plus remote MCP shares one extension owner, settlement, permissions and generation', {timeout:30000},async t=>{
   const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-companion-')),cwd=path.join(dir,'project'),agentDir=path.join(dir,'agent');
   await fs.mkdir(cwd);await fs.mkdir(agentDir);
-  await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarm:'off',compaction:{enabled:false},retry:{enabled:false}}));
+  await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({cacheWarming:'off',compaction:{enabled:false},retry:{enabled:false}}));
   const config={principal:'rpc-companion',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,command:true,bash:true,delete:true,new_session:true}],attachmentDir:path.join(dir,'ipc')};
   const configFile=path.join(dir,'owner.json');await fs.writeFile(configFile,JSON.stringify(config));
   const setup=await new Bridge(config).init(),made=await setup.create({folder_id:'project',request_id:'seed'}),saved=await setup.session(made.session_id);

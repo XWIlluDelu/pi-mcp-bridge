@@ -45,7 +45,8 @@ export class Journal {
       diagnostics.emit('receipt.replay',{op,mutation_ref:diagnosticRef(id),status:prior.receipt.status});
       return prior.receipt;
     }
-    if (body === undefined) throw new Error('RECEIPT_NOT_FOUND');
+    // Omitting the action is a receipt-only lookup with optional body validation.
+    if (body === undefined || action === undefined) throw new Error('RECEIPT_NOT_FOUND');
     const base = {key,fingerprint,receipt:{request_id:id,operation:op,status:'unknown'}};
     // Serialize the whole transition, not only writes. A terminal receipt is
     // observable only after its own snapshot has reached durable storage.

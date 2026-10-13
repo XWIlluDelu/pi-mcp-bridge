@@ -2,11 +2,11 @@
 
 `bash` is a separate remote entry point for native terminal `!command`,
 not a prompt sent to a model. `send` retains normal prompt semantics.
-There is no second executor, environment profile, cwd override or shell configuration.
+Execution uses Pi's existing environment, cwd and shell configuration.
 
 ## Independent owner switch
 
-Direct bash is opt-in and defaults to deny. Add an explicit `bash:true` grant
+Direct bash is opt-in/default-denied. Add an explicit `bash:true` project/session grant
 only when desired. `bash:false` blocks it, `null` inherits, and an absent grant
 denies by the existing permission resolver. The human permission menu labels it
 **Direct bash**.
@@ -36,20 +36,21 @@ Explicit release restrictions still block cold reacquisition.
 Owned Pi and RPC bindings invoke native `bash`, including `user_bash`
 extensions and native `bashExecution` recording. SDK bindings use public
 `extensionRunner.emitUserBash`, `executeBash`, and `recordBashResult` with
-the same hook/result/operations handling. Native cwd, shell path, command prefix,
-environment, cancellation and output sanitization remain Pi's responsibility.
-Arbitrary asynchronous extension preflight/hooks have no universal native
-cancellation barrier; this tool does not add one. The recorded command/result
-enters native history/context exactly as `!`;
-this tool does not add `!!` exclusion behavior or fabricate a prompt.
+the same hook/result/operations handling. Pi handles cwd, shell path, command
+prefix, environment, native cancellation and output sanitization. Commands record
+as `!`; `!!` exclusion is outside this API. Extensions must coordinate cancellation
+of their own asynchronous preflight and background work.
 
 Exit code 7 is a completed native result, not transport rejection.
 `cancelled:true` reports native cancellation; the process and session survive.
-`accepted/completion:native_bash_result` means the native result was obtained,
-not that the command's side effects succeeded or were rolled back.
+`accepted/completion:native_bash_result` confirms Pi returned a native result.
+Use its exit code and cancellation fields to interpret execution; already
+executed effects remain.
 
 Use a stable request ID. Repeat it without `command` to recover its private
-receipt/output. A different command under that ID conflicts. ACK uncertainty
+receipt/output. Cursor requests only look up an existing receipt, even if
+`command` is repeated; a missing receipt returns `RECEIPT_NOT_FOUND` without
+execution. A different command under that ID conflicts. ACK uncertainty
 never reruns a command; an owned RPC late ACK can persist the eventual result.
 The generic host stores results before flushing its IPC ACK, making captured
 output recoverable even if the socket disappears.
@@ -58,16 +59,18 @@ output recoverable even if the socket disappears.
 timeout or SIGKILL. The command may continue after `unknown`; use the existing
 stop control when authorized. Simultaneous Bridge bash admissions are rejected
 while a request is awaiting its result, not placed into a hidden command queue.
+A stop also invalidates commands still awaiting native dispatch, even if the
+stop completes before their state/preparation checks return.
 
 ## Output budgets
 
-`output` is Pi's returned sanitized combined stdout/stderr. Pi may itself
-truncate it: `truncated:true` and `fullOutputPath` preserve that native fact;
-Bridge does not auto-read the spill file or promise unlimited shell output.
+`output` contains Pi's sanitized combined stdout/stderr. Pi can truncate the
+inline result; `truncated` and any `fullOutputPath` are preserved. Bridge pages
+that returned result without opening spill files.
 
 Bridge pagination never silently truncates the **returned native result**.
-Default/maximum `max_chars` is 12,000/32,768 serialized
-`{"output":"..."}` characters, excluding receipt metadata.
+Default/maximum `max_chars` is 12,000/32,768 serialized UTF-16 units in
+`{"output":"..."}`, excluding receipt metadata.
 Follow `next_cursor` with the same session/request ID until
 `output_complete:true`, concatenating `output`. Offsets count decoded UTF-16
 code units without splitting surrogate pairs. Cursor binding includes the
@@ -86,12 +89,11 @@ callback, keeping direct commands cancellable. SDK/RPC bindings supply both.
 As with other host callbacks, the owner coordinates its own additional queues
 and preparation; this is not universal process arbitration.
 
-The ordinary companion and old hosts without this seam return
+The ordinary companion and hosts without this seam return
 `BASH_UNSUPPORTED`, with no execution and no second writer. Public extension
 `pi.exec` is not substituted: it is not the native session bash recording/
 Escape cancellation path.
 
-Tests use only disposable offline RPC/SDK sessions and synthetic owner IPC:
-native hooks/recording, no model prompt, separate grants, backend deny,
-paged/replayed output, nonzero exits, lost ACK recovery, direct-command stop
-and subsequent prompt continuation.
+Offline test suites verify: native hooks and recording, independent grants and
+backend denial, paged output and replay, nonzero exit codes, lost ACK recovery,
+stop cancellation, and subsequent prompt continuation.

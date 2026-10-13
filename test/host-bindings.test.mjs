@@ -71,3 +71,18 @@ test('release requires explicit host confirmation and waits tracked dispatched w
  const unconfirmed=createSdkHostBinding(sdk(()=>{}),{release:async()=>({})});
  await assert.rejects(unconfirmed.release(),/HOST_RELEASE_UNCONFIRMED/);
 });
+
+test('SDK handled bash is recorded after stop; only fallback execution rechecks admission',async()=>{
+ for(const handled of [true,false]){
+  let stopping=false,recorded=0,captured=0;
+  const result={output:'already executed by native hook',exitCode:0,cancelled:false,truncated:false};
+  const session={sessionFile:'/synthetic/native.jsonl',sessionId:'native',sessionManager:{getCwd:()=>'/synthetic'},
+   clearQueue:()=>({steering:[],followUp:[]}),abort:async()=>{},abortBash:()=>{},
+   extensionRunner:{emitUserBash:async()=>{stopping=true;return handled?{result}:{};}},
+   recordBashResult:()=>{recorded++;},executeBash:()=>assert.fail('stop forbids fallback execution')};
+  const work=createSdkHostBinding(session).bash({command:'fixture',sessionFile:session.sessionFile,sessionId:session.sessionId,
+   beforeDispatch:()=>{if(stopping)throw new Error('STOP_IN_PROGRESS');},onResult:async value=>{assert.deepEqual(value,{...result,fullOutputPath:null});captured++;}});
+  if(handled){assert.equal((await work).completed,true);assert.equal(recorded,1);assert.equal(captured,1);}
+  else{await assert.rejects(work,/STOP_IN_PROGRESS/);assert.equal(recorded,0);assert.equal(captured,0);}
+ }
+});

@@ -28,3 +28,15 @@ test('owned bash rejects misbound native identity and preserves late native resu
  rpc.receiveResponse({type:'response',id:'bash-ack',command:'abort_bash',success:true},rpc.generation);assert.equal(rpc.pending.size,1);
  rpc.receiveResponse({type:'response',id:'bash-ack',command:'bash',success:true,data:result},rpc.generation);await ack.promise;assert.equal(rpc.pending.size,0);
 });
+
+test('native dispatch fences are definite refusals, not uncertain bash execution',async t=>{
+ const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-bash-fence-'));t.after(()=>fs.rm(dir,{recursive:true,force:true}));
+ const session={file:'/synthetic/session.jsonl',header:{id:'native'}},rpc=new PiRpc({attachmentDir:dir},session);
+ rpc.alive=true;rpc.child={stdin:{write:()=>assert.fail('fenced command must not be written')}};
+ const dispatch=rpc.dispatch.bind(rpc);
+ rpc.dispatch=(command,...args)=>command.type==='get_state'?Promise.resolve({sessionFile:session.file,sessionId:session.header.id}):dispatch(command,...args);
+ for(const code of ['HANDOFF_PENDING','RUNTIME_SHUTTING_DOWN']){
+  rpc.handoffPending=code==='HANDOFF_PENDING';rpc.gracefulExitPromise=code==='RUNTIME_SHUTTING_DOWN'?Promise.resolve():null;
+  await assert.rejects(rpc.executeBash({command:'not dispatched',recovery_id:'b'.repeat(64)}),error=>error.code===code&&!error.uncertain);
+ }
+});

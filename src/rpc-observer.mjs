@@ -8,10 +8,11 @@ export default function rpcObserver(pi){
   // Keep uncertainty across factory replacement in the same owned process.
   const key=Symbol.for('pi-mcp-bridge.rpc-observer.preflight');
   const preflight=globalThis[key]?.generation===generation?globalThis[key]
-    :(globalThis[key]={generation,preparingUnconfirmed:false,overlapUnconfirmed:false});
+    :(globalThis[key]={generation,preparingUnconfirmed:false,overlapUnconfirmed:false,nonRpcInputSeen:false});
   // ctx.isIdle() omits prompt preflight. Settlement has no input identity;
   // once seen inputs overlap, it cannot establish which preparation finished.
-  pi.on('input',()=>{
+  pi.on('input',event=>{
+    if(event.source!=='rpc')preflight.nonRpcInputSeen=true;
     if(preflight.preparingUnconfirmed)preflight.overlapUnconfirmed=true;
     preflight.preparingUnconfirmed=true;
   });
@@ -31,7 +32,7 @@ export default function rpcObserver(pi){
           const request=JSON.parse(body.slice(0,body.indexOf('\n')));
           if(!context||request.op!=='state'||request.generation!==generation||
              request.file!==context.sessionManager.getSessionFile()||request.sessionId!==context.sessionManager.getSessionId())throw new Error('RUNTIME_SESSION_CHANGED');
-          result={data:{isIdle:context.isIdle(),hasPendingMessages:context.hasPendingMessages(),preparingUnconfirmed:preflight.preparingUnconfirmed}};
+          result={data:{isIdle:context.isIdle(),hasPendingMessages:context.hasPendingMessages(),preparingUnconfirmed:preflight.preparingUnconfirmed,nonRpcInputSeen:preflight.nonRpcInputSeen}};
         }catch(error){result={error:error.message};}
         connection.end(JSON.stringify({generation,...result})+'\n');
       });

@@ -1,7 +1,7 @@
 // Native cancellation and recoverable withdrawal, never process teardown.
 import { Journal } from './journal.mjs';
 import path from 'node:path';
-import { hash, cursorSignature, textCursor, fitDecodedText } from './data.mjs';
+import { hash, textCursorOffset, textBoundary, textCursor, fitDecodedText } from './data.mjs';
 
 const withdrawals=dir=>new Journal({stateDir:path.join(dir,'stop'),principal:'withdrawn-inputs'});
 export function withdrawalCapture(dir,session,generation,id) {
@@ -36,14 +36,8 @@ export async function recoveredWithdrawal(dir,session,generation,id) {
 export function withdrawalPage(receipt,record,args) {
   const binding={session_id:args.session_id,view:'stop_withdrawn',entry_id:args.request_id,message_index:0};
   const revision=hash({generation:record.generation,text:record.text,includesEditorDraft:record.includesEditorDraft});
-  let offset=0;
-  if(args.cursor){
-    let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
-    if(cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(binding)||cursor.revision!==revision||cursor.leaf_id!==null)throw new Error('STALE_CURSOR');
-    offset=cursor.offset;
-    if(!Number.isSafeInteger(offset)||offset<0||offset>record.text.length||
-      (offset>0&&/[\uD800-\uDBFF]/.test(record.text[offset-1])&&/[\uDC00-\uDFFF]/.test(record.text[offset])))throw new Error('INVALID_CURSOR');
-  }
+  const offset=textCursorOffset({...binding,cursor:args.cursor},revision,null);
+  if(offset>record.text.length||!textBoundary(record.text,offset))throw new Error('INVALID_CURSOR');
   const rest=record.text.slice(offset),units=fitDecodedText(rest,args.max_chars??12000,text=>({withdrawn_text:text}));
   if(rest&&!units)throw new Error('WITHDRAWAL_BUDGET_TOO_SMALL');
   const end=offset+units;

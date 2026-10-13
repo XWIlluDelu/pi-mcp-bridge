@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Bridge } from '../src/bridge.mjs';
-import { AttachedRuntime, readClaim, reserveOwner, updateOwner, releaseOwner, processIdentity, ownerAlive, privateDirectory, waitOwnerExit } from '../src/attachments.mjs';
+import { AttachedRuntime, readClaim, reserveOwner, updateOwner, releaseOwner, ownerAlive, privateDirectory, waitOwnerExit } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 import { operationSchemas } from '../src/tool-schemas.mjs';
 const base=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -106,7 +106,9 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
    const result=await runtime.send({text:'public fixture',mode});assert.equal(result.status,'unknown');assert.equal(result.dispatch,'submitted');assert.equal(result.reason,'PI_ACCEPTANCE_UNOBSERVABLE');
   }
   assert.deepEqual(calls.map(x=>x.options),[{expandPromptTemplates:true},{expandPromptTemplates:true},{expandPromptTemplates:true,deliverAs:'steer'},{expandPromptTemplates:true,deliverAs:'followUp'}]);
-  idle=false;assert.equal((await runtime.send({text:'compacting',mode:'idle_only'})).status,'skipped');assert.equal(calls.length,4);
+  await assert.rejects(runtime.send({text:'fenced-before-socket-write',beforeDispatch:()=>{throw new Error('STOP_IN_PROGRESS');}}),error=>error.message==='STOP_IN_PROGRESS'&&!error.uncertain);
+ assert.equal(calls.length,4);
+ idle=false;assert.equal((await runtime.send({text:'compacting',mode:'idle_only'})).status,'skipped');assert.equal(calls.length,4);
   const escaped={session_id:f.id,request_id:'escaped',text:'\0'.repeat(100000),mode:'native'};
   assert.equal(operationSchemas.send.safeParse(escaped).success,true);
   assert.equal((await runtime.send(escaped)).dispatch,'submitted');assert.equal(calls.at(-1).text,escaped.text);

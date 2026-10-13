@@ -21,7 +21,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
   owner??=await processIdentity();
   if(!owner||!await ownerAlive(owner))fail('PROCESS_IDENTITY_UNAVAILABLE');
   const record=await reserveOwner(attachmentDir,target,'host',owner);
-  let callbacks,server,ready=false,closed=false,stopping=false,bashing=false,releasing,closing;
+  let callbacks,server,ready=false,closed=false,stopping=false,stopSequence=0,bashing=false,releasing,closing;
   const sockets=new Set(),operations=new Set();
   async function identity(value){
     if(value!==undefined&&(value.sessionFile!==target.file||value.sessionId!==target.header.id))fail('RUNTIME_SESSION_CHANGED');
@@ -60,9 +60,14 @@ export async function reserveHostSession({attachmentDir,session,owner}){
     if(!ready||closed||request?.generation!==record.generation||request.file!==target.file||request.sessionId!==target.header.id)fail('RUNTIME_SESSION_CHANGED');
   }
   async function operate(request){
+    const admittedAt=stopSequence,stoppedAtEntry=stopping;
     const observed=await state(),args=request.body??{};
     const pendingMessageCount=Number.isSafeInteger(observed.pendingMessageCount)&&observed.pendingMessageCount>=0?observed.pendingMessageCount:null;
     let data;
+    const beforeDispatch=()=>{
+      if(stoppedAtEntry||stopping||admittedAt!==stopSequence)fail('STOP_IN_PROGRESS');
+      if(!ready||closed)fail('RUNTIME_SESSION_CHANGED');
+    };
     if(request.op==='state')data={sessionFile:target.file,sessionId:target.header.id,generation:record.generation,
       isIdle:typeof observed.isIdle==='boolean'?observed.isIdle:null,isStreaming:typeof observed.isStreaming==='boolean'?observed.isStreaming:null,
       isCompacting:typeof observed.isCompacting==='boolean'?observed.isCompacting:null,pendingMessageCount};
@@ -70,26 +75,26 @@ export async function reserveHostSession({attachmentDir,session,owner}){
       const snapshot=structuredClone(await callbacks.snapshot());await identity(snapshot);
       if(!Array.isArray(snapshot?.entries)||!snapshot.entries.every(entry=>typeof entry?.id==='string'&&entry.id.length<=128)||
         !(snapshot.leafId===null||typeof snapshot.leafId==='string'&&snapshot.leafId.length<=128))fail('INVALID_HOST_SNAPSHOT');
-      const revisionInput={entries:snapshot.entries,leaf:snapshot.leafId,generation:record.generation};
-      if(Buffer.byteLength(JSON.stringify(revisionInput))>32*1024*1024)fail('SESSION_TOO_LARGE');
+      const revisionInput=JSON.stringify({entries:snapshot.entries,leaf:snapshot.leafId,generation:record.generation});
+      if(Buffer.byteLength(revisionInput)>32*1024*1024)fail('SESSION_TOO_LARGE');
       const activity=activityObservation('host_context',{idle:observed.isIdle,streaming:observed.isStreaming,compacting:observed.isCompacting,
         count:pendingMessageCount,pending:pendingMessageCount===null?null:pendingMessageCount>0});
       data=renderRead({entries:snapshot.entries,leafId:snapshot.leafId,revision:hash(revisionInput),activity},args,{leafSource:'live',generation:record.generation});
     }else if(request.op==='send'){
-      if(stopping)fail('STOP_IN_PROGRESS');
+      beforeDispatch();
       if(typeof args.text!=='string'||!args.text.length||args.text.length>100000||!['native','idle_only','steer','queue'].includes(args.mode))fail('INVALID_ATTACHED_SEND');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
-      data=receipt(await callbacks.submit({text:args.text,mode:args.mode}));
+      data=receipt(await callbacks.submit({text:args.text,mode:args.mode,beforeDispatch}));
     }else if(request.op==='bash'){
       if(typeof callbacks.bash!=='function'||typeof callbacks.stop!=='function')fail('BASH_UNSUPPORTED');
       if(typeof args.command!=='string'||!args.command.length||args.command.length>100000)fail('INVALID_ATTACHED_BASH');
-      if(stopping)fail('STOP_IN_PROGRESS');if(bashing)fail('BASH_IN_PROGRESS');
+      beforeDispatch();if(bashing)fail('BASH_IN_PROGRESS');
       const capture=bashCapture(attachmentDir,target,record.generation,args.recovery_id);let captured=false;
       bashing=true;
       try{
         const result=await callbacks.bash({command:args.command,sessionFile:target.file,sessionId:target.header.id,
-          beforeDispatch:()=>{if(stopping||!ready||closed)fail(stopping?'STOP_IN_PROGRESS':'RUNTIME_SESSION_CHANGED');},
+          beforeDispatch,
           onResult:async value=>{await state();await capture(value);captured=true;}});
         if(result?.completed!==true||!captured)fail('INVALID_BASH_RESULT');data={completed:true};
       }finally{bashing=false;}
@@ -97,7 +102,7 @@ export async function reserveHostSession({attachmentDir,session,owner}){
       if(typeof callbacks.stop!=='function')fail('STOP_UNSUPPORTED');
       if(stopping)fail('STOP_IN_PROGRESS');
       const capture=withdrawalCapture(attachmentDir,target,record.generation,args.recovery_id);let captured=false;
-      stopping=true;
+      stopping=true;stopSequence++;
       try{
         data=stopReceipt(await callbacks.stop({sessionFile:target.file,sessionId:target.header.id,onWithdraw:async value=>{
           await state();await capture(value);captured=true;
@@ -111,9 +116,12 @@ export async function reserveHostSession({attachmentDir,session,owner}){
     if(closing)return closing;
     closed=true;ready=false;
     closing=(async()=>{
-      await retire();await Promise.allSettled([...operations]);
-      for(const socket of sockets)socket.destroy();
-      if(server)await new Promise(resolve=>server.close(resolve));
+      try{await retire();}
+      finally{
+        await Promise.allSettled([...operations]);
+        for(const socket of sockets)socket.destroy();
+        if(server)await new Promise(resolve=>server.close(resolve));
+      }
       // Controller disconnect is not proof the actual writer has exited.
       if(!await ownerAlive(record.owner))await releaseOwner(attachmentDir,target,record);
     })();return closing;

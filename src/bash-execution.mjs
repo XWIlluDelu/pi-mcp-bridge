@@ -1,7 +1,7 @@
 // Native Pi bash results, not a second shell executor.
 import path from 'node:path';
 import {Journal} from './journal.mjs';
-import {hash,cursorSignature,textCursor,fitDecodedText} from './data.mjs';
+import {hash,textCursorOffset,textBoundary,textCursor,fitDecodedText} from './data.mjs';
 const results=dir=>new Journal({stateDir:path.join(dir,'bash'),principal:'native-bash-results'});
 export function nativeBashResult(value){
  if(!value||typeof value.output!=='string'||typeof value.cancelled!=='boolean'||typeof value.truncated!=='boolean'||
@@ -21,14 +21,8 @@ export async function recoveredBash(dir,session,generation,id){
 }
 export function bashOutputPage(receipt,record,args){
  const binding={session_id:args.session_id,view:'bash_output',entry_id:args.request_id,message_index:0};
- const revision=hash(record);let offset=0;
- if(args.cursor){
-  let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
-  if(cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(binding)||cursor.revision!==revision||cursor.leaf_id!==null)throw new Error('STALE_CURSOR');
-  offset=cursor.offset;
-  if(!Number.isSafeInteger(offset)||offset<0||offset>record.output.length||
-     (offset>0&&/[\uD800-\uDBFF]/.test(record.output[offset-1])&&/[\uDC00-\uDFFF]/.test(record.output[offset])))throw new Error('INVALID_CURSOR');
- }
+ const revision=hash(record),offset=textCursorOffset({...binding,cursor:args.cursor},revision,null);
+ if(offset>record.output.length||!textBoundary(record.output,offset))throw new Error('INVALID_CURSOR');
  const rest=record.output.slice(offset),units=fitDecodedText(rest,args.max_chars??12000,output=>({output}));
  if(rest&&!units)throw new Error('BASH_BUDGET_TOO_SMALL');
  const end=offset+units;

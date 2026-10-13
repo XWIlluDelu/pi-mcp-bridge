@@ -16,8 +16,9 @@ import { serveOwnerControl } from './owner-runtime.mjs';
 import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { prepareTrash } from './trash.mjs';
+import { idleHandoff, cancelHandoff } from './idle-handoff.mjs';
 export class Bridge {
-  constructor(config, factory, {configFile}={}) { this.config = config; this.configFile=configFile;const {grants,...settings}=config;this.ownerSettings=structuredClone(settings);this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); }
+  constructor(config, factory, {configFile}={}) { this.config = config; this.configFile=configFile;const {grants,...settings}=config;this.ownerSettings=structuredClone(settings);this.pool = new RuntimePool(config,factory); this.journal = new Journal(config); this.locks = new Map(); this.handoffs=new Map(); this.inputs=new Set(); }
   async init() {
     validateOwnerConfig(this.config);
     await privateDirectory(this.pool.attachmentDir);
@@ -40,7 +41,31 @@ export class Bridge {
     const next = prior.catch(()=>{}).then(fn); this.locks.set(id,next);
     try { return await next; } finally { if (this.locks.get(id) === next) this.locks.delete(id); }
   }
+  async withInput(sessionId,fn){
+    // Keep cancellation on this request across permission, receipt and state I/O.
+    // A completed stop must not revive input that has not reached Pi yet.
+    const input={sessionId,stopped:this.locks.has(`stop:${sessionId}`)};
+    this.inputs.add(input);
+    const beforeDispatch=()=>{
+      this.assertOpen();
+      if(input.stopped||this.locks.has(`stop:${sessionId}`))throw new Error('STOP_IN_PROGRESS');
+    };
+    try{return await fn(beforeDispatch);}finally{this.inputs.delete(input);}
+  }
   async sessions() { return diagnostics.measure('session.discover',{},()=>discover(this.config)); }
+  async mutationLock(id,action,save,fn,lockId=id){
+    const blockedReason=()=>this.handoffs.has(id)?'HANDOFF_PENDING':
+      action==='send'&&this.locks.has(`stop:${id}`)?'STOP_IN_PROGRESS':null;
+    const blocked=async reason=>{
+      try{this.check(action,await this.session(id));return save({status:'rejected',reason});}
+      catch(error){return save({status:'rejected',reason:safeReason(error)});}
+    };
+    const reason=blockedReason();
+    if(reason)return blocked(reason);
+    return this.locked(lockId,()=>{
+      const reason=blockedReason();return reason?blocked(reason):fn();
+    });
+  }
   async refreshPermissions(){
     if(!this.configFile)return;
     const task=diagnostics.measure('permission.reload',{},()=>(this.permissionsReload??Promise.resolve()).catch(()=>{}).then(async()=>{
@@ -55,8 +80,9 @@ export class Bridge {
   check(action,s) { const allowed=permitted(this.config,action,s);diagnostics.emit('permission.check',{op:action,allowed});if (!allowed) throw new Error('NOT_FOUND_OR_DENIED'); }
   async list(args = {}) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
+    const sessions=await this.sessions(),offset=args.offset??0,limit=Math.min(100,args.limit??30);
     const rows = [];
-    for (const s of await this.sessions()) {
+    for (const s of args.query?sessions:sessions.slice(offset,offset+limit)) {
       if (!permitted(this.config,'read',s)) { if (!args.query) rows.push({session_id:s.id}); continue; }
       let saved;
       try { saved = await loadSavedSession(s); } catch { /* Identity remains accessible; content reads report their own error. */ }
@@ -65,8 +91,8 @@ export class Bridge {
       if (args.query && !JSON.stringify({title,cwd:s.header.cwd}).toLowerCase().includes(args.query.toLowerCase())) continue;
       rows.push({session_id:s.id,title:typeof title==='string'?title.slice(0,200):null,cwd:s.header.cwd.slice(0,1024),leaf_id:saved?.leafId??null,permissions:{read:true,send:permitted(this.config,'send',s),command:permitted(this.config,'command',s),bash:permitted(this.config,'bash',s),delete:permitted(this.config,'delete',s)}});
     }
-    const offset = args.offset ?? 0, limit = Math.min(100,args.limit ?? 30);
-    return {sessions:rows.slice(offset,offset+limit),next_offset:offset+limit < rows.length ? offset+limit:null,
+    return {sessions:args.query?rows.slice(offset,offset+limit):rows,
+      next_offset:offset+limit < (args.query?rows.length:sessions.length) ? offset+limit:null,
       folders:this.config.folders.filter(f=>permitted(this.config,'new_session',{cwd:f.path})).map(f=>({folder_id:f.id}))};
   }
   async read(args,{signal}={}) {
@@ -134,69 +160,73 @@ export class Bridge {
     }
   }
   async send(args) {
-    this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
-    const body = args.text === undefined ? undefined : {text:args.text,mode:args.mode ?? 'native'};
-    return this.journal.run(args.request_id,'send',args.session_id,body,save=>this.locked(args.session_id,async()=>{
-      try {
-        if(this.locks.has(`stop:${args.session_id}`))throw new Error('STOP_IN_PROGRESS');
-        const s = await this.session(args.session_id); this.check('send',s);
-        // Existing owners remain readable/controllable independently of whether
-        // their original working directory still exists. Only a new execution
-        // needs a validated directory and a valid saved transcript.
-        let runtime = await this.pool.forRead(s);
-        if (!runtime) {
-          await validateExecutionCwd(s.cwd);
-          await loadSavedSession(s);
-          runtime = await this.pool.resolve(s);
-        }
-        if(this.locks.has(`stop:${args.session_id}`))throw new Error('STOP_IN_PROGRESS');
-        if(runtime.attached)return save(await runtime.send({...args,...body}));
-        if (body.mode === 'idle_only') {
-          const state = await runtime.state();
-          if (state.isStreaming || state.isCompacting) return save({status:'skipped',reason:'busy'});
-        }
-        const command = {type:'prompt',message:body.text};
-        if (body.mode === 'steer') command.streamingBehavior = 'steer';
-        if (body.mode === 'queue') command.streamingBehavior = 'followUp';
-        const late = result => save(result.ok ? {status:'accepted',disposition:result.data.disposition,completion:'not_tracked'} : {status:'rejected',reason:result.code}).catch(()=>{});
-        const result = await runtime.command(command,args.timeout_ms ?? 5000,late);
-        return save({status:'accepted',disposition:result.disposition,completion:'not_tracked'});
-      } catch(e) { return save({status:e.uncertain?'unknown':'rejected',reason:safeReason(e)}); }
-    }));
+    return this.withInput(args.session_id,async beforeDispatch=>{
+      this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
+      const body = args.text === undefined ? undefined : {text:args.text,mode:args.mode ?? 'native'};
+      return this.journal.run(args.request_id,'send',args.session_id,body,save=>this.mutationLock(args.session_id,'send',save,async()=>{
+        try {
+          beforeDispatch();
+          const s = await this.session(args.session_id); this.check('send',s);
+          // Existing owners remain readable/controllable independently of whether
+          // their original working directory still exists. Only a new execution
+          // needs a validated directory and a valid saved transcript.
+          let runtime = await this.pool.forRead(s);
+          if (!runtime) {
+            await validateExecutionCwd(s.cwd);
+            await loadSavedSession(s);
+            runtime = await this.pool.resolve(s);
+          }
+          beforeDispatch();
+          if(runtime.attached)return save(await runtime.send({...args,...body,beforeDispatch}));
+          if (body.mode === 'idle_only') {
+            const state = await runtime.state();
+            if (state.isStreaming || state.isCompacting) return save({status:'skipped',reason:'busy'});
+          }
+          const command = {type:'prompt',message:body.text};
+          if (body.mode === 'steer') command.streamingBehavior = 'steer';
+          if (body.mode === 'queue') command.streamingBehavior = 'followUp';
+          const late = result => save(result.ok ? {status:'accepted',disposition:result.data.disposition,completion:'not_tracked'} : {status:'rejected',reason:result.code}).catch(()=>{});
+          const result = await runtime.command(command,args.timeout_ms ?? 5000,late,beforeDispatch);
+          return save({status:'accepted',disposition:result.disposition,completion:'not_tracked'});
+        } catch(e) { return save({status:e.uncertain?'unknown':'rejected',reason:safeReason(e)}); }
+      }));
+    });
   }
   async bash(args){
-    this.assertOpen();
-    if(!bashSchema.safeParse(args).success)throw new Error('INVALID_BASH_ARGS');
-    if(this.configFile)await this.refreshPermissions();
-    const session=await this.session(args.session_id);this.check('bash',session);
-    const recovery_id=hash({principal:this.config.principal,session:session.id,request:args.request_id});
-    const body=args.command===undefined?undefined:{command:args.command};
-    const receipt=await this.journal.run(args.request_id,'bash',session.id,body,async save=>{
-      if(this.locks.has(`bash:${session.id}`))return save({status:'rejected',reason:'BASH_IN_PROGRESS'});
-      return this.locked(`bash:${session.id}`,async()=>{
-        let generation;
-        try{
-          const beforeDispatch=()=>{
-            this.assertOpen();this.check('bash',session);
-            if(this.locks.has(`stop:${session.id}`))throw new Error('STOP_IN_PROGRESS');
-          };
-          beforeDispatch();
-          let runtime=await this.pool.forRead(session);
-          if(!runtime){await validateExecutionCwd(session.cwd);await loadSavedSession(session);runtime=await this.pool.resolve(session);}
-          if(this.configFile)await this.refreshPermissions();beforeDispatch();
-          if(typeof runtime.executeBash!=='function')throw new Error('BASH_UNSUPPORTED');
-          generation=runtime.generation??runtime.record?.generation??null;
-          await save({status:'unknown',generation});
-          await runtime.executeBash({...args,recovery_id,beforeDispatch,onLate:()=>save({status:'accepted',completion:'native_bash_result',generation})});
-          return save({status:'accepted',completion:'native_bash_result',generation});
-        }catch(error){return save({status:error.uncertain?'unknown':'rejected',reason:safeReason(error),...(generation?{generation}:{})});}
+    return this.withInput(args.session_id,async checkInput=>{
+      this.assertOpen();
+      if(!bashSchema.safeParse(args).success)throw new Error('INVALID_BASH_ARGS');
+      if(this.configFile)await this.refreshPermissions();
+      const session=await this.session(args.session_id);this.check('bash',session);
+      const recovery_id=hash({principal:this.config.principal,session:session.id,request:args.request_id});
+      const body=args.command===undefined?undefined:{command:args.command};
+      const receipt=await this.journal.run(args.request_id,'bash',session.id,body,args.cursor!==undefined?undefined:async save=>{
+        if(this.locks.has(`bash:${session.id}`))return save({status:'rejected',reason:'BASH_IN_PROGRESS'});
+        return this.locked(`bash:${session.id}`,async()=>{
+          let generation;
+          try{
+            const beforeDispatch=()=>{
+              checkInput();this.check('bash',session);
+              if(this.handoffs.has(session.id))throw new Error('HANDOFF_PENDING');
+            };
+            beforeDispatch();
+            let runtime=await this.pool.forRead(session);
+            if(!runtime){await validateExecutionCwd(session.cwd);await loadSavedSession(session);runtime=await this.pool.resolve(session);}
+            if(this.configFile)await this.refreshPermissions();beforeDispatch();
+            if(typeof runtime.executeBash!=='function')throw new Error('BASH_UNSUPPORTED');
+            generation=runtime.generation??runtime.record?.generation??null;
+            await save({status:'unknown',generation});
+            await runtime.executeBash({...args,recovery_id,beforeDispatch,onLate:()=>save({status:'accepted',completion:'native_bash_result',generation})});
+            return save({status:'accepted',completion:'native_bash_result',generation});
+          }catch(error){return save({status:error.uncertain?'unknown':'rejected',reason:safeReason(error),...(generation?{generation}:{})});}
+        });
       });
+      if(this.configFile)await this.refreshPermissions();
+      this.assertOpen();this.check('bash',session);
+      const result=receipt.generation?await recoveredBash(this.pool.attachmentDir,session,receipt.generation,recovery_id):null;
+      if(!result){if(receipt.status==='accepted')throw new Error('BASH_RECOVERY_MISSING');return {...receipt,output_available:false};}
+      return bashOutputPage(receipt,result,args);
     });
-    if(this.configFile)await this.refreshPermissions();
-    this.assertOpen();this.check('bash',session);
-    const result=receipt.generation?await recoveredBash(this.pool.attachmentDir,session,receipt.generation,recovery_id):null;
-    if(!result){if(receipt.status==='accepted')throw new Error('BASH_RECOVERY_MISSING');return {...receipt,output_available:false};}
-    return bashOutputPage(receipt,result,args);
   }
   async stop(args) {
     this.assertOpen();
@@ -206,10 +236,12 @@ export class Bridge {
     this.check('command',session);
     if(!permitted(this.config,'read',session))throw new Error('STOP_REQUIRES_READ');
     const recovery_id=hash({principal:this.config.principal,session:session.id,request:args.request_id});
-    const receipt=await this.journal.run(args.request_id,'stop',session.id,args.cursor?undefined:{},save=>this.locked(`stop:${session.id}`,async()=>{
+    const receipt=await this.journal.run(args.request_id,'stop',session.id,args.cursor!==undefined?undefined:{},save=>this.mutationLock(session.id,'command',save,async()=>{
       let generation;
       try {
         this.assertOpen();
+        // Invalidate pending input without waiting behind its admission lock.
+        for(const input of this.inputs)if(input.sessionId===session.id)input.stopped=true;
         // Independent of prompt admission's lock; never start a writer.
         const runtime=await this.pool.forRead(session);
         this.assertOpen();
@@ -219,10 +251,13 @@ export class Bridge {
         if(typeof runtime.stopExecution!=='function')throw new Error('STOP_UNSUPPORTED');
         generation=runtime.generation??runtime.record?.generation??null;
         await save({status:'unknown',generation});
+        // A join may have begun during owner lookup, ACL reload or receipt I/O.
+        // No stop command has been dispatched yet, so this is a definite refusal.
+        if(this.handoffs.has(session.id))throw new Error('HANDOFF_PENDING');
         const result=stopReceipt(await runtime.stopExecution({...args,recovery_id}));
         return save({...result,generation});
       }catch(error){return save({status:error.uncertain?'unknown':'rejected',reason:safeReason(error),...(generation?{generation}:{})});}
-    }));
+    },`stop:${session.id}`));
     // Returning/replaying withdrawn content always rechecks current ACLs.
     if(this.configFile)await this.refreshPermissions();
     this.assertOpen();this.check('command',session);this.check('read',session);
@@ -253,7 +288,7 @@ export class Bridge {
   }
   async delete(args) {
     this.assertOpen();if(this.configFile){await this.refreshPermissions();this.assertOpen();}
-    return this.journal.run(args.request_id,'delete',args.session_id,{},save=>this.locked(args.session_id,async()=>{
+    return this.journal.run(args.request_id,'delete',args.session_id,{},save=>this.mutationLock(args.session_id,'delete',save,async()=>{
       let trash, release;
       try {
         const s = await this.session(args.session_id); this.check('delete',s);
@@ -265,6 +300,8 @@ export class Bridge {
       finally {await trash?.cancel().catch(()=>{});await release?.();}
     }));
   }
+  handoffForLocal(request,options){return idleHandoff(this,request,options);}
+  cancelHandoff(request){return cancelHandoff(this,request);}
   async releaseForLocal({session_id}){
     this.assertOpen();
     return this.locked(session_id,async()=>{
@@ -319,5 +356,5 @@ export class Bridge {
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure',{code,uncertain:error.uncertain===true});
-  return ['BASH_IN_PROGRESS','BASH_UNSUPPORTED','INVALID_BASH_RESULT','STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','ATTACHED_OPERATION_FAILED','COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
+  return ['HANDOFF_PENDING','BASH_IN_PROGRESS','BASH_UNSUPPORTED','INVALID_BASH_RESULT','STOP_IN_PROGRESS','STOP_UNSUPPORTED','INVALID_STOP_RECEIPT','ATTACHED_OPERATION_FAILED','COLD_REACQUIRE_BLOCKED','HOST_RELEASE_UNSUPPORTED','HOST_RELEASE_FAILED','HOST_NOT_READY','HOST_SUBMIT_UNCERTAIN','EXECUTION_CWD_UNAVAILABLE','INVALID_SESSION','INVALID_SESSION_TREE','NOT_FOUND_OR_DENIED','ATTACHMENT_REQUEST_TOO_LARGE','PROMPT_ADMISSION_PENDING','PI_REJECTED','ACK_TIMEOUT','WRITE_UNKNOWN','RUNTIME_DISCONNECTED','RUNTIME_START_FAILED','RUNTIME_SESSION_CHANGED','LIVE_OWNER_UNREACHABLE','OWNER_STILL_ALIVE','ATTACHMENT_REGISTRY_BUSY','PI_ACCEPTANCE_UNOBSERVABLE'].includes(code) ? code : 'OPERATION_FAILED';
 }
