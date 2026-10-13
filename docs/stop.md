@@ -1,14 +1,13 @@
 # Remote stop (native Escape-family control)
 
 `stop` cancels current native execution and withdraws queued prompts, while
-keeping the live Pi process, session file, history and ownership. It is not
-Ctrl+C, shutdown, release, deletion, or an arbitrary RPC/slash-command executor.
-It is an independent MCP tool, not an ordered batch item.
+keeping the live Pi process, session file, history and ownership. This independent
+MCP tool follows native Escape-family cancellation; it is excluded from batch.
 
 ## Permissions and call
 
-Stop requires the independent, default-denied `command` grant.
-It neither grants nor requires send access.
+Stop uses the independent, default-denied `command` grant. It neither grants
+nor requires `send`.
 
 Stop also requires `read`, because returning the withdrawn contents is mandatory.
 A command-authorized caller without read gets `STOP_REQUIRES_READ` **before
@@ -22,8 +21,11 @@ Replays and continuation calls recheck both current permissions.
 The target must already have a live cooperative runtime. An inactive saved
 session returns `skipped/not_running` without launching Pi. An unreachable
 owner does not trigger a fallback writer. New Bridge sends to the target are
-refused while its stop control is in progress; the host endpoint similarly
-fences its Bridge admissions during the callback.
+refused before joining the prompt lock while its stop control is in progress.
+Pending sends and bash retain cancellation across permission, receipt and state
+I/O, including when stop finishes before that I/O returns. The host endpoint
+passes the same admission check through native dispatch. Fresh post-stop inputs
+work normally; rejected input remains with its caller.
 
 ## Cancellation and complete text recovery
 
@@ -40,8 +42,10 @@ branch-summary operations; independent `!bash`/`!!bash` needs `abortBash()`.
 Native tool cancellation still depends on tools cooperating with their signal.
 
 `withdrawn_text` contains complete native-ordered text: steering then follow-up,
-joined with two newlines. Each queue retains its order. A host may return its
-whole restored editor text, labelled `includes_editor_draft:true`.
+joined with two newlines, as in native queued-text restoration. This grouping
+preserves each queue's order rather than interleaving original enqueue times.
+A host may instead return its whole restored editor text, labelled
+`includes_editor_draft:true`.
 
 The default 12,000 and maximum 32,768 `max_chars` bound the serialized
 `{"withdrawn_text":"..."}` content of each response, excluding receipt/cursor
@@ -49,9 +53,9 @@ metadata. Long text is never silently truncated: `next_cursor` and
 `withdrawn_complete:false` require another call with the **same request ID**.
 `text_offset`/`total_text_units` count decoded UTF-16 code units; pages do not
 split surrogate pairs. Concatenate `withdrawn_text` in page order until complete.
-Continue with the returned nonempty `cursor` and original session/request ID;
-page budgets may change. This queries the existing receipt. Do not use a new
-request ID to retry an uncertain stop.
+Continue with `cursor`, adjusting the budget if desired. A cursor request only
+queries an existing receipt; an unknown request ID returns `RECEIPT_NOT_FOUND`.
+A misbound/stale cursor is rejected without another cancellation.
 
 Recovery text uses the existing private Journal storage primitive under the
 owner attachment directory's `stop/receipts/`. The Bridge's ordinary mutation
@@ -59,14 +63,13 @@ receipt references its native identity/generation; queued text is not written
 into the transcript or exposed through send's non-content receipt. It remains
 retrievable after Bridge restart and after the live owner goes away.
 
-`accepted/native_ack` means the native public calls acknowledged;
-`accepted/requested` means the host requested cancellation. Neither is exact
-task completion or rollback of already executed tools. A lost ACK is
-`unknown`; already captured withdrawn text can still be returned. Reuse the
-request ID to recover it, never send a new ID merely to retry an uncertain stop:
-that could interrupt a later run. Cancellation does not stop arbitrary extension
-preflight/background work; Pi's before-agent-start hooks have no universal
-cancellation barrier.
+`accepted/native_ack` confirms native public API acknowledgement;
+`accepted/requested` indicates host-initiated cancellation. A lost ACK resolves to
+`unknown`; captured withdrawn text remains retrievable by querying the same request ID.
+Callers must reuse the request ID for recovery rather than issuing a new stop ID,
+which could interrupt a subsequent run. Cancellation covers native execution and
+queued prompts; already executed effects remain. Extensions must coordinate
+cancellation of their own asynchronous preflight and background work.
 
 ## Generic hosts and companion compatibility
 
@@ -81,22 +84,22 @@ Missing capture/invalid coverage is not a successful stop.
 
 Public SDK/RPC bindings provide this callback when their session/client exposes
 all three cancellation/queue methods. They cover the native session queues;
-a host with additional UI/admission queues must withdraw them through its own
-generic callback.
+a host with additional UI/admission queues must withdraw those through its callback.
 
-**Ordinary startup-loaded companion remains unsupported for full stop-all.**
+**Ordinary companion lacks the public APIs for full stop.**
 In TUI, public `ctx.abort()` synchronously restores session and TUI compaction
 queues into the editor, and public editor get/set can recover the joined text
 while retaining an existing draft. Text recovery is not the blocker.
 However, `ExtensionContext` exposes neither independent bash cancellation nor
 bash state. RPC context also lacks the public queue-withdrawal method.
-Companion requests return `STOP_UNSUPPORTED` before cancellation. A TUI host
-with a public `AgentSession` can implement the callback;
-`main({extensionFactories})` alone does not expose it.
+Companion/old-host requests therefore return `STOP_UNSUPPORTED` before cancellation.
+A TUI host that owns a public `AgentSession` can implement the callback;
+`main({extensionFactories})` alone does not expose that session.
 
 ## Verification
 
-Disposable offline SDK/RPC fixtures cover agent execution, queued text over one
-page, independent bash, retry, compaction, branch summary, same-process
-continuation, host IPC, lost ACK recovery, replay and permission separation.
-The ordinary RPC companion refuses full stop and remains usable.
+Offline SDK/RPC tests verify: running agent cancellation, multi-page queued text
+recovery, independent bash termination, retry, manual compaction, branch summary,
+same-process continuation, host IPC, lost ACK recovery, restart replay, cursor
+binding and permission enforcement. The ordinary RPC companion returns
+`STOP_UNSUPPORTED` while continuing normal operation.

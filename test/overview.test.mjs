@@ -8,6 +8,8 @@ import {Bridge} from '../src/bridge.mjs';
 import {renderRead,recordsFor,hash} from '../src/data.mjs';
 import {readClaim,AttachedRuntime} from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
+import {isolatedRuntime} from './fixtures/isolated-runtime.mjs';
+import {overviewRecords} from '../src/overview.mjs';
 import {operationSchemas,batchSchema} from '../src/tool-schemas.mjs';
 const message=(id,parentId,role,content,extra={})=>({type:'message',id,parentId,message:{role,content,...extra}});
 const data=entries=>({entries,leafId:entries.at(-1)?.id??null,revision:hash(entries)});
@@ -167,7 +169,7 @@ test('overview selection is stable across page budgets and filters, with UTF16 f
 });
 test('saved, official RPC and attached reads share overview records and distinguish leaf provenance without writes',async t=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-overview-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'overview-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'p',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}],attachmentDir:path.join(dir,'ipc')};
+ const config={principal:'overview-fixture',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'p',path:cwd}],grants:[{folder:cwd,read:true,send:true,new_session:true}],attachmentDir:path.join(dir,'ipc'),...isolatedRuntime(path.join(dir,'agent'))};
  const bridge=await new Bridge(config).init();const original=process.env.PI_MCP_ATTACH_DIR;let shutdown;
  try{
   const made=await bridge.create({folder_id:'p',request_id:'seed'}),saved=await bridge.session(made.session_id);
@@ -234,4 +236,15 @@ test('split-turn compaction retains preceding assistant and failed/repaired tool
  assert.deepEqual(records[0].omitted_projection_ranges,[]);assert.equal(records[0].omitted_candidate_records,0);
  assert.equal(JSON.stringify(records).includes('HIDDEN_OLD_GOAL'),false);assert.equal(JSON.stringify(records).includes('RAW_ONLY_STATE'),false);
  assert.ok(JSON.stringify(records).length<12000);
+});
+
+test('overview does not render omitted tool-result bodies after reaching its record limit',()=>{
+ const entries=[];
+ const add=(id,role,content,extra={})=>entries.push({sourceEntry:{id,type:'message'},messages:[{role,content,...extra}]});
+ add('initial','user','task');add('old-answer','assistant','previous answer');add('latest','user','new request');
+ for(let i=0;i<64;i++)add('result-'+i,'toolResult',[{type:'text',get text(){assert.fail('omitted tool payload must not be rendered');}}],{toolCallId:'call-'+i,isError:false});
+ add('answer','assistant','short current answer');
+ const records=overviewRecords({entries});
+ assert.equal(records.length,20);assert.ok(records.some(r=>r.label==='latest_assistant'));
+ assert.ok(records[0].omitted_candidate_records>0);
 });

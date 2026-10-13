@@ -155,7 +155,7 @@ export function cursorSignature(args) {
 export function textCursor(args,revision,leaf,offset) {
   return Buffer.from(JSON.stringify({kind:'projected_text',signature:cursorSignature(args),revision,leaf_id:leaf,offset})).toString('base64url');
 }
-const textBoundary=(text,offset)=>!(offset>0&&offset<text.length&&
+export const textBoundary=(text,offset)=>!(offset>0&&offset<text.length&&
   text.charCodeAt(offset-1)>=0xd800&&text.charCodeAt(offset-1)<=0xdbff&&
   text.charCodeAt(offset)>=0xdc00&&text.charCodeAt(offset)<=0xdfff);
 export function fitDecodedText(text,maxChars,render) {
@@ -166,14 +166,15 @@ export function fitDecodedText(text,maxChars,render) {
   }
   return textBoundary(text,low)?low:low-1;
 }
+export function textCursorOffset(args,revision,leaf) {
+  if(!args.cursor)return args.text_offset??0;
+  let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
+  if(!cursor||cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(args)||cursor.revision!==revision||cursor.leaf_id!==leaf)throw new Error('STALE_CURSOR');
+  if(!Number.isSafeInteger(cursor.offset)||cursor.offset<0)throw new Error('INVALID_CURSOR');
+  return cursor.offset;
+}
 function pageProjectedText(records,args,revision,leaf) {
-  let offset=args.text_offset??0;
-  if(args.cursor){
-    let cursor;try{cursor=JSON.parse(Buffer.from(args.cursor,'base64url').toString());}catch{throw new Error('INVALID_CURSOR');}
-    if(!cursor||cursor.kind!=='projected_text'||cursor.signature!==cursorSignature(args)||cursor.revision!==revision||cursor.leaf_id!==leaf)throw new Error('STALE_CURSOR');
-    if(!Number.isSafeInteger(cursor.offset)||cursor.offset<0)throw new Error('INVALID_CURSOR');
-    offset=cursor.offset;
-  }
+  const offset=textCursorOffset(args,revision,leaf);
   const row=records.find(record=>record.message_index===args.message_index);
   if(!row)throw new Error('PROJECTED_MESSAGE_NOT_FOUND');
   const field=args.field??'content';

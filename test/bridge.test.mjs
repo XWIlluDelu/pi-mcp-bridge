@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
+import {syncBuiltinESMExports} from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
@@ -237,13 +239,18 @@ test('overlapping bridge state and session storage is rejected',async t=>{
 });
 
 test('shutdown stops admission and drains sends before closing owned runtime',async t=>{
-  const f=await fixture(t);let unblock;const gate=new Promise(r=>{unblock=r;});
+  const f=await fixture(t);await f.bridge.send({session_id:f.id,request_id:'start',text:'hello'});
+  let unblock;const gate=new Promise(r=>{unblock=r;});
   const original=f.bridge.journal.put.bind(f.bridge.journal);let held=true;
   f.bridge.journal.put=async(...args)=>{if(held){held=false;await gate;}return original(...args);};
-  const sending=f.bridge.send({session_id:f.id,request_id:'shutdown-race',text:'hello'});
+  const sending=f.bridge.send({session_id:f.id,request_id:'shutdown-race',text:'not dispatched'});
   const closing=f.bridge.close();
-  await assert.rejects(f.bridge.send({session_id:f.id,request_id:'late',text:'no'}),/BRIDGE_CLOSING/);
-  unblock();await sending;await closing;
+  try{await assert.rejects(f.bridge.send({session_id:f.id,request_id:'late',text:'no'}),/BRIDGE_CLOSING/);}
+  finally{unblock();}
+  const receipt=await sending;await closing;
+  assert.equal(receipt.status,'rejected');
+  assert.deepEqual((await f.bridge.journal.get('shutdown-race')).receipt,receipt);
+  assert.equal(f.runtime.calls.length,1);
   assert.equal(f.runtime.alive,false);assert.equal(f.runtime.resumes,1);
 });
 
@@ -281,4 +288,21 @@ test('delete rename failure cleans intents while post-move sync failure preserve
    assert.deepEqual(await f.bridge.delete({session_id:f.id,request_id:'delete'}),result);
   }
  }
+});
+
+
+test('list bounds unfiltered transcript work to its page and searches only readable histories',async t=>{
+ const f=await fixture(t);await f.bridge.create({folder_id:'project',request_id:'second'});
+ const sessions=await f.bridge.sessions(),files=new Set(sessions.map(s=>s.file)),seen=[];
+ const original=fsSync.createReadStream;
+ t.mock.method(fsSync,'createReadStream',(...args)=>{if(files.has(args[0]))seen.push(args[0]);return original(...args);});
+ syncBuiltinESMExports();
+ try{
+  const first=await f.bridge.list({limit:1});assert.equal(first.sessions.length,1);assert.equal(first.next_offset,1);assert.deepEqual(seen,[sessions[0].file]);
+  seen.length=0;const second=await f.bridge.list({limit:1,offset:first.next_offset});assert.equal(second.next_offset,null);assert.deepEqual(seen,[sessions[1].file]);
+  seen.length=0;await f.bridge.list({query:'project',limit:1});assert.equal(seen.length,2);
+  f.config.grants.push({session_id:sessions[1].id,read:false});seen.length=0;
+  assert.deepEqual((await f.bridge.list({limit:1,offset:1})).sessions,[{session_id:sessions[1].id}]);assert.equal(seen.length,0);
+  await f.bridge.list({query:'project'});assert.deepEqual(seen,[sessions[0].file]);
+ }finally{t.mock.restoreAll();syncBuiltinESMExports();}
 });

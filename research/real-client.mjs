@@ -19,7 +19,7 @@ await fs.writeFile(path.join(cwd,'keep.txt'),'public fixture');
 await fs.writeFile(path.join(agentDir,'models.json'),JSON.stringify({providers:{'test-gateway':{baseUrl,api:'openai-completions',apiKey:'${OPENAI_API_KEY}',models:[{id:model,reasoning:Boolean(thinkingFormat),...(thinkingFormat?{compat:{thinkingFormat}}:{}),input:['text'],contextWindow:64000,maxTokens:process.env.PI_REAL_REVIEW==='1'?4096:1024}]}}}));
 await fs.writeFile(path.join(agentDir,'settings.json'),JSON.stringify({retry:{enabled:false},cacheWarming:'off',compaction:{enabled:false}}));
 const inheritEnv=['OPENAI_API_KEY','HTTPS_PROXY','HTTP_PROXY','NO_PROXY','NODE_EXTRA_CA_CERTS','SSL_CERT_FILE','NODE_USE_ENV_PROXY'];
-const config={principal:'real-fixture',stateDir:path.join(root,'state'),sessionRoots:[path.join(root,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],piRuntime:{agentDir,inheritEnv},piArgs:['--provider','test-gateway','--model',model,'--thinking','off']};
+const config={principal:'real-fixture',stateDir:path.join(root,'state'),sessionRoots:[path.join(root,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}],piRuntime:{agentDir,inheritEnv,tools:[]},piArgs:['--no-extensions','--no-context-files','--no-skills','--no-prompt-templates','--no-themes','--provider','test-gateway','--model',model,'--thinking','off']};
 const configFile=path.join(root,'owner-config.json');await fs.writeFile(configFile,JSON.stringify(config));
 const env=Object.fromEntries(['PATH',...inheritEnv].filter(k=>process.env[k]!==undefined).map(k=>[k,process.env[k]]));env.NODE_USE_ENV_PROXY='1';
 let client;

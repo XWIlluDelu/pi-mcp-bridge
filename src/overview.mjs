@@ -22,16 +22,15 @@ function spreadIndices(length) {
   }
   return result;
 }
-function textExcerpt(text,limit=EXCERPT_CHARS){
-  const json=JSON.stringify(text);
+function textExcerpt(text,limit=EXCERPT_CHARS,json=JSON.stringify(text)){
   if(json.length<=limit)return {value:text};
   const head=Math.ceil(limit/2),tail=limit-head;
   return {json_excerpt:json.slice(0,head),json_tail_excerpt:json.slice(json.length-tail),
     tail_char_offset:json.length-tail,total_chars:json.length,omitted_char_ranges:[[head,json.length-tail]]};
 }
 // Reuse short blocks' spare capacity without changing which blocks are sampled.
-function textBudgets(texts){
-  const sizes=texts.map(text=>JSON.stringify(text).length),budgets=sizes.map(()=>0);
+function textBudgets(sizes){
+  const budgets=sizes.map(()=>0);
   let remaining=EXCERPT_CHARS,active=sizes.map((_,index)=>index);
   while(remaining&&active.length){
     const share=Math.max(1,Math.floor(remaining/active.length));
@@ -72,11 +71,12 @@ function messageDetails(message) {
       // Three samples bound per-message provenance while covering both ends and
       // an interior block. The text budget is shared, never multiplied.
       const chosen=spreadIndices(textIndices.length).slice(0,3).map(index=>textIndices[index]);
-      const budgets=textBudgets(chosen.map(index=>message.content[index].text));
-      details.payload=textExcerpt(message.content[textIndex].text,budgets[0]);
+      const encoded=chosen.map(index=>JSON.stringify(message.content[index].text));
+      const budgets=textBudgets(encoded.map(json=>json.length));
+      details.payload=textExcerpt(message.content[textIndex].text,budgets[0],encoded[0]);
       details.payload_source={field:'content',block_index:textIndex,block_field:'text'};
       if(chosen.length>1)details.additional_text_blocks=chosen.slice(1).map((index,offset)=>({
-        payload:textExcerpt(message.content[index].text,budgets[offset+1]),
+        payload:textExcerpt(message.content[index].text,budgets[offset+1],encoded[offset+1]),
         payload_source:{field:'content',block_index:index,block_field:'text'},
       }));
       details.selected_text_blocks=chosen;
@@ -131,7 +131,7 @@ export function overviewRecords(projection) {
   function message(r,label) {
     if(!r||keys.has(r.projection_index))return;
     keys.add(r.projection_index);
-    candidates.push({...source(r),kind:'message',label,role:r.message.role,...messageDetails(r.message)});
+    candidates.push(()=>({...source(r),kind:'message',label,role:r.message.role,...messageDetails(r.message)}));
   }
   function tools(group,label) {
     // Pair each result with the nearest preceding call of the same ID. A
@@ -140,23 +140,23 @@ export function overviewRecords(projection) {
     for(const item of calls.toReversed()){
       const {row,call,result}=item;
       if(toolKeys.has(item)||(!indices.has(row.projection_index)&&!indices.has(result?.projection_index)))continue;
-      toolKeys.add(item);candidates.push({
+      toolKeys.add(item);candidates.push(()=>({
       ...source(row),kind:'tool_observation',label,
       status:result?(result.message.isError===true?'failed':result.message.isError===false?'succeeded':'result_observed'):'unobserved',
       result_source:result?source(result):null,payload:excerpt({call_id:call.id,name:call.name,arguments:call.arguments}),
-      });
+      }));
     }
     for(const result of unpairedResults.toReversed()){
       if(toolKeys.has(result)||!indices.has(result.projection_index))continue;
-      toolKeys.add(result);candidates.push({...source(result),kind:'tool_observation',label,
+      toolKeys.add(result);candidates.push(()=>({...source(result),kind:'tool_observation',label,
         status:result.message.isError===true?'failed':result.message.isError===false?'succeeded':'result_observed',
         call_source:null,result_source:source(result),call_visibility:'not_in_projection',
-        payload:excerpt({toolCallId:result.message.toolCallId,toolName:result.message.toolName})});
+        payload:excerpt({toolCallId:result.message.toolCallId,toolName:result.message.toolName})}));
     }
   }
   message(latest,'latest_user');
   message(rows.findLast(r=>r.message.role==='assistant'),'latest_assistant');
-  if(checkpoint)candidates.push({...source(checkpoint),kind:'checkpoint',label:'active_compaction',payload:excerpt(checkpoint.message)});
+  if(checkpoint)candidates.push(()=>({...source(checkpoint),kind:'checkpoint',label:'active_compaction',payload:excerpt(checkpoint.message)}));
   if(!checkpoint)message(users[0],'initial_task');
   message(previous,'previous_user');
   message(prior.findLast(r=>assistantIndices.has(r.projection_index)),'previous_assistant');
@@ -178,17 +178,16 @@ export function overviewRecords(projection) {
   // A large tool body cannot consume the overview before the current request,
   // latest assistant, paired statuses and active checkpoint are considered.
   for(const row of current.toReversed())message(row,'current_group');
-  message(previous,'previous_user');
   message(prior.findLast(r=>r.message.role==='assistant'),'previous_assistant');
-  tools(prior,'previous_group');
   for(const row of prior.toReversed())message(row,'previous_group');
   for(const row of rows.filter(r=>r.type==='branch_summary').toReversed()){
-    candidates.push({...source(row),kind:'branch_summary',label:'branch_summary',payload:excerpt(row.message)});
+    candidates.push(()=>({...source(row),kind:'branch_summary',label:'branch_summary',payload:excerpt(row.message)}));
   }
   const selected=[];let chars=0;
-  for(const record of candidates){
-    const size=JSON.stringify(record).length;
-    if(selected.length<MAX_RECORDS&&chars+size<=MAX_CHARS){selected.push(record);chars+=size;}
+  for(const candidate of candidates){
+    if(selected.length===MAX_RECORDS)break;
+    const record=candidate(),size=JSON.stringify(record).length;
+    if(chars+size<=MAX_CHARS){selected.push(record);chars+=size;}
   }
   const covered=new Set(selected.filter(r=>r.kind!=='tool_observation').map(r=>r.projection_index));
   const omitted=[];

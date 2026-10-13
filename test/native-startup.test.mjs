@@ -46,6 +46,47 @@ test('Bridge launcher without profile uses native HOME/settings/packages/tools a
   const settings=JSON.parse(await fs.readFile(path.join(agent,'settings.json'),'utf8'));
   assert.equal(settings.defaultModel,'native-model');assert.equal(settings.defaultThinkingLevel,'high');
 });
+test('installed companion leaves Bridge-owned claims intact and registers ordinary RPC',{timeout:20000},async t=>{
+  const f=await fixture(t,{provider:'bridge-fixture',model:'deterministic'}),agent=path.join(f.dir,'profile'),ipc=path.join(f.dir,'ipc');
+  await fs.mkdir(path.join(agent,'extensions'),{recursive:true});
+  await fs.writeFile(path.join(agent,'settings.json'),JSON.stringify({defaultProvider:'bridge-fixture',defaultModel:'deterministic',cacheWarming:'off',retry:{enabled:false},compaction:{enabled:false}}));
+  await fs.writeFile(path.join(agent,'auth.json'),JSON.stringify({'bridge-fixture':{type:'api_key',key:'synthetic-profile-fixture-only'}}));
+  await fs.writeFile(path.join(agent,'extensions','companion.js'),
+    `export {default} from ${JSON.stringify(pathToFileURL(path.join(base,'src/attach-extension.mjs')).href)};`);
+  await fs.writeFile(path.join(agent,'extensions','provider.js'),
+    `export {default} from ${JSON.stringify(pathToFileURL(path.join(base,'research/faux-extension.mjs')).href)};`);
+  await fs.writeFile(path.join(agent,'extensions','probe.js'),
+    "export default pi=>pi.on('session_start',()=>pi.appendEntry('profile-probe',{tools:pi.getActiveTools()}));");
+  const script=`
+    import {RuntimePool} from ${JSON.stringify(pathToFileURL(path.join(base,'src/rpc.mjs')).href)};
+    import {readClaim} from ${JSON.stringify(pathToFileURL(path.join(base,'src/attachments.mjs')).href)};
+    import {RpcClient} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-coding-agent'))};
+    const target={id:'profile-fixture',file:${JSON.stringify(f.file)},cwd:${JSON.stringify(f.cwd)},header:{id:${JSON.stringify(f.id)}}},dir=${JSON.stringify(ipc)};
+    const pool=new RuntimePool({stateDir:${JSON.stringify(path.join(f.dir,'state'))},attachmentDir:dir});
+    let rpc;
+    let owned,profile,disposition,settlement;
+    try{
+      rpc=await pool.resolve(target);owned=await readClaim(dir,target);
+      const snapshot=await rpc.entries();profile=snapshot.entries.find(e=>e.customType==='profile-probe').data;
+      if(owned.generation!==rpc.ownerRecord.generation)throw Error('CLAIM_REPLACED');
+      ({disposition}=await rpc.command({type:'prompt',message:'PROFILE_STARTUP_INPUT'}));
+      while(rpc.settlement.sequence===0)await new Promise(resolve=>setTimeout(resolve,10));
+      settlement=rpc.settlement.sequence;
+      if(await pool.forRead(target)!==rpc)throw Error('RUNTIME_REPLACED');
+    }finally{await pool.close();}
+    const local=new RpcClient({cliPath:${JSON.stringify(path.join(base,'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'))},cwd:target.cwd,args:['--session',target.file]});
+    try{
+      await local.start();const state=await local.getState(),external=await readClaim(dir,target);
+      console.log(JSON.stringify({ownedKind:owned.kind,ownedPhase:owned.phase,disposition,settlement,tools:profile.tools,externalKind:external.kind,externalPhase:external.phase,sameSession:state.sessionId===target.header.id}));
+    }finally{await local.stop();}
+  `;
+  const result=await exec(process.execPath,['--input-type=module','-e',script],{env:{PATH:process.env.PATH,HOME:f.dir,PI_CODING_AGENT_DIR:agent,PI_MCP_ATTACH_DIR:ipc,PI_OFFLINE:'1'},timeout:15000});
+  const observed=JSON.parse(result.stdout);
+  assert.equal(observed.ownedKind,'rpc');assert.equal(observed.ownedPhase,'ready');
+  assert.equal(observed.disposition,'started');assert.equal(observed.settlement,1);
+  assert.equal(observed.externalKind,'extension');assert.equal(observed.externalPhase,'ready');assert.equal(observed.sameSession,true);
+  for(const tool of ['read','bash','edit','write'])assert.ok(observed.tools.includes(tool));
+});
 test('initial startup migrates before extension factory, but before-switch hook sees target before open',{timeout:15000},async t=>{
   const f=await fixture(t),initial=f.file,target=path.join(path.dirname(initial),'legacy-target.jsonl'),evidence=path.join(f.dir,'order.json'),extension=path.join(f.dir,'order.mjs'),agent=path.join(f.dir,'agent');
   await fs.mkdir(agent);

@@ -35,7 +35,16 @@ test('MCP native bash switch is independent, defaults off and gates execution/re
  let response=await f.call({request_id:'own-result',command:'native command',max_chars:512});
  assert.ok(!response.isError);let result=response.structuredContent,output=result.output;
  assert.equal(result.exitCode,0);assert.equal(result.truncated,false);assert.ok(result.next_cursor);
- const bad=await f.call({request_id:'new-binding',cursor:result.next_cursor});assert.equal(bad.isError,true);assert.equal(f.calls(),1);
+ for(const command of [undefined,'native command']){
+  const bad=await f.call({request_id:'new-binding',command,cursor:result.next_cursor});
+  assert.equal(bad.isError,true);assert.equal(bad.content[0].text,'RECEIPT_NOT_FOUND');
+  assert.equal(f.calls(),1,'A misbound continuation must not execute a new command');
+  assert.equal(await f.bridge.journal.get('new-binding'),null,'A missing receipt lookup must not create an uncertain mutation');
+ }
+ const changed=await f.call({request_id:'own-result',command:'different',cursor:result.next_cursor});
+ assert.equal(changed.isError,true);assert.equal(changed.content[0].text,'REQUEST_ID_CONFLICT');
+ const repeated=await f.call({request_id:'own-result',command:'native command',cursor:result.next_cursor,max_chars:512});
+ assert.ok(!repeated.isError);assert.equal(f.calls(),1);
  while(result.next_cursor){
   response=await f.call({request_id:'own-result',cursor:result.next_cursor,max_chars:32768});
   assert.ok(!response.isError);result=response.structuredContent;output+=result.output;
@@ -55,4 +64,19 @@ test('native bash ACK uncertainty retains captured output and never repeats exec
   const result=(await request).structuredContent;assert.equal(result.status,'unknown');assert.equal(result.output,'result before lost ACK');
   assert.deepEqual((await f.call({request_id:'slow-ack'})).structuredContent,result);
  }finally{finish.resolve();}
+});
+
+test('bash respects the handoff fence before and after runtime lookup',async t=>{
+ const f=await fixture(t);f.rule.bash=true;
+ f.bridge.handoffs.set(f.saved.id,{});
+ let result=(await f.call({request_id:'join-pending',command:'not admitted'})).structuredContent;
+ assert.equal(result.status,'rejected');assert.equal(result.reason,'HANDOFF_PENDING');assert.equal(f.calls(),0);
+ f.bridge.handoffs.delete(f.saved.id);
+ const entered=Promise.withResolvers(),finish=Promise.withResolvers(),lookup=f.bridge.pool.forRead.bind(f.bridge.pool);
+ t.mock.method(f.bridge.pool,'forRead',async session=>{const runtime=await lookup(session);entered.resolve();await finish.promise;return runtime;});
+ const pending=f.call({request_id:'join-during-lookup',command:'not admitted'});
+ await entered.promise;f.bridge.handoffs.set(f.saved.id,{});finish.resolve();
+ result=(await pending).structuredContent;
+ assert.equal(result.status,'rejected');assert.equal(result.reason,'HANDOFF_PENDING');assert.equal(f.calls(),0);
+ f.bridge.handoffs.delete(f.saved.id);
 });

@@ -41,8 +41,9 @@ export function createSdkHostBinding(session,{release,onError}={}){
       assertIdentity(before,identity(session));
       return {...before,entries,leafId};
     },
-    submit:async({text,mode='native'})=>{
+    submit:async({text,mode='native',beforeDispatch})=>{
       if(!['native','idle_only','steer','queue'].includes(mode))throw new Error('INVALID_HOST_SUBMISSION');
+      beforeDispatch?.();
       if(mode==='idle_only'&&!session.isIdle)return {status:'skipped',reason:'busy'};
       // Public prompt() resolves at completion, not at admission. Even a
       // synchronous throw after entering host code cannot prove no side effect.
@@ -54,10 +55,13 @@ export function createSdkHostBinding(session,{release,onError}={}){
          typeof session.extensionRunner?.emitUserBash!=='function')throw new Error('BASH_UNSUPPORTED');
       const before=identity(session);assertIdentity(expected,before);beforeDispatch?.();
       const handled=await session.extensionRunner.emitUserBash({type:'user_bash',command,excludeFromContext:false,cwd:session.sessionManager.getCwd()});
-      assertIdentity(before,identity(session));beforeDispatch?.();
+      assertIdentity(before,identity(session));
       let result;
       if(handled?.result){result=handled.result;session.recordBashResult(command,result,{excludeFromContext:false});}
-      else result=await tracked.track(session.executeBash(command,undefined,{excludeFromContext:false,operations:handled?.operations}));
+      else {
+        beforeDispatch?.();
+        result=await tracked.track(session.executeBash(command,undefined,{excludeFromContext:false,operations:handled?.operations}));
+      }
       assertIdentity(before,identity(session));await onResult(nativeBashResult(result));
       return {completed:true};
     },
@@ -88,12 +92,13 @@ export function createRpcHostBinding(client,{release,onError}={}){
       assertIdentity(before,after);
       return {...identity(after),entries:structuredClone(snapshot.entries),leafId:snapshot.leafId};
     },
-    submit:async({text,mode='native'})=>{
+    submit:async({text,mode='native',beforeDispatch})=>{
       if(!['native','idle_only','steer','queue'].includes(mode))throw new Error('INVALID_HOST_SUBMISSION');
       if(mode==='idle_only'){
         const observed=await state();
         if(observed.isStreaming||observed.isCompacting)return {status:'skipped',reason:'busy'};
       }
+      beforeDispatch?.();
       try{
         const disposition=await tracked.track(client.prompt(text,undefined,options(mode).streamingBehavior));
         if(!['started','queued','handled'].includes(disposition))return unknown();

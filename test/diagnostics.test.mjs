@@ -16,6 +16,23 @@ test('attached state diagnostics retain built-in failures but suppress unknown s
  assert.equal(JSON.stringify(rows).includes('PRIVATE_'),false);
 });
 
+test('native control operations and refusal codes remain identifiable without logging content',async()=>{
+ const rows=[],log=createDiagnostics({enabled:true,write:line=>rows.push(JSON.parse(line))});
+ const refusals={stop:'STOP_IN_PROGRESS',bash:'BASH_UNSUPPORTED'};
+ for(const [op,reason] of Object.entries(refusals)){
+  await log.measure('tool',{op},()=>({status:'rejected',reason}));
+  assert.equal(rows.at(-1).op,op);assert.equal(rows.at(-1).code,reason);
+ }
+ for(const op of ['command','abort','abort_bash','clear_queue']){
+  log.emit('permission.check',{op,allowed:false,text:'PRIVATE_PROMPT',command:'PRIVATE_COMMAND',output:'PRIVATE_OUTPUT'});
+  assert.equal(rows.at(-1).op,op);
+ }
+ log.emit('read.source',{view:'status'});assert.equal(rows.at(-1).view,'status');
+ log.emit('rpc.command.end',{op:'PRIVATE_OPERATION',code:'PRIVATE_ERROR'});
+ assert.equal(rows.at(-1).op,undefined);assert.equal(rows.at(-1).code,'OTHER_ERROR');
+ assert.equal(JSON.stringify(rows).includes('PRIVATE_'),false);
+});
+
 test('diagnostics isolate concurrent contexts and exclude unapproved fields and errors',async()=>{
  const rows=[],log=createDiagnostics({enabled:true,write:line=>rows.push(JSON.parse(line))});
  await Promise.all(['a','b'].map(async id=>log.measure('tool',{op:'read',mutation_ref:diagnosticRef(id)},async()=>{

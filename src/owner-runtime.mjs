@@ -12,11 +12,12 @@ export function ownerSocket(config){
 }
 export async function serveOwnerControl(bridge){
   const socket=ownerSocket(bridge.config);await privateDirectory(path.dirname(socket));
-  const connections=new Set(),operations=new Set();let closing=false;
+  const connections=new Set(),operations=new Set(),handoffs=new Set();let closing=false;
   const server=net.createServer({allowHalfOpen:true},connection=>{
-    connections.add(connection);connection.setEncoding('utf8');let buffer='',admitted=false;
+    connections.add(connection);connection.setEncoding('utf8');let buffer='',admitted=false,controller,completed=false;
     connection.setTimeout(30000,()=>connection.destroy());
-    connection.on('error',()=>{});connection.on('close',()=>connections.delete(connection));
+    connection.on('error',()=>{});connection.on('close',()=>{connections.delete(connection);if(!completed)controller?.abort();});
+    connection.on('end',()=>{if(!completed)controller?.abort();});
     connection.on('data',chunk=>{
       if(admitted||closing)return;
       buffer+=chunk;if(Buffer.byteLength(buffer)>8192){connection.destroy();return;}
@@ -24,10 +25,14 @@ export async function serveOwnerControl(bridge){
       const task=(async()=>{
         try{
           const request=JSON.parse(buffer.slice(0,buffer.indexOf('\n')));
-          if(!request||!['release','reset'].includes(request.op)||!/^ps_[a-f0-9]{32}$/.test(request.session_id))throw new Error('INVALID_OWNER_COMMAND');
-          const data=await bridge[request.op==='release'?'releaseForLocal':'resetColdResume'](request);
+          const methods={release:'releaseForLocal',reset:'resetColdResume',handoff:'handoffForLocal',handoff_cancel:'cancelHandoff'};
+          if(!request||!Object.hasOwn(methods,request.op)||!/^ps_[a-f0-9]{32}$/.test(request.session_id))throw new Error('INVALID_OWNER_COMMAND');
+          if(request.op==='handoff'){controller=new AbortController();handoffs.add(controller);connection.setTimeout(0);}
+          const data=await bridge[methods[request.op]](request,{signal:controller?.signal});
+          completed=true;
           connection.end(JSON.stringify({data})+'\n');
-        }catch(error){connection.end(JSON.stringify({error:{code:error.code??error.message}})+'\n');}
+        }catch(error){completed=true;connection.end(JSON.stringify({error:{code:controller?.signal.aborted?'HANDOFF_CANCELLED':error.code??error.message}})+'\n');}
+        finally{if(controller)handoffs.delete(controller);}
       })();
       operations.add(task);void task.finally(()=>operations.delete(task)).catch(()=>{});
     });
@@ -38,18 +43,26 @@ export async function serveOwnerControl(bridge){
   }catch(error){await new Promise(resolve=>server.close(resolve));throw error;}
   return {async close(){
     closing=true;
+    for(const controller of handoffs)controller.abort();
     const stopped=new Promise(resolve=>server.close(resolve));
     await Promise.allSettled([...operations]);for(const connection of connections)connection.destroy();
     await stopped;
   }};
 }
-export async function ownerRequest(config,request){
+export async function ownerRequest(config,request,{signal}={}){
   return new Promise((resolve,reject)=>{
     const connection=net.createConnection(ownerSocket(config));let buffer='';
-    connection.setEncoding('utf8');connection.setTimeout(30000,()=>connection.destroy(new Error('OWNER_CONTROL_TIMEOUT')));
-    connection.on('error',reject);connection.on('connect',()=>connection.end(JSON.stringify(request)+'\n'));
+    const cancel=()=>connection.destroy(new Error('HANDOFF_CANCELLED'));
+    signal?.addEventListener('abort',cancel,{once:true});if(signal?.aborted)cancel();
+    connection.on('close',()=>signal?.removeEventListener('abort',cancel));
+    connection.setEncoding('utf8');connection.setTimeout(request.op==='handoff'?0:30000,()=>connection.destroy(new Error('OWNER_CONTROL_TIMEOUT')));
+    connection.on('error',reject);connection.on('connect',()=>{
+      if(request.op==='handoff')connection.write(JSON.stringify(request)+'\n');
+      else connection.end(JSON.stringify(request)+'\n');
+    });
     connection.on('data',chunk=>{buffer+=chunk;});
     connection.on('end',()=>{
+      connection.end();
       try{const result=JSON.parse(buffer);if(result.error)throw Object.assign(new Error(result.error.code),{code:result.error.code});resolve(result.data);}
       catch(error){reject(error);}
     });

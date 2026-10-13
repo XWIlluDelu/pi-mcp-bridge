@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -27,7 +28,7 @@ export function launchProfile(config, hostEnv = process.env) {
     : tools.length ? ['--tools',tools.join(',')] : ['--no-tools']};
 }
 export class PiRpc {
-  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; this.settlement = {generation:this.generation,sequence:0,observed_at:null,aborted:null}; }
+  constructor(config, session) { this.config = config; this.session = session; this.pending = new Map(); this.alive = false; this.exited = false; this.generation = randomUUID(); this.promptAdmission = null; this.settlement = {generation:this.generation,sequence:0,observed_at:null,aborted:null}; this.handoffSettlement = 0; }
   async start() {
     await assertSingleSessionFile(this.session.file);
     const {env,toolArgs} = launchProfile(this.config);
@@ -75,6 +76,7 @@ export class PiRpc {
   }
   receiveResponse(event, generation) {
     if (generation !== this.generation || !event) return;
+    if(event.type==='agent_start')this.handoffSettlement=this.settlement.sequence+1;
     if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
       this.settlement = {generation,sequence:this.settlement.sequence+1,observed_at:new Date().toISOString(),aborted:event.aborted};
       return; // Session observation only; never release an unresolved prompt ACK fence.
@@ -88,17 +90,22 @@ export class PiRpc {
         (event.success !== false && !(event.success === true && ['started','queued','handled'].includes(event.data?.disposition))))) return;
     if (['bash','clear_queue','abort','abort_bash'].includes(req.commandType) && (event.command!==req.commandType || typeof event.success!=='boolean')) return;
     this.pending.delete(event.id); clearTimeout(req.timer);
+    // A started/queued ACK is admission, never completion. In the supported
+    // owned RPC path its run must subsequently settle, including queued work.
+    if(req.commandType==='prompt'&&event.success===true&&['started','queued'].includes(event.data?.disposition))
+      this.handoffSettlement=this.settlement.sequence+1;
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation) this.promptAdmission = null;
     const result = event.success ? {ok:true,data:event.data} : {ok:false,code:'PI_REJECTED'};
     if (req.timedOut) { req.log?.('rpc.late_ack',{op:req.commandType,generation,late:true,status:result.ok?'ok':'error'});req.onLate?.(result); return; }
     if (result.ok) req.resolve(result.data); else req.reject(new RpcFailure(result.code));
   }
-  async command(command, timeout = 5000, onLate) {
+  async command(command, timeout = 5000, onLate, beforeDispatch) {
     if (command.type === 'get_state') return this.state(timeout);
     await this.state();
     const late = onLate && (async result => {
       try { await this.state(); onLate(result); } catch { /* Preserve unknown after a session switch. */ }
     });
+    beforeDispatch?.();
     let result, rejection;
     try { result = await this.dispatch(command, timeout, late); }
     catch (error) { if (error.code !== 'PI_REJECTED') throw error; rejection = error; }
@@ -113,6 +120,8 @@ export class PiRpc {
   }
   dispatchRequest(command, timeout = 5000, onLate) {
     if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
+    if(this.handoffPending&&!['get_state','get_entries'].includes(command.type))return Promise.reject(new RpcFailure('HANDOFF_PENDING'));
+    if(this.gracefulExitPromise)return Promise.reject(new RpcFailure('RUNTIME_SHUTTING_DOWN'));
     if (command.type === 'prompt' && this.promptAdmission) return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
     const id = randomUUID(), generation = this.generation;
     const serialized = `${JSON.stringify({...command,id})}\n`;
@@ -160,12 +169,16 @@ export class PiRpc {
     beforeDispatch?.();
     const capture=bashCapture(this.config.attachmentDir,this.session,this.generation,recovery_id);
     const keep=async result=>{await check();await capture(nativeBashResult(result));};
+    let acknowledged=false;
     try{
       const result=await this.dispatch({type:'bash',command},timeout_ms,response=>{
         if(response.ok)void keep(response.data).then(()=>onLate?.()).catch(error=>diagnostics.emit('operation.failure',{code:error.code??error.message,uncertain:true}));
       });
-      await keep(result);
-    }catch(error){error.uncertain=true;throw error;}
+      acknowledged=true;await keep(result);
+    }catch(error){
+      if(acknowledged||error.code==='PI_REJECTED')error.uncertain=true;
+      throw error;
+    }
   }
   async stopExecution({timeout_ms=5000,recovery_id}={}){
     // Cancellation identity failures must not use state()'s process teardown.
@@ -200,7 +213,53 @@ export class PiRpc {
     if(observed.isIdle!==true||observed.hasPendingMessages!==false)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
     if(this.promptAdmission)throw new RpcFailure('PROMPT_ADMISSION_PENDING');
   }
+  async waitForHandoff(signal){
+    for(;;){
+      signal?.throwIfAborted();
+      // Use dispatch, not state(): identity mismatch must not invoke stop().
+      const state=await this.dispatch({type:'get_state'});
+      if(state.sessionFile!==this.session.file||state.sessionId!==this.session.header.id)throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      if(!this.ownerRecord?.socket||typeof state.isStreaming!=='boolean'||typeof state.isCompacting!=='boolean'||
+         !Number.isSafeInteger(state.pendingMessageCount)||state.pendingMessageCount<0)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+      const observed=await new AttachedRuntime(this.config,this.session,this.ownerRecord).state();
+      // Public context cannot correlate extension-origin preflight with ACKs.
+      // Keep that uncertainty sticky; the legacy input/settlement latch alone
+      // is deliberately NOT used as a quiescence proof here.
+      if(observed.nonRpcInputSeen!==false)throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+      // Stop may return an uncertain receipt while native control ACKs are still
+      // outstanding. Its lock ending is not proof that those mutations finished.
+      const pendingMutation=[...this.pending.values()].some(req=>!['get_state','get_entries'].includes(req.commandType));
+      if(!this.promptAdmission&&!pendingMutation&&this.settlement.sequence>=this.handoffSettlement&&
+         state.isStreaming===false&&state.isCompacting===false&&state.pendingMessageCount===0&&
+         observed.isIdle===true&&observed.hasPendingMessages===false){
+        signal?.throwIfAborted();return;
+      }
+      await delay(25,undefined,{signal});
+    }
+  }
+  async gracefulExit(){
+    if(this.gracefulExitPromise)return this.gracefulExitPromise;
+    if(!this.child||this.exited||!this.alive)throw new RpcFailure('RUNTIME_DISCONNECTED');
+    const child=this.child,record=this.ownerRecord;
+    if(!record||record.owner?.pid!==child.pid||!await ownerAlive(record.owner))throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    this.gracefulExitPromise=(async()=>{
+      await new Promise((resolve,reject)=>{
+        child.once('exit',(code,signal)=>{
+          if(code!==0||signal)reject(new RpcFailure('RUNTIME_EXIT_ABNORMAL'));
+          else resolve();
+        });
+        // Native RPC EOF awaits session_shutdown. No signal, abort, clear_queue,
+        // timeout escalation, or shutdown acknowledgment substitutes for exit.
+        child.stdin.end();
+      });
+      if(await ownerAlive(record.owner))throw new RpcFailure('OWNER_STILL_ALIVE');
+      this.lines?.close();
+      await releaseOwner(this.config.attachmentDir,this.session,record);this.ownerRecord=null;
+    })();
+    return this.gracefulExitPromise;
+  }
   async stop() {
+    if(this.gracefulExitPromise&&!this.exited){await this.gracefulExitPromise;return;}
     const release=async()=>{if(this.ownerRecord){await releaseOwner(this.config.attachmentDir,this.session,this.ownerRecord);this.ownerRecord=null;}};
     if (!this.child || this.exited) {this.promptAdmission=null;await release();return;}
     if (this.stopPromise) return this.stopPromise;

@@ -132,10 +132,10 @@ export async function waitOwnerExit(owner,timeout=5000){
 }
 export class AttachedRuntime {
   constructor(config,session,record){this.config=config;this.session=session;this.record=record;this.alive=true;this.attached=true;}
-  async request(op,body={},timeout=5000){
-    return diagnostics.measure('attached.request',{op,generation:this.record.generation},()=>this.requestOnce(op,body,timeout));
+  async request(op,body={},timeout=5000,beforeDispatch){
+    return diagnostics.measure('attached.request',{op,generation:this.record.generation},()=>this.requestOnce(op,body,timeout,beforeDispatch));
   }
-  async requestOnce(op,body={},timeout=5000){
+  async requestOnce(op,body={},timeout=5000,beforeDispatch){
     const mutating=['send','stop','bash'].includes(op);
     const serialized=JSON.stringify({op,body,generation:this.record.generation,file:this.record.file,sessionId:this.record.sessionId})+'\n';
     if(Buffer.byteLength(serialized)>MAX_ATTACHMENT_REQUEST_BYTES)throw new AttachmentFailure('ATTACHMENT_REQUEST_TOO_LARGE');
@@ -148,7 +148,10 @@ export class AttachedRuntime {
       const timer=setTimeout(()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)),timeout);
       socket.on('error',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)));
       socket.on('end',()=>finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE',written&&mutating)));
-      socket.on('connect',()=>{written=true;socket.write(serialized);});
+      socket.on('connect',()=>{
+        try{beforeDispatch?.();}catch(error){finish(error);return;}
+        written=true;socket.write(serialized);
+      });
       socket.on('data',chunk=>{
         bytes+=chunk.toString();if(Buffer.byteLength(bytes)>100000)return finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE',written&&mutating));
         const newline=bytes.indexOf('\n');if(newline<0)return;
@@ -166,10 +169,10 @@ export class AttachedRuntime {
   async start(){await this.state();return this;}
   state(timeout=5000){return this.request('state',{},timeout);}
   async read(args){const result=await this.request('read',args);assertProjectedTextResponse(result,args);return result;}
-  send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000);}
+  send(args){return this.request('send',{text:args.text,mode:args.mode??'native'},args.timeout_ms??5000,args.beforeDispatch);}
   async executeBash({command,recovery_id,timeout_ms=5000,beforeDispatch}){
     beforeDispatch?.();
-    const result=await this.request('bash',{command,recovery_id,timeout_ms},timeout_ms);
+    const result=await this.request('bash',{command,recovery_id,timeout_ms},timeout_ms,beforeDispatch);
     if(result?.completed!==true)throw new AttachmentFailure('INVALID_BASH_RESULT',true);
   }
   async stopExecution({recovery_id,timeout_ms=5000}){
