@@ -2,6 +2,7 @@
 
 Read alongside the [target experience](redesign.md). Links pin inspected source
 revisions; each comparison examines its implications for Bridge.
+[Design experiments](design-trials.md) evaluate these ideas on native Pi runtimes.
 
 Bridge adapts an existing Pi environment, including runtimes it does not own.
 Codex/OpenCode control their agent engine; HAPI controls its wrapper and input path;

@@ -348,9 +348,9 @@ through protected environment, not the command/config. The harness uses a
 tool-disabled disposable profile. `PI_REAL_REVIEW=1` reviews public HEAD source;
 `PI_REAL_REVIEW_ONLY=1` skips lifecycle prompts. Review feedback is untrusted and stays local.
 
-Recovery: confirm relevant old processes have stopped before owner-managed
-cleanup of a stale Bridge, registry or permission-editor lock. Live or
-transitioning owners continue to block fallback.
+Recovery: Bridge/permission-editor locks require owner-confirmed cleanup after
+the relevant processes stop. Registry transactions recover exact-dead-owner locks;
+unknown identities remain blocked. Registered live or transitioning owners block fallback.
 Restarting Bridge does not clear a deliberate no-cold-reacquire marker. Use the
 [owner-local reset procedure](docs/runtime-handoff.md#explicit-return-to-cold-resume)
 only after the local writer closes. Client schema refresh and host adapter reload

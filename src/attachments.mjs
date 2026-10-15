@@ -46,15 +46,53 @@ export async function privateDirectory(dir){
   if(!stat.isDirectory()||stat.isSymbolicLink()||stat.uid!==process.getuid()||(stat.mode&0o077)||await fs.realpath(dir)!==path.resolve(dir))throw new AttachmentFailure('INVALID_ATTACHMENT_DIRECTORY');
 }
 export function claimFile(dir,session){return path.join(dir,`${opaqueId(`${session.file}\0${session.header.id}`)}.owner.json`);}
+async function recoverRegistryLock(dir,lock){
+  let handle,gate;
+  try{
+    // Keep the observed inode open: unlink/recreate must not let a new holder
+    // reuse its inode number while we check the old process identity.
+    handle=await fs.open(lock,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    const observed=await handle.stat({bigint:true});
+    if(!observed.isFile()||observed.size>1024)return;
+    const bytes=Buffer.alloc(1025),{bytesRead}=await handle.read(bytes,0,bytes.length,0);
+    let owner;
+    try{owner=JSON.parse(bytes.subarray(0,bytesRead).toString('utf8'));}
+    catch(error){if(error instanceof SyntaxError)return;throw error;}
+    if(!Number.isSafeInteger(owner?.pid)||owner.pid<1||typeof owner.start!=='string'||!/^(0|[1-9]\d*)$/.test(owner.start)||
+       typeof owner.boot!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(owner.boot)||await ownerAlive(owner))return;
+    // Only recovery needs this kernel-owned gate. It vanishes on process death;
+    // unlike another lockfile it cannot itself leave a stale recovery lock.
+    gate=net.createServer(socket=>socket.destroy());
+    try{await new Promise((resolve,reject)=>{
+      gate.once('error',reject);gate.listen('\0pi-mcp-registry-'+opaqueId(path.resolve(dir)),resolve);
+    });}catch(error){if(error.code==='EADDRINUSE')return;throw error;}
+    const current=await fs.lstat(lock,{bigint:true});
+    if(current.dev===observed.dev&&current.ino===observed.ino)await fs.unlink(lock);
+  }catch(error){if(!['ENOENT','ELOOP'].includes(error.code))throw error;}
+  finally{
+    try{await handle?.close();}
+    finally{if(gate?.listening)await new Promise(resolve=>gate.close(resolve));}
+  }
+}
 export async function registryTransaction(dir,action){
   await privateDirectory(dir);
-  const lock=path.join(dir,'registry.lock');let fd;
-  for(let attempt=0;attempt<100;attempt++){
-    try{fd=await fs.open(lock,'wx',0o600);break;}catch(e){if(e.code!=='EEXIST')throw e;await new Promise(r=>setTimeout(r,10));}
+  const lock=path.join(dir,'registry.lock'),tmp=`${lock}.${process.pid}.${randomUUID()}.tmp`;let acquired=false;
+  try{
+    // Publish a complete identity atomically, still excluding older wx clients.
+    // A crash before publication leaves only an unclaimed temporary file.
+    await fs.writeFile(tmp,JSON.stringify(await processIdentity()),{flag:'wx',mode:0o600});
+    for(let attempt=0;attempt<100;attempt++){
+      try{await fs.link(tmp,lock);acquired=true;break;}
+      catch(error){if(error.code!=='EEXIST')throw error;await recoverRegistryLock(dir,lock);}
+      await new Promise(resolve=>setTimeout(resolve,10));
+    }
+    if(!acquired)throw new AttachmentFailure('ATTACHMENT_REGISTRY_BUSY');
+    await fs.unlink(tmp);
+    return await action();
+  }finally{
+    try{if(acquired)await fs.unlink(lock);}
+    finally{await fs.rm(tmp,{force:true});}
   }
-  if(!fd)throw new AttachmentFailure('ATTACHMENT_REGISTRY_BUSY');
-  try{await fd.writeFile(JSON.stringify(await processIdentity()));return await action();}
-  finally{await fd.close();await fs.unlink(lock);}
 }
 export async function readClaim(dir,session){
   await privateDirectory(dir);
