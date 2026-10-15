@@ -358,3 +358,5 @@ are separate: a Bridge restart cannot update an external owner's cached module.
 
 Optional `PI_MCP_LOG=1` enables content-free stderr timing/correlation diagnostics:
 [boundaries and local/remote comparison](deploy/diagnostics.md).
+[Experience outlook](docs/redesign.md) guides future interaction design alongside
+the current API; it is not a release acceptance checklist.

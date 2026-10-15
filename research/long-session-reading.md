@@ -49,4 +49,5 @@ one. These counts describe this fixture and its default page budget.
   projection's chronological order.
 
 All reads left session bytes and provider-call count unchanged. The fixture
-verifies bounded reading and recovery of its selected evidence. Turn organization and continuation during activity require separate evaluation.
+verifies bounded reading and recovery of its selected evidence. [Further read-design questions](../docs/redesign.md#reading-selection-and-chronology)
+include turn organization and continuation during activity.
