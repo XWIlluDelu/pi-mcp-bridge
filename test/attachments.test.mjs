@@ -226,7 +226,7 @@ test('registry failure during shutdown still closes old socket and retains block
  const lock=path.join(f.config.attachmentDir,'registry.lock');
  try{
   await handlers.session_start({reason:'startup'},ctx);const record=await readClaim(f.config.attachmentDir,f.session);
-  await fs.writeFile(lock,'simulated interrupted registry transaction',{mode:0o600});
+  await fs.writeFile(lock,JSON.stringify({...record.owner,start:'0'+record.owner.start}),{mode:0o600});
   await assert.rejects(handlers.session_shutdown({reason:'reload'},ctx),/ATTACHMENT_REGISTRY_BUSY/);
   await assert.rejects(fs.stat(record.socket),{code:'ENOENT'});await fs.unlink(lock);
   assert.equal((await readClaim(f.config.attachmentDir,f.session)).generation,record.generation);

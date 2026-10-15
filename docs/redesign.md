@@ -18,9 +18,9 @@ and technical exploration; [README](../README.md) describes the current API.
 | Stop execution, return all withdrawn inputs, retain history and the running instance | Implemented for owned RPC and capable hosts. Current stop requires `command` plus `read`; the target removes this extra authorization. |
 | Create a session and send its first prompt | Creation currently makes an empty session. A combined operation must check both create and send permissions and recover partial success. |
 | Delete a session | Recoverable JSONL removal exists, after confirmed writer release/exit. |
-| Serialize operations within one session, run independent sessions in parallel | Public batch serializes all operations. Independent target lanes remain a design option. |
+| Serialize operations within one session, run independent sessions in parallel | Public batch remains serial; a [per-session lane trial](design-trials.md#scheduling-independent-targets) showed reduced waiting. |
 | Share one Pi instance across local and remote clients | Registered companion/host routes reuse the writer. Arbitrary existing RPC processes are not automatically discoverable or controllable. |
-| Open a TUI and naturally take over after current work finishes | Manual `/bridge-join` exists; automatic native TUI entry still needs a pre-open integration. |
+| Open a TUI and naturally take over after current work finishes | Manual `/bridge-join` exists. A [fresh-TUI startup-command trial](design-trials.md#native-tui-entry-and-closure) works; normal entry is not integrated. |
 | Keep work running after TUI closes, if the runtime permits it | No transparent process-survival path exists. Interrupting the task is an accepted alternative when background continuation is unavailable. |
 | Standard local stdio and authenticated remote Streamable HTTP | Both exist. Reconnect and long-running observation must preserve operation identity without resending uncertain actions. |
 

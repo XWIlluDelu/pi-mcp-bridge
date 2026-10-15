@@ -142,6 +142,20 @@ assertion about unregistered writers; reset cannot discover all arbitrary Pi
 processes. It clears only the restriction. The next authorized send can
 cold-resume using normal Pi configuration. Restarting Bridge is not a reset.
 
+### Interrupted registry updates
+
+Registry transactions publish a complete process identity atomically. After that
+exact process exits, a later transaction can reclaim its lock without weakening
+the separate writer claim or clearing `noColdReacquire`. Concurrent recovery is
+serialized by a short-lived Linux abstract socket; the kernel releases it if the
+recovering process dies. The opened inode stays pinned until the pathname check,
+so recovery cannot delete a new holder's replacement lock.
+
+Registry participants use the same canonical IPC directory and Linux PID/network
+namespaces. Live locks and old locks with unreadable or incomplete identities
+remain blocked; age alone never authorizes removal. After a TUI crash, use the
+normal confirmed reset command rather than manually unlinking registry files.
+
 ## Verification
 
 | Test | Main coverage |
@@ -150,3 +164,4 @@ cold-resume using normal Pi configuration. Restarting Bridge is not a reset.
 | `native-startup.test.mjs` | Native configuration, installed companion/controller coexistence and initial versus before-switch file-open order. |
 | `owner-runtime.test.mjs` | Release/reset CLI, exact exit, persistent restriction, observer/reload limits and errors. |
 | `host-lifecycle.test.mjs`, `attachments.test.mjs` | Owner retirement, released tombstones, TUI reopen and replacement generations. |
+| `registry-lock.test.mjs` | Current/legacy writer crashes, concurrent recovery, directory aliases, replacement-inode protection and complete lock publication. |

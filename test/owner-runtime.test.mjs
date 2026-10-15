@@ -61,8 +61,10 @@ test('owner CLI release holds across restart and attachment; only explicit confi
   await local.stop();await waitOwnerExit(held.owner);
   assert.equal((await f.bridge.send({session_id:f.id,request_id:'still-held',text:'NEVER_ADMITTED'})).reason,'COLD_REACQUIRE_BLOCKED');
   await assert.rejects(ownerRequest(f.config,{op:'reset',session_id:f.id}),/LOCAL_CLOSE_CONFIRMATION_REQUIRED/);
+  const lock=path.join(f.bridge.pool.attachmentDir,'registry.lock');
+  await fs.writeFile(lock,JSON.stringify(held.owner),{mode:0o600}); // Interrupted registry cleanup from the now-dead native owner.
   const reset=await exec(process.execPath,[path.join(base,'src/owner-runtime.mjs'),f.file,'reset',f.id,'--confirm-local-closed']);
-  assert.equal(JSON.parse(reset.stdout).status,'reset');
+  assert.equal(JSON.parse(reset.stdout).status,'reset');await assert.rejects(fs.stat(lock),{code:'ENOENT'});
   assert.equal((await f.bridge.send({session_id:f.id,request_id:'resumed',text:'COLD_RESUME_AFTER_RESET'})).status,'accepted');
   assert.equal((await f.bridge.pool.get(f.id).state()).sessionId,f.session.header.id);
 });
