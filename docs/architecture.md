@@ -30,6 +30,7 @@ MCP, Bridge and attached owners use the same context-timeline read contract and 
 - **Authorization:** three-tier rights, unknown-key refusal, live edits, continuation/replay authorization, revocation during cold startup, hidden-parent references, current permissions after cached lookup.
 - **Reading:** context grouping, hidden/orphan prompt boundaries, system sections, compaction/branch summaries, checkpoint edits, tool pairing, Unicode reconstruction, pinned history, bounded live observation, warm lookup without rescans, title-cache invalidation, companion idle evidence.
 - **Requests and recovery:** concurrent deduplication, ACK timeouts, late identity validation, persistence failures, crash/restart receipt recovery, shutdown races.
+- **Images:** native image bytes, including more than 32 images within byte limits, reach each supported owner and provider context.
 - **Batch:** per-session lanes, independent progress, invalid-item isolation, captured-read rebudgeting, envelope byte limits.
 - **Ownership:** Unix owner claims, namespace-safe dead-owner registry recovery, filesystem aliases, unreachable hosts, release cancellation/drain, idle EOF handoff, cold resume only after an appropriate exact-death condition.
 - **Transports:** modern and legacy standard MCP clients over stdio/HTTP, shared proxies, authentication/header errors, frame limits, disconnects, bounded response waits.

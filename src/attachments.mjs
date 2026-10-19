@@ -375,7 +375,12 @@ export class AttachedRuntime {
           if (response.generation !== this.record.generation) throw new Error();
           if (
             op === 'send' &&
-            ['INVALID_PROMPT_INPUT', 'INVALID_ATTACHED_SEND'].includes(response.error)
+            [
+              'IMAGE_INPUT_UNSUPPORTED',
+              'MODEL_IMAGE_INPUT_UNSUPPORTED',
+              'INVALID_PROMPT_INPUT',
+              'INVALID_ATTACHED_SEND',
+            ].includes(response.error)
           )
             return finish(new AttachmentFailure(response.error));
           if (mutating && ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS'].includes(response.error))
@@ -456,10 +461,13 @@ export class AttachedRuntime {
     return result;
   }
   send(args) {
+    if (args.images && this.record.imagesSupported !== true)
+      throw new AttachmentFailure('IMAGE_INPUT_UNSUPPORTED');
     return this.request(
       'send',
       {
         text: args.text,
+        ...(args.images ? { images: args.images } : {}),
         mode: args.mode ?? 'default',
       },
       args.timeout_ms ?? 5000,

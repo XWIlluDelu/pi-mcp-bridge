@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
 import { renderContextRead } from './context-read.mjs';
-import { SEND_MODES, attachedPromptInput } from './prompt-input.mjs';
+import { SEND_MODES, attachedPromptInput, assertImageModel } from './prompt-input.mjs';
 import { activityObservation } from './activity.mjs';
 import {
   MAX_ATTACHMENT_REQUEST_BYTES,
@@ -254,6 +254,7 @@ export default function attachExtension(pi) {
               const input = attachedPromptInput(args);
               if (!SEND_MODES.includes(args.mode))
                 throw new AttachmentFailure('INVALID_ATTACHED_SEND');
+              assertImageModel(input.images, ctx.model);
               // This command reaches owner-local control, outside MCP grants.
               // Pi dispatches slash commands before input events, so refuse them
               // at this remote admission boundary, including collision suffixes.
@@ -265,7 +266,12 @@ export default function attachExtension(pi) {
                 const options = { expandPromptTemplates: true };
                 if (['default', 'steer'].includes(args.mode)) options.deliverAs = 'steer';
                 if (args.mode === 'follow_up') options.deliverAs = 'followUp';
-                pi.sendUserMessage(input.text, options);
+                pi.sendUserMessage(
+                  input.images
+                    ? [...(input.text ? [{ type: 'text', text: input.text }] : []), ...input.images]
+                    : input.text,
+                  options,
+                );
                 data = {
                   status: 'unknown',
                   dispatch: 'submitted',
@@ -314,6 +320,7 @@ export default function attachExtension(pi) {
       runtime.ready = true;
       await updateOwner(dir, session, record, {
         phase: 'ready',
+        imagesSupported: true,
       });
       // A successful replacement lifecycle conclusively releases this process's previous native identity.
       await registryTransaction(dir, async () => {

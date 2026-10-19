@@ -2,6 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 
 const codes = new Set([
+  'IMAGE_INPUT_UNSUPPORTED',
+  'MODEL_IMAGE_INPUT_UNSUPPORTED',
   'RECOVERY_PERSIST_FAILED',
   'HOST_RELEASE_UNSUPPORTED',
   'HOST_RELEASE_FAILED',

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { readSchema as publicReadSchema } from './read-schema.mjs';
-import { SEND_MODES } from './prompt-input.mjs';
+import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
 const id = z.string().min(1).max(128);
 const request = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 export const stopSchema = z
@@ -25,6 +25,7 @@ export const publicOperationSchemas = {
       session_id: id,
       request_id: request,
       text: z.string().min(1).max(100000).optional(),
+      images: imagesSchema.optional(),
       mode: z.enum(SEND_MODES).optional(),
       timeout_ms: timeout,
     })
@@ -36,6 +37,7 @@ export const publicOperationSchemas = {
       project: directory,
       request_id: request,
       text: z.string().min(1).max(100000).optional(),
+      images: imagesSchema.optional(),
       name: z.string().min(1).max(200).optional(),
       fork_from: id.optional(),
       timeout_ms: timeout,
