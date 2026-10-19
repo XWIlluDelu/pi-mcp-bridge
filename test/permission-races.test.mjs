@@ -6,34 +6,7 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-async function nativeFixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-permission-native-'),
-    cwd = path.join(dir, 'project');
-  let bridge;
-  t.after(async () => {
-    try {
-      await bridge?.close();
-    } finally {
-      await fs.rm(dir, { recursive: true, force: true });
-    }
-  });
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    principal: 'permission-test',
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'p', path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
-  };
-  const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
-  bridge = await new Bridge(config, undefined, { configFile }).init();
-  const { session_id: id } = await savedSession(bridge);
-  return { bridge, id, cwd, config, configFile };
-}
+import { fixture as nativeFixture } from './fixtures/model-runtime.mjs';
 for (const operation of ['send', 'create', 'command'])
   test(
     operation + ' reauthorizes at native dispatch after a slow identity observation',
@@ -42,7 +15,7 @@ for (const operation of ['send', 'create', 'command'])
         { bridge, id } = f;
       f.config.grants[0].command = true;
       await fs.writeFile(f.configFile, JSON.stringify(f.config));
-      await bridge.pool.resolve(await bridge.session(id));
+      await bridge.models({ session_id: id, start: true });
       let revoked = false;
       const dispatched = [];
       function intercept(runtime) {

@@ -20,6 +20,7 @@ export default function (pi) {
     models: [
       { id: 'vision', input: ['text', 'image'] },
       { id: 'text-only', input: ['text'] },
+      { id: 'reasoner', input: ['text', 'image'], reasoning: true },
     ],
     tokensPerSecond: 10000,
   });

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { modelSelectionSchema } from './models.mjs';
 
 // Fit a complete base64 prompt (including text/JSON overhead) into the existing
 // 8 MiB MCP/IPC request bound. No URL fetching or local-path access is implied.
@@ -52,15 +53,18 @@ export const imagesSchema = z
 const promptSchema = z.object({
   text: z.string().min(1).max(100000).optional(),
   images: imagesSchema.optional(),
+  model: modelSelectionSchema.optional(),
 });
 export function promptInput(args) {
   const parsed = promptSchema.safeParse({
     text: args.text,
     images: args.images,
+    model: args.model,
   });
   if (!parsed.success) throw new Error('INVALID_PROMPT_INPUT');
-  const { text, images } = parsed.data;
+  const { text, images, model } = parsed.data;
   if (text === undefined && images === undefined) {
+    if (model) throw new Error('MODEL_REQUIRES_PROMPT');
     return undefined;
   }
   // Pi 1.1 removes consumed queue entries only for nonempty message text.
@@ -69,6 +73,7 @@ export function promptInput(args) {
   return {
     text: text ?? '[Image attachment]',
     ...(images ? { images } : {}),
+    ...(model ? { model } : {}),
   };
 }
 // Accept normalized image-only IPC input as well as a direct owner's input.

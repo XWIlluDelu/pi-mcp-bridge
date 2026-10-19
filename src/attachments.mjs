@@ -8,6 +8,7 @@ import { stopReceipt } from './stop-execution.mjs';
 import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
+import { cleanModelPage, cleanModelSetting, sameModel } from './models.mjs';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -307,7 +308,7 @@ export class AttachedRuntime {
     );
   }
   async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
-    const mutating = ['send', 'stop', 'bash'].includes(op);
+    const mutating = ['send', 'set_model', 'stop', 'bash'].includes(op);
     const serialized =
       JSON.stringify({
         op,
@@ -374,8 +375,13 @@ export class AttachedRuntime {
           const response = JSON.parse(line);
           if (response.generation !== this.record.generation) throw new Error();
           if (
-            op === 'send' &&
+            ['send', 'set_model'].includes(op) &&
             [
+              'MODEL_SELECTION_UNSUPPORTED',
+              'MODEL_SELECTION_PENDING',
+              'MODEL_UNAVAILABLE',
+              'THINKING_LEVEL_UNSUPPORTED',
+              'THINKING_SUPPORT_UNKNOWN',
               'IMAGE_INPUT_UNSUPPORTED',
               'MODEL_IMAGE_INPUT_UNSUPPORTED',
               'INVALID_PROMPT_INPUT',
@@ -401,6 +407,12 @@ export class AttachedRuntime {
             return finish(
               new AttachmentFailure(
                 [
+                  'MODEL_SELECTION_CHANGED',
+                  'MODEL_SELECTION_FAILED',
+                  'MODELS_UNSUPPORTED',
+                  'INVALID_MODEL_METADATA',
+                  'THINKING_LEVEL_UNSUPPORTED',
+                  'THINKING_SUPPORT_UNKNOWN',
                   'BASH_UNSUPPORTED',
                   'INVALID_BASH_RESULT',
                   'STOP_IN_PROGRESS',
@@ -440,6 +452,27 @@ export class AttachedRuntime {
   state(timeout = 5000) {
     return this.request('state', {}, timeout);
   }
+  async set_model(args) {
+    if (this.record.modelSelectionSupported !== true)
+      throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
+    const result = await this.request(
+      'set_model',
+      {
+        model: args.model,
+        thinking_level: args.thinking_level,
+        timeout_ms: args.timeout_ms ?? 5000,
+      },
+      args.timeout_ms ?? 5000,
+      args.beforeDispatch,
+    );
+    if (result?.status !== 'accepted' || (args.model && !sameModel(result.model, args.model)))
+      throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
+    return { status: 'accepted', ...cleanModelSetting(result), scope: 'session' };
+  }
+  async models(args = {}) {
+    if (this.record.modelsSupported !== true) throw new AttachmentFailure('MODELS_UNSUPPORTED');
+    return cleanModelPage(await this.request('models', { offset: args.offset, limit: args.limit }));
+  }
   async read(args) {
     const result = await this.request('read', args);
     assertContextReadResponse(result, args);
@@ -461,6 +494,7 @@ export class AttachedRuntime {
     return result;
   }
   send(args) {
+    if (args.model) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
     if (args.images && this.record.imagesSupported !== true)
       throw new AttachmentFailure('IMAGE_INPUT_UNSUPPORTED');
     return this.request(

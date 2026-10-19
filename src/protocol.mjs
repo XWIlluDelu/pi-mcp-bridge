@@ -18,14 +18,22 @@ import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
 export const descriptions = {
+  models:
+    'Inspect a known session’s native available chat-model snapshot and current selection. Requires send permission; never returns credentials or full provider configuration. start:true explicitly allows cold-starting that saved session without a prompt. Inactive sessions otherwise return availability unknown. Includes input modes, limits, reasoning and native thinking levels; null means unknown. Standalone set_model changes persistent session state, including while busy. send/create with model require an exclusively Bridge-owned idle runtime.',
+  reload:
+    'Reload a proven-idle Bridge-owned RPC by normal EOF exit and reopening the same saved session (method:rpc_reopen). This is not SDK hot reload or arbitrary slash execution. Requires send permission, never stop; refuses busy, unconfirmed idle, inactive sessions and external owners. Reapplies native launch settings/extensions, including explicit CLI overrides; reports new generation and current model/thinking. Does not restart the Bridge service or tunnel. Required request_id recovers the existing outcome without reopening again. Timeout returns unknown while the fenced operation continues; never retry with a new ID.',
+  compact:
+    'Manually compact through native Pi. Defaults to idle-only with send permission; refuses busy or unproven idle. Only explicit interrupt:true permits native abort-before-compaction and additionally requires stop permission. An interrupting call may abort the agent even if summarization later fails. It does not emulate stop-all or withdraw queues. Supported on Bridge-owned RPC only; other owners explicitly reject. Returns bounded completion metadata, never summary text; use read for the native summary. Timeout means unknown: recover with same request_id and recover:true, never repeat with a new ID. Native stop can cancel compaction; no arbitrary slash command execution.',
+  set_model:
+    'Set the persistent session model through native Pi without sending a prompt. Requires send permission. Busy switching is allowed: in-flight provider requests keep their model, subsequent agent calls (including tool continuations and queued prompts) use the then-current selection. This does not bind models to individual prompts or change global defaults. Supply model:{provider,id} and/or thinking_level, plus session_id and request_id. Explicit unsupported thinking is rejected before changing model; native model-only adjustment is reported with actual thinking_level. Omit both model and thinking_level with the same request_id to recover, never resubmit with a new ID after uncertainty.',
   list: 'List authorized Pi sessions with project, name, recent activity and coarse runtime status. Filters combine; newest activity first. list permission is independent of read.',
   read: 'Read the effective Pi context as a chronological timeline grouped by prompt. Select summaries, earliest/recent prompts and each prompt’s text, thinking and tool records. Defaults select all. Continue next_cursor with the same selectors; sampling omissions differ from capacity pagination.',
-  send: 'Send text and/or native images to the session’s single reusable Pi instance. images are base64 PNG/JPEG/GIF/WebP blocks; no fixed image-count cap, total decoded size at most 5 MiB. Requires an image-capable model and owner. default maps to steer; idle_only rejects busy sessions; steer and follow_up select native queues. Required stable request_id identifies one submission, not completion. Omit text and images to recover its receipt. Never replay unknown work under a new ID.',
+  send: 'Send text and/or native images to the session’s single reusable Pi instance. images are base64 PNG/JPEG/GIF/WebP blocks; no fixed image-count cap, total decoded size at most 5 MiB. Requires an image-capable model and owner. Optional model:{provider,id} selects the session model before sending; busy/queued/unsupported owners reject explicit selection. default maps to steer; idle_only rejects busy sessions; steer and follow_up select native queues. Required stable request_id identifies one submission, not completion. Omit text, images and model to recover its receipt. Never replay unknown work under a new ID.',
   command:
     'Execute a native Pi !command, not a model prompt, with independent command permission. Required request_id prevents repeated shell execution. Omit command to recover output; continue next_cursor with the same ID. timeout_ms is an acknowledgement budget, not a shell kill deadline. Unsupported hosts return BASH_UNSUPPORTED.',
   stop: 'Stop current execution and withdraw queued prompts while retaining the session and process. Requires only stop permission and request_id. An existing receipt is replayed without stopping a later run; without one, omitting cursor can execute stop. After a lost response, use the same ID with cursor:"" for receipt-only recovery from the first page; missing receipts return RECEIPT_NOT_FOUND without dispatch. Preserve the empty string, do not drop it with a truthy filter. Continue withdrawn text via next_cursor with the same ID. Unsupported hosts return STOP_UNSUPPORTED.',
   create:
-    'Create a session in project (absolute project directory) and send initial text and/or images. Images use the same rules as send. Optional name and fork_from copy the parent’s committed tail without switching its owner. Requires target create permission and source read when forking. Omit text and images only to recover an existing request_id. A partial receipt retains the created session ID and send status.',
+    'Create a session in project (absolute project directory) and send initial text and/or images. Images and optional model:{provider,id} use the same rules as send. Optional name and fork_from copy the parent’s committed tail without switching its owner. Requires target create permission and source read when forking. Omit text, images and model only to recover an existing request_id. A partial receipt retains the created session ID and send status.',
   delete:
     'Recoverably move an authorized session to Bridge trash, stopping its owned live runtime. Project files are retained. Repeat request_id to recover the receipt.',
   batch:
@@ -36,6 +44,10 @@ export const descriptions = {
 export const toolNames = [
   'list',
   'read',
+  'models',
+  'set_model',
+  'compact',
+  'reload',
   'send',
   'command',
   'stop',

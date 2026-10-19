@@ -6,11 +6,18 @@
 - **Policy and admission:** `bridge.mjs` composes per-operation permission checks, request receipts, session locks and stop/handoff fences. `permissions.mjs` resolves independent rights; `owner-config.mjs` validates and atomically edits them. Public schemas live in `tool-schemas.mjs`.
 - **History:** `data.mjs` validates native files and identity without requiring the project cwd to be available. `context-read.mjs` projects the effective native branch, applies selectors, then budgets chronological result pages. Known-ID lookups cache file locations but revalidate native identity and cwd on every access. `session-metadata.mjs` caches at most 256 short titles, keyed by inode, size and modification/change times; it never retains transcript bodies.
 - **Runtime:** `rpc.mjs` owns child lifecycle, prompt admission, native ACK recovery and the pool. `attachments.mjs` coordinates exact process identity and private IPC. `attach-extension.mjs` is a cooperative native extension; `host-adapter.mjs` supports hosts with an explicit controller contract.
+- **Native controls:** `models.mjs` allowlists runtime metadata and validates model/thinking selection. `compact.mjs` keeps read-protected summaries out of receipts. `reload.mjs` fences and normally reopens an idle owned RPC using the existing ownership registry, session lock and journal.
 - **Durability:** `journal.mjs` binds each request ID to its operation, target and body, serializes transitions and fsyncs durable receipts. `create-session.mjs` publishes a complete native prefix before starting the child. `trash.mjs` performs recoverable moves. The stop and bash modules capture native results independently of a disconnected MCP response.
 - **Local owner control:** `owner-runtime.mjs`, `idle-handoff.mjs`, `join-extension.mjs` and `open.mjs` negotiate before a live session is opened. Owner control is private local IPC, not a remotely authorized prompt command.
 - **Observation:** `live-message.mjs` retains bounded native partial text/thinking. `activity.mjs` separates idle evidence from settlement. `diagnostics.mjs` emits opt-in, privacy-filtered operational events.
 
 MCP, Bridge and attached owners use the same context-timeline read contract and send modes. Forking uses a separate native snapshot that preserves entries omitted by the public projection. An incompatible owner returns `OWNER_READ_REFRESH_REQUIRED`.
+
+## API distinctions
+
+- `list({session_id})` observes task state. `models` reads the separate native model catalog and current model/thinking. A saved session needs explicit `models.start` to start a runtime solely for discovery.
+- `set_model` changes session settings independently, including while busy. `send/create.model` selects a model immediately before submitting a prompt on a proven-idle Bridge-owned RPC; queued messages have no per-message model binding.
+- `stop` cancels execution and withdraws queued text. `compact` changes context; `reload` reopens the process. Their permissions, side effects and recovery receipts remain distinct.
 
 ## Invariants
 
@@ -30,7 +37,7 @@ MCP, Bridge and attached owners use the same context-timeline read contract and 
 - **Authorization:** three-tier rights, unknown-key refusal, live edits, continuation/replay authorization, revocation during cold startup, hidden-parent references, current permissions after cached lookup.
 - **Reading:** context grouping, hidden/orphan prompt boundaries, system sections, compaction/branch summaries, checkpoint edits, tool pairing, Unicode reconstruction, pinned history, bounded live observation, warm lookup without rescans, title-cache invalidation, companion idle evidence.
 - **Requests and recovery:** concurrent deduplication, ACK timeouts, late identity validation, persistence failures, crash/restart receipt recovery, shutdown races.
-- **Images:** native image bytes, including more than 32 images within byte limits, reach each supported owner and provider context.
+- **Native controls:** image bytes (including more than 32 images within byte limits), model metadata redaction, provider-call boundaries, partial selection, default-idle compaction, cancellation, exact-identity idle RPC reopen.
 - **Batch:** per-session lanes, independent progress, invalid-item isolation, captured-read rebudgeting, envelope byte limits.
 - **Ownership:** Unix owner claims, namespace-safe dead-owner registry recovery, filesystem aliases, unreachable hosts, release cancellation/drain, idle EOF handoff, cold resume only after an appropriate exact-death condition.
 - **Transports:** modern and legacy standard MCP clients over stdio/HTTP, shared proxies, authentication/header errors, frame limits, disconnects, bounded response waits.

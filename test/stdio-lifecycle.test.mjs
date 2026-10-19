@@ -201,7 +201,7 @@ test('modern stdio discovers without initialize and EOF drains a native receipt 
   const missing = await server.request('tools/list', {});
   assert.equal(missing.error.code, -32602);
   const listed = await server.request('tools/list', { _meta });
-  assert.equal(listed.result.tools.length, 9);
+  assert.equal(listed.result.tools.length, 13);
   const pending = server.request('tools/call', {
     name: 'send',
     arguments: { session_id: f.id, request_id: 'modern-eof', text: '/lifecycle-fixture' },

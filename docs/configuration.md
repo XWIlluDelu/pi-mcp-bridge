@@ -41,6 +41,15 @@ Explicit `piRuntime` keys:
 
 A `piRuntime` override changes the runtime environment; it is not a permission grant. Model tools and installed extensions can run shell commands, access files or make network calls, so denying the Bridge's direct `command` tool does not sandbox a prompt authorized by `send`.
 
+### Native control permissions
+
+- `send`: model discovery, model/thinking settings, manual `compact` and idle RPC `reload`.
+- `create`: a `create` call's initial model selection.
+- `stop`: required in addition to `send` only for explicit `compact(interrupt:true)`. Default idle compaction and idle reopen do not need it.
+- `read`: protects compaction summaries.
+
+See [model control](model-control.md) for details.
+
 ## Seven independent rights
 
 `list`, `read`, `send`, `command`, `stop`, `create` and `delete` are independent. All seven can be set at the default and project tiers. A session can override all except `create`, because creation targets a project, not an existing session.

@@ -864,12 +864,16 @@ test('standard MCP client attaches to an existing offline TUI through the single
     assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), [
       'batch',
       'command',
+      'compact',
       'create',
       'delete',
       'health',
       'list',
+      'models',
       'read',
+      'reload',
       'send',
+      'set_model',
       'stop',
     ]);
     const call = async (name, args) => {

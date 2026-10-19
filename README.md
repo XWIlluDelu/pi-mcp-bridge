@@ -6,7 +6,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 
 - **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Pages start with the newest selected content and continue backwards.
 - **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
-- **Stop:** cancel execution and withdraw queued input, with its complete text available in pages.
+- **Control:** discover runtime-available models, set a session's model and thinking level, compact context (idle by default), or reopen an idle owned RPC. Stop execution and withdraw queued input, with its complete text available in pages.
 - **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
 - **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
 - **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
@@ -45,17 +45,21 @@ For multiple clients, start one shared HTTP service; each stdio-only client can 
 
 ### Tools at a glance
 
-| Tool      | Main arguments                                                       | Permission                              |
-| --------- | -------------------------------------------------------------------- | --------------------------------------- |
-| `list`    | Optional project/name/time/ID filters; offset/limit                  | `list` per returned session             |
-| `read`    | `session_id`; optional preset/select/cursor/max_bytes                | `read`                                  |
-| `send`    | `session_id`, `request_id`, text/images; optional mode               | `send`                                  |
-| `command` | `session_id`, `request_id`, `command`                                | `command`                               |
-| `stop`    | `session_id`, `request_id`                                           | `stop` only                             |
-| `create`  | `project`, `request_id`, text and/or images; optional name/fork_from | Target `create`; source `read` for fork |
-| `delete`  | `session_id`, `request_id`                                           | `delete`                                |
-| `batch`   | 1–10 `{op,args}` items                                               | Each wrapped operation's own permission |
-| `health`  | Optional known `session_id`; permissions by default                  | Diagnostics; does not change grants     |
+| Tool        | Main arguments                                                       | Permission                              |
+| ----------- | -------------------------------------------------------------------- | --------------------------------------- |
+| `list`      | Optional project/name/time/ID filters; offset/limit                  | `list` per returned session             |
+| `read`      | `session_id`; optional preset/select/cursor/max_bytes                | `read`                                  |
+| `models`    | Known `session_id`; optional start/offset/limit                      | `send`                                  |
+| `set_model` | `session_id`, `request_id`, model and/or thinking_level              | `send`                                  |
+| `compact`   | `session_id`, `request_id`; optional instructions/interrupt          | `send`; explicit interrupt also `stop`  |
+| `reload`    | `session_id`, `request_id`; idle owned RPC reopen                    | `send`                                  |
+| `send`      | `session_id`, `request_id`, text/images; optional mode/model         | `send`                                  |
+| `command`   | `session_id`, `request_id`, `command`                                | `command`                               |
+| `stop`      | `session_id`, `request_id`                                           | `stop` only                             |
+| `create`    | `project`, `request_id`, text and/or images; optional name/fork_from | Target `create`; source `read` for fork |
+| `delete`    | `session_id`, `request_id`                                           | `delete`                                |
+| `batch`     | 1–10 `{op,args}` items                                               | Each wrapped operation's own permission |
+| `health`    | Optional known `session_id`; permissions by default                  | Diagnostics; does not change grants     |
 
 Every mutation requires a `request_id`. Native acceptance is not model completion, and a timeout can leave the outcome `unknown`: recover using the same `request_id` rather than submitting the work again. See [API](docs/api.md) and [reading](docs/reading.md).
 
@@ -74,7 +78,7 @@ The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits 
 **Native boundaries:**
 
 - An unregistered RPC process cannot be attached to by PID.
-- The companion extension can observe and submit, but Pi's ordinary extension API does not allow complete native shell/stop control.
+- The companion supports reading, text/images and standalone model/thinking settings. Remote command, stop, compact, reload and combined prompt+model require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
 - Closing a native TUI interrupts its running task; it does not transfer that task to a background process. After a graceful close, cold resume is allowed only once exact process death is established.
 - Host applications with their own controller can supply native capabilities.
 
@@ -82,6 +86,7 @@ The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits 
 
 - [Configuration and permissions](docs/configuration.md)
 - [API and recovery contracts](docs/api.md)
+- [Runtime models, thinking, compaction and reload](docs/model-control.md)
 - [Context selection, pagination and live observation](docs/reading.md)
 - [Runtime ownership, TUI handoff and capabilities](docs/runtime.md)
 - [MCP protocols and transports](docs/transports.md)

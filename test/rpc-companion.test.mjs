@@ -124,12 +124,16 @@ test(
     assert.deepEqual((await remote.listTools()).tools.map((x) => x.name).sort(), [
       'batch',
       'command',
+      'compact',
       'create',
       'delete',
       'health',
       'list',
+      'models',
       'read',
+      'reload',
       'send',
+      'set_model',
       'stop',
     ]);
     assert.equal(

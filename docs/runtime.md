@@ -14,16 +14,21 @@ processes do not proxy each other's private RPC pipes.
 
 ## Runtime capabilities
 
-| Capability            | Bridge-owned RPC                             | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings            |
-| --------------------- | -------------------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
-| Read context          | Yes                                          | Yes                                                   | Native snapshot                           |
-| Live text/thinking    | Native delta events                          | Public extension events                               | When the host supplies live observation   |
-| Send text/images      | Native ACK                                   | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
-| Native command / stop | Yes, including queued-input withdrawal       | Unsupported                                           | Yes                                       |
-| TUI handoff           | Drain and normal EOF, then reserved TUI join | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                   |
+| Capability                        | Bridge-owned RPC                              | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings            |
+| --------------------------------- | --------------------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
+| Read context                      | Yes                                           | Yes                                                   | Native snapshot                           |
+| Live text/thinking                | Native delta events                           | Public extension events                               | When the host supplies live observation   |
+| Send text/images                  | Native ACK                                    | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
+| Models; standalone model/thinking | Yes                                           | Yes                                                   | Yes                                       |
+| Prompt + model                    | Proven-idle only                              | Unsupported                                           | Unsupported                               |
+| Native command / stop             | Yes, including queued-input withdrawal        | Unsupported                                           | Yes                                       |
+| Manual compact                    | Idle by default; explicit interrupt supported | Unsupported                                           | Unsupported                               |
+| Remote reload                     | Proven-idle `rpc_reopen`                      | Unsupported; local TUI `/reload` instead              | Host controls lifecycle                   |
+| TUI handoff                       | Drain and normal EOF, then reserved TUI join  | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                   |
 
 Saved sessions can be read without a runtime. Authorized send or command can
-cold-start an RPC; stop never does. Custom hosts expose only the callbacks and
+cold-start an RPC; stop never does. Model discovery starts an inactive session
+only with explicit `start:true`. Custom hosts expose only the callbacks and
 capabilities they implement.
 
 The ordinary companion returns `PI_ACCEPTANCE_UNOBSERVABLE` after
@@ -36,6 +41,16 @@ Default sending follows ordinary TUI Enter: steer while busy. Explicit
 follow-up maps to Pi's follow-up queue. Pi's configured queue consumption modes
 remain in effect. Idle-only checks available admission/preparation state and
 does not silently convert a busy input into a queued one.
+
+## Model settings, compaction and reload
+
+Runtime model discovery and standalone session model/thinking settings are
+available on owned RPC and updated cooperative bindings. Model-plus-prompt
+selection, manual compaction and `reload` via `rpc_reopen` require an owned RPC.
+See [native controls](model-control.md) for precise queue/model timing, default
+idle-only compaction, permission checks, reload's normal EOF lifecycle and
+unsupported routes. RPC reopen changes generation but preserves committed
+session identity/context; it does not restart the Bridge service.
 
 ## Image-capable owners
 

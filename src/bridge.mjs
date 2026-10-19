@@ -1,5 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { compactSchema, compactReceipt } from './compact.mjs';
+import { reloadSchema, reopenOwned } from './reload.mjs';
+import { setModelSchema, sameModel } from './models.mjs';
 import { randomUUID } from 'node:crypto';
 import { readSchema } from './read-schema.mjs';
 import { stopSchema, bashSchema } from './tool-schemas.mjs';
@@ -157,6 +160,243 @@ export class Bridge {
     const allowed = permitted(this.config, action, s);
     diagnostics.emit('permission.check', { op: action, allowed });
     if (!allowed) throw new Error('NOT_FOUND_OR_DENIED');
+  }
+  async models(args) {
+    this.assertOpen();
+    if (this.configFile) await this.refreshPermissions();
+    const session = await this.session(args.session_id);
+    this.check('send', session);
+    const inspect = async () => {
+      if (this.configFile) await this.refreshPermissions();
+      this.check('send', session);
+      if (args.start && this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
+      let runtime = await this.pool.forRead(session);
+      if (!runtime && args.start) {
+        await validateExecutionCwd(session.cwd);
+        await loadSavedSession(session);
+        runtime = await this.pool.resolve(session);
+      }
+      const page = runtime
+        ? await runtime.models(args)
+        : {
+            source: 'inactive',
+            availability: 'unknown',
+            current: null,
+            models: null,
+            total: null,
+            next_offset: null,
+          };
+      if (this.configFile) await this.refreshPermissions();
+      this.check('send', session);
+      return {
+        session_id: session.id,
+        ...page,
+        model_selection: !runtime
+          ? 'unknown'
+          : !runtime.attached || runtime.record.modelSelectionSupported === true
+            ? 'session'
+            : 'unsupported',
+        prompt_model_selection: !runtime
+          ? 'unknown'
+          : !runtime.attached
+            ? 'idle_only_session'
+            : 'unsupported',
+      };
+    };
+    return args.start ? this.locked(session.id, inspect) : inspect();
+  }
+  async set_model(args) {
+    if (!setModelSchema.safeParse(args).success) throw new Error('INVALID_MODEL_ARGUMENTS');
+    return this.withInput(args.session_id, async (checkInput) => {
+      this.assertOpen();
+      if (this.configFile) await this.refreshPermissions();
+      const session = await this.session(args.session_id);
+      this.check('send', session);
+      const body =
+        args.model !== undefined || args.thinking_level !== undefined
+          ? { model: args.model, thinking_level: args.thinking_level }
+          : undefined;
+      return this.journal.run(args.request_id, 'set_model', session.id, body, (save) =>
+        this.mutationLock(session.id, 'send', save, async () => {
+          try {
+            let runtime = await this.pool.forRead(session);
+            if (!runtime) {
+              await validateExecutionCwd(session.cwd);
+              await loadSavedSession(session);
+              checkInput();
+              runtime = await this.pool.resolve(session);
+            }
+            if (this.configFile) await this.refreshPermissions();
+            const authorized = async () => {
+              if (this.configFile) await this.refreshPermissions();
+              checkInput();
+              this.check('send', session);
+            };
+            await authorized();
+            if (runtime.attached)
+              return await save(await runtime.set_model({ ...args, beforeDispatch: authorized }));
+            const configured = await runtime.selectModel(args.model, {
+              thinkingLevel: args.thinking_level,
+              timeout: args.timeout_ms ?? 5000,
+              beforeDispatch: authorized,
+              onLate: async (result) => {
+                if (!result.ok) return save({ status: 'rejected', reason: result.code });
+                const current = await runtime.state();
+                if (!sameModel(current.model, result.selected_model))
+                  return save({ status: 'unknown', reason: 'MODEL_SELECTION_CHANGED' });
+                if (result.phase === 'model' && args.thinking_level !== undefined)
+                  return save({
+                    status: 'rejected',
+                    reason: 'MODEL_SELECTED_THINKING_NOT_SET',
+                    model: result.selected_model,
+                    thinking_level: current.thinkingLevel ?? null,
+                    thinking_adjustment: 'unknown',
+                    scope: 'session',
+                  });
+                return save({
+                  status: 'accepted',
+                  model: result.selected_model,
+                  thinking_level: current.thinkingLevel ?? null,
+                  thinking_adjustment: 'unknown',
+                  scope: 'session',
+                });
+              },
+            });
+            return await save({ status: 'accepted', ...configured, scope: 'session' });
+          } catch (error) {
+            return save({
+              status: error.uncertain ? 'unknown' : 'rejected',
+              reason: safeReason(error),
+            });
+          }
+        }),
+      );
+    });
+  }
+  async reload(args) {
+    if (!reloadSchema.safeParse(args).success) throw new Error('INVALID_RELOAD_ARGUMENTS');
+    return this.withInput(args.session_id, async (checkInput) => {
+      const session = await this.session(args.session_id);
+      const authorize = async () => {
+        if (this.configFile) await this.refreshPermissions();
+        checkInput();
+        this.check('send', session);
+      };
+      await authorize();
+      // A lookup of an in-progress request observes its durable phase immediately.
+      // It does not enqueue another reopen, even after a caller's timeout.
+      if (await this.journal.get(args.request_id))
+        return this.journal.execute(args.request_id, 'reload', session.id, {}, undefined);
+      const work = this.journal.run(args.request_id, 'reload', session.id, {}, (save) =>
+        this.mutationLock(session.id, 'send', save, async () => {
+          try {
+            return await reopenOwned(this, session, save, authorize);
+          } catch (error) {
+            return save({
+              status: error.uncertain ? 'unknown' : 'rejected',
+              ...error.reload_details,
+              reason: safeReason(error),
+            });
+          }
+        }),
+      );
+      let timer;
+      try {
+        return await Promise.race([
+          work,
+          new Promise((resolve) => {
+            timer = setTimeout(
+              () =>
+                resolve({
+                  request_id: args.request_id,
+                  operation: 'reload',
+                  status: 'unknown',
+                  method: 'rpc_reopen',
+                  session_id: session.id,
+                  reason: 'ACK_TIMEOUT',
+                }),
+              args.timeout_ms ?? 5000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    });
+  }
+  async compact(args) {
+    if (
+      !compactSchema.safeParse(args).success ||
+      (args.recover && (args.instructions !== undefined || args.interrupt !== undefined))
+    )
+      throw new Error('INVALID_COMPACT_ARGUMENTS');
+    return this.withInput(args.session_id, async (checkInput) => {
+      this.assertOpen();
+      if (this.configFile) await this.refreshPermissions();
+      const session = await this.session(args.session_id);
+      this.check('send', session);
+      // Recovery of an interrupting call still requires its original grant.
+      const prior = await this.journal.get(args.request_id);
+      if (args.interrupt || prior?.receipt.interrupt_requested) this.check('stop', session);
+      const body = args.recover
+        ? undefined
+        : { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
+      return this.journal.run(args.request_id, 'compact', session.id, body, (persist) => {
+        const save = (result) => persist({ interrupt_requested: body.interrupt, ...result });
+        return this.mutationLock(session.id, 'send', save, async () => {
+          try {
+            await save({ status: 'unknown' });
+            let runtime = await this.pool.forRead(session);
+            if (runtime?.attached) throw new Error('COMPACT_UNSUPPORTED');
+            if (!runtime) {
+              await validateExecutionCwd(session.cwd);
+              await loadSavedSession(session);
+              checkInput();
+              runtime = await this.pool.resolve(session);
+            }
+            if (!body.interrupt)
+              await runtime.assertIdle({
+                busy: 'COMPACT_BUSY',
+                unconfirmed: 'COMPACT_IDLE_UNCONFIRMED',
+              });
+            if (this.configFile) await this.refreshPermissions();
+            const authorized = async () => {
+              if (this.configFile) await this.refreshPermissions();
+              checkInput();
+              this.check('send', session);
+              if (body.interrupt) this.check('stop', session);
+            };
+            await authorized();
+            const late = (result) =>
+              save(
+                result.ok
+                  ? compactReceipt(result.data)
+                  : {
+                      status: 'rejected',
+                      reason: result.code,
+                      native_effects: 'native_compact_attempted',
+                    },
+              );
+            const result = await runtime.command(
+              { type: 'compact', customInstructions: body.instructions },
+              args.timeout_ms ?? 5000,
+              late,
+              authorized,
+            );
+            return await save(compactReceipt(result));
+          } catch (error) {
+            return save({
+              status: error.uncertain ? 'unknown' : 'rejected',
+              reason: safeReason(error),
+              native_effects:
+                error.code === 'PI_REJECTED' || error.uncertain
+                  ? 'native_compact_attempted'
+                  : 'none',
+            });
+          }
+        });
+      });
+    });
   }
   async list(args = {}) {
     this.assertOpen();
@@ -378,6 +618,11 @@ export class Bridge {
         };
       return this.journal.run(args.request_id, 'send', args.session_id, body, (save) =>
         this.mutationLock(args.session_id, 'send', save, async () => {
+          const selection = body.model
+            ? {
+                model_selection: { requested: body.model, scope: 'session', status: 'not_changed' },
+              }
+            : {};
           try {
             beforeDispatch();
             const s = await this.session(args.session_id);
@@ -399,6 +644,29 @@ export class Bridge {
             await authorized();
             if (runtime.attached)
               return save(await runtime.send({ ...args, ...body, beforeDispatch: authorized }));
+            if (body.model && body.mode === 'idle_only') {
+              const state = await runtime.state();
+              if (
+                runtime.promptAdmission ||
+                state.isStreaming ||
+                state.isCompacting ||
+                state.pendingMessageCount > 0
+              )
+                return save({ ...selection, status: 'skipped', reason: 'busy' });
+            }
+            if (body.model) {
+              await runtime.selectModel(body.model, {
+                images: body.images,
+                idle: true,
+                timeout: args.timeout_ms ?? 5000,
+                beforeDispatch: authorized,
+                report: (status) => {
+                  selection.model_selection.status = status;
+                },
+                onLate: (result) => save(modelSelectedWithoutPrompt(result, selection, body.model)),
+              });
+              await authorized();
+            }
             if (body.mode === 'idle_only' || body.images) {
               const state = await runtime.state();
               assertImageModel(body.images, state.model);
@@ -423,11 +691,12 @@ export class Bridge {
               save(
                 result.ok
                   ? {
+                      ...selection,
                       status: 'accepted',
                       disposition: result.data.disposition,
                       completion: 'not_tracked',
                     }
-                  : { status: 'rejected', reason: result.code },
+                  : { ...selection, status: 'rejected', reason: result.code },
               );
             const result = await runtime.command(
               command,
@@ -436,12 +705,14 @@ export class Bridge {
               authorized,
             );
             return save({
+              ...selection,
               status: 'accepted',
               disposition: result.disposition,
               completion: 'not_tracked',
             });
           } catch (e) {
             return save({
+              ...selection,
               status: e.uncertain ? 'unknown' : 'rejected',
               reason: safeReason(e),
             });
@@ -621,11 +892,14 @@ export class Bridge {
       this.locked(`project:${folder.path}`, async () => {
         let child,
           created = false;
+        const selection = input.model
+          ? { model_selection: { requested: input.model, scope: 'session', status: 'not_changed' } }
+          : {};
         const outcome = (send) => ({
           status: send.status,
           created,
           session_id: child?.id,
-          send,
+          send: { ...selection, ...send },
         });
         try {
           await validateExecutionCwd(folder.path);
@@ -663,6 +937,20 @@ export class Bridge {
               const runtime = await this.pool.resolve(child);
               await beforeDispatch();
               if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
+              if (input.model) {
+                await runtime.selectModel(input.model, {
+                  images: input.images,
+                  idle: true,
+                  timeout: args.timeout_ms ?? 5000,
+                  beforeDispatch,
+                  report: (status) => {
+                    selection.model_selection.status = status;
+                  },
+                  onLate: (result) =>
+                    save(outcome(modelSelectedWithoutPrompt(result, selection, input.model))),
+                });
+                await beforeDispatch();
+              }
               if (input.images) {
                 assertImageModel(input.images, (await runtime.state()).model);
                 await beforeDispatch();
@@ -849,6 +1137,18 @@ export class Bridge {
     return this.closePromise;
   }
 }
+function modelSelectedWithoutPrompt(result, selection, requested) {
+  const selected = result.ok && sameModel(result.data, requested);
+  return {
+    status: 'rejected',
+    reason: selected
+      ? 'MODEL_SELECTED_PROMPT_NOT_SENT'
+      : result.ok
+        ? 'MODEL_SELECTION_CHANGED'
+        : result.code,
+    model_selection: { ...selection.model_selection, status: selected ? 'selected' : 'unknown' },
+  };
+}
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure', { code, uncertain: error.uncertain === true });
@@ -856,6 +1156,27 @@ function safeReason(error) {
     'RECEIPT_PERSIST_FAILED',
     'IMAGE_INPUT_UNSUPPORTED',
     'MODEL_IMAGE_INPUT_UNSUPPORTED',
+    'MODEL_SELECTION_UNSUPPORTED',
+    'MODEL_SELECTION_PENDING',
+    'MODEL_SELECTION_BUSY',
+    'MODEL_SELECTION_IDLE_UNCONFIRMED',
+    'MODEL_SELECTION_FAILED',
+    'MODEL_SELECTION_CHANGED',
+    'MODEL_UNAVAILABLE',
+    'THINKING_LEVEL_UNSUPPORTED',
+    'THINKING_SUPPORT_UNKNOWN',
+    'MODEL_REQUIRES_PROMPT',
+    'MODELS_UNSUPPORTED',
+    'COMPACT_UNSUPPORTED',
+    'COMPACTION_PENDING',
+    'INVALID_COMPACT_RESULT',
+    'COMPACT_BUSY',
+    'COMPACT_IDLE_UNCONFIRMED',
+    'RELOAD_BUSY',
+    'RELOAD_IDLE_UNCONFIRMED',
+    'RELOAD_NOT_RUNNING',
+    'RELOAD_UNSUPPORTED',
+    'RELOAD_OWNER_CHANGED',
     'RUNTIME_EXIT_ABNORMAL',
     'RECOVERY_PERSIST_FAILED',
     'BRIDGE_CLOSING',

@@ -4,6 +4,8 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
+import { modelPage, sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
+import { assertImageModel } from './prompt-input.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
@@ -110,6 +112,8 @@ export class PiRpc {
     this.exited = false;
     this.generation = randomUUID();
     this.promptAdmission = null;
+    this.modelMutation = null;
+    this.compactionMutation = null;
     this.settlement = {
       generation: this.generation,
       sequence: 0,
@@ -243,7 +247,15 @@ export class PiRpc {
     )
       return;
     if (
-      ['bash', 'clear_queue', 'abort', 'abort_bash'].includes(req.commandType) &&
+      [
+        'set_model',
+        'set_thinking_level',
+        'compact',
+        'bash',
+        'clear_queue',
+        'abort',
+        'abort_bash',
+      ].includes(req.commandType) &&
       (event.command !== req.commandType || typeof event.success !== 'boolean')
     )
       return;
@@ -257,6 +269,13 @@ export class PiRpc {
       ['started', 'queued'].includes(event.data?.disposition)
     )
       this.handoffSettlement = this.settlement.sequence + 1;
+    if (
+      this.compactionMutation?.id === event.id &&
+      this.compactionMutation.generation === generation
+    )
+      this.compactionMutation = null;
+    if (this.modelMutation?.id === event.id && this.modelMutation.generation === generation)
+      this.modelMutation = null;
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation)
       this.promptAdmission = null;
     const result = event.success
@@ -330,7 +349,8 @@ export class PiRpc {
     try {
       checkedState = await this.state();
     } catch (error) {
-      if (command.type === 'prompt') error.uncertain = true;
+      if (['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type))
+        error.uncertain = true;
       throw error;
     }
     if (rejection) throw rejection;
@@ -354,12 +374,25 @@ export class PiRpc {
     if (this.handoffPending && !['get_state', 'get_entries'].includes(command.type))
       return Promise.reject(new RpcFailure('HANDOFF_PENDING'));
     if (this.gracefulExitPromise) return Promise.reject(new RpcFailure('RUNTIME_SHUTTING_DOWN'));
-    if (command.type === 'prompt' && this.promptAdmission)
+    if (
+      ['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type) &&
+      this.compactionMutation
+    )
+      return Promise.reject(new RpcFailure('COMPACTION_PENDING'));
+    if (
+      ['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type) &&
+      this.modelMutation
+    )
+      return Promise.reject(new RpcFailure('MODEL_SELECTION_PENDING'));
+    if (['prompt', 'compact'].includes(command.type) && this.promptAdmission)
       return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
     const id = randomUUID(),
       generation = this.generation;
     const serialized = `${JSON.stringify({ ...command, id })}\n`;
     if (command.type === 'prompt') this.promptAdmission = { id, generation };
+    if (['set_model', 'set_thinking_level'].includes(command.type))
+      this.modelMutation = { id, generation };
+    if (command.type === 'compact') this.compactionMutation = { id, generation };
     return new Promise((resolve, reject) => {
       const req = {
         resolve,
@@ -372,7 +405,15 @@ export class PiRpc {
         log: diagnostics.capture(),
       };
       const discardRead = () => {
-        if (['get_state', 'get_entries'].includes(command.type)) this.pending.delete(id);
+        if (
+          [
+            'get_state',
+            'get_entries',
+            'get_available_models',
+            'get_available_thinking_levels',
+          ].includes(command.type)
+        )
+          this.pending.delete(id);
       };
       req.timer = setTimeout(() => {
         req.timedOut = true;
@@ -410,6 +451,107 @@ export class PiRpc {
   }
   entries() {
     return this.command({ type: 'get_entries' });
+  }
+  async models(args = {}) {
+    const result = await this.command({ type: 'get_available_models' });
+    const state = await this.state();
+    return modelPage(result.models, state.model, state.thinkingLevel, args);
+  }
+  async assertIdle({
+    busy = 'MODEL_SELECTION_BUSY',
+    unconfirmed = 'MODEL_SELECTION_IDLE_UNCONFIRMED',
+  } = {}) {
+    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    // Idle-gated controls must refuse a mismatched owner, never tear it down.
+    const state = await this.dispatch({ type: 'get_state' });
+    if (state.sessionFile !== this.session.file || state.sessionId !== this.session.header.id)
+      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    if (
+      this.promptAdmission ||
+      this.settlement.sequence < this.handoffSettlement ||
+      [...this.pending.values()].some(
+        (r) =>
+          ![
+            'get_state',
+            'get_entries',
+            'get_available_models',
+            'get_available_thinking_levels',
+          ].includes(r.commandType),
+      ) ||
+      state.isStreaming ||
+      state.isCompacting ||
+      state.pendingMessageCount > 0
+    )
+      throw new RpcFailure(busy);
+    if (
+      state.isStreaming !== false ||
+      state.isCompacting !== false ||
+      state.pendingMessageCount !== 0 ||
+      !this.ownerRecord?.socket
+    )
+      throw new RpcFailure(unconfirmed);
+    const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
+    if (observed.nonRpcInputSeen !== false) throw new RpcFailure(unconfirmed);
+    if (observed.isIdle !== true || observed.hasPendingMessages !== false)
+      throw new RpcFailure(busy);
+    return state;
+  }
+  // Native selection is persistent session state, NOT a per-prompt binding.
+  // Active provider calls keep their captured model; later calls/queued inputs
+  // consult the then-current selection. The Bridge lane orders our selection
+  // and submission, not the complete run or unrelated native extension work.
+  async selectModel(
+    model,
+    { images, thinkingLevel, idle = false, timeout = 5000, beforeDispatch, report, onLate } = {},
+  ) {
+    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    if (this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    if (idle) await this.assertIdle();
+    const { models } = await this.command({ type: 'get_available_models' });
+    const initial = await this.state();
+    const target = models?.find((m) => sameModel(m, model ?? initial.model));
+    if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
+    assertImageModel(images, target);
+    assertThinkingLevel(target, thinkingLevel);
+    const state = idle ? await this.assertIdle() : await this.state();
+    await beforeDispatch?.();
+    if (!sameModel(state.model, target)) {
+      report?.('unknown');
+      // A timed-out set_model keeps subsequent input fenced until its exact ACK.
+      // Never submit the prompt from a late selection ACK.
+      const changed = await this.command(
+        { type: 'set_model', provider: target.provider, modelId: target.id },
+        timeout,
+        (result) =>
+          onLate?.({
+            ...result,
+            phase: 'model',
+            selected_model: { provider: target.provider, id: target.id },
+          }),
+        beforeDispatch,
+      );
+      if (!sameModel(changed, target)) throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
+      report?.('selected');
+    }
+    let selected = idle ? await this.assertIdle() : await this.state();
+    if (!sameModel(selected.model, target)) throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
+    if (thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel) {
+      await this.command(
+        { type: 'set_thinking_level', level: thinkingLevel },
+        timeout,
+        (result) =>
+          onLate?.({
+            ...result,
+            phase: 'thinking',
+            selected_model: { provider: target.provider, id: target.id },
+          }),
+        beforeDispatch,
+      );
+      selected = await this.state();
+      if (!sameModel(selected.model, target)) throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
+    }
+    report?.('selected');
+    return modelSetting(selected.model, selected.thinkingLevel, state.thinkingLevel, thinkingLevel);
   }
   async executeBash({ command, timeout_ms = 5000, recovery_id, beforeDispatch, onLate }) {
     const check = async () => {
