@@ -1,7 +1,7 @@
 // Bind existing owners through Pi 1.1 public APIs. These helpers never open a
 // session, spawn a process, read stdio, or access private admission hooks.
 import { nativeBashResult } from './bash-execution.mjs';
-import { SEND_MODES } from './prompt-input.mjs';
+import { SEND_MODES, assertImageModel } from './prompt-input.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown = () => ({
   status: 'unknown',
@@ -72,14 +72,16 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       assertIdentity(before, identity(session));
       return { ...before, entries, leafId };
     },
-    submit: async ({ text, mode = 'default', beforeDispatch }) => {
+    supportsImages: true,
+    submit: async ({ text, images, mode = 'default', beforeDispatch }) => {
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
+      assertImageModel(images, session.model);
       beforeDispatch?.();
       if (mode === 'idle_only' && !session.isIdle) return { status: 'skipped', reason: 'busy' };
       // Public prompt() resolves at completion, not at admission. Even a
       // synchronous throw after entering host code cannot prove no side effect.
       try {
-        tracked.track(session.prompt(text, options(mode)));
+        tracked.track(session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }));
       } catch (error) {
         try {
           onError?.(error);
@@ -184,8 +186,10 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
         leafId: snapshot.leafId,
       };
     },
-    submit: async ({ text, mode = 'default', beforeDispatch }) => {
+    supportsImages: true,
+    submit: async ({ text, images, mode = 'default', beforeDispatch }) => {
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
+      if (images) assertImageModel(images, (await client.getState()).model);
       if (mode === 'idle_only') {
         const observed = await state();
         if (observed.isStreaming || observed.isCompacting || observed.pendingMessageCount > 0)
@@ -194,7 +198,7 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       beforeDispatch?.();
       try {
         const disposition = await tracked.track(
-          client.prompt(text, undefined, options(mode).streamingBehavior),
+          client.prompt(text, images, options(mode).streamingBehavior),
         );
         if (!['started', 'queued', 'handled'].includes(disposition)) return unknown();
         return { status: 'accepted', disposition, completion: 'not_tracked' };

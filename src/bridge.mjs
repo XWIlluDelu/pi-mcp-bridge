@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { permitted, permissionWarnings } from './permissions.mjs';
 import { sessionMetadata, runtimeStatus } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
-import { SEND_MODES, promptInput } from './prompt-input.mjs';
+import { SEND_MODES, promptInput, assertImageModel } from './prompt-input.mjs';
 import { renderContextRead } from './context-read.mjs';
 import { discover, readSessionIdentity, loadSavedSession, validateExecutionCwd } from './data.mjs';
 import { hash, atomicJson } from './storage.mjs';
@@ -399,14 +399,16 @@ export class Bridge {
             await authorized();
             if (runtime.attached)
               return save(await runtime.send({ ...args, ...body, beforeDispatch: authorized }));
-            if (body.mode === 'idle_only') {
+            if (body.mode === 'idle_only' || body.images) {
               const state = await runtime.state();
+              assertImageModel(body.images, state.model);
               if (
-                runtime.promptAdmission ||
-                state.isStreaming ||
-                state.isCompacting ||
-                state.isIdle === false ||
-                state.pendingMessageCount > 0
+                body.mode === 'idle_only' &&
+                (runtime.promptAdmission ||
+                  state.isStreaming ||
+                  state.isCompacting ||
+                  state.isIdle === false ||
+                  state.pendingMessageCount > 0)
               )
                 return save({ status: 'skipped', reason: 'busy' });
             }
@@ -414,6 +416,7 @@ export class Bridge {
             const command = {
               type: 'prompt',
               message: body.text,
+              ...(body.images ? { images: body.images } : {}),
             };
             command.streamingBehavior = body.mode === 'follow_up' ? 'followUp' : 'steer';
             const late = (result) =>
@@ -660,6 +663,10 @@ export class Bridge {
               const runtime = await this.pool.resolve(child);
               await beforeDispatch();
               if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
+              if (input.images) {
+                assertImageModel(input.images, (await runtime.state()).model);
+                await beforeDispatch();
+              }
               const onLate = (result) =>
                 save(
                   outcome(
@@ -676,6 +683,7 @@ export class Bridge {
                 {
                   type: 'prompt',
                   message: input.text,
+                  ...(input.images ? { images: input.images } : {}),
                   streamingBehavior: 'steer',
                 },
                 args.timeout_ms ?? 5000,
@@ -846,6 +854,8 @@ function safeReason(error) {
   diagnostics.emit('operation.failure', { code, uncertain: error.uncertain === true });
   return [
     'RECEIPT_PERSIST_FAILED',
+    'IMAGE_INPUT_UNSUPPORTED',
+    'MODEL_IMAGE_INPUT_UNSUPPORTED',
     'RUNTIME_EXIT_ABNORMAL',
     'RECOVERY_PERSIST_FAILED',
     'BRIDGE_CLOSING',

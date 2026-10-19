@@ -106,9 +106,56 @@ Every continuation reauthorizes read.
 
 `timeout_ms` (50–30000, default 5000) bounds admission acknowledgement, not
 model execution. Queued input is an accepted submission, not a completed task.
-Omit `text` and reuse the same session/request ID to recover a receipt.
+Omit `text` and `images` and reuse the same session/request ID to recover a receipt.
 A plain companion reports unknown acceptance when the public extension API
 cannot prove admission; it does not invent a native ACK.
+
+### Image input (send and create)
+
+Both tools accept `images` in native Pi `ImageContent` format:
+
+```json
+{
+  "session_id": "ps_…",
+  "request_id": "image-1",
+  "text": "Describe this picture",
+  "images": [{ "type": "image", "mimeType": "image/png", "data": "<actual base64 image bytes>" }]
+}
+```
+
+For `create`, replace `session_id` with the configured absolute `project`.
+You may omit `text` for image-only input. The Bridge adds the neutral text
+`[Image attachment]` because Pi 1.1 cannot clear consumed empty-text queue
+entries; the picture still arrives as a native image block. Omitting **both** payload fields
+means receipt recovery, not a new empty prompt. Never resubmit uncertain work under a
+new ID. Images participate in the durable request fingerprint: changing image
+bytes, MIME type, count or order under the same ID is a conflict. Recovery does
+not require uploading the images again.
+
+- Accepted MIME types: `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
+- One or more images, **no fixed count cap**; at most **5 MiB decoded bytes total**
+  per send/create. Total bytes and serialized envelope size bound validation work; native model/
+  provider-specific image limits still apply.
+- `data` must be canonical base64, without whitespace or a `data:` prefix.
+  URLs, local paths and client attachment IDs are not fetched or opened.
+- The **8 MiB serialized request limit** still applies to HTTP, stdio and IPC.
+  A batch shares that envelope limit; it is not multiplied by its item count.
+- The Bridge validates base64, size and format signatures before dispatch.
+  Pi retains its normal decoding, resizing and extension input behavior.
+  A selected model without image input is rejected with
+  `MODEL_IMAGE_INPUT_UNSUPPORTED`.
+- Images enter native user-message image blocks, not descriptions, OCR text or
+  base64 embedded in a text prompt. Native history and forked context retain
+  those blocks; read pagination remains bounded even for large image records.
+- Old companion/host endpoints without advertised image support return
+  `IMAGE_INPUT_UNSUPPORTED` before sending, even when text accompanies the image.
+  Reload/reopen them safely with the updated integration; never fall back to
+  text-only delivery.
+
+A native ACK confirms admission, not successful visual interpretation. Model
+responses and any native image-processing diagnostics are read from the session.
+Pi's native stop/queue-withdrawal APIs recover queued **text**, not image bytes;
+a stop receipt must not be treated as an attachment backup.
 
 ### Native command
 
@@ -192,8 +239,8 @@ A receipt contains `created`, the child `session_id` when chosen, and nested
 remains recoverable. The initial prompt holds the new session's admission lane
 so a concurrently submitted prompt cannot overtake it.
 
-Omit `text` with the same project/request ID to recover.
-Missing initial text without an existing receipt yields `RECEIPT_NOT_FOUND`; it does not create an
+Omit `text` and `images` with the same project/request ID to recover.
+Missing both initial payload fields without an existing receipt yields `RECEIPT_NOT_FOUND`; it does not create an
 empty session. If the process crashes before the created identity is durably
 recorded, recovery may remain unknown; it still never creates a second child.
 

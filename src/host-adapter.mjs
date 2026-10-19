@@ -203,6 +203,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       beforeDispatch();
       const input = attachedPromptInput(args);
       if (!SEND_MODES.includes(args.mode)) fail('INVALID_ATTACHED_SEND');
+      if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
       data = receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
@@ -358,6 +359,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
         releaseSupported: Boolean(callbacks.release),
+        imagesSupported: callbacks.supportsImages === true,
       });
       if (closed || releasing) {
         await retire();

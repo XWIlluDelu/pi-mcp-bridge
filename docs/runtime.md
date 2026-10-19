@@ -18,7 +18,7 @@ processes do not proxy each other's private RPC pipes.
 | --------------------- | -------------------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
 | Read context          | Yes                                          | Yes                                                   | Native snapshot                           |
 | Live text/thinking    | Native delta events                          | Public extension events                               | When the host supplies live observation   |
-| Send text             | Native ACK                                   | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
+| Send text/images      | Native ACK                                   | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
 | Native command / stop | Yes, including queued-input withdrawal       | Unsupported                                           | Yes                                       |
 | TUI handoff           | Drain and normal EOF, then reserved TUI join | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                   |
 
@@ -36,6 +36,20 @@ Default sending follows ordinary TUI Enter: steer while busy. Explicit
 follow-up maps to Pi's follow-up queue. Pi's configured queue consumption modes
 remain in effect. Idle-only checks available admission/preparation state and
 does not silently convert a busy input into a queued one.
+
+## Image-capable owners
+
+Image input passes through owned RPC prompt commands, Pi's
+`RpcClient.prompt(text, images, streamingBehavior)` binding, SDK prompt options,
+and companion `sendUserMessage()` content blocks. See [image input](api.md#image-input-send-and-create)
+for accepted payloads and limits. It uses the existing send/create grants.
+
+The registry advertises `imagesSupported: true` for an updated companion.
+The supplied SDK/RPC bindings declare `supportsImages: true`; a custom host's
+callbacks must explicitly declare the same flag and forward `submit().images`
+to its native input API. Omitting the declaration keeps text working but
+rejects image submissions. Existing running owners do not gain the capability
+merely because their files were updated: use safe reload/reopen.
 
 ## TUI-first and ordinary RPC registration
 
