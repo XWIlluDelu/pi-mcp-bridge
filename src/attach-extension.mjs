@@ -1,5 +1,12 @@
 // Load explicitly in the owner's ordinary Pi TUI or RPC: -e /absolute/path/src/attach-extension.mjs
 import fs from 'node:fs/promises';
+import {
+  modelPage,
+  modelSettingsSchema,
+  sameModel,
+  assertThinkingLevel,
+  modelSetting,
+} from './models.mjs';
 import net from 'node:net';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -176,6 +183,7 @@ export default function attachExtension(pi) {
           aborted: null,
         },
       };
+      let selecting = false;
       const activity = () =>
         activityObservation('attached_context', {
           idle: ctx.isIdle(),
@@ -219,10 +227,14 @@ export default function attachExtension(pi) {
           try {
             const request = JSON.parse(buffer.slice(0, end));
             check(request);
+            if (request.op === 'set_model' && Number.isInteger(request.body?.timeout_ms))
+              socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
             await validateStorage(runtime);
             check(request);
             let data;
             const args = request.body ?? {};
+            if (selecting && ['send', 'set_model'].includes(request.op))
+              throw new AttachmentFailure('MODEL_SELECTION_PENDING');
             if (request.op === 'state')
               data = {
                 sessionFile: file,
@@ -250,8 +262,45 @@ export default function attachExtension(pi) {
                       { header, entries, leafId, live: runtime.liveMessage.snapshot() },
                       args,
                     );
+            } else if (request.op === 'set_model') {
+              const parsed = modelSettingsSchema.safeParse(args);
+              if (!parsed.success) throw new AttachmentFailure('INVALID_MODEL_ARGUMENTS');
+              const target = ctx.modelRegistry
+                .getAvailable()
+                .find((m) => sameModel(m, args.model ?? ctx.model));
+              if (!target) throw new AttachmentFailure('MODEL_UNAVAILABLE');
+              assertThinkingLevel(target, args.thinking_level);
+              const previous = pi.getThinkingLevel();
+              selecting = true;
+              try {
+                try {
+                  if (args.model && !sameModel(ctx.model, target) && !(await pi.setModel(target)))
+                    throw new Error('MODEL_UNAVAILABLE');
+                  check(request);
+                  if (args.thinking_level !== undefined) pi.setThinkingLevel(args.thinking_level);
+                } catch {
+                  throw new AttachmentFailure('MODEL_SELECTION_FAILED', true);
+                }
+                if (!sameModel(ctx.model, target))
+                  throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
+                data = {
+                  status: 'accepted',
+                  ...modelSetting(ctx.model, pi.getThinkingLevel(), previous, args.thinking_level),
+                  scope: 'session',
+                };
+              } finally {
+                selecting = false;
+              }
+            } else if (request.op === 'models') {
+              data = modelPage(
+                ctx.modelRegistry.getAvailable(),
+                ctx.model,
+                pi.getThinkingLevel(),
+                request.body ?? {},
+              );
             } else if (request.op === 'send') {
               const input = attachedPromptInput(args);
+              if (input.model) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
               if (!SEND_MODES.includes(args.mode))
                 throw new AttachmentFailure('INVALID_ATTACHED_SEND');
               assertImageModel(input.images, ctx.model);
@@ -321,6 +370,8 @@ export default function attachExtension(pi) {
       await updateOwner(dir, session, record, {
         phase: 'ready',
         imagesSupported: true,
+        modelsSupported: true,
+        modelSelectionSupported: true,
       });
       // A successful replacement lifecycle conclusively releases this process's previous native identity.
       await registryTransaction(dir, async () => {

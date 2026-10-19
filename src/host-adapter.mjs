@@ -6,6 +6,7 @@ import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { renderContextRead } from './context-read.mjs';
 import { SEND_MODES, attachedPromptInput } from './prompt-input.mjs';
+import { cleanModelPage, cleanModelSetting, modelSettingsSchema, sameModel } from './models.mjs';
 import { bashCapture } from './bash-execution.mjs';
 import { stopReceipt, withdrawalCapture } from './stop-execution.mjs';
 import {
@@ -56,6 +57,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     stopping = false,
     stopSequence = 0,
     bashing = false,
+    selecting = false,
     releasing,
     closing;
   const sockets = new Set(),
@@ -141,6 +143,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         ? observed.pendingMessageCount
         : null;
     let data;
+    if (selecting && ['send', 'set_model'].includes(request.op)) fail('MODEL_SELECTION_PENDING');
     const beforeDispatch = () => {
       if (stoppedAtEntry || stopping || admittedAt !== stopSequence) fail('STOP_IN_PROGRESS');
       if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
@@ -155,7 +158,27 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         isCompacting: typeof observed.isCompacting === 'boolean' ? observed.isCompacting : null,
         pendingMessageCount,
       };
-    else if (['read', 'snapshot'].includes(request.op)) {
+    else if (request.op === 'set_model') {
+      if (typeof callbacks.selectModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
+      const parsed = modelSettingsSchema.safeParse(args);
+      if (!parsed.success) fail('INVALID_MODEL_ARGUMENTS');
+      beforeDispatch();
+      selecting = true;
+      try {
+        const selected = cleanModelSetting(
+          await callbacks.selectModel({ ...parsed.data, beforeDispatch }),
+        );
+        await identity();
+        if (parsed.data.model && !sameModel(selected.model, parsed.data.model))
+          throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
+        data = { status: 'accepted', ...selected, scope: 'session' };
+      } finally {
+        selecting = false;
+      }
+    } else if (request.op === 'models') {
+      if (typeof callbacks.models !== 'function') fail('MODELS_UNSUPPORTED');
+      data = cleanModelPage(await callbacks.models({ offset: args.offset, limit: args.limit }));
+    } else if (['read', 'snapshot'].includes(request.op)) {
       const snapshot = structuredClone(await callbacks.snapshot());
       await identity(snapshot);
       if (
@@ -202,6 +225,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     } else if (request.op === 'send') {
       beforeDispatch();
       const input = attachedPromptInput(args);
+      if (input.model) fail('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(args.mode)) fail('INVALID_ATTACHED_SEND');
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
@@ -283,7 +307,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     if (
       !value ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
-      ['release', 'cancel', 'stop', 'bash'].some(
+      ['release', 'cancel', 'stop', 'bash', 'models', 'selectModel'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
       )
     )
@@ -319,7 +343,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
               const request = JSON.parse(buffer.slice(0, end));
               validateRequest(request);
               if (
-                ['stop', 'bash'].includes(request.op) &&
+                ['stop', 'bash', 'set_model'].includes(request.op) &&
                 Number.isInteger(request.body?.timeout_ms)
               )
                 socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
@@ -360,6 +384,8 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         phase: 'ready',
         releaseSupported: Boolean(callbacks.release),
         imagesSupported: callbacks.supportsImages === true,
+        modelsSupported: typeof callbacks.models === 'function',
+        modelSelectionSupported: typeof callbacks.selectModel === 'function',
       });
       if (closed || releasing) {
         await retire();

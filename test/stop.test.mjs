@@ -570,7 +570,7 @@ test('generic host IPC and actual MCP return joined editor recovery; missing cal
   });
   const tools = await client.listTools();
   assert.ok(tools.tools.find((tool) => tool.name === 'stop'));
-  assert.equal(tools.tools.length, 9);
+  assert.equal(tools.tools.length, 13);
   const call = async (request_id, extra = {}) =>
     (await client.callTool({ name: 'stop', arguments: { session_id: f.id, request_id, ...extra } }))
       .structuredContent;

@@ -87,6 +87,30 @@ function request(f, op, body = {}, changes = {}) {
     });
   });
 }
+test('model selection extends the IPC deadline to the requested ACK budget', async (t) => {
+  const f = await fixture(t),
+    deadlines = [],
+    setTimeout = net.Socket.prototype.setTimeout;
+  f.callbacks.selectModel = async () => ({
+    model: { provider: 'p', id: 'm' },
+    thinking_level: 'off',
+    thinking_adjustment: 'none',
+  });
+  await f.controller.ready(f.callbacks);
+  t.mock.method(net.Socket.prototype, 'setTimeout', function (ms, ...args) {
+    if (this.server?.address?.() === f.controller.record.socket) deadlines.push(ms);
+    return setTimeout.call(this, ms, ...args);
+  });
+  const runtime = new AttachedRuntime(
+    { attachmentDir: f.attachmentDir },
+    f.session,
+    f.controller.record,
+  );
+  const result = await runtime.set_model({ model: { provider: 'p', id: 'm' }, timeout_ms: 14000 });
+  assert.equal(result.status, 'accepted');
+  assert.deepEqual(deadlines, [5000, 14000]);
+});
+
 test('two-phase host reservation blocks another writer before ready and exposes bounded live reads', async (t) => {
   const f = await fixture(t);
   assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'starting');

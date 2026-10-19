@@ -2,6 +2,7 @@
 // session, spawn a process, read stdio, or access private admission hooks.
 import { nativeBashResult } from './bash-execution.mjs';
 import { SEND_MODES, assertImageModel } from './prompt-input.mjs';
+import { modelPage, sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown = () => ({
   status: 'unknown',
@@ -73,7 +74,42 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       return { ...before, entries, leafId };
     },
     supportsImages: true,
-    submit: async ({ text, images, mode = 'default', beforeDispatch }) => {
+    models:
+      typeof session.modelRuntime?.getAvailableSnapshot === 'function'
+        ? async (args) =>
+            modelPage(
+              session.modelRuntime.getAvailableSnapshot(),
+              session.model,
+              session.thinkingLevel,
+              args,
+            )
+        : undefined,
+    selectModel:
+      typeof session.setModel === 'function'
+        ? async ({ model, thinking_level, beforeDispatch }) => {
+            const target = session.modelRuntime
+              .getAvailableSnapshot()
+              .find((m) => sameModel(m, model ?? session.model));
+            if (!target) throw new Error('MODEL_UNAVAILABLE');
+            assertThinkingLevel(target, thinking_level);
+            if (thinking_level !== undefined && typeof session.setThinkingLevel !== 'function')
+              throw new Error('THINKING_LEVEL_UNSUPPORTED');
+            const previous = session.thinkingLevel;
+            beforeDispatch?.();
+            try {
+              if (model && !sameModel(session.model, target))
+                await session.setModel(target, { persist: false });
+              beforeDispatch?.();
+              if (thinking_level !== undefined)
+                session.setThinkingLevel(thinking_level, { persist: false });
+            } catch {
+              throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
+            }
+            return modelSetting(session.model, session.thinkingLevel, previous, thinking_level);
+          }
+        : undefined,
+    submit: async ({ text, images, model, mode = 'default', beforeDispatch }) => {
+      if (model) throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
       assertImageModel(images, session.model);
       beforeDispatch?.();
@@ -163,6 +199,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
 }
 
 export function createRpcHostBinding(client, { release, onError } = {}) {
+  let selectionUnconfirmed = false;
   const tracked = tracker(release, onError);
   const state = async () => {
     const value = await client.getState();
@@ -187,8 +224,52 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       };
     },
     supportsImages: true,
-    submit: async ({ text, images, mode = 'default', beforeDispatch }) => {
+    models:
+      typeof client.getAvailableModels === 'function'
+        ? async (args) => {
+            const models = await client.getAvailableModels(),
+              state = await client.getState();
+            return modelPage(models, state.model, state.thinkingLevel, args);
+          }
+        : undefined,
+    selectModel:
+      typeof client.setModel === 'function'
+        ? async ({ model, thinking_level, beforeDispatch }) => {
+            if (selectionUnconfirmed) throw new Error('MODEL_SELECTION_PENDING');
+            const initial = await client.getState();
+            const target = (await client.getAvailableModels()).find((m) =>
+              sameModel(m, model ?? initial.model),
+            );
+            if (!target) throw new Error('MODEL_UNAVAILABLE');
+            assertThinkingLevel(target, thinking_level);
+            if (thinking_level !== undefined && typeof client.setThinkingLevel !== 'function')
+              throw new Error('THINKING_LEVEL_UNSUPPORTED');
+            beforeDispatch?.();
+            try {
+              if (model && !sameModel(initial.model, target))
+                await tracked.track(client.setModel(target.provider, target.id));
+              beforeDispatch?.();
+              if (thinking_level !== undefined)
+                await tracked.track(client.setThinkingLevel(thinking_level));
+              const selected = await client.getState();
+              return modelSetting(
+                selected.model,
+                selected.thinkingLevel,
+                initial.thinkingLevel,
+                thinking_level,
+              );
+            } catch {
+              // RpcClient's plain Error cannot distinguish a negative ACK from a
+              // timed-out command still running. Don't let new input race a late set.
+              selectionUnconfirmed = true;
+              throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
+            }
+          }
+        : undefined,
+    submit: async ({ text, images, model, mode = 'default', beforeDispatch }) => {
+      if (model) throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
+      if (selectionUnconfirmed) throw new Error('MODEL_SELECTION_PENDING');
       if (images) assertImageModel(images, (await client.getState()).model);
       if (mode === 'idle_only') {
         const observed = await state();

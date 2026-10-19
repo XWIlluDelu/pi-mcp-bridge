@@ -100,7 +100,16 @@ export async function executeBatch(bridge, input, { signal } = {}) {
     }
     delete largest.result;
     const args = operations[largest.index].args;
-    const mutation = ['send', 'command', 'stop', 'create', 'delete'].includes(largest.op);
+    const mutation = [
+      'send',
+      'set_model',
+      'compact',
+      'reload',
+      'command',
+      'stop',
+      'create',
+      'delete',
+    ].includes(largest.op);
     largest.recovery = {
       ...(mutation ? { request_id: args.request_id } : {}),
       ...(args.session_id ? { session_id: args.session_id } : {}),

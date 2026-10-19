@@ -91,6 +91,12 @@ fragment reconstruction and transient live output. Selection defaults to the
 full effective context; capacity and explicit selection omissions are separate.
 Every continuation reauthorizes read.
 
+### Models, thinking, compact and reload
+
+See [model discovery and native controls](model-control.md) for `models`,
+`set_model` (model and/or thinking), idle-only `compact`, and targeted RPC
+`reload`, including permissions, lifecycle and receipt recovery.
+
 ### Send
 
 ```json
@@ -106,7 +112,10 @@ Every continuation reauthorizes read.
 
 `timeout_ms` (50–30000, default 5000) bounds admission acknowledgement, not
 model execution. Queued input is an accepted submission, not a completed task.
-Omit `text` and `images` and reuse the same session/request ID to recover a receipt.
+Omit `text`, `images` and `model` and reuse the same session/request ID to recover a receipt.
+Optional `model:{provider,id}` selects the persistent session model just before
+submission on a proven-idle Bridge-owned RPC. Busy/queued/shared-owner cases
+refuse the combination without enqueueing; see [model timing](model-control.md#model-plus-a-prompt).
 A plain companion reports unknown acceptance when the public extension API
 cannot prove admission; it does not invent a native ACK.
 
@@ -127,7 +136,7 @@ For `create`, replace `session_id` with the configured absolute `project`.
 You may omit `text` for image-only input. The Bridge adds the neutral text
 `[Image attachment]` because Pi 1.1 cannot clear consumed empty-text queue
 entries; the picture still arrives as a native image block. Omitting **both** payload fields
-means receipt recovery, not a new empty prompt. Never resubmit uncertain work under a
+(and `model`, if used) means receipt recovery, not a new empty prompt. Never resubmit uncertain work under a
 new ID. Images participate in the durable request fingerprint: changing image
 bytes, MIME type, count or order under the same ID is a conflict. Recovery does
 not require uploading the images again.
@@ -239,7 +248,7 @@ A receipt contains `created`, the child `session_id` when chosen, and nested
 remains recoverable. The initial prompt holds the new session's admission lane
 so a concurrently submitted prompt cannot overtake it.
 
-Omit `text` and `images` with the same project/request ID to recover.
+Omit `text`, `images` and `model` with the same project/request ID to recover.
 Missing both initial payload fields without an existing receipt yields `RECEIPT_NOT_FOUND`; it does not create an
 empty session. If the process crashes before the created identity is durably
 recorded, recovery may remain unknown; it still never creates a second child.

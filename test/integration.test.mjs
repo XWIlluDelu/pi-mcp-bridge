@@ -231,12 +231,16 @@ test('standard MCP stdio client initializes and exercises the single-operation t
     assert.deepEqual((await client.listTools()).tools.map((t) => t.name).sort(), [
       'batch',
       'command',
+      'compact',
       'create',
       'delete',
       'health',
       'list',
+      'models',
       'read',
+      'reload',
       'send',
+      'set_model',
       'stop',
     ]);
     const call = async (name, args) => {

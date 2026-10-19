@@ -192,12 +192,16 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), [
       'batch',
       'command',
+      'compact',
       'create',
       'delete',
       'health',
       'list',
+      'models',
       'read',
+      'reload',
       'send',
+      'set_model',
       'stop',
     ]);
     const id = made.session_id;

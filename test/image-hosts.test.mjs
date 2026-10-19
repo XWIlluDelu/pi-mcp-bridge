@@ -143,6 +143,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
           models: [
             { id: 'vision', input: ['text', 'image'] },
             { id: 'text-only', input: ['text'] },
+            { id: 'reasoner', input: ['text', 'image'], reasoning: true },
           ],
           tokensPerSecond: 10000,
         });
@@ -296,8 +297,71 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         ).length,
         1,
       );
+      const models = await call('models', { session_id: saved.id });
+      assert.equal(models.current.id, 'vision');
+      assert.equal(models.source, 'runtime');
+      const rejected = await call('send', {
+        session_id: saved.id,
+        request_id: 'no-combined-selection',
+        text: 'MUST_NOT_SEND',
+        model: { provider: models.current.provider, id: 'text-only' },
+      });
+      assert.equal(rejected.status, 'rejected');
+      assert.equal(rejected.reason, 'MODEL_SELECTION_UNSUPPORTED');
+      assert.equal((await call('models', { session_id: saved.id })).current.id, 'vision');
+      const switched = await call('set_model', {
+        session_id: saved.id,
+        request_id: 'standalone-selection',
+        model: { provider: models.current.provider, id: 'text-only' },
+      });
+      assert.equal(switched.status, 'accepted', JSON.stringify(switched));
+      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
+      assert.deepEqual(
+        await call('set_model', { session_id: saved.id, request_id: 'standalone-selection' }),
+        switched,
+      );
+      const unavailable = await call('set_model', {
+        session_id: saved.id,
+        request_id: 'missing-selection',
+        model: { provider: models.current.provider, id: 'absent' },
+      });
+      assert.equal(unavailable.status, 'rejected');
+      assert.equal(unavailable.reason, 'MODEL_UNAVAILABLE');
+      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
+      const thinking = await call('set_model', {
+        session_id: saved.id,
+        request_id: 'thinking-off',
+        thinking_level: 'off',
+      });
+      assert.equal(thinking.status, 'accepted', JSON.stringify(thinking));
+      assert.equal(thinking.thinking_level, 'off');
+      const unsupported = await call('set_model', {
+        session_id: saved.id,
+        request_id: 'unsupported-thinking',
+        model: { provider: models.current.provider, id: 'vision' },
+        thinking_level: 'high',
+      });
+      assert.equal(unsupported.status, 'rejected');
+      assert.equal(unsupported.reason, 'THINKING_LEVEL_UNSUPPORTED');
+      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
+      const reasoning = await call('set_model', {
+        session_id: saved.id,
+        request_id: 'reasoning-selection',
+        model: { provider: models.current.provider, id: 'reasoner' },
+        thinking_level: 'high',
+      });
+      assert.equal(reasoning.status, 'accepted', JSON.stringify(reasoning));
+      assert.equal(reasoning.thinking_level, 'high');
+      const current = (await call('models', { session_id: saved.id })).current;
+      assert.equal(current.id, 'reasoner');
+      assert.equal(current.thinking_level, 'high');
       const publicRead = await call('read', { session_id: saved.id, max_bytes: 65536 });
       assert.ok(JSON.stringify(publicRead.items).includes('IMAGE_CONTEXT:'));
+      for (const op of ['compact', 'reload']) {
+        const denied = await call(op, { session_id: saved.id, request_id: 'unsupported-' + op });
+        assert.equal(denied.status, 'rejected');
+        assert.equal(denied.reason, op.toUpperCase() + '_UNSUPPORTED');
+      }
       if (route.endsWith('companion')) {
         for (const op of ['command', 'stop']) {
           const denied = await call(op, {
