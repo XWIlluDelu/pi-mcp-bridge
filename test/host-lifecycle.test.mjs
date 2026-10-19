@@ -1,0 +1,358 @@
+import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { savedSession } from './fixtures/saved-session.mjs';
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import net from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { Bridge } from '../src/bridge.mjs';
+import { atomicJson } from '../src/storage.mjs';
+import { reserveHostSession } from '../src/host-adapter.mjs';
+import attachExtension from '../src/attach-extension.mjs';
+import {
+  reserveOwner,
+  releaseOwner,
+  readClaim,
+  ownerAlive,
+  updateOwner,
+  AttachedRuntime,
+  registryTransaction,
+  claimFile,
+} from '../src/attachments.mjs';
+async function fixture(t) {
+  const dir = await fs.mkdtemp('/tmp/pi-host-life-'),
+    cwd = path.join(dir, 'project');
+  await fs.mkdir(cwd);
+  const config = {
+    principal: 'fixture',
+    defaults: denyAllPermissions(),
+    stateDir: path.join(dir, 'state'),
+    attachmentDir: path.join(dir, 'ipc'),
+    sessionRoots: [path.join(dir, 'sessions')],
+    folders: [{ id: 'p', path: cwd }],
+    grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
+  };
+  let spawns = 0;
+  const bridge = await new Bridge(config, async () => {
+    spawns++;
+    throw Error('UNEXPECTED_SPAWN');
+  }).init();
+  const created = await savedSession(bridge, { folder_id: 'p', request_id: 'seed' }),
+    session = await bridge.session(created.session_id);
+  t.after(async () => {
+    await bridge.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  return { dir, config, bridge, session, spawns: () => spawns };
+}
+const identity = (session) => ({ sessionFile: session.file, sessionId: session.header.id });
+async function until(fn) {
+  const end = Date.now() + 10000;
+  while (Date.now() < end) {
+    const value = await fn();
+    if (value) return value;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw Error('FIXTURE_TIMEOUT');
+}
+
+test('profile companion leaves the same-process host controller and its shutdown lifecycle in charge', async (t) => {
+  const f = await fixture(t),
+    host = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session: f.session }),
+    id = identity(f.session);
+  const prior = process.env.PI_MCP_ATTACH_DIR;
+  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+  const handlers = {};
+  attachExtension({
+    on: (name, handler) => {
+      handlers[name] = handler;
+    },
+  });
+  const ctx = {
+    mode: 'rpc',
+    sessionManager: {
+      getSessionFile: () => f.session.file,
+      getSessionId: () => f.session.header.id,
+      getHeader: () => f.session.header,
+    },
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    shutdown: () => assert.fail('companion must not shut down the host'),
+  };
+  try {
+    const initial = await readClaim(f.config.attachmentDir, f.session);
+    await handlers.session_start({}, ctx);
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), initial);
+    await host.ready({
+      state: async () => id,
+      snapshot: async () => ({ ...id, entries: [], leafId: null }),
+      submit: async () => ({ status: 'unknown' }),
+    });
+    const ready = await readClaim(f.config.attachmentDir, f.session);
+    await handlers.session_start({}, ctx);
+    await handlers.session_shutdown({});
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), ready);
+    assert.equal((await f.bridge.read({ session_id: f.session.id })).items.length, 0);
+    assert.equal(f.spawns(), 0);
+  } finally {
+    await handlers.session_shutdown({});
+    await host.close();
+    if (prior === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+    else process.env.PI_MCP_ATTACH_DIR = prior;
+  }
+});
+test('host close cleans up its listener on registry failure without releasing the live writer', async (t) => {
+  const f = await fixture(t),
+    createServer = net.createServer;
+  let listener, connection;
+  t.mock.method(net, 'createServer', (...args) => {
+    listener = createServer(...args);
+    return listener;
+  });
+  const host = await reserveHostSession({
+      attachmentDir: f.config.attachmentDir,
+      session: f.session,
+    }),
+    id = identity(f.session);
+  const lock = path.join(f.config.attachmentDir, 'registry.lock');
+  try {
+    await host.ready({
+      state: async () => id,
+      snapshot: async () => ({ ...id, entries: [], leafId: null }),
+      submit: async () => ({ status: 'unknown' }),
+    });
+    await f.bridge.read({ session_id: f.session.id });
+    const claim = await readClaim(f.config.attachmentDir, f.session);
+    connection = net.createConnection(claim.socket);
+    connection.on('error', () => {});
+    await new Promise((resolve, reject) => {
+      connection.once('connect', resolve);
+      connection.once('error', reject);
+    });
+    const disconnected = new Promise((resolve) => connection.once('close', resolve));
+    await fs.writeFile(lock, 'interrupted owner registry update', { mode: 0o600 });
+    await assert.rejects(host.close(), /ATTACHMENT_REGISTRY_BUSY/);
+    assert.equal(
+      listener.listening,
+      false,
+      'A failed claim update must not leave the controller listening',
+    );
+    await disconnected;
+    await assert.rejects(fs.stat(claim.socket), { code: 'ENOENT' });
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), claim);
+    assert.equal(await ownerAlive(claim.owner), true);
+    const sent = await f.bridge.send({
+      session_id: f.session.id,
+      request_id: 'closed-host',
+      text: 'must not cold-start',
+    });
+    assert.equal(sent.status, 'rejected');
+    assert.equal(sent.reason, 'LIVE_OWNER_UNREACHABLE');
+    assert.equal(f.spawns(), 0);
+  } finally {
+    await fs.rm(lock, { force: true });
+    // Keep a failing lifecycle regression from leaving a listener in the test runner.
+    connection?.destroy();
+    if (listener) await new Promise((resolve) => listener.close(resolve));
+  }
+});
+
+test('a new owner in the release/reclaim gap blocks deletion without moving the file', async (t) => {
+  const f = await fixture(t),
+    host = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session: f.session });
+  const id = identity(f.session);
+  await host.ready({
+    state: async () => id,
+    snapshot: async () => ({ ...id, entries: [], leafId: null }),
+    submit: async () => ({ status: 'unknown' }),
+    release: async () => ({ released: true }),
+  });
+  let competitor;
+  try {
+    const runtime = await f.bridge.pool.forRead(f.session),
+      stop = runtime.stopForDelete.bind(runtime);
+    runtime.stopForDelete = async () => {
+      await stop();
+      competitor = await reserveOwner(f.config.attachmentDir, f.session, 'rpc');
+    };
+    const result = await f.bridge.delete({ session_id: f.session.id, request_id: 'delete' });
+    assert.equal(result.status, 'rejected');
+    assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
+    assert.ok(await fs.stat(f.session.file));
+    assert.equal(
+      (await readClaim(f.config.attachmentDir, f.session)).generation,
+      competitor.generation,
+    );
+    assert.deepEqual(await fs.readdir(path.join(f.config.stateDir, 'trash')), []);
+    assert.equal(f.spawns(), 0);
+  } finally {
+    if (competitor) await releaseOwner(f.config.attachmentDir, f.session, competitor);
+    await host.close();
+  }
+});
+
+test('released-for-local host deletion accepts only the terminal generation and never resurrects its owner', async (t) => {
+  const f = await fixture(t);
+  await f.bridge.releaseForLocal({ session_id: f.session.id });
+  const host = await reserveHostSession({
+      attachmentDir: f.config.attachmentDir,
+      session: f.session,
+    }),
+    id = identity(f.session);
+  try {
+    await host.ready({
+      state: async () => id,
+      snapshot: async () => ({ ...id, entries: [], leafId: null }),
+      submit: async () => ({ status: 'unknown' }),
+      release: async () => ({ released: true }),
+    });
+    assert.equal(host.record.noColdReacquire, true);
+    const result = await f.bridge.delete({
+      session_id: f.session.id,
+      request_id: 'delete-released-host',
+    });
+    assert.equal(result.status, 'deleted', JSON.stringify(result));
+    const terminal = await readClaim(f.config.attachmentDir, f.session);
+    assert.equal(terminal.phase, 'released');
+    assert.equal(terminal.owner, null);
+    assert.equal(terminal.noColdReacquire, true);
+    await host.close();
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), terminal);
+    await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
+    assert.equal(f.spawns(), 0);
+  } finally {
+    await host.close();
+  }
+});
+
+test('host close after release preserves its tombstone and rejects live republishing', async (t) => {
+  const f = await fixture(t);
+  await f.bridge.releaseForLocal({ session_id: f.session.id });
+  const host = await reserveHostSession({
+      attachmentDir: f.config.attachmentDir,
+      session: f.session,
+    }),
+    id = identity(f.session);
+  try {
+    await host.ready({
+      state: async () => id,
+      snapshot: async () => ({ ...id, entries: [], leafId: null }),
+      submit: async () => ({ status: 'unknown' }),
+      release: async () => ({ released: true }),
+    });
+    await host.release();
+    const terminal = await readClaim(f.config.attachmentDir, f.session);
+    assert.equal(terminal.generation, host.record.generation);
+    assert.equal(terminal.owner, null);
+    await host.close();
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), terminal);
+    await assert.rejects(
+      updateOwner(f.config.attachmentDir, f.session, host.record, { phase: 'ready' }),
+      /RUNTIME_SESSION_CHANGED/,
+    );
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), terminal);
+    assert.equal(await ownerAlive(terminal.owner), false);
+  } finally {
+    await host.close();
+  }
+});
+
+for (const replacement of [
+  'different-terminal-generation',
+  'live-same-generation',
+  'live-different-generation',
+])
+  test('host release receipt rejects ' + replacement, async (t) => {
+    const f = await fixture(t);
+    await f.bridge.releaseForLocal({ session_id: f.session.id });
+    const record = await reserveOwner(f.config.attachmentDir, f.session, 'host');
+    await updateOwner(f.config.attachmentDir, f.session, record, { phase: 'ready' });
+    const next = {
+      ...record,
+      generation: replacement === 'live-same-generation' ? record.generation : randomUUID(),
+      ...(replacement === 'different-terminal-generation'
+        ? { phase: 'released', owner: null }
+        : { phase: 'ready' }),
+    };
+    const server = net.createServer((socket) => {
+      socket.on('error', () => {});
+      socket.once('data', () => {
+        void (async () => {
+          await registryTransaction(f.config.attachmentDir, () =>
+            atomicJson(claimFile(f.config.attachmentDir, f.session), next),
+          );
+          socket.end(
+            JSON.stringify({ generation: record.generation, data: { released: true } }) + '\n',
+          );
+        })().catch((error) => socket.destroy(error));
+      });
+    });
+    await new Promise((resolve) => server.listen(record.socket, resolve));
+    try {
+      const runtime = new AttachedRuntime(f.config, f.session, record);
+      await assert.rejects(runtime.stopForDelete(), /RUNTIME_SESSION_CHANGED/);
+      assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), next);
+      assert.ok(await fs.stat(f.session.file));
+      assert.equal(f.spawns(), 0);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+test('controller death preserves the surviving writer claim and prevents bridge fallback', async (t) => {
+  const f = await fixture(t),
+    marker = path.join(f.dir, 'ready.json'),
+    file = path.join(f.dir, 'controller.json');
+  await fs.writeFile(
+    file,
+    JSON.stringify({ attachmentDir: f.config.attachmentDir, session: f.session, marker }),
+  );
+  const controller = spawn(
+    process.execPath,
+    [fileURLToPath(new URL('./fixtures/host-controller.mjs', import.meta.url)), file],
+    { stdio: 'ignore' },
+  );
+  const exited = new Promise((resolve) => controller.once('exit', resolve));
+  let owner;
+  try {
+    ({ owner } = await until(async () => {
+      try {
+        return JSON.parse(await fs.readFile(marker, 'utf8'));
+      } catch {
+        return null;
+      }
+    }));
+    assert.equal((await f.bridge.read({ session_id: f.session.id })).items.length, 0);
+    controller.kill('SIGKILL');
+    await exited;
+    assert.equal(await ownerAlive(owner), true);
+    const claim = await readClaim(f.config.attachmentDir, f.session);
+    assert.deepEqual(claim.owner, owner);
+    await assert.rejects(f.bridge.read({ session_id: f.session.id }), /LIVE_OWNER_UNREACHABLE/);
+    const result = await f.bridge.send({
+      session_id: f.session.id,
+      request_id: 'after-crash',
+      text: 'public fixture',
+    });
+    assert.equal(result.status, 'rejected');
+    assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
+    assert.equal(f.spawns(), 0);
+  } finally {
+    if (controller.exitCode === null && controller.signalCode === null) {
+      controller.kill('SIGKILL');
+      await exited;
+    }
+    if (!owner) {
+      try {
+        owner = (await readClaim(f.config.attachmentDir, f.session))?.owner;
+      } catch {}
+    }
+    if (owner && (await ownerAlive(owner))) {
+      process.kill(owner.pid, 'SIGTERM');
+      await until(async () => !(await ownerAlive(owner)));
+    }
+  }
+});
