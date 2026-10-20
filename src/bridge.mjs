@@ -1060,37 +1060,65 @@ export class Bridge {
   cancelHandoff(request) {
     return cancelHandoff(this, request);
   }
-  async releaseForLocal({ session_id }) {
+  async releaseForLocal({ session_id, interrupt = false }) {
     this.assertOpen();
-    return this.locked(session_id, async () => {
-      this.assertOpen();
-      const session = await this.session(session_id),
-        dir = this.pool.attachmentDir;
-      if (this.pool.starting.has(session_id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
-      const runtime = await this.pool.forRead(session);
-      if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
-      if (runtime) {
-        if (!(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
-        await runtime.assertReleasable();
-        await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
-        await this.pool.stop(session_id); // Wait exact child exit; stop never targets external owners.
-      } else
-        await registryTransaction(dir, async () => {
-          const current = await readClaim(dir, session);
-          if (current && (await ownerAlive(current.owner)))
-            throw new Error('LIVE_OWNER_UNREACHABLE');
-          await atomicJson(claimFile(dir, session), {
-            kind: 'rpc',
-            file: session.file,
-            sessionId: session.header.id,
-            generation: current?.generation ?? randomUUID(),
-            owner: null,
-            phase: 'released',
-            noColdReacquire: true,
+    if (typeof interrupt !== 'boolean') throw new Error('INVALID_OWNER_COMMAND');
+    if (this.handoffs.has(session_id)) throw new Error('HANDOFF_PENDING');
+    const priorStop = this.locks.get(`stop:${session_id}`),
+      release = { kind: 'release' };
+    this.handoffs.set(session_id, release);
+    try {
+      return await this.locked(session_id, async () => {
+        // An admitted stop finishes its receipt capture before owner shutdown.
+        await priorStop?.catch(() => {});
+        this.assertOpen();
+        const session = await this.session(session_id),
+          dir = this.pool.attachmentDir;
+        if (this.pool.starting.has(session_id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
+        const runtime = await this.pool.forRead(session);
+        if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
+        if (runtime) {
+          if (!(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
+          runtime.handoffPending = true;
+          try {
+            if (interrupt) {
+              await runtime.checkedState();
+              const owner = runtime.ownerRecord?.owner;
+              if (owner?.pid !== runtime.child?.pid || !(await ownerAlive(owner)))
+                throw new Error('RUNTIME_SESSION_CHANGED');
+            } else await runtime.assertReleasable();
+            await runtime.drainRecovery();
+            if (!interrupt && runtime.recoveryError()) throw runtime.recoveryError();
+            await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
+            if (interrupt) await this.pool.stop(session_id);
+            else {
+              await runtime.gracefulExit();
+              this.pool.instances.delete(session_id);
+            }
+          } finally {
+            if (!runtime.gracefulExitPromise && !runtime.stopPromise)
+              runtime.handoffPending = false;
+          }
+        } else
+          await registryTransaction(dir, async () => {
+            const current = await readClaim(dir, session);
+            if (current && (await ownerAlive(current.owner)))
+              throw new Error('LIVE_OWNER_UNREACHABLE');
+            await atomicJson(claimFile(dir, session), {
+              kind: 'rpc',
+              file: session.file,
+              sessionId: session.header.id,
+              generation: current?.generation ?? randomUUID(),
+              owner: null,
+              phase: 'released',
+              noColdReacquire: true,
+            });
           });
-        });
-      return { session_id, status: 'released', no_cold_reacquire: true };
-    });
+        return { session_id, status: 'released', no_cold_reacquire: true };
+      });
+    } finally {
+      if (this.handoffs.get(session_id) === release) this.handoffs.delete(session_id);
+    }
   }
   async resetColdResume({ session_id, confirm_local_closed }) {
     this.assertOpen();
@@ -1208,6 +1236,7 @@ function safeReason(error) {
     'WRITE_UNKNOWN',
     'RUNTIME_DISCONNECTED',
     'RUNTIME_START_FAILED',
+    'RUNTIME_STOP_FAILED',
     'RUNTIME_SESSION_CHANGED',
     'LIVE_OWNER_UNREACHABLE',
     'OWNER_STILL_ALIVE',

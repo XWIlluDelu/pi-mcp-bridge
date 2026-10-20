@@ -136,11 +136,16 @@ manually. Owner-local join is not a remotely callable prompt command.
 5. Recheck the reservation in Pi's cancellable pre-open hook and switch to the
    latest saved history.
 
-Owner automation should call the handoff protocol directly rather than first
-waiting for the observer's `preparingUnconfirmed` flag to clear. Overlapping RPC
-inputs deliberately leave that coarse flag sticky. The owned handoff has stronger
-ACK, queue and settlement evidence and can prove quiescence without clearing it.
-New mutations are fenced during handoff; reads remain available while it waits.
+Owner automation should call the handoff protocol directly. Idle-gated controls
+and local release share its ACK, queue and settlement checks; completed queued RPC
+input does not leave a lasting preflight barrier. New mutations are fenced during
+handoff; reads remain available while it waits.
+
+Pi 1.1 cannot correlate independent extension-origin preflight with completion.
+An instance that has received such input can remain unconfirmed even after a
+settlement event. This does not block ordinary prompts or standalone model
+settings. If lossless release cannot be established, use the explicit interrupting
+maintenance path below rather than inferring completion from a quiet stream.
 
 While waiting, the fresh TUI does not mirror the old RPC's live output.
 Notifications explain waiting/failure; Ctrl+Alt+J cancels. A startup extension
@@ -189,9 +194,29 @@ For a deliberate idle owner-local release without opening a TUI, use:
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID
 ```
 
-This retains the cold-resume fence until a cooperative join or explicit reset.
+This fences new mutations, checks idle and waits for normal EOF exit without
+signals. It retains the cold-resume fence until a cooperative join or explicit reset.
+
+If the owner accepts interruption of running or unobservable preparation work:
+
+```sh
+node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID --interrupt
+```
+
+This private local operation verifies the owned child/session identity, sends
+SIGTERM and waits for its exit. It does not require idle, send SIGKILL on a timer,
+or terminate a shared companion/host. Saved history remains intact; unfinished
+in-memory work may be lost. After confirming all local writers have closed, use
+the reset command above to permit cold resume of the same saved session.
+A client timeout does not cancel an exit already requested or release ownership.
+If signal delivery fails, the owner may retry explicitly after resolving the error;
+there is no automatic retry.
 
 ## Shutdown and durable recovery
+
+Bridge process shutdown also waits for SIGTERM termination without automatic
+SIGKILL escalation. A process manager's independent stop timeout still applies;
+configure it according to the owner's maintenance policy.
 
 Prompt ACKs establish started/queued/handled admission, not model completion.
 A timeout after dispatch means `unknown`. Retry the same business

@@ -172,6 +172,11 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         if (parsed.data.model && !sameModel(selected.model, parsed.data.model))
           throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
         data = { status: 'accepted', ...selected, scope: 'session' };
+      } catch (error) {
+        // A stop/admission failure between native steps can follow a completed
+        // model change. Do not serialize it as a definite pre-dispatch refusal.
+        if (error.uncertain === true) throw new AttachmentFailure('MODEL_SELECTION_FAILED', true);
+        throw error;
       } finally {
         selecting = false;
       }

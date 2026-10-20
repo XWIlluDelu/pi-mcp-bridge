@@ -243,7 +243,7 @@ test(
 );
 
 test(
-  'owned handoff proves quiescence despite a sticky coarse preflight flag after queued RPC input',
+  'owner release and handoff both prove quiescence after overlapping queued RPC input',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(
@@ -282,10 +282,10 @@ test(
         rpc.settlement.sequence >= rpc.handoffSettlement
       );
     }, 'native settled and queues drained');
-    // A standalone observer cannot correlate overlapping inputs with their ACKs.
-    // This coarse flag deliberately stays sticky; it is not a prerequisite for
-    // the owned handoff, which has the full ACK and settlement evidence.
-    assert.equal((await observer.state()).preparingUnconfirmed, true);
+    // All queued RPC work is accounted for by ACK and settlement evidence.
+    assert.equal((await observer.state()).nonRpcInputSeen, false);
+    // The immediate owner release must use the same completed-work evidence.
+    await rpc.assertReleasable();
     const result = await transfer(f);
     assert.equal(result.status, 'reserved');
     assert.equal(rpc.child.exitCode, 0);

@@ -145,16 +145,22 @@ async function main() {
     !['release', 'reset'].includes(op) ||
     !session_id ||
     rest.length ||
-    (op === 'release' && confirmation !== undefined) ||
+    (op === 'release' && confirmation !== undefined && confirmation !== '--interrupt') ||
     (op === 'reset' && confirmation !== '--confirm-local-closed')
   )
     throw new Error(
-      'Usage: node src/owner-runtime.mjs OWNER_CONFIG release SESSION_ID | reset SESSION_ID --confirm-local-closed',
+      'Usage: node src/owner-runtime.mjs OWNER_CONFIG release SESSION_ID [--interrupt] | reset SESSION_ID --confirm-local-closed',
     );
   const { config } = await readOwnerConfig(path.resolve(file));
   console.log(
     JSON.stringify(
-      await ownerRequest(config, { op, session_id, confirm_local_closed: op === 'reset' }),
+      await ownerRequest(config, {
+        op,
+        session_id,
+        ...(op === 'reset'
+          ? { confirm_local_closed: true }
+          : { interrupt: confirmation === '--interrupt' }),
+      }),
     ),
   );
 }

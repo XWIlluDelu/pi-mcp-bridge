@@ -60,6 +60,14 @@ Bridge calls share the session's mutation lane and do not change other sessions.
 
 **Timeout and recovery.** `timeout_ms` is 50–30000 (default 5000) and is the ACK budget. To recover, repeat the same `request_id` and omit **both** `model` and `thinking_level`; both fields are fingerprinted. A timeout fences later owned input until the exact late ACK arrives.
 
+A cooperative RPC binding blocks new input only while a native setter is
+unconfirmed. No-op validation failures and failed state reads after a confirmed
+setter do not leave that block in place. Pi 1.1's `RpcClient` does not distinguish a
+negative ACK from a timeout in its public error type; an actual setter failure
+therefore remains uncertain. The owning application must resolve that operation
+or retire the old RPC before replacing the binding; a later state read alone is
+not proof that a timed-out setter has finished.
+
 **Partial outcomes.** Model and thinking changes are separate native steps, not a rollback transaction. An uncertain or failed later step can leave the earlier model change in place. If the model step completes late before an explicit thinking step ran, the receipt reports `MODEL_SELECTED_THINKING_NOT_SET` with the observed selection, and the remaining step is never executed afterward.
 
 ## Model plus a prompt: `send` and `create`

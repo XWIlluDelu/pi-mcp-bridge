@@ -143,10 +143,11 @@ test(
     assert.equal(held.kind, 'extension');
     assert.equal(held.noColdReacquire, true);
     assert.notEqual(held.generation, old.generation);
-    await assert.rejects(
-      ownerRequest(f.config, { op: 'release', session_id: f.id }),
-      /EXTERNAL_OWNER_NOT_RELEASABLE/,
-    );
+    for (const interrupt of [false, true])
+      await assert.rejects(
+        ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
+        /EXTERNAL_OWNER_NOT_RELEASABLE/,
+      );
     await assert.rejects(
       ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true }),
       /OWNER_STILL_ALIVE/,
@@ -244,21 +245,25 @@ test(
     await assert.rejects(fs.stat(record.socket), { code: 'ENOENT' });
   },
 );
-test('stop failure retains no-cold marker without claiming release success', async (t) => {
+test('failed normal exit retains the owner claim without reporting release success', async (t) => {
   const f = await fixture(t),
     owned = await f.bridge.pool.resolve(f.session),
-    stop = owned.stop;
-  owned.stop = async () => {
-    throw new RpcFailure('RPC_STOP_TIMEOUT');
+    exit = owned.gracefulExit;
+  owned.gracefulExit = async () => {
+    throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
   };
   await assert.rejects(
     ownerRequest(f.config, { op: 'release', session_id: f.id }),
-    /RPC_STOP_TIMEOUT/,
+    /RUNTIME_EXIT_ABNORMAL/,
   );
   const held = await readClaim(f.bridge.pool.attachmentDir, f.session);
   assert.equal(held.noColdReacquire, true);
   assert.equal(await ownerAlive(held.owner), true);
-  owned.stop = stop;
+  owned.gracefulExit = exit;
+  assert.equal(
+    (await ownerRequest(f.config, { op: 'release', session_id: f.id })).status,
+    'released',
+  );
 });
 test('release preserves state errors and never stops a mismatched child', async (t) => {
   const f = await fixture(t),
@@ -274,6 +279,10 @@ test('release preserves state errors and never stops a mismatched child', async 
   owned.dispatch = async () => ({ sessionFile: '/synthetic/other.jsonl', sessionId: 'other' });
   await assert.rejects(
     ownerRequest(f.config, { op: 'release', session_id: f.id }),
+    /RUNTIME_SESSION_CHANGED/,
+  );
+  await assert.rejects(
+    ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: true }),
     /RUNTIME_SESSION_CHANGED/,
   );
   assert.equal(await ownerAlive(owner), true);
@@ -303,6 +312,10 @@ test('release refuses busy, unknown state and admission ambiguity without signal
     );
     assert.equal(await ownerAlive(owned.ownerRecord.owner), true);
   }
+  await assert.rejects(
+    ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: 'yes' }),
+    /INVALID_OWNER_COMMAND/,
+  );
   owned.promptAdmission = { id: 'ambiguous', generation: owned.generation };
   await assert.rejects(
     ownerRequest(f.config, { op: 'release', session_id: f.id }),
@@ -384,11 +397,40 @@ for (const overlap of [false, true])
           /RUNTIME_IDLE_UNCONFIRMED/,
         );
         assert.equal(await ownerAlive(owner), true);
-      } else
-        assert.equal(
-          (await ownerRequest(f.config, { op: 'release', session_id: f.id })).status,
-          'released',
-        );
+      }
+      // Settlement has no correlation ID for independent extension preflight.
+      // A deliberate owner interruption gives this generation a recovery exit.
+      await assert.rejects(
+        ownerRequest(f.config, { op: 'release', session_id: f.id }),
+        /RUNTIME_IDLE_UNCONFIRMED/,
+      );
+      const released = await exec(process.execPath, [
+        path.join(base, 'src/owner-runtime.mjs'),
+        f.file,
+        'release',
+        f.id,
+        '--interrupt',
+      ]);
+      assert.equal(JSON.parse(released.stdout).status, 'released');
+      assert.equal(await ownerAlive(owner), false);
+      assert.notEqual(owned.child.signalCode, 'SIGKILL');
+      await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
+      assert.equal(
+        (
+          await f.bridge.send({
+            session_id: f.id,
+            request_id: 'recovered',
+            text: 'AFTER_MAINTENANCE',
+          })
+        ).status,
+        'accepted',
+      );
+      const fresh = f.bridge.pool.get(f.id);
+      assert.notEqual(fresh.generation, owned.generation);
+      await until(() => fresh.settlement.sequence === 1);
+      await fresh.assertReleasable();
+      const projected = await f.bridge.read({ session_id: f.id });
+      assert.ok(JSON.stringify(projected).includes('AFTER_MAINTENANCE'));
     },
   );
 test('release of saved session and reset serialize with sends; pending startup is not aborted', async (t) => {
