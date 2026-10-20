@@ -95,17 +95,25 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
             if (thinking_level !== undefined && typeof session.setThinkingLevel !== 'function')
               throw new Error('THINKING_LEVEL_UNSUPPORTED');
             const previous = session.thinkingLevel;
+            let mutationStarted = false;
             beforeDispatch?.();
             try {
-              if (model && !sameModel(session.model, target))
+              if (model && !sameModel(session.model, target)) {
+                mutationStarted = true;
                 await session.setModel(target, { persist: false });
+              }
               beforeDispatch?.();
-              if (thinking_level !== undefined)
+              if (thinking_level !== undefined) {
+                mutationStarted = true;
                 session.setThinkingLevel(thinking_level, { persist: false });
-            } catch {
+              }
+              return modelSetting(session.model, session.thinkingLevel, previous, thinking_level);
+            } catch (error) {
+              // A failed request may already have changed native settings, even
+              // when each dispatched setter completed successfully.
+              if (!mutationStarted) throw error;
               throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
             }
-            return modelSetting(session.model, session.thinkingLevel, previous, thinking_level);
           }
         : undefined,
     submit: async ({ text, images, model, mode = 'default', beforeDispatch }) => {
@@ -244,13 +252,22 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
             assertThinkingLevel(target, thinking_level);
             if (thinking_level !== undefined && typeof client.setThinkingLevel !== 'function')
               throw new Error('THINKING_LEVEL_UNSUPPORTED');
+            let mutationStarted = false;
             beforeDispatch?.();
             try {
-              if (model && !sameModel(initial.model, target))
+              if (model && !sameModel(initial.model, target)) {
+                mutationStarted = true;
+                selectionUnconfirmed = true;
                 await tracked.track(client.setModel(target.provider, target.id));
+                selectionUnconfirmed = false;
+              }
               beforeDispatch?.();
-              if (thinking_level !== undefined)
+              if (thinking_level !== undefined) {
+                mutationStarted = true;
+                selectionUnconfirmed = true;
                 await tracked.track(client.setThinkingLevel(thinking_level));
+                selectionUnconfirmed = false;
+              }
               const selected = await client.getState();
               return modelSetting(
                 selected.model,
@@ -258,10 +275,14 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
                 initial.thinkingLevel,
                 thinking_level,
               );
-            } catch {
+            } catch (error) {
+              // Request outcome and future-input safety are separate: a failed
+              // read/check after an ACK can follow a real change, but only an
+              // unconfirmed setter keeps selectionUnconfirmed fenced.
+              if (!mutationStarted) throw error;
               // RpcClient's plain Error cannot distinguish a negative ACK from a
-              // timed-out command still running. Don't let new input race a late set.
-              selectionUnconfirmed = true;
+              // timed-out command still running. Don't parse its message or clear
+              // the fence just because a later state read succeeds.
               throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
             }
           }

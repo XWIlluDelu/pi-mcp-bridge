@@ -14,19 +14,13 @@ export default function rpcObserver(pi) {
       ? globalThis[key]
       : (globalThis[key] = {
           generation,
-          preparingUnconfirmed: false,
-          overlapUnconfirmed: false,
           nonRpcInputSeen: false,
         });
-  // ctx.isIdle() omits prompt preflight. Settlement has no input identity;
-  // once seen inputs overlap, it cannot establish which preparation finished.
+  // ctx.isIdle() omits prompt preflight. Only the pipe owner has RPC ACKs;
+  // independent extension inputs need an explicit interrupting owner release
+  // if their completion cannot be established through the native interface.
   pi.on('input', (event) => {
     if (event.source !== 'rpc') preflight.nonRpcInputSeen = true;
-    if (preflight.preparingUnconfirmed) preflight.overlapUnconfirmed = true;
-    preflight.preparingUnconfirmed = true;
-  });
-  pi.on('agent_settled', () => {
-    if (!preflight.overlapUnconfirmed) preflight.preparingUnconfirmed = false;
   });
   pi.on('session_start', async (_event, ctx) => {
     context = ctx;
@@ -60,7 +54,6 @@ export default function rpcObserver(pi) {
             data: {
               isIdle: context.isIdle(),
               hasPendingMessages: context.hasPendingMessages(),
-              preparingUnconfirmed: preflight.preparingUnconfirmed,
               nonRpcInputSeen: preflight.nonRpcInputSeen,
             },
           };

@@ -457,17 +457,19 @@ export class PiRpc {
     const state = await this.state();
     return modelPage(result.models, state.model, state.thinkingLevel, args);
   }
-  async assertIdle({
-    busy = 'MODEL_SELECTION_BUSY',
-    unconfirmed = 'MODEL_SELECTION_IDLE_UNCONFIRMED',
-  } = {}) {
-    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
-    // Idle-gated controls must refuse a mismatched owner, never tear it down.
+  async checkedState() {
+    // Idle checks and owner maintenance must never stop a mismatched session.
     const state = await this.dispatch({ type: 'get_state' });
     if (state.sessionFile !== this.session.file || state.sessionId !== this.session.header.id)
       throw new RpcFailure('RUNTIME_SESSION_CHANGED');
-    if (
+    return state;
+  }
+  async idleSnapshot() {
+    const state = await this.checkedState();
+    const pendingWork = () =>
       this.promptAdmission ||
+      this.modelMutation ||
+      this.compactionMutation ||
       this.settlement.sequence < this.handoffSettlement ||
       [...this.pending.values()].some(
         (r) =>
@@ -477,24 +479,43 @@ export class PiRpc {
             'get_available_models',
             'get_available_thinking_levels',
           ].includes(r.commandType),
-      ) ||
-      state.isStreaming ||
-      state.isCompacting ||
+      );
+    if (
+      pendingWork() ||
+      state.isStreaming === true ||
+      state.isCompacting === true ||
       state.pendingMessageCount > 0
     )
-      throw new RpcFailure(busy);
+      return { state, status: 'busy' };
     if (
       state.isStreaming !== false ||
       state.isCompacting !== false ||
       state.pendingMessageCount !== 0 ||
       !this.ownerRecord?.socket
     )
-      throw new RpcFailure(unconfirmed);
+      return { state, status: 'unconfirmed' };
     const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
-    if (observed.nonRpcInputSeen !== false) throw new RpcFailure(unconfirmed);
-    if (observed.isIdle !== true || observed.hasPendingMessages !== false)
-      throw new RpcFailure(busy);
-    return state;
+    if (observed.isIdle === false || observed.hasPendingMessages === true || pendingWork())
+      return { state, status: 'busy' };
+    // Pi 1.1 cannot correlate independent extension preflight with an RPC ACK.
+    // Historical RPC input counts are not evidence of unfinished work.
+    if (
+      observed.nonRpcInputSeen !== false ||
+      observed.isIdle !== true ||
+      observed.hasPendingMessages !== false
+    )
+      return { state, status: 'unconfirmed' };
+    return { state, status: 'idle' };
+  }
+  async assertIdle({
+    busy = 'MODEL_SELECTION_BUSY',
+    unconfirmed = 'MODEL_SELECTION_IDLE_UNCONFIRMED',
+  } = {}) {
+    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    const result = await this.idleSnapshot();
+    if (result.status !== 'idle')
+      throw new RpcFailure(result.status === 'busy' ? busy : unconfirmed);
+    return result.state;
   }
   // Native selection is persistent session state, NOT a per-prompt binding.
   // Active provider calls keep their captured model; later calls/queued inputs
@@ -632,66 +653,14 @@ export class PiRpc {
   }
   async assertReleasable() {
     if (this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
-    const state = await this.dispatch({ type: 'get_state' });
-    if (state.sessionFile !== this.session.file || state.sessionId !== this.session.header.id)
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
-    if (this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
-    if (state.isStreaming === true || state.isCompacting === true || state.pendingMessageCount > 0)
-      throw new RpcFailure('RUNTIME_BUSY');
-    if (
-      state.isStreaming !== false ||
-      state.isCompacting !== false ||
-      state.pendingMessageCount !== 0 ||
-      !this.ownerRecord?.socket
-    )
-      throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-    const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
-    if (observed.preparingUnconfirmed) throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-    if (observed.isIdle === false || observed.hasPendingMessages === true)
-      throw new RpcFailure('RUNTIME_BUSY');
-    if (observed.isIdle !== true || observed.hasPendingMessages !== false)
-      throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-    if (this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    await this.assertIdle({ busy: 'RUNTIME_BUSY', unconfirmed: 'RUNTIME_IDLE_UNCONFIRMED' });
   }
   async waitForHandoff(signal) {
     for (;;) {
       signal?.throwIfAborted();
-      // Use dispatch, not state(): identity mismatch must not invoke stop().
-      const state = await this.dispatch({ type: 'get_state' });
-      if (state.sessionFile !== this.session.file || state.sessionId !== this.session.header.id)
-        throw new RpcFailure('RUNTIME_SESSION_CHANGED');
-      if (
-        !this.ownerRecord?.socket ||
-        typeof state.isStreaming !== 'boolean' ||
-        typeof state.isCompacting !== 'boolean' ||
-        !Number.isSafeInteger(state.pendingMessageCount) ||
-        state.pendingMessageCount < 0
-      )
-        throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-      const observed = await new AttachedRuntime(
-        this.config,
-        this.session,
-        this.ownerRecord,
-      ).state();
-      // Public context cannot correlate extension-origin preflight with ACKs.
-      // Keep that uncertainty sticky; the legacy input/settlement latch alone
-      // is deliberately NOT used as a quiescence proof here.
-      if (observed.nonRpcInputSeen !== false) throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-      // Stop may return an uncertain receipt while native control ACKs are still
-      // outstanding. Its lock ending is not proof that those mutations finished.
-      const pendingMutation = [...this.pending.values()].some(
-        (req) => !['get_state', 'get_entries'].includes(req.commandType),
-      );
-      if (
-        !this.promptAdmission &&
-        !pendingMutation &&
-        this.settlement.sequence >= this.handoffSettlement &&
-        state.isStreaming === false &&
-        state.isCompacting === false &&
-        state.pendingMessageCount === 0 &&
-        observed.isIdle === true &&
-        observed.hasPendingMessages === false
-      ) {
+      const result = await this.idleSnapshot();
+      if (result.status === 'unconfirmed') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+      if (result.status === 'idle') {
         signal?.throwIfAborted();
         return;
       }
@@ -742,13 +711,21 @@ export class PiRpc {
     }
     if (this.stopPromise) return this.stopPromise;
     this.stopPromise = (async () => {
-      const exited = new Promise((resolve) => this.child.once('exit', resolve));
-      this.child.kill('SIGTERM');
-      const timer = setTimeout(() => this.child.kill('SIGKILL'), 1500);
-      await exited;
+      let observeExit;
+      const exited = new Promise((resolve) => {
+        observeExit = resolve;
+        this.child.once('exit', observeExit);
+      });
+      try {
+        if (this.child.kill('SIGTERM') === false) throw new RpcFailure('RUNTIME_STOP_FAILED');
+        // Explicit shutdown may interrupt work; elapsed time never authorizes
+        // force-kill. Keep ownership until this child exits.
+        await exited;
+      } finally {
+        this.child.off('exit', observeExit);
+      }
       this.exited = true;
       this.promptAdmission = null;
-      clearTimeout(timer);
       this.lines?.close();
       if (this.ownerRecord?.socket)
         await fs.unlink(this.ownerRecord.socket).catch((error) => {
@@ -756,7 +733,13 @@ export class PiRpc {
         });
       await release();
     })();
-    return this.stopPromise;
+    try {
+      return await this.stopPromise;
+    } finally {
+      // A failed signal/cleanup is not a permanently pending exit. A later
+      // explicit stop may retry; no automatic replay or claim release occurs.
+      this.stopPromise = null;
+    }
   }
 }
 export class RuntimePool {

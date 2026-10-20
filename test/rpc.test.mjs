@@ -140,6 +140,52 @@ test('RPC pipe failure still requires confirmed process exit before stop returns
   assert.equal(terminated, true);
   assert.equal(exited, true);
 });
+test('a failed SIGTERM can be retried explicitly without a stale stop promise', async () => {
+  const rpc = new PiRpc({}, {}),
+    child = new EventEmitter(),
+    signals = [];
+  rpc.child = child;
+  rpc.alive = true;
+  child.kill = (signal) => {
+    signals.push(signal);
+    throw Object.assign(new Error('test signal denied'), { code: 'EPERM' });
+  };
+  await assert.rejects(rpc.stop(), { code: 'EPERM' });
+  assert.equal(child.listenerCount('exit'), 0);
+  child.kill = () => false;
+  await assert.rejects(rpc.stop(), { code: 'RUNTIME_STOP_FAILED' });
+  assert.equal(child.listenerCount('exit'), 0);
+  child.kill = (signal) => {
+    signals.push(signal);
+    queueMicrotask(() => child.emit('exit', 0));
+    return true;
+  };
+  await rpc.stop();
+  assert.deepEqual(signals, ['SIGTERM', 'SIGTERM']);
+  assert.equal(rpc.exited, true);
+});
+test('owner termination waits for exit without timer-based SIGKILL', async () => {
+  const rpc = new PiRpc({}, {}),
+    child = new EventEmitter(),
+    signals = [];
+  rpc.child = child;
+  rpc.alive = true;
+  child.kill = (signal) => {
+    signals.push(signal);
+    return true;
+  };
+  let stopped = false;
+  const stopping = rpc.stop().then(() => {
+    stopped = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 1650));
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.equal(stopped, false);
+  child.emit('exit', 0);
+  await stopping;
+  assert.equal(stopped, true);
+  assert.equal(rpc.exited, true);
+});
 test('pool terminates an unusable old runtime before replacement', async () => {
   let stopped = false;
   const pool = new RuntimePool({}, async () => {

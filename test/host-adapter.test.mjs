@@ -368,6 +368,32 @@ test('read snapshots are detached before awaited identity checks and later host 
   assert.ok(JSON.stringify(result.data).includes('PUBLIC_FIXTURE'));
   assert.ok(!JSON.stringify(result.data).includes('LATER_MUTATION'));
 });
+test('model selection preserves partial-change uncertainty across the owner IPC boundary', async (t) => {
+  const f = await fixture(t);
+  let partial = false;
+  f.callbacks.selectModel = async () => {
+    throw Object.assign(new Error('STOP_IN_PROGRESS'), { uncertain: partial });
+  };
+  await f.controller.ready(f.callbacks);
+  const runtime = new AttachedRuntime(
+    { attachmentDir: f.attachmentDir },
+    f.session,
+    f.controller.record,
+  );
+  for (partial of [false, true]) {
+    await assert.rejects(
+      runtime.set_model({ thinking_level: 'high' }),
+      (error) =>
+        error.uncertain === partial &&
+        error.code === (partial ? 'MODEL_SELECTION_FAILED' : 'STOP_IN_PROGRESS'),
+    );
+  }
+  // Neither error leaves the host's short-lived selection gate engaged.
+  assert.equal(
+    (await request(f, 'send', { text: 'AFTER_FAILURE', mode: 'default' })).data.status,
+    'accepted',
+  );
+});
 test('publication failure after listening closes endpoint while retaining ownership', async (t) => {
   const f = await fixture(t),
     state = f.callbacks.state;
