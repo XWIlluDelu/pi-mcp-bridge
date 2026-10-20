@@ -66,29 +66,66 @@ to its native input API. Omitting the declaration keeps text working but
 rejects image submissions. Existing running owners do not gain the capability
 merely because their files were updated: use safe reload/reopen.
 
-## TUI-first and ordinary RPC registration
+## Daily TUI and ordinary RPC registration
 
-Start a normal TUI from the intended project with the companion loaded:
+To make ordinary `pi` launches participate, add the companion's absolute path
+to the native agent settings (`~/.pi/agent/settings.json`, or the selected
+`PI_CODING_AGENT_DIR`). Merge with the existing `extensions` array; keep all
+other settings and packages:
+
+```json
+{
+  "extensions": ["/absolute/pi-mcp-bridge/src/attach-extension.mjs"]
+}
+```
+
+Use the same canonical file as the Bridge installation's `open.mjs`; do not
+install a copied wrapper as a second extension. Pi deduplicates the normal
+settings entry and an explicit `-e` for the same canonical file.
+
+The daily companion reads the existing private owner configuration at
+`$XDG_CONFIG_HOME/pi-mcp-bridge/owner.json`, or
+`$HOME/.config/pi-mcp-bridge/owner.json`. `PI_MCP_OWNER_CONFIG` selects a
+different file. No default configuration means the companion stays inactive;
+an explicitly selected missing file or invalid/private-permission failure is
+reported as an extension load error. The owner file must belong to the user
+and have no group/other permissions.
+
+This profile uses the configured `attachmentDir` (default `stateDir/ipc`) and
+registers only sessions under the existing `sessionRoots`. It checks path
+metadata before reading the session header or entries. No-session runs and
+out-of-scope sessions get no endpoint. A fresh native session can reserve its
+identity before first persistence; public discovery starts once Pi writes
+the session file. Reload replaces the endpoint generation; switching away
+retires that process's former companion claim without changing another owner.
+
+A normal RPC host using that same native agent directory inherits the extension
+through Pi settings, without a Bridge-specific host dependency. Its original
+host retains stdin/stdout and process lifecycle control; Bridge uses the
+private companion endpoint, not those pipes. Remote operations still require
+the existing Bridge grants. Before enabling daily access, check that these
+grants and roots cover exactly the sessions intended for remote use.
+
+For an explicit one-off launch with the same scope:
 
 ```sh
-PI_MCP_ATTACH_DIR=/absolute/bridge-state/ipc \
 PI_MCP_OWNER_CONFIG=/absolute/path/owner.json \
 pi -e /absolute/pi-mcp-bridge/src/attach-extension.mjs
 ```
 
-Use the same attachment directory as the Bridge (the default is
-`stateDir/ipc`). Its saved native session must lie under a configured
-`sessionRoots` directory to be discovered. Bridge grants still govern remote
-operations; loading a companion does not grant access.
+If `PI_MCP_ATTACH_DIR` is also set, it must agree with that owner file.
+A directory-only `PI_MCP_ATTACH_DIR` remains the explicit low-level registration
+path for hosts managing their own scope; it does not use the daily owner profile.
+Use the owner profile, not directory-only configuration, for scoped daily access.
 
-An ordinary RPC host can load the same extension using its existing Pi launch
-arguments and `PI_MCP_ATTACH_DIR`. For example, `pi --mode rpc -e
-/absolute/pi-mcp-bridge/src/attach-extension.mjs` starts a fresh cooperating RPC
-session; its original host retains stdin/stdout and process lifecycle control.
-The Bridge uses the extension's private endpoint, not a second reader or writer
-on those pipes. Existing unregistered hosts need an owner-controlled extension
-load/reload or a safe reopen. Registration occurs too late to make blindly
-opening an already-owned target with `--session` safe.
+Existing processes do not load a newly configured extension automatically.
+The native owner may use TUI `/reload` at a suitable time or launch its next
+session normally; a plain RPC host must manage its own lifecycle. Registration
+occurs too late to make blindly opening an already-owned target with
+`--session` safe. A GUI started first can retain its Pi while Bridge joins via
+the companion. A GUI opened after a Bridge-owned RPC needs an existing shared
+control route or an explicit safe handoff; installing the companion alone does
+not connect the GUI to that existing pipe.
 
 ## Open a Bridge session in a native terminal
 

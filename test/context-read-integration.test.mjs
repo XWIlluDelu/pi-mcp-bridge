@@ -462,7 +462,7 @@ test('saved, official RPC and native companion share the selected projection wit
   const manager = SessionManager.open(f.saved.file),
     handlers = {};
   manager.branch('b');
-  attachExtension({
+  await attachExtension({
     on: (event, fn) => {
       handlers[event] = fn;
     },

@@ -5,9 +5,10 @@ import { readOwnerConfig } from './owner-config.mjs';
 import { ownerRequest } from './owner-runtime.mjs';
 import { processIdentity, readClaim } from './attachments.mjs';
 
-export default function joinExtension(pi) {
-  const file = process.env.PI_MCP_OWNER_CONFIG,
-    dir = process.env.PI_MCP_ATTACH_DIR;
+export default function joinExtension(
+  pi,
+  { file = process.env.PI_MCP_OWNER_CONFIG, dir = process.env.PI_MCP_ATTACH_DIR } = {},
+) {
   if (!file || !dir) return;
   let pending;
   pi.on('session_shutdown', () => {

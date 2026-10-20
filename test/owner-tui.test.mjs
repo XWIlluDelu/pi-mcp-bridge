@@ -54,7 +54,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     ],
   };
   const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
+  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const setup = await new Bridge(config).init();
   const made = await savedSession(setup, { folder_id: 'project', request_id: 'seed' });
   const session = await setup.session(made.session_id);

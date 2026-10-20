@@ -1,4 +1,4 @@
-// Load explicitly in the owner's ordinary Pi TUI or RPC: -e /absolute/path/src/attach-extension.mjs
+// Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
 import {
   modelPage,
@@ -20,6 +20,7 @@ import {
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
+import { companionProfile, companionIncludes } from './companion-profile.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import {
   privateDirectory,
@@ -34,11 +35,41 @@ import {
   AttachmentFailure,
 } from './attachments.mjs';
 
-export default function attachExtension(pi) {
-  const dir = process.env.PI_MCP_ATTACH_DIR;
+export default async function attachExtension(pi) {
+  const profile = await companionProfile();
+  if (!profile) return;
+  const { dir, file } = profile;
   let active;
-  if (!dir) return;
-  joinExtension(pi);
+  joinExtension(pi, { dir, file });
+  async function retirePreviousClaims(currentFile, owner) {
+    // Replacement/reload can reconstruct this extension, so use native identity
+    // rather than closure state. Never retire a controller or a different process.
+    if (
+      !(await fs.stat(dir).catch((error) => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      }))
+    )
+      return;
+    await registryTransaction(dir, async () => {
+      for (const name of await fs.readdir(dir)) {
+        if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
+        const file = path.join(dir, name);
+        const other = await readOwnerRecord(dir, file);
+        if (
+          other?.file !== currentFile &&
+          ['tui', 'extension'].includes(other?.kind) &&
+          other.owner?.pid === owner.pid &&
+          other.owner.start === owner.start &&
+          other.owner.boot === owner.boot
+        ) {
+          if (other.noColdReacquire)
+            await atomicJson(file, { ...other, phase: 'released', owner: null });
+          else await fs.unlink(file);
+        }
+      }
+    });
+  }
   async function closeServer(runtime) {
     if (!runtime) return;
     runtime.ready = false;
@@ -120,9 +151,15 @@ export default function attachExtension(pi) {
   pi.on('session_start', async (_event, ctx) => {
     if (!['tui', 'rpc'].includes(ctx.mode)) return;
     try {
+      const file = ctx.sessionManager.getSessionFile();
+      // Check only path metadata before inspecting entries or publishing IPC.
+      // No-session runs and sessions outside the owner's roots remain ordinary Pi.
+      if (!companionIncludes(profile, file)) {
+        await retirePreviousClaims(file, await processIdentity());
+        return;
+      }
       await privateDirectory(dir);
-      const file = ctx.sessionManager.getSessionFile(),
-        header = ctx.sessionManager.getHeader();
+      const header = ctx.sessionManager.getHeader();
       if (!file || !header || !path.isAbsolute(file))
         throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
       const session = { file, header },
@@ -374,26 +411,7 @@ export default function attachExtension(pi) {
         modelSelectionSupported: true,
       });
       // A successful replacement lifecycle conclusively releases this process's previous native identity.
-      await registryTransaction(dir, async () => {
-        for (const name of await fs.readdir(dir)) {
-          if (
-            !/^ps_[a-f0-9]{32}\.owner\.json$/.test(name) ||
-            path.join(dir, name) === claimFile(dir, session)
-          )
-            continue;
-          const other = await readOwnerRecord(dir, path.join(dir, name));
-          if (
-            ['tui', 'extension'].includes(other?.kind) &&
-            other.owner?.pid === owner.pid &&
-            other.owner.start === owner.start &&
-            other.owner.boot === owner.boot
-          ) {
-            if (other.noColdReacquire)
-              await atomicJson(path.join(dir, name), { ...other, phase: 'released', owner: null });
-            else await fs.unlink(path.join(dir, name));
-          }
-        }
-      });
+      await retirePreviousClaims(file, owner);
     } catch (error) {
       // Pi catches hook errors. A TUI can request graceful exit; an externally
       // owned RPC host must remain under its owner's lifecycle control.

@@ -69,6 +69,8 @@ Every mutation requires a `request_id`. Native acceptance is not model completio
 
 Cold resume uses the user's own Pi settings, authentication, tools, extensions and project configuration; isolation is opt-in (the tests use it).
 
+For ordinary `pi` and RPC-host launches to participate, [add the companion to native Pi settings](docs/runtime.md#daily-tui-and-ordinary-rpc-registration). It reads the existing private owner configuration and registers only its session roots; grants remain unchanged. Newly configured extensions do not attach to already-running processes automatically.
+
 To open a Bridge-owned session in an interactive native TUI:
 
 ```sh

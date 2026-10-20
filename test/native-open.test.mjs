@@ -52,6 +52,9 @@ test(
     await fs.writeFile(
       path.join(agent, 'settings.json'),
       JSON.stringify({
+        // The same canonical companion is also supplied by openProfile -e.
+        // Native Pi must deduplicate it rather than create two owners/sockets.
+        extensions: [path.resolve('src/attach-extension.mjs')],
         defaultProvider: 'bridge-fixture',
         defaultModel: 'deterministic',
         defaultThinkingLevel: 'off',
@@ -77,7 +80,7 @@ test(
       piArgs: ['--offline'],
     };
     const configFile = path.join(dir, 'owner.json');
-    await fs.writeFile(configFile, JSON.stringify(config));
+    await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     const prior = process.env.PI_OPEN_FIXTURE_HOLD,
       priorPath = process.env.PATH;
     process.env.PI_OPEN_FIXTURE_HOLD = '1';
@@ -159,6 +162,12 @@ test(
     owner = await readClaim(config.attachmentDir, session);
     assert.equal(owner.phase, 'ready');
     assert.equal(owner.kind, 'tui');
+    assert.deepEqual(
+      (await fs.readdir(config.attachmentDir)).filter(
+        (name) => name.startsWith(owner.owner.pid + '-') && name.endsWith('.sock'),
+      ),
+      [path.basename(owner.socket)],
+    );
     assert.equal(resumed.pid, owner.owner.pid);
     assert.equal(await fs.realpath(resumed.cli), native.implementation);
     const initial = JSON.parse(

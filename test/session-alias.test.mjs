@@ -65,7 +65,7 @@ test('initial attachment rechecks first persistence after a missing-file snapsho
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -125,7 +125,7 @@ test('initial attachment rejects a persisted file belonging to a different nativ
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -168,7 +168,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -233,12 +233,12 @@ test('persisted paths retain protection against a different live native owner cl
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const a = {},
     b = {};
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       a[name] = fn;
     },
   });
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       b[name] = fn;
     },
@@ -373,7 +373,7 @@ test('TUI claim rejects hardlink and symlink aliases before publishing a record'
   for (const file of [f.session.file, hardlink, symlink]) {
     const handlers = {};
     let shutdown = false;
-    attachExtension({
+    await attachExtension({
       on: (name, fn) => {
         handlers[name] = fn;
       },
@@ -400,7 +400,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -461,7 +461,7 @@ test('missing targets do not bypass canonical parent or observed-file checks', a
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -517,7 +517,7 @@ test('RPC extension storage failure retains ownership without shutting down its 
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let shutdowns = 0;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -565,7 +565,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let stopped = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
