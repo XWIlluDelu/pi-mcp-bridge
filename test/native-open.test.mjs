@@ -1,3 +1,4 @@
+import { nativeInstallation } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,7 +27,8 @@ test(
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-native-open-'),
       cwd = path.join(dir, 'project'),
-      agent = path.join(dir, 'agent');
+      agent = path.join(dir, 'agent'),
+      native = await nativeInstallation(dir);
     await fs.mkdir(cwd);
     await fs.mkdir(path.join(agent, 'extensions'), { recursive: true });
     const provider = path.resolve('test/fixtures/faux-extension.mjs');
@@ -42,7 +44,7 @@ test(
     export default pi=>{
       pi.on('session_start',async(event,ctx)=>{
         await fs.writeFile(dir+'/'+(event.reason==='resume'?'resumed.json':'startup-'+process.pid+'.json'),JSON.stringify({
-          file:ctx.sessionManager.getSessionFile(),tools:pi.getActiveTools(),entries:ctx.sessionManager.getEntries()}));
+          cli:process.argv[1],pid:process.pid,file:ctx.sessionManager.getSessionFile(),tools:pi.getActiveTools(),entries:ctx.sessionManager.getEntries()}));
       });
       pi.on('agent_before_settle',async()=>{if(process.env.PI_OPEN_FIXTURE_HOLD==='1'){await fs.writeFile(dir+'/settling','yes');while(!await exists(dir+'/continue'))await new Promise(r=>setTimeout(r,10));}});
     };`,
@@ -76,8 +78,10 @@ test(
     };
     const configFile = path.join(dir, 'owner.json');
     await fs.writeFile(configFile, JSON.stringify(config));
-    const prior = process.env.PI_OPEN_FIXTURE_HOLD;
+    const prior = process.env.PI_OPEN_FIXTURE_HOLD,
+      priorPath = process.env.PATH;
     process.env.PI_OPEN_FIXTURE_HOLD = '1';
+    process.env.PATH = native.PATH;
     const bridge = await new Bridge(config).init(),
       made = await savedSession(bridge, { folder_id: 'p' }),
       session = await bridge.session(made.session_id);
@@ -94,6 +98,7 @@ test(
       await fs.rm(dir, { recursive: true, force: true });
       if (prior === undefined) delete process.env.PI_OPEN_FIXTURE_HOLD;
       else process.env.PI_OPEN_FIXTURE_HOLD = prior;
+      process.env.PATH = priorPath;
     });
     assert.equal(
       (await bridge.send({ session_id: session.id, request_id: 'work', text: 'NATIVE_OPEN_WORK' }))
@@ -117,6 +122,8 @@ test(
       LANG: 'C.UTF-8',
       PI_OFFLINE: '1',
     });
+    assert.equal(profile.command, native.executable);
+    assert.equal(rpc.child.spawnfile, native.executable);
     assert.equal(profile.args.includes('--session'), false);
     tui = spawn(
       'script',
@@ -152,6 +159,8 @@ test(
     owner = await readClaim(config.attachmentDir, session);
     assert.equal(owner.phase, 'ready');
     assert.equal(owner.kind, 'tui');
+    assert.equal(resumed.pid, owner.owner.pid);
+    assert.equal(await fs.realpath(resumed.cli), native.implementation);
     const initial = JSON.parse(
       await fs.readFile(path.join(dir, 'startup-' + owner.owner.pid + '.json'), 'utf8'),
     );
@@ -165,5 +174,9 @@ test(
       text: 'HEADLESS_AFTER_NATIVE_QUIT',
     });
     assert.equal(resumedHeadless.status, 'accepted', JSON.stringify(resumedHeadless));
+    const next = bridge.pool.get(session.id);
+    assert.equal(next.child.spawnfile, native.executable);
+    assert.notEqual(next.child.pid, old.owner.pid);
+    assert.equal(next.session.file, session.file);
   },
 );

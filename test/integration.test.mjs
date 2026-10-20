@@ -420,10 +420,10 @@ export default function(pi){
     assert.equal(first.reason, 'ACK_TIMEOUT');
     const runtime = bridge.pool.get(session_id);
     await until(async () => (await rows()).length === 1);
-    assert.equal((await runtime.state()).isStreaming, false); // Pi has not published busy during preparation.
+    assert.equal((await runtime.state()).isStreaming, true); // Pi 1.3 counts before_agent_start as an active run.
     const preparationRead = await runtime.entries();
     assert.equal(preparationRead.activity.source, 'rpc_get_state');
-    assert.equal(preparationRead.activity.streaming, false);
+    assert.equal(preparationRead.activity.streaming, true);
     assert.equal(preparationRead.activity.idle, null);
     assert.equal(preparationRead.activity.preparing, null);
     assert.equal(preparationRead.activity.bridge_admission.pending, true);

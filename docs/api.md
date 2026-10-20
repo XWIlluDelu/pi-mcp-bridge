@@ -134,7 +134,7 @@ Both tools accept `images` in native Pi `ImageContent` format:
 
 For `create`, replace `session_id` with the configured absolute `project`.
 You may omit `text` for image-only input. The Bridge adds the neutral text
-`[Image attachment]` because Pi 1.1 cannot clear consumed empty-text queue
+`[Image attachment]` because Pi 1.3 cannot clear consumed empty-text queue
 entries; the picture still arrives as a native image block. Omitting **both** payload fields
 (and `model`, if used) means receipt recovery, not a new empty prompt. Never resubmit uncertain work under a
 new ID. Images participate in the durable request fingerprint: changing image

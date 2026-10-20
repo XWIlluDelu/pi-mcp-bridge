@@ -42,7 +42,9 @@ MCP, Bridge and attached owners use the same context-timeline read contract and 
 - **Ownership:** Unix owner claims, namespace-safe dead-owner registry recovery, filesystem aliases, unreachable hosts, release cancellation/drain, idle EOF handoff, cold resume only after an appropriate exact-death condition.
 - **Transports:** modern and legacy standard MCP clients over stdio/HTTP, shared proxies, authentication/header errors, frame limits, disconnects, bounded response waits.
 
-CI runs this suite and formatting on Node 22 and 26 for pushes and pull requests to `main`, without provider credentials. `npm run format:check` covers maintained source, tests, docs and the CI workflow. Exact dependency versions and the lockfile pin the tested protocol/native baseline. `npm audit` checks the dependency graph and does not replace behavioral protocol or concurrency tests.
+CI runs this suite and formatting on Node 22 and 26 for pushes and pull requests to `main`, without provider credentials. `npm run format:check` covers maintained source, tests, docs and the CI workflow. Exact dependency versions and the lockfile pin the SDK and test baseline, not the user's runtime executable. `npm audit` checks the dependency graph and does not replace behavioral protocol or concurrency tests.
+
+The native fixtures explicitly select that test CLI. To exercise an installed Pi instead, run `BRIDGE_TEST_PI_CLI=/absolute/path/to/pi npm test`. The default-launch tests also check PATH selection and actual native process identity, with a temporary HOME/agent directory so the user's credentials and sessions remain untouched.
 
 ## Operational boundaries
 

@@ -12,7 +12,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest, ownerSocket } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
+import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function until(fn) {
@@ -117,7 +117,7 @@ test(
       'COLD_REACQUIRE_BLOCKED',
     );
     const local = new RpcClient({
-      cliPath: path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      cliPath: nativePiCli,
       cwd: f.cwd,
       env: {
         HOME: f.dir,
@@ -328,7 +328,7 @@ for (const overlap of [false, true])
   test(
     overlap
       ? 'observed overlapping extension inputs remain unconfirmed after unrelated settlement'
-      : 'independent extension preflight stays unconfirmed even when public isIdle reports true',
+      : 'independent extension startup reports busy before agent_start',
     { timeout: 20000 },
     async (t) => {
       const f = await fixture(t),
@@ -339,9 +339,9 @@ for (const overlap of [false, true])
       await fs.writeFile(
         extension,
         `import fs from 'node:fs/promises';export default pi=>{
-    pi.registerCommand('autonomous-preflight',{handler:()=>{for(const text of ${JSON.stringify(messages)})pi.sendUserMessage(text);}});
+    pi.registerCommand('autonomous-preflight',{handler:()=>{for(const text of ${JSON.stringify(messages)})pi.sendUserMessage(text,{deliverAs:'followUp'});}});
     pi.registerCommand('preflight-reload',{handler:async(_args,ctx)=>{await ctx.reload();}});
-    pi.on('before_agent_start',async event=>{if(event.prompt!=='ASYNC_PREFLIGHT')return;await fs.writeFile(${JSON.stringify(started)},'started');while(!await fs.stat(${JSON.stringify(gate)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));});
+    pi.on(${JSON.stringify(overlap ? 'input' : 'before_agent_start')},async event=>{if((event.text??event.prompt)==='ASYNC_PREFLIGHT'){await fs.writeFile(${JSON.stringify(started)},'started');while(!await fs.stat(${JSON.stringify(gate)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));}return {action:'continue'};});
   };`,
       );
       f.config.piArgs.push('-e', extension);
@@ -364,7 +364,7 @@ for (const overlap of [false, true])
       const owned = f.bridge.pool.get(f.id);
       if (overlap) await until(() => owned.settlement.sequence === 1);
       const state = await owned.state();
-      assert.equal(state.isStreaming, false);
+      assert.equal(state.isStreaming, !overlap); // input hooks precede busy; before_agent_start no longer does.
       assert.equal(state.pendingMessageCount, 0);
       assert.equal(owned.promptAdmission, null);
       const owner = owned.ownerRecord.owner;
@@ -374,7 +374,10 @@ for (const overlap of [false, true])
       );
       assert.deepEqual(
         { release, ownerAlive: await ownerAlive(owner) },
-        { release: { reason: 'RUNTIME_IDLE_UNCONFIRMED' }, ownerAlive: true },
+        {
+          release: { reason: overlap ? 'RUNTIME_IDLE_UNCONFIRMED' : 'RUNTIME_BUSY' },
+          ownerAlive: true,
+        },
       );
       assert.notEqual(
         (await readClaim(f.bridge.pool.attachmentDir, f.session)).noColdReacquire,

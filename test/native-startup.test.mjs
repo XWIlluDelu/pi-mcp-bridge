@@ -1,3 +1,4 @@
+import { nativePiCli, nativeInstallation } from './fixtures/isolated-runtime.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -22,7 +23,13 @@ async function fixture(t, model = {}) {
     timestamp: Date.now(),
   });
   manager.appendMessage({ ...fauxAssistantMessage('Saved native seed response'), ...model });
-  return { dir, cwd, file: manager.getSessionFile(), id: manager.getSessionId() };
+  return {
+    dir,
+    cwd,
+    file: manager.getSessionFile(),
+    id: manager.getSessionId(),
+    native: await nativeInstallation(dir),
+  };
 }
 test(
   'Bridge launcher without profile uses native HOME/settings/packages/tools and saved selection',
@@ -46,7 +53,7 @@ test(
       path.join(pkg, 'index.mjs'),
       `import {fauxProvider} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-ai'))};export default pi=>{
     const faux=fauxProvider({provider:'native-fixture',models:[{id:'native-model',name:'Synthetic native default',reasoning:true},{id:'saved-model',name:'Synthetic saved selection',reasoning:true}]});
-    pi.registerProvider(faux.provider);pi.on('session_start',()=>pi.appendEntry('native-package',{tools:pi.getActiveTools(),env:process.env.NATIVE_FIXTURE_VALUE}));
+    pi.registerProvider(faux.provider);pi.on('session_start',()=>pi.appendEntry('native-package',{tools:pi.getActiveTools(),env:process.env.NATIVE_FIXTURE_VALUE,cli:process.argv[1],home:process.env.HOME,pid:process.pid}));
   };`,
     );
     await fs.writeFile(
@@ -76,26 +83,37 @@ test(
     let rpc=await new PiRpc(config,session).start();
     try{
       const state=await rpc.state(),entries=await rpc.entries(),shell=await rpc.command({type:'bash',command:'pwd'});
+      if(entries.entries.find(e=>e.customType==='native-package').data.pid!==rpc.child.pid)throw Error('NATIVE_PROCESS_IDENTITY_MISMATCH');
       // Select a different saved model without overwriting the native defaults.
       await rpc.command({type:'set_model',provider:'native-fixture',modelId:'saved-model'});
       await rpc.command({type:'set_thinking_level',level:'medium'});await rpc.stop();
       rpc=await new PiRpc(config,session).start();const restored=await rpc.state();
-      console.log(JSON.stringify({model:state.model.id,thinking:state.thinkingLevel,probe:entries.entries.find(e=>e.customType==='native-package').data,shell:shell.output.trim(),restoredModel:restored.model.id,restoredThinking:restored.thinkingLevel}));
+      console.log(JSON.stringify({executable:rpc.child.spawnfile,model:state.model.id,thinking:state.thinkingLevel,probe:entries.entries.find(e=>e.customType==='native-package').data,shell:shell.output.trim(),restoredModel:restored.model.id,restoredThinking:restored.thinkingLevel}));
     }finally{await rpc.stop();}
   `;
     const result = await exec(process.execPath, ['--input-type=module', '-e', script], {
       env: {
-        PATH: process.env.PATH,
+        PATH: f.native.PATH,
         HOME: f.dir,
         PI_OFFLINE: '1',
         NATIVE_FIXTURE_VALUE: 'inherited',
       },
       timeout: 10000,
     });
-    assert.deepEqual(JSON.parse(result.stdout), {
+    const observed = JSON.parse(result.stdout);
+    assert.ok(Number.isSafeInteger(observed.probe.pid));
+    assert.equal(await fs.realpath(observed.probe.cli), f.native.implementation);
+    assert.deepEqual(observed, {
+      executable: f.native.executable,
       model: 'native-model',
       thinking: 'high',
-      probe: { tools: ['read', 'bash'], env: 'inherited' },
+      probe: {
+        tools: ['read', 'bash'],
+        env: 'inherited',
+        cli: observed.probe.cli,
+        home: f.dir,
+        pid: observed.probe.pid,
+      },
       shell: f.cwd,
       restoredModel: 'saved-model',
       restoredThinking: 'medium',
@@ -157,8 +175,10 @@ test(
       while(rpc.settlement.sequence===0)await new Promise(resolve=>setTimeout(resolve,10));
       settlement=rpc.settlement.sequence;
       if(await pool.forRead(target)!==rpc)throw Error('RUNTIME_REPLACED');
+      pool.config.piExecutable='/nonexistent/native-pi-fixture';
+      if(await pool.resolve(target)!==rpc)throw Error('EXISTING_WRITER_NOT_REUSED');
     }finally{await pool.close();}
-    const local=new RpcClient({cliPath:${JSON.stringify(path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'))},cwd:target.cwd,args:['--session',target.file]});
+    const local=new RpcClient({cliPath:${JSON.stringify(nativePiCli)},cwd:target.cwd,args:['--session',target.file]});
     try{
       await local.start();const state=await local.getState(),external=await readClaim(dir,target);
       console.log(JSON.stringify({ownedKind:owned.kind,ownedPhase:owned.phase,disposition,settlement,tools:profile.tools,externalKind:external.kind,externalPhase:external.phase,sameSession:state.sessionId===target.header.id}));
@@ -166,7 +186,7 @@ test(
   `;
     const result = await exec(process.execPath, ['--input-type=module', '-e', script], {
       env: {
-        PATH: process.env.PATH,
+        PATH: f.native.PATH,
         HOME: f.dir,
         PI_CODING_AGENT_DIR: agent,
         PI_MCP_ATTACH_DIR: ipc,
@@ -222,7 +242,7 @@ test(
       PI_OFFLINE: '1',
     });
     const client = new RpcClient({
-      cliPath: path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      cliPath: nativePiCli,
       cwd: f.cwd,
       env,
       args: [

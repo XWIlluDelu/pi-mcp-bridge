@@ -104,13 +104,17 @@ It loads the companion explicitly, inherits normal Pi configuration through the
 owner's launch profile. It never starts with `--session TARGET`: Pi opens and may migrate that file
 before loading extensions, which is too early to negotiate a live owner.
 
-The normal default is the bundled, tested Pi 1.1 CLI. An owner may set
-`piExecutable` to an absolute executable path for a compatible Pi installation.
-This selects the executable for both cold RPC and the TUI launcher; it does not
-make incompatible RPC/extension versions interchangeable. `piRuntime` environment,
-agent-directory and tool overrides remain explicit owner choices. Otherwise
-native settings, packages, authentication, tools and extensions are discovered
-normally from the process environment and project.
+Cold RPC, create, reopen and the TUI launcher resolve the user's `pi` from the
+child environment's PATH. The Bridge ignores its own SDK binaries even when npm
+prepends them to PATH. It never silently substitutes that dependency for the
+user's installation. `piExecutable` selects an explicit absolute executable;
+missing or non-executable selections fail before spawning. Existing cooperating
+owners are reused as-is, without replacing their process or version.
+
+Pi 1.3.0 is the tested native/SDK baseline, not a production version override.
+`piRuntime` environment, agent-directory and tool overrides remain explicit owner
+choices. Otherwise native settings, packages, authentication, tools and extensions
+are discovered normally from the process environment and project.
 
 For example, an owner-config field `"piExecutable": "/usr/local/bin/pi"`
 selects that executable. Without `piRuntime.inheritEnv`, the child inherits the
@@ -141,9 +145,10 @@ and local release share its ACK, queue and settlement checks; completed queued R
 input does not leave a lasting preflight barrier. New mutations are fenced during
 handoff; reads remain available while it waits.
 
-Pi 1.1 cannot correlate independent extension-origin preflight with completion.
-An instance that has received such input can remain unconfirmed even after a
-settlement event. This does not block ordinary prompts or standalone model
+Pi 1.3 reports `before_agent_start` as busy. Earlier `input` hooks still precede
+that busy state, and independent extension-origin input has no completion
+correlation ID. An instance that has received such input can remain unconfirmed
+even after a settlement event. This does not block ordinary prompts or standalone model
 settings. If lossless release cannot be established, use the explicit interrupting
 maintenance path below rather than inferring completion from a quiet stream.
 

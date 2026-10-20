@@ -62,7 +62,7 @@ Bridge calls share the session's mutation lane and do not change other sessions.
 
 A cooperative RPC binding blocks new input only while a native setter is
 unconfirmed. No-op validation failures and failed state reads after a confirmed
-setter do not leave that block in place. Pi 1.1's `RpcClient` does not distinguish a
+setter do not leave that block in place. Pi 1.3's `RpcClient` does not distinguish a
 negative ACK from a timeout in its public error type; an actual setter failure
 therefore remains uncertain. The owning application must resolve that operation
 or retire the old RPC before replacing the binding; a later state read alone is
@@ -126,4 +126,4 @@ Recovery never creates another child, reverts the model or sends again. Changing
 - **Cooperative RPC:** the original pipe owner controls native lifecycle. Pi has no RPC reload command; the pipe owner must manage the process lifecycle.
 - **SDK hosts:** native `AgentSession.reload()` invalidates the old extension runner and reloads settings, resources and tools before session-start. It also resets a process-global provider registry. A generic remote wrapper could lose its own channel or alter other SDK sessions, so the supplied binding does not advertise remote reload. The owning application must coordinate it.
 
-Native lifecycle sources: Pi 1.1 `AgentSession.reload()`, the RPC command dispatcher, and this repository's companion `session_shutdown`/`session_start` handlers.
+Native lifecycle sources: Pi 1.3 `AgentSession.reload()`, the RPC command dispatcher, and this repository's companion `session_shutdown`/`session_start` handlers.

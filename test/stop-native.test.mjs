@@ -19,7 +19,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { readClaim, processIdentity } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
+import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 
 async function until(fn) {
   const end = Date.now() + 10000;
@@ -315,7 +315,7 @@ test(
       PI_OFFLINE: '1',
     });
     const client = new RpcClient({
-      cliPath: path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      cliPath: nativePiCli,
       cwd: f.cwd,
       env,
       args: ['--session', f.saved.file, ...f.config.piArgs],

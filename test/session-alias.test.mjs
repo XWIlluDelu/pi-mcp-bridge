@@ -1,3 +1,4 @@
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -289,6 +290,7 @@ async function fixture(t) {
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const config = {
+    piExecutable: nativePiCli,
     principal: 'alias-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
