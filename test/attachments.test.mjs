@@ -257,7 +257,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     },
     sendUserMessage: (text, options) => calls.push({ text, options }),
   };
-  attachExtension(pi);
+  await attachExtension(pi);
   const entries = [
     {
       type: 'message',
@@ -576,7 +576,7 @@ test('delayed shutdown flush cannot call a replaced or invalidated Pi context', 
   const handlers = {},
     callbacks = [];
   let shutdowns = 0;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -660,7 +660,7 @@ test('registry failure during shutdown still closes old socket and retains block
     previous = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -709,7 +709,7 @@ test('socket startup failure retains live ownership and blocks both send fallbac
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
   let shutdown = false;
-  attachExtension({
+  await attachExtension({
     on: (name, fn) => {
       handlers[name] = fn;
     },

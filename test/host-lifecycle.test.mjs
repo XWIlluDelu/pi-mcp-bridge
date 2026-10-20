@@ -66,7 +66,7 @@ test('profile companion leaves the same-process host controller and its shutdown
   const prior = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
-  attachExtension({
+  await attachExtension({
     on: (name, handler) => {
       handlers[name] = handler;
     },
