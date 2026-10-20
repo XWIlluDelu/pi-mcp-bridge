@@ -20,7 +20,7 @@ import {
   claimFile,
   AttachedRuntime,
 } from '../src/attachments.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
+import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import joinExtension from '../src/join-extension.mjs';
 const base = path.resolve('.'),
   delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -412,8 +412,8 @@ test(
   async (t) => {
     const f = await fixture(
       t,
-      `pi.on('before_agent_start',async event=>{if(event.prompt==='HELD_PREFLIGHT'){
-    pi.sendMessage({customType:'unrelated',content:'CUSTOM_TURN',display:false},{triggerTurn:true});await mark('preflight');await wait('preflight-go');}});`,
+      `pi.on('input',async event=>{if(event.text==='HELD_PREFLIGHT'){
+    pi.sendMessage({customType:'unrelated',content:'CUSTOM_TURN',display:false},{triggerTurn:true});await mark('preflight');await wait('preflight-go');}return {action:'continue'};});`,
     );
     t.after(() => f.mark('preflight-go').catch(() => {}));
     assert.equal(
@@ -564,10 +564,13 @@ test('independent extension input is refused without shutdown', { timeout: 15000
   await rpc.command({ type: 'prompt', message: '/start-external' });
   await until(() => exists(path.join(f.dir, 'external')));
   const old = structuredClone(rpc.ownerRecord);
-  await assert.rejects(transfer(f), /RUNTIME_IDLE_UNCONFIRMED/);
+  assert.equal((await rpc.state()).isStreaming, true);
+  const refused = assert.rejects(transfer(f), /RUNTIME_IDLE_UNCONFIRMED/);
+  await until(() => rpc.handoffPending);
   assert.equal(await ownerAlive(old.owner), true);
   assert.equal(rpc.gracefulExitPromise, undefined);
   await f.mark('external-go');
+  await refused;
   await until(() => rpc.settlement.sequence === 1);
 });
 
@@ -734,7 +737,7 @@ for (const mode of [
     );
     const args = [
       process.execPath,
-      path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
+      nativePiCli,
       '--offline',
       '--session',
       sessionB.file,

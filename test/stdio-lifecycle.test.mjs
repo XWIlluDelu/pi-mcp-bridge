@@ -1,7 +1,7 @@
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
+import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -324,7 +324,7 @@ test('EOF disconnects an actual external Pi TUI without stopping it', async (t) 
   );
   const args = [
     process.execPath,
-    path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
+    nativePiCli,
     '--session',
     f.session.file,
     '--no-extensions',

@@ -1,17 +1,8 @@
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PiRpc, RpcFailure, RuntimePool, launchProfile, piCommand } from '../src/rpc.mjs';
-
-test('owner-selected Pi executable is direct, while omission retains the supported bundled CLI', () => {
-  const selected = piCommand({ piExecutable: '/synthetic/bin/pi' });
-  assert.deepEqual(selected, { command: '/synthetic/bin/pi', args: [] });
-  const bundled = piCommand({});
-  assert.equal(bundled.command, process.execPath);
-  assert.ok(bundled.args[0].endsWith('/dist/bundle/cli.js'));
-  for (const piExecutable of ['relative', null, '/synthetic/\0pi'])
-    assert.throws(() => piCommand({ piExecutable }), /INVALID_PI_EXECUTABLE/);
-});
+import { PiRpc, RpcFailure, RuntimePool, launchProfile } from '../src/rpc.mjs';
 
 test('launcher uses native defaults and only explicit owner overrides', () => {
   const host = {
@@ -407,7 +398,11 @@ test('actual RPC launch rejects null, missing and symlink-replaced cwd without s
     const file = path.join(root, 'session.jsonl'),
       header = { type: 'session', version: 3, id: kind, cwd };
     await fs.writeFile(file, JSON.stringify(header) + '\n');
-    const config = { stateDir: path.join(root, 'state'), attachmentDir: path.join(root, 'ipc') };
+    const config = {
+      piExecutable: nativePiCli,
+      stateDir: path.join(root, 'state'),
+      attachmentDir: path.join(root, 'ipc'),
+    };
     const session = { file, header, cwd: kind === 'null' ? null : cwd };
     if (kind === 'missing') await fs.rmdir(cwd);
     if (kind === 'symlink') {

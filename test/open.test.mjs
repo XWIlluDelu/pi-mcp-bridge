@@ -28,9 +28,15 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
       grants: [],
     };
   await fs.writeFile(file, JSON.stringify(config));
-  const host = { HOME: dir, PATH: '/bin', SYNTHETIC_NATIVE_VALUE: 'retained' };
+  const binary = path.join(dir, 'pi'),
+    explicit = path.join(dir, 'selected-pi');
+  await fs.writeFile(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  await fs.writeFile(explicit, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const host = { HOME: dir, PATH: dir, SYNTHETIC_NATIVE_VALUE: 'retained' };
   const profile = await openProfile(file, id, host);
   assert.equal(profile.cwd, cwd);
+  assert.equal(profile.command, binary);
+  assert.equal(profile.args[0], '-e');
   assert.equal(profile.env.HOME, dir);
   assert.equal(profile.env.SYNTHETIC_NATIVE_VALUE, 'retained');
   assert.equal(profile.env.PI_MCP_OWNER_CONFIG, file);
@@ -45,9 +51,9 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
     target,
   ])
     assert.equal(profile.args.includes(forbidden), false);
-  await fs.writeFile(file, JSON.stringify({ ...config, piExecutable: '/synthetic/bin/pi' }));
+  await fs.writeFile(file, JSON.stringify({ ...config, piExecutable: explicit }));
   const selected = await openProfile(file, id, host);
-  assert.equal(selected.command, '/synthetic/bin/pi');
+  assert.equal(selected.command, explicit);
   assert.equal(selected.args[0], '-e');
   await fs.writeFile(file, JSON.stringify(config));
   let observed;

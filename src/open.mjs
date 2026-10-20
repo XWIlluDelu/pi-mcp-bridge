@@ -16,7 +16,7 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   const { env, toolArgs } = launchProfile(config, hostEnv);
   env.PI_MCP_OWNER_CONFIG = configFile;
   env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  const executable = piCommand(config);
+  const executable = await piCommand(config, env, session.cwd);
   // Owner piArgs may set a provider or load resources, but may not select or
   // fork any saved session before the safe /bridge-join reservation.
   const extra = config.piArgs ?? [];

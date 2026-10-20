@@ -7,7 +7,7 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive } from '../src/attachments.mjs';
 
 test(
-  'explicit owner interruption recovers unobservable preflight without changing the saved session',
+  'explicit owner interruption recovers held native startup without changing the saved session',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t),
@@ -42,9 +42,10 @@ test(
     const runtime = f.bridge.pool.get(f.id),
       previous = runtime.ownerRecord,
       session = runtime.session;
+    assert.equal((await runtime.state()).isStreaming, true);
     await assert.rejects(
       ownerRequest(f.config, { op: 'release', session_id: f.id }),
-      /RUNTIME_IDLE_UNCONFIRMED/,
+      /RUNTIME_BUSY/,
     );
     const signals = [],
       kill = runtime.child.kill.bind(runtime.child);

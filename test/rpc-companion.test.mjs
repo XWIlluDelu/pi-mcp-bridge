@@ -1,3 +1,4 @@
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -79,7 +80,7 @@ test(
       PI_MCP_ATTACH_DIR: config.attachmentDir,
     });
     const local = new RpcClient({
-      cliPath: path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/cli.js'),
+      cliPath: nativePiCli,
       cwd,
       env,
       provider: 'bridge-fixture',

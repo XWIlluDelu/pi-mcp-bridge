@@ -1,3 +1,4 @@
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -80,7 +81,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     `import fs from 'node:fs';export default function(){fs.writeFileSync(${JSON.stringify(pidFile)},JSON.stringify(process.pid));}`,
   );
   const client = new RpcClient({
-    cliPath: path.join(base, 'node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
+    cliPath: nativePiCli,
     cwd: f.cwd,
     env: { HOME: f.dir, PI_CODING_AGENT_DIR: path.join(f.dir, 'agent'), PI_OFFLINE: '1' },
     provider: 'bridge-fixture',

@@ -1,3 +1,4 @@
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -42,17 +43,7 @@ function tuiClient({ cwd, env, args, saved, config }) {
     async start() {
       child = spawn(
         'script',
-        [
-          '-qefc',
-          [
-            process.execPath,
-            path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
-            ...args,
-          ]
-            .map(quote)
-            .join(' '),
-          '/dev/null',
-        ],
+        ['-qefc', [process.execPath, nativePiCli, ...args].map(quote).join(' '), '/dev/null'],
         {
           cwd,
           env: { ...env, PATH: process.env.PATH, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
@@ -189,7 +180,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
             ',String(process.pid));}',
         );
         const nativeOptions = {
-          cliPath: path.resolve('node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js'),
+          cliPath: nativePiCli,
           cwd,
           env: {
             HOME: dir,

@@ -13,9 +13,11 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 
 ## Start locally
 
-Requires Linux and Node.js 22.19 or later; process-identity and Unix-socket ownership coordination are Linux-specific. The pinned native baseline is Pi 1.1.0; `piExecutable` can select another compatible executable.
+Requires Linux, Node.js 22.19 or later, and your own Pi installation (tested with Pi 1.3.0). Process-identity and Unix-socket ownership coordination are Linux-specific. Cold RPC and the TUI launcher use `pi` from the launching process's PATH; `piExecutable` can select an absolute path. The Bridge's SDK/test dependency is not a fallback runtime.
 
 ```sh
+command -v pi
+pi --version
 npm ci
 mkdir -p -m 700 /absolute/private/path
 cp deploy/owner.example.json /absolute/private/path/owner.json
