@@ -1,7 +1,0 @@
-{
-  "command": "/usr/bin/node",
-  "args": [
-    "/absolute/path/to/pi-mcp-bridge/src/server.mjs",
-    "/absolute/path/to/owner.json"
-  ]
-}

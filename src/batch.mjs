@@ -1,88 +1,124 @@
-import { batchSchema } from './tool-schemas.mjs';
-import { diagnostics, diagnosticRef } from './diagnostics.mjs';
-import { rebudgetRead } from './read-page.mjs';
-export const BATCH_RESPONSE_LIMIT=32768;
-// Ten 100,000-code-unit prompts, worst-case JSON escaping, plus envelopes.
-export const BATCH_INPUT_LIMIT=6100000;
-const fail=(code,items=[],extra={})=>({status:'rejected',error:{code,items,...extra},results:[]});
-const publicError=error=>/^[A-Z][A-Z_]{2,60}$/.test(error.message)?error.message:'OPERATION_FAILED';
-export function preflightBatch(input){
- const parsed=batchSchema.safeParse(input);
- if(!parsed.success)return {error:fail('INVALID_BATCH',[...new Set(parsed.error.issues.map(x=>x.path[1]).filter(Number.isInteger))])};
- const operations=parsed.data.operations;
- if(JSON.stringify(parsed.data).length>BATCH_INPUT_LIMIT)return {error:fail('BATCH_INPUT_TOO_LARGE')};
- const sessions=new Map(),requests=new Map();
- for(const [index,item]of operations.entries()){
-  const {op,args}=item;
-  if(args.session_id){const entries=sessions.get(args.session_id)??[];entries.push({index,op});sessions.set(args.session_id,entries);}
-  if(op==='read')continue;
-  const key=`${op}:${args.session_id??args.folder_id}`;
-  const body=op==='send'?(args.text===undefined?undefined:JSON.stringify({text:args.text,mode:args.mode??'native'})):'{}';
-  const previous=requests.get(args.request_id);
-  if(previous&&(previous.key!==key||(previous.body!==undefined&&body!==undefined&&previous.body!==body)))return {error:fail('REQUEST_ID_CONFLICT',[previous.index,index])};
-  if(!previous||previous.body===undefined)requests.set(args.request_id,{index,key,body});
- }
- for(const [session_id,entries]of sessions){
-  const firstDelete=entries.find(x=>x.op==='delete');
-  // Reads may capture the session before deletion. Reads after it contradict
-  // the batch; send/delete is conflicting in either order, since send ACKs
-  // do not mean model work has settled.
-  if(firstDelete&&entries.some(x=>x.op==='send'||(x.op==='read'&&x.index>firstDelete.index)))return {error:fail('DELETE_CONFLICT',entries.map(x=>x.index),{session_id})};
- }
- return {operations};
+import { batchSchema, publicOperationSchemas } from './tool-schemas.mjs';
+import { rebudgetContextRead } from './context-read.mjs';
+import { TOOL_RESULT_LIMIT, toolResultBytes } from './response-budget.mjs';
+
+export const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
+export const BATCH_INPUT_LIMIT = 6100000;
+const size = (value) => Buffer.byteLength(JSON.stringify(value));
+const code = (error) =>
+  /^[A-Z][A-Z_]{2,60}$/.test(error.message) ? error.message : 'OPERATION_FAILED';
+
+export function preflightBatch(input) {
+  const parsed = batchSchema.safeParse(input);
+  if (!parsed.success)
+    return { error: { status: 'rejected', error: { code: 'INVALID_BATCH' }, results: [] } };
+  if (size(input) > BATCH_INPUT_LIMIT)
+    return { error: { status: 'rejected', error: { code: 'BATCH_INPUT_TOO_LARGE' }, results: [] } };
+  return { operations: parsed.data.operations };
 }
-export async function executeBatch(bridge,input,{signal}={}){
- const {operations,error}=preflightBatch(input);if(error)return error;
- const payload={status:'processed',response_max_chars:BATCH_RESPONSE_LIMIT,results:[]};
- const captures=[];
- for(const [index,{op,args}]of operations.entries()){
-  // SDK close aborts the response handler, not the admitted ordered batch.
-  // Forward cancellation to status reads; their item error never stops mutations.
-  const item={index,op};
-  const actual=op==='read'&&args.view!=='status'?{...args,max_chars:args.max_chars??12000}:args;
-  // Upper bound on returned item content, not an exact measurement or the
-  // original I/O budget: later snapshot resizing may lower this bound.
-  if(op==='read'&&actual.max_chars!==undefined)item.applied_max_chars=actual.max_chars;
-  try{item.result=await diagnostics.measure('batch.item',{op,index,mutation_ref:diagnosticRef(args.request_id),session_ref:diagnosticRef(args.session_id)},()=>bridge[op](actual,{signal}));}catch(e){item.error={code:publicError(e)};}
-  payload.results.push(item);
-  if(op==='read'&&item.result!==undefined){item.result=structuredClone(item.result);captures.push({item,args:actual,result:item.result});}
- }
- const size=value=>JSON.stringify(value).length;
- if(size(payload)>BATCH_RESPONSE_LIMIT&&captures.length){
-  // Water-fill using actual serialized envelopes. Small reads release their
-  // unused share to large reads regardless of operation order.
-  const sizes=captures.map(c=>size(c.result));
-  const available=Math.max(0,BATCH_RESPONSE_LIMIT-(size(payload)-sizes.reduce((a,b)=>a+b,0)));
-  let low=0,high=Math.max(...sizes);
-  while(low<high){const mid=Math.ceil((low+high)/2);if(sizes.reduce((sum,n)=>sum+Math.min(n,mid),0)<=available)low=mid;else high=mid-1;}
-  for(const capture of captures){
-   const budget=Math.min(size(capture.result),low);
-   const resized=rebudgetRead(capture.result,capture.args,budget);
-   if(resized){capture.item.result=resized;if(capture.args.max_chars!==undefined)capture.item.applied_max_chars=Math.min(capture.args.max_chars,budget);}
-   else {delete capture.item.result;capture.item.error={code:'BATCH_RESULT_OMITTED',retry:'READ_SEPARATELY'};}
+
+export async function executeBatch(bridge, input, { signal } = {}) {
+  const { operations, error } = preflightBatch(input);
+  if (error) return error;
+  const lanes = new Map(),
+    results = new Array(operations.length);
+  const jobs = operations.map((item, index) => {
+    const op = item?.op,
+      schema = Object.hasOwn(publicOperationSchemas, op) ? publicOperationSchemas[op] : null;
+    const parsed = schema?.safeParse(item?.args);
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      Object.keys(item).some((key) => !['op', 'args'].includes(key)) ||
+      !parsed?.success
+    ) {
+      results[index] = {
+        index,
+        op: typeof op === 'string' ? op.slice(0, 64) : null,
+        error: {
+          code: 'INVALID_OPERATION',
+          ...(typeof op === 'string' && op.length > 64 ? { op_truncated: true } : {}),
+        },
+      };
+      return Promise.resolve();
+    }
+    const args = parsed.data;
+    // Creates with a source share its lane so a preceding parent mutation/read
+    // has the same ordering as standalone operations. Independent creates share
+    // the project's creation lane; no additional authorization is introduced.
+    const lane =
+      args.session_id ??
+      args.fork_from ??
+      (op === 'create' ? `project:${args.project}` : `independent:${index}`);
+    const previous = lanes.get(lane) ?? Promise.resolve();
+    const job = previous
+      .catch(() => {})
+      .then(async () => {
+        try {
+          results[index] = {
+            index,
+            op,
+            result: structuredClone(await bridge[op](args, { signal })),
+          };
+        } catch (error) {
+          results[index] = {
+            index,
+            op,
+            error: {
+              code: code(error),
+              ...(error?.uncertain
+                ? { uncertain: true, recovery: 'SAME_REQUEST_ID', request_id: args.request_id }
+                : {}),
+            },
+          };
+        }
+      });
+    lanes.set(lane, job);
+    return job;
+  });
+  await Promise.all(jobs);
+  const response = { status: 'processed', response_max_bytes: BATCH_RESPONSE_LIMIT, results };
+  // Resize captured reads, never reread after a later mutation. Account for
+  // JSON escaping and text/structured duplication, not just the inner object.
+  while (size(response) > BATCH_RESPONSE_LIMIT || toolResultBytes(response) > TOOL_RESULT_LIMIT) {
+    const largest = results
+      .filter((item) => item.result !== undefined)
+      .sort((a, b) => size(b.result) - size(a.result))[0];
+    if (!largest) throw new Error('BATCH_RESPONSE_LIMIT');
+    if (largest.op === 'read') {
+      const current = size(largest.result),
+        smaller = rebudgetContextRead(
+          largest.result,
+          operations[largest.index].args,
+          Math.floor(current * 0.65),
+        );
+      if (smaller && size(smaller) < current) {
+        largest.result = smaller;
+        continue;
+      }
+    }
+    delete largest.result;
+    const args = operations[largest.index].args;
+    const mutation = [
+      'send',
+      'set_model',
+      'compact',
+      'reload',
+      'command',
+      'stop',
+      'create',
+      'delete',
+    ].includes(largest.op);
+    largest.recovery = {
+      ...(mutation ? { request_id: args.request_id } : {}),
+      ...(args.session_id ? { session_id: args.session_id } : {}),
+      ...(args.project ? { project: args.project } : {}),
+    };
+    largest.error = {
+      code: 'BATCH_RESULT_OMITTED',
+      retry: mutation ? 'SAME_REQUEST_ID' : 'READ_SEPARATELY',
+    };
   }
-  // Complete-record pagination can leave spare capacity. Try larger prefixes
-  // from the same snapshots; never rerun a read past a later mutation.
-  for(const capture of captures){
-   const spare=BATCH_RESPONSE_LIMIT-size(payload);if(spare<=0)break;
-   const old=capture.item.result,oldSize=old===undefined?0:size(old);
-   const resized=rebudgetRead(capture.result,capture.args,oldSize+spare);
-   if(resized&&size(resized)>oldSize){
-    const previous={...capture.item};capture.item.result=resized;delete capture.item.error;
-    if(capture.args.max_chars!==undefined)capture.item.applied_max_chars=Math.min(capture.args.max_chars,oldSize+spare);
-    if(size(payload)>BATCH_RESPONSE_LIMIT){for(const key of Object.keys(capture.item))delete capture.item[key];Object.assign(capture.item,previous);}
-   }
-  }
- }
- // Preserve normal mutation receipts; oversized exceptional results retain
- // explicit replay guidance instead of silent truncation or fabricated cursors.
- while(JSON.stringify(payload).length>BATCH_RESPONSE_LIMIT){
-  const candidates=payload.results.filter(x=>x.result!==undefined);
-  const reads=candidates.filter(x=>x.op==='read');
-  const largest=(reads.length?reads:candidates).sort((a,b)=>size(b.result)-size(a.result))[0];
-  if(!largest)throw new Error('BATCH_RESPONSE_LIMIT');
-  delete largest.result;
-  largest.error={code:'BATCH_RESULT_OMITTED',retry:largest.op==='read'?'READ_SEPARATELY':'SAME_REQUEST_ID'};
- }
- return payload;
+  return response;
 }

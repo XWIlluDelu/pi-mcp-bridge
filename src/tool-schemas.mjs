@@ -1,22 +1,84 @@
 import { z } from 'zod';
-const id=z.string().min(1).max(128);
-const request=z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
-const index=z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
-export const hasTextSelector=args=>['message_index','block_index','text_offset','field','section'].some(key=>args[key]!==undefined);
-// Stop is intentionally independent, not an ordered batch item.
-export const stopSchema=z.object({session_id:id,request_id:request,timeout_ms:z.number().int().min(50).max(30000).optional(),max_chars:z.number().int().min(256).max(32768).optional(),cursor:z.string().max(2000).optional()}).strict();
-export const bashSchema=stopSchema.extend({command:z.string().min(1).max(100000).optional()});
-export const operationSchemas={
- read:z.object({session_id:id,view:z.enum(['context','raw','summary','overview','status']).optional(),entry_id:id.optional(),field:z.enum(['content','sections']).describe('Projected message field; defaults to content. sections requires a named system-message section.').optional(),section:id.describe('Exact own key in projected SystemMessage.sections; string values only. No merge or metadata flattening.').optional(),message_index:index.describe('Zero-based projected message within entry_id; context only. Selects content text or a named system section, not raw source.').optional(),block_index:index.describe('Zero-based block in effective projected content; only type:text is supported. Required for array content.').optional(),text_offset:index.describe('Initial decoded-text offset in UTF-16 code units (not JSON excerpt offsets); cannot split a surrogate pair.').optional(),leaf_id:z.string().nullable().optional(),since:id.optional(),query:z.string().max(200).optional(),cursor:z.string().max(2048).optional(),limit:z.number().int().min(1).max(50).optional(),max_chars:z.number().int().min(256).max(32768).optional(),after_settlement:z.object({generation:id,sequence:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)}).strict().optional(),wait_ms:z.number().int().min(0).max(10000).optional()}),
- send:z.object({session_id:id,request_id:request,text:z.string().min(1).max(100000).optional(),mode:z.enum(['native','idle_only','steer','queue']).optional(),timeout_ms:z.number().int().min(50).max(30000).optional()}),
- create:z.object({folder_id:id,request_id:request}),
- delete:z.object({session_id:id,request_id:request}),
+import { readSchema as publicReadSchema } from './read-schema.mjs';
+import { compactSchema } from './compact.mjs';
+import { reloadSchema } from './reload.mjs';
+import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
+import { modelSelectionSchema, modelsSchema, setModelSchema } from './models.mjs';
+const id = z.string().min(1).max(128);
+const request = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
+export const stopSchema = z
+  .object({
+    session_id: id,
+    request_id: request,
+    timeout_ms: z.number().int().min(50).max(30000).optional(),
+    max_chars: z.number().int().min(256).max(32768).optional(),
+    cursor: z.string().max(2000).optional(),
+  })
+  .strict();
+export const bashSchema = stopSchema.extend({ command: z.string().min(1).max(100000).optional() });
+// Public transport contracts. Recovery calls may omit mutation payloads; the
+// journal, not schema validation, decides whether an initial payload is required.
+const timeout = z.number().int().min(50).max(30000).optional();
+const directory = z.string().min(1).max(4096);
+const date = z.string().datetime({ offset: true });
+export const publicOperationSchemas = {
+  models: modelsSchema,
+  set_model: setModelSchema,
+  compact: compactSchema,
+  reload: reloadSchema,
+  read: publicReadSchema,
+  send: z
+    .object({
+      session_id: id,
+      request_id: request,
+      text: z.string().min(1).max(100000).optional(),
+      images: imagesSchema.optional(),
+      model: modelSelectionSchema.optional(),
+      mode: z.enum(SEND_MODES).optional(),
+      timeout_ms: timeout,
+    })
+    .strict(),
+  command: bashSchema,
+  stop: stopSchema,
+  create: z
+    .object({
+      project: directory,
+      request_id: request,
+      text: z.string().min(1).max(100000).optional(),
+      images: imagesSchema.optional(),
+      model: modelSelectionSchema.optional(),
+      name: z.string().min(1).max(200).optional(),
+      fork_from: id.optional(),
+      timeout_ms: timeout,
+    })
+    .strict(),
+  delete: z.object({ session_id: id, request_id: request }).strict(),
 };
-const validRead=args=>args.view==='status'
- ? ['entry_id','field','section','message_index','block_index','text_offset','leaf_id','since','query','cursor','limit','max_chars'].every(key=>args[key]===undefined)&&(!(args.wait_ms>0)||args.after_settlement!==undefined)
- : args.wait_ms===undefined&&args.after_settlement===undefined&&(!hasTextSelector(args)||
-   ((args.view===undefined||args.view==='context')&&args.entry_id!==undefined&&args.message_index!==undefined&&
-    ['since','query'].every(key=>args[key]===undefined)&&
-    (args.field==='sections'?args.section!==undefined&&args.block_index===undefined:args.section===undefined)));
-export const readSchema=operationSchemas.read.refine(validRead,{message:'Invalid read view, text selector or status wait combination'});
-export const batchSchema=z.object({operations:z.array(z.discriminatedUnion('op',Object.entries(operationSchemas).map(([op,args])=>z.object({op:z.literal(op),args:op==='read'?args.strict().refine(validRead):args.strict()}).strict()))).min(1).max(10)}).strict();
+export const batchSchema = z.object({ operations: z.array(z.unknown()).min(1).max(10) }).strict();
+export const publicSchemas = {
+  list: z
+    .object({
+      project: z.string().max(200).optional(),
+      name: z.string().max(200).optional(),
+      active_after: date.optional(),
+      active_before: date.optional(),
+      session_id: id.optional(),
+      offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    })
+    .strict()
+    .refine(
+      (args) =>
+        !args.active_after ||
+        !args.active_before ||
+        Date.parse(args.active_after) <= Date.parse(args.active_before),
+      { message: 'active_after must not exceed active_before' },
+    ),
+  ...publicOperationSchemas,
+  batch: batchSchema,
+  health: z
+    .object({ domain: z.literal('permissions').optional(), session_id: id.optional() })
+    .strict(),
+};
+publicOperationSchemas.list = publicSchemas.list;
+publicOperationSchemas.health = publicSchemas.health;

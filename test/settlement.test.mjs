@@ -11,7 +11,11 @@ test('settled observations are session-wide, cloned, and scoped to the exact run
   assert.deepEqual(rpc.settlement, initial);
   rpc.promptAdmission = { id: 'unresolved', generation: rpc.generation };
   rpc.receiveResponse({ type: 'agent_settled', aborted: false }, rpc.generation);
-  const observed = rpcActivity({ isStreaming: false, pendingMessageCount: 0 }, true, rpc.settlement);
+  const observed = rpcActivity(
+    { isStreaming: false, pendingMessageCount: 0 },
+    true,
+    rpc.settlement,
+  );
   assert.equal(observed.settlement.sequence, 1);
   assert.equal(observed.settlement.aborted, false);
   assert.ok(Number.isFinite(Date.parse(observed.settlement.observed_at)));

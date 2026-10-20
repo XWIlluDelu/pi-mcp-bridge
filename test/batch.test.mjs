@@ -1,100 +1,116 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import os from 'node:os';
-import { executeBatch,BATCH_RESPONSE_LIMIT } from '../src/batch.mjs';
-import { Bridge } from '../src/bridge.mjs';
-import { editPermission,readOwnerConfig } from '../src/owner-config.mjs';
-const item=(op,args)=>({op,args});
-async function fixture(t){
- const dir=await fs.mkdtemp(path.join(os.tmpdir(),'pi-batch-')),cwd=path.join(dir,'project');await fs.mkdir(cwd);
- const config={principal:'batch-test',stateDir:path.join(dir,'state'),sessionRoots:[path.join(dir,'sessions')],folders:[{id:'project',path:cwd}],grants:[{folder:cwd,read:true,send:true,delete:true,new_session:true}]};
- const bridge=await new Bridge(config).init();t.after(async()=>{await bridge.close();await fs.rm(dir,{recursive:true,force:true});});
- return {bridge,config,dir,cwd};
-}
-
-test('batch validates every item and delete conflicts before any effects',async()=>{
- let calls=0;const bridge={create:async()=>{calls++;},read:async()=>{calls++;},delete:async()=>{calls++;}};
- for(const operations of [
-  [item('create',{folder_id:'project',request_id:'first'}),item('send',{session_id:'s',request_id:'invalid space',text:'no'})],
-  [item('create',{folder_id:'project',request_id:'first'}),item('delete',{session_id:'s',request_id:'delete'}),item('read',{session_id:'s'})],
-  [item('send',{session_id:'s',request_id:'send',text:'no'}),item('delete',{session_id:'s',request_id:'delete'})],
-  [item('create',{folder_id:'one',request_id:'duplicate'}),item('create',{folder_id:'two',request_id:'duplicate'})],
-  [item('send',{session_id:'s',request_id:'duplicate',text:'first'}),item('send',{session_id:'s',request_id:'duplicate',text:'different'})],
-  [item('send',{session_id:'s',request_id:'duplicate',text:'same',mode:'native'}),item('send',{session_id:'s',request_id:'duplicate',text:'same',mode:'queue'})],
-  [item('read',{session_id:'s',leaf_id:'x'.repeat(6100001)})],
-  Array.from({length:11},()=>item('read',{session_id:'s'})),
-  [],
- ]){const result=await executeBatch(bridge,{operations});assert.equal(result.status,'rejected');assert.deepEqual(result.results,[]);}
- assert.equal(calls,0);
- const conflict=await executeBatch(bridge,{operations:[item('delete',{session_id:'s',request_id:'delete'}),item('read',{session_id:'s'})]});
- assert.deepEqual(conflict.error,{code:'DELETE_CONFLICT',items:[0,1],session_id:'s'});
+import { executeBatch, preflightBatch } from '../src/batch.mjs';
+const send = (session_id, request_id) => ({
+  op: 'send',
+  args: { session_id, request_id, text: 'hello' },
 });
-
-test('batch permits read-before-delete, captures it once, and keeps contradictory orders fenced',async t=>{
- const f=await fixture(t),made=await f.bridge.create({folder_id:'project',request_id:'ordered-seed'});
- const saved=await f.bridge.session(made.session_id);
- await fs.appendFile(saved.file,JSON.stringify({type:'message',id:'before-delete',parentId:null,message:{role:'user',content:'captured before delete'}})+'\n');
- const operations=[item('read',{session_id:made.session_id,view:'raw'}),item('delete',{session_id:made.session_id,request_id:'ordered-delete'})];
- const result=await executeBatch(f.bridge,{operations});
- assert.equal(result.status,'processed');assert.equal(result.results[0].result.items[0].entry_id,'before-delete');
- assert.equal(result.results[1].result.status,'deleted');
- assert.equal((await f.bridge.sessions()).length,0);
- const replay=await executeBatch(f.bridge,{operations});
- assert.equal(replay.results[0].error.code,'NOT_FOUND_OR_DENIED');
- assert.deepEqual(replay.results[1].result,result.results[1].result);
- const calls=[],bridge={read:async()=>calls.push('read'),send:async()=>calls.push('send'),delete:async()=>calls.push('delete')};
- const read=item('read',{session_id:'s'}),send=item('send',{session_id:'s',request_id:'s-send',text:'work'}),remove=item('delete',{session_id:'s',request_id:'s-delete'});
- for(const operations of [[remove,read],[remove,send],[send,remove],[read,remove,read]]){
-  assert.equal((await executeBatch(bridge,{operations})).error.code,'DELETE_CONFLICT');
- }
- assert.deepEqual(calls,[]);
+test('batch is a transparent wrapper with per-item validation and original-order results', async () => {
+  const calls = [],
+    bridge = {
+      send: async (args) => {
+        calls.push(args.request_id);
+        return { status: 'accepted' };
+      },
+      read: async () => {
+        throw new Error('NOT_FOUND_OR_DENIED');
+      },
+      health: async () => ({ ok: true }),
+    };
+  const result = await executeBatch(bridge, {
+    operations: [
+      send('a', 'one'),
+      { op: 'read', args: { session_id: 'denied' } },
+      null,
+      { op: 'batch', args: {} },
+      { op: 'health', args: { domain: 'permissions' } },
+      send('a', 'two'),
+    ],
+  });
+  assert.deepEqual(calls, ['one', 'two']);
+  assert.deepEqual(
+    result.results.map((x) => x.index),
+    [0, 1, 2, 3, 4, 5],
+  );
+  assert.equal(result.results[1].error.code, 'NOT_FOUND_OR_DENIED');
+  assert.equal(result.results[2].error.code, 'INVALID_OPERATION');
+  assert.equal(result.results[3].error.code, 'INVALID_OPERATION');
+  assert.equal(result.results[4].result.ok, true);
 });
-
-test('batch runs in order, continues failures and never infers send completion',async()=>{
- const calls=[];let complete=false;
- const bridge={send:async()=>{calls.push('send');return {status:'accepted',disposition:'started',completion:'not_tracked'};},read:async()=>{calls.push('read');return {complete};},delete:async()=>{calls.push('delete');throw new Error('NOT_FOUND_OR_DENIED');},create:async()=>{calls.push('create');return {status:'created',session_id:'new'};}};
- const result=await executeBatch(bridge,{operations:[item('send',{session_id:'s',request_id:'send',text:'start'}),item('read',{session_id:'s'}),item('delete',{session_id:'other',request_id:'delete'}),item('create',{folder_id:'project',request_id:'create'})]});
- assert.deepEqual(calls,['send','read','delete','create']);assert.equal(result.status,'processed');assert.equal(result.results[1].result.complete,false);assert.equal(result.results[2].error.code,'NOT_FOUND_OR_DENIED');assert.equal(result.results[3].result.status,'created');
+test('different sessions progress independently while each session retains input order', async () => {
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers(),
+    events = [];
+  const bridge = {
+    send: async (args) => {
+      events.push(args.request_id);
+      if (args.request_id === 'a1') {
+        entered.resolve();
+        await release.promise;
+      }
+      return { status: 'accepted' };
+    },
+  };
+  const pending = executeBatch(bridge, {
+    operations: [send('a', 'a1'), send('a', 'a2'), send('b', 'b1')],
+  });
+  await entered.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ['a1', 'b1']);
+  release.resolve();
+  await pending;
+  assert.deepEqual(events, ['a1', 'b1', 'a2']);
 });
-
-test('batch uses normal per-item permissions and durable request-ID replay',async t=>{
- const f=await fixture(t);const first=await f.bridge.create({folder_id:'project',request_id:'seed'});
- f.config.grants.push({session_id:first.session_id,read:false,delete:false});
- const operations=[item('read',{session_id:first.session_id}),item('delete',{session_id:first.session_id,request_id:'forbidden-delete'})];
- // Ordered reads/deletes independently check their grants; neither is allowed here.
- const denied=await executeBatch(f.bridge,{operations});
- assert.equal(denied.status,'processed');assert.equal(denied.results[0].error.code,'NOT_FOUND_OR_DENIED');
- assert.equal(denied.results[1].result.status,'rejected');assert.equal(denied.results[1].result.reason,'NOT_FOUND_OR_DENIED');
- assert.equal((await f.bridge.journal.get('forbidden-delete')).receipt.status,'rejected');
- const allowed=[item('create',{folder_id:'project',request_id:'new'}),item('read',{session_id:first.session_id}),item('create',{folder_id:'missing',request_id:'denied'}),item('create',{folder_id:'project',request_id:'new'})];
- const result=await executeBatch(f.bridge,{operations:allowed});assert.equal(result.results[0].result.status,'created');assert.equal(result.results[1].error.code,'NOT_FOUND_OR_DENIED');assert.equal(result.results[2].result.status,'rejected');assert.deepEqual(result.results[0].result,result.results[3].result);
- assert.deepEqual((await executeBatch(f.bridge,{operations:allowed})).results,result.results);
- assert.equal((await f.bridge.sessions()).length,2);
+test('outer size/shape bounds reject before any operation but bad item args do not', async () => {
+  let calls = 0;
+  const bridge = {
+    send: async () => {
+      calls++;
+      return { status: 'accepted' };
+    },
+  };
+  for (const input of [
+    { operations: [] },
+    { operations: Array.from({ length: 11 }, () => send('a', 'x')) },
+    { operations: [send('a', 'x')], extra: true },
+  ]) {
+    assert.equal((await executeBatch(bridge, input)).status, 'rejected');
+    assert.equal(calls, 0);
+  }
+  const result = await executeBatch(bridge, {
+    operations: [
+      { op: 'send', args: { session_id: 'a', request_id: 'bad', text: '', mode: 'invented' } },
+      send('a', 'good'),
+    ],
+  });
+  assert.equal(result.results[0].error.code, 'INVALID_OPERATION');
+  assert.equal(calls, 1);
+  assert.ok(preflightBatch({ operations: [null] }).operations);
 });
-
-test('each batch item reloads permission edits instead of sharing an earlier grant',async t=>{
- const f=await fixture(t);await f.bridge.close();const file=path.join(f.dir,'config.json');await fs.writeFile(file,JSON.stringify(f.config));
- const bridge=await new Bridge(f.config,undefined,{configFile:file}).init();
- try{
-  const create=bridge.create.bind(bridge);let count=0;
-  bridge.create=async args=>{const result=await create(args);if(++count===1){const snapshot=await readOwnerConfig(file);await editPermission(file,snapshot.revision,{folder:f.cwd},'new_session',false);}return result;};
-  const result=await executeBatch(bridge,{operations:[item('create',{folder_id:'project',request_id:'first'}),item('create',{folder_id:'project',request_id:'second'})]});
-  assert.equal(result.results[0].result.status,'created');assert.equal(result.results[1].result.status,'rejected');assert.equal((await bridge.sessions()).length,1);
- }finally{await bridge.close();}
-});
-
-test('batch read budgets bound escaped persisted data and preserve usable cursors',async t=>{
- const f=await fixture(t);const made=await f.bridge.create({folder_id:'project',request_id:'seed'}),session=await f.bridge.session(made.session_id);
- await fs.appendFile(session.file,JSON.stringify({type:'message',id:'large',parentId:null,message:{role:'user',content:'"\\\n\t😀'.repeat(8000)}})+'\n');
- const args={session_id:made.session_id,view:'raw',max_chars:32768};
- const result=await executeBatch(f.bridge,{operations:Array.from({length:10},()=>item('read',args))});
- assert.ok(JSON.stringify(result).length<=BATCH_RESPONSE_LIMIT);assert.equal(result.results.length,10);
- for(const row of result.results){assert.ok(row.result.next_cursor);assert.ok(row.applied_max_chars<32768);const next=await f.bridge.read({...args,cursor:row.result.next_cursor});assert.ok(next.items[0].char_offset>0);}
-});
-
-test('exceptional oversized results are explicitly omitted without losing mutation replay guidance',async()=>{
- const result=await executeBatch({send:async()=>({status:'unknown',untrustedExtra:'x'.repeat(100000)})},{operations:[item('send',{session_id:'s',request_id:'id',text:'fixture'})]});
- assert.ok(JSON.stringify(result).length<=BATCH_RESPONSE_LIMIT);assert.deepEqual(result.results[0].error,{code:'BATCH_RESULT_OMITTED',retry:'SAME_REQUEST_ID'});
+test('fork shares its source lane; list and health do not add mutation permissions', async () => {
+  const events = [],
+    bridge = {
+      send: async () => {
+        events.push('send');
+      },
+      create: async () => {
+        events.push('fork');
+        return { session_id: 'child' };
+      },
+      list: async () => ({ sessions: [] }),
+      health: async () => ({ ok: true }),
+    };
+  const result = await executeBatch(bridge, {
+    operations: [
+      send('parent', 's'),
+      {
+        op: 'create',
+        args: { project: '/project', fork_from: 'parent', request_id: 'fork', text: 'first' },
+      },
+      { op: 'list', args: {} },
+      { op: 'health', args: { domain: 'runtime' } },
+    ],
+  });
+  assert.deepEqual(events, ['send', 'fork']);
+  assert.equal(result.results.length, 4);
 });

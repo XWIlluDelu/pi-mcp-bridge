@@ -1,6 +1,0 @@
-# Candidate drop-in for a reviewed tunnel-client deployment ONLY.
-# This handles clean exit after stdio child failure; it does NOT fix the
-# client's internal shutdown budget. Resolve TUNNEL_COMPATIBILITY.md first.
-# Existing unit start limits, lock preflight and KillMode remain in force.
-[Service]
-Restart=always
