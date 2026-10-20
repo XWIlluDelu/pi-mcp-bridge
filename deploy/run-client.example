@@ -1,5 +1,0 @@
-#!/bin/sh
-# Owner must replace these paths/arguments with a configured foreground MCP
-# client. That client must spawn the bridge over stdio and wait for it on stop.
-# Do not start server.mjs alone here. Do not put credentials in arguments.
-exec /absolute/path/to/approved-mcp-client --config /absolute/path/to/client-config

@@ -1,0 +1,21 @@
+{
+  "principal": "owner-agent",
+  "stateDir": "/home/example/.local/state/pi-mcp-bridge",
+  "sessionRoots": ["/home/example/.pi/agent/sessions/--home-example-project--"],
+  "folders": [
+    {
+      "id": "project",
+      "path": "/home/example/project"
+    }
+  ],
+  "defaults": {
+    "list": false,
+    "read": false,
+    "send": false,
+    "command": false,
+    "stop": false,
+    "create": false,
+    "delete": false
+  },
+  "grants": []
+}

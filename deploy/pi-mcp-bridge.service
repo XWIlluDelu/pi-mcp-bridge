@@ -1,5 +1,5 @@
 [Unit]
-Description=Owner-controlled MCP client and Pi bridge
+Description=Pi MCP Bridge shared HTTP service
 StartLimitIntervalSec=120
 StartLimitBurst=3
 
@@ -7,11 +7,11 @@ StartLimitBurst=3
 Type=exec
 WorkingDirectory=%h/.local/share/pi-mcp-bridge
 ExecStartPre=/usr/bin/node %h/.local/share/pi-mcp-bridge/deploy/check-owner.mjs %h/.config/pi-mcp-bridge/owner.json
-ExecStart=%h/.config/pi-mcp-bridge/run-client
+ExecStart=/usr/bin/node %h/.local/share/pi-mcp-bridge/src/http-server.mjs %h/.config/pi-mcp-bridge/owner.json
 EnvironmentFile=-%h/.config/pi-mcp-bridge/service.env
 UMask=0077
 StandardInput=null
-StandardOutput=null
+StandardOutput=journal
 StandardError=journal
 Restart=on-failure
 RestartSec=10

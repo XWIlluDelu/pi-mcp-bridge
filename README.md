@@ -1,362 +1,107 @@
 # Pi MCP Bridge
 
-A local, vendor-independent MCP server for saved Pi sessions, Bridge-owned RPC
-workers and cooperating ordinary Pi TUI/RPC hosts. It exposes `list`, `read`,
-`send`, `stop`, `bash`, `create`, `delete` and ordered `batch` over stdio
-or authenticated loopback Streamable HTTP.
+Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agents through MCP, with owner-controlled permissions and one cooperating writer per session. Local clients use stdio; remote clients use a loopback HTTP service behind an authenticated tunnel.
 
-Integration uses public Pi APIs and private Unix sockets, independently of any
-host project. Cooperative process identity/attachment currently requires Linux.
-Native tools, models, settings, extensions and existing authentication remain
-Pi's responsibility.
+## What it does
 
-## Install and try
+- **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Pages start with the newest selected content and continue backwards.
+- **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
+- **Control:** discover runtime-available models, set a session's model and thinking level, compact context (idle by default), or reopen an idle owned RPC. Stop execution and withdraw queued input, with its complete text available in pages.
+- **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
+- **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
+- **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
 
-Requires Node >=22.19.0; regression checks use Node 26.10.0 and Pi 1.1.0.
+## Start locally
+
+Requires Linux, Node.js 22.19 or later, and your own Pi installation (tested with Pi 1.3.0). Process-identity and Unix-socket ownership coordination are Linux-specific. Cold RPC and the TUI launcher use `pi` from the launching process's PATH; `piExecutable` can select an absolute path. The Bridge's SDK/test dependency is not a fallback runtime.
 
 ```sh
-npm ci --ignore-scripts
-npm test
-node research/init-demo.mjs
-node research/demo-client.mjs
-node src/server.mjs "$PWD/demo/owner-config.json"
+command -v pi
+pi --version
+npm ci
+mkdir -p -m 700 /absolute/private/path
+cp deploy/owner.example.json /absolute/private/path/owner.json
+chmod 600 /absolute/private/path/owner.json
 ```
 
-The demo uses disposable synthetic sessions and an explicitly isolated,
-tool-disabled Pi profile, without real model credentials. Initialization preserves
-existing demo configuration; ensure reused configs explicitly select isolation.
-The final command speaks MCP on stdin/stdout. Example client configuration:
+Replace every example path and add only the grants you intend. The example denies every operation until you grant it.
+
+Review existing `sessionRoots`, `stateDir` and `attachmentDir` directories: they must be owned by the service user, canonical (not symlink aliases), and private. Pi can create session directories as **0755** under a normal umask; Bridge requires no group/other access. After reviewing the selected existing directories, the owner can use `chmod 700 /absolute/path/to/selected/directory`. Apply it only to those directories, not recursively to all Pi data. See [storage requirements](docs/configuration.md#storage-and-project-paths).
+
+Then run the read-only preflight:
+
+```sh
+node deploy/check-owner.mjs /absolute/private/path/owner.json
+```
+
+For a single stdio MCP client:
 
 ```json
 {
   "command": "node",
-  "args": ["/absolute/path/pi-mcp-bridge/src/server.mjs",
-           "/absolute/path/pi-mcp-bridge/demo/owner-config.json"]
+  "args": ["/absolute/path/to/pi-mcp-bridge/src/server.mjs", "/absolute/private/path/owner.json"]
 }
 ```
 
-For independently running Bridge access, see [loopback HTTP](deploy/HTTP.md).
-The [stdio service kit](deploy/README.md) requires a foreground client to own
-the protocol pipe and await shutdown. Both are owner-installed;
-closing terminals is distinct from keeping the access service running.
+For multiple clients, start one shared HTTP service; each stdio-only client can run `src/stdio-proxy.mjs` against it. See [transport setup](docs/transports.md) for the token, tunnel, protocol versions, timeouts and connection recovery.
 
-## Owner configuration
+### Tools at a glance
 
-`sessionRoots` are private Pi JSONL storage directories. `folders` are separately
-configured project working directories. Owner configuration assigns the fixed
-caller principal, runtime options and grants:
+| Tool        | Main arguments                                                       | Permission                              |
+| ----------- | -------------------------------------------------------------------- | --------------------------------------- |
+| `list`      | Optional project/name/time/ID filters; offset/limit                  | `list` per returned session             |
+| `read`      | `session_id`; optional preset/select/cursor/max_bytes                | `read`                                  |
+| `models`    | Known `session_id`; optional start/offset/limit                      | `send`                                  |
+| `set_model` | `session_id`, `request_id`, model and/or thinking_level              | `send`                                  |
+| `compact`   | `session_id`, `request_id`; optional instructions/interrupt          | `send`; explicit interrupt also `stop`  |
+| `reload`    | `session_id`, `request_id`; idle owned RPC reopen                    | `send`                                  |
+| `send`      | `session_id`, `request_id`, text/images; optional mode/model         | `send`                                  |
+| `command`   | `session_id`, `request_id`, `command`                                | `command`                               |
+| `stop`      | `session_id`, `request_id`                                           | `stop` only                             |
+| `create`    | `project`, `request_id`, text and/or images; optional name/fork_from | Target `create`; source `read` for fork |
+| `delete`    | `session_id`, `request_id`                                           | `delete`                                |
+| `batch`     | 1–10 `{op,args}` items                                               | Each wrapped operation's own permission |
+| `health`    | Optional known `session_id`; permissions by default                  | Diagnostics; does not change grants     |
 
-```json
-[
-  {"folder":"/projects/demo","read":true,"send":true,"new_session":true},
-  {"folder":"/projects/demo/child","read":false},
-  {"session_id":"ps_returned_opaque_id","send":false},
-  {"session_id":"ps_returned_opaque_id","send":null}
-]
-```
+Every mutation requires a `request_id`. Native acceptance is not model completion, and a timeout can leave the outcome `unknown`: recover using the same `request_id` rather than submitting the work again. See [API](docs/api.md) and [reading](docs/reading.md).
 
-| Grant | Controls |
-| --- | --- |
-| `read` | Transcript, metadata and runtime observations |
-| `send` | Model-mediated prompts |
-| `command` | Remote stop; also requires read to return withdrawn text |
-| `bash` | Direct native shell commands and their own results |
-| `delete` | Recoverable removal of a session file |
-| `new_session` | Creation within an exposed folder; folder scope only |
+## Native Pi integration
 
-Each grant is independent and defaults to deny. An explicit session rule wins,
-then the nearest project rule. Later entries replace the same permission at the
-same scope; `null` inherits. Project paths are canonicalized. Create-only folders
-and bash-only callers do not imply prompt access; stop does not grant shell execution.
+Cold resume uses the user's own Pi settings, authentication, tools, extensions and project configuration; isolation is opt-in (the tests use it).
 
-Entrypoints reload grants before requests. Other configuration changes require
-restart (`CONFIG_RESTART_REQUIRED`). An invalid config blocks new requests;
-already dispatched work may finish. Content/output replay checks current access.
+For ordinary `pi` and RPC-host launches to participate, [add the companion to native Pi settings](docs/runtime.md#daily-tui-and-ordinary-rpc-registration). It reads the existing private owner configuration and registers only its session roots; grants remain unchanged. Newly configured extensions do not attach to already-running processes automatically.
 
-This is API authorization, not an OS sandbox. Owner-authorized shell/model tools
-run with Pi's host privileges. Session-operation arguments do not override caller identity, grants, storage
-roots or runtime configuration; these come from the owner file. Protect the owner file and
-state directory from untrusted local code, and authenticate remote transport.
-
-### Native runtime defaults
-
-Without overrides, cold resume inherits the service environment and uses Pi's
-normal agent directory (`PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`), settings,
-saved model/thinking selection, tools, packages, resources and authentication.
-Service and interactive-shell environments may differ.
-
-```json
-{
-  "piRuntime": {"tools":["read","bash"]},
-  "piArgs": ["--thinking","high"]
-}
-```
-
-Omitted/null `tools` and `inheritEnv` retain native defaults. `tools:[]` disables
-tools; an explicit environment list filters inheritance while retaining PATH.
-`agentDir` selects another profile; filtering environment alone does not isolate
-file-based credentials. CLI flags can append extensions or toggle resources.
-Tests and demos isolate explicitly; standard startup uses normal native defaults.
-
-### Local Pi controls and attachment
-
-Load the companion and permission menu using the same owner configuration and
-private IPC directory as Bridge. Close/release an existing writer before a direct
-`--session` launch; for a busy Bridge-owned session, use the idle join below.
+To open a Bridge-owned session in an interactive native TUI:
 
 ```sh
-cd /absolute/path/to/authorized-project
-PI_MCP_OWNER_CONFIG=/absolute/path/to/owner.json \
-PI_MCP_ATTACH_DIR=/absolute/path/to/private-ipc \
-  pi --session /absolute/path/inside/sessionRoots/session.jsonl \
-  -e /absolute/path/pi-mcp-bridge/src/attach-extension.mjs \
-  -e /absolute/path/pi-mcp-bridge/src/owner-permissions-extension.mjs
+node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
 ```
 
-Ordinary RPC uses the same recipe with `--mode rpc`; its caller retains
-stdin/stdout. The companion uses a separate local socket without spawning a second writer.
-Pi retains its normal profile and credentials in-place.
+The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits for admitted work and a normal EOF exit, then switches to the saved session. The session file is not opened before negotiation. Ordinary TUI/RPC instances participate by loading the companion extension. See [runtime integration](docs/runtime.md).
 
-**Ctrl+Alt+P** changes existing session/project grants via Allow, Block or Inherit.
-It does not add roots/projects/callers or change models. The owner-local menu is a
-TUI shortcut rather than a remotely callable slash command. Edits atomically
-preserve unrelated config and refuse detected concurrent changes. A crashed
-permission editor may leave a lock requiring owner-confirmed cleanup.
+**Native boundaries:**
 
-To join a Bridge-owned session, launch ordinary Pi on a fresh/different session
-with the companion and use `/bridge-join ps_…`. It waits for admitted work,
-confirms normal child exit, then switches to the latest history. **Ctrl+Alt+J**
-cancels the wait. Initial `pi --session <owned-file>` is different: Pi opens that
-file before loading extensions. See [handoff and recovery](docs/runtime-handoff.md).
+- An unregistered RPC process cannot be attached to by PID.
+- The companion supports reading, text/images and standalone model/thinking settings. Remote command, stop, compact, reload and combined prompt+model require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
+- Closing a native TUI interrupts its running task; it does not transfer that task to a background process. After a graceful close, cold resume is allowed only once exact process death is established.
+- Host applications with their own controller can supply native capabilities.
 
-### Supported live routes
+## Documentation
 
-| Runtime | read/send | Full stop | Native bash |
-| --- | --- | --- | --- |
-| Bridge-owned RPC | Yes | Yes | Yes |
-| Generic SDK/RPC host | Yes | Optional public callback | Optional public callback |
-| Ordinary companion | Yes | `STOP_UNSUPPORTED` | `BASH_UNSUPPORTED` |
+- [Configuration and permissions](docs/configuration.md)
+- [API and recovery contracts](docs/api.md)
+- [Runtime models, thinking, compaction and reload](docs/model-control.md)
+- [Context selection, pagination and live observation](docs/reading.md)
+- [Runtime ownership, TUI handoff and capabilities](docs/runtime.md)
+- [MCP protocols and transports](docs/transports.md)
+- [Architecture and verification](docs/architecture.md)
 
-The companion can recover TUI queued text, but public extension context lacks
-standalone bash cancellation/execution. `pi.exec` is not substituted for native
-history/Escape behavior. Generic host bindings use the existing owner's public
-session/client; see [host adapter](docs/host-adapter.md).
-
-Claims bind canonical file, native ID, process identity and generation. Reload or
-session replacement retires the old endpoint. A live unavailable owner blocks a
-fallback writer; Bridge close disconnects external hosts without terminating them.
-Unregistered writers do not participate in this cooperative registry. Session files
-must be canonical regular files with one hard link. Owner-local release persists
-a no-cold-reacquire restriction until explicit reset; valid attachments remain usable.
-Details and observed startup/preflight limits are in the handoff document.
-
-## Tools
-
-### list
-
-Returns discoverable opaque session IDs. Readable rows also include bounded
-native title, cwd, leaf and effective permissions; unreadable rows contain only
-the ID. Query searches readable title/cwd, never hidden metadata. Offset/limit
-paginate rows. Discovery reads bounded header chunks; without query, only the
-page's readable histories are parsed. A query scans until the page and one further
-match establish `next_offset`, or until readable histories are exhausted. A
-no-match query can still parse all readable histories. Creation-capable folders
-appear separately.
-
-### read
-
-`session_id` is required. Default view is `context`:
-
-| View | Content |
-| --- | --- |
-| `context` | Native effective projection for the selected leaf, including compaction and context edits |
-| `overview` | Bounded extractive source locators, excerpts, checkpoints and tool observations |
-| `raw` | Original stored entries, including replaced/hidden originals |
-| `summary` | Visible compaction/branch-summary records |
-| `status` | Live state/settlement observation, without transcript retrieval |
-
-Permission is checked before loading content or contacting the runtime. Saved
-sessions use their persisted resume leaf; live reads use the owner's leaf.
-`leaf_id` selects historical ancestry; `raw` is stored-entry order instead.
-`entry_id` selects source records, `query` filters serialized selected records,
-and `since` applies only to raw. Overview is extractive; its manifest identifies
-sampled and omitted ranges with source locators.
-
-Regular pages use `limit` (1–50) and `max_chars` (256–32768, default 12000).
-Oversized entries return `json_fragment`, `char_offset`, `total_chars`; concatenate
-fragments before JSON decoding. Follow `next_cursor` with the same selection,
-changing the budget if desired. Changed history/selection yields `STALE_CURSOR`.
-Budgets count serialized item content; envelope/cursor metadata adds overhead.
-
-#### Precise decoded text
-
-Skip opaque blocks and read an individual projected text block:
-
-```json
-{
-  "session_id":"ps_...",
-  "view":"context",
-  "entry_id":"native-entry-id",
-  "message_index":0,
-  "block_index":1,
-  "text_offset":0,
-  "max_chars":512
-}
-```
-
-`message_index` selects a message within that entry's projection. String content
-needs no block index; array content needs an exact text block. For a projected
-system section, replace `block_index` with:
-
-```json
-{"field":"sections","section":"project_context"}
-```
-
-Only an own string-valued section is readable. Empty content remains empty;
-sections are not flattened or merged with later system updates. Native hidden/
-replacement semantics apply. Compaction entries may contain a short summary and
-a richer `systemMessage`. These are saved checkpoints, distinct from current
-injected memory or the final provider payload. Reads project existing records
-without invoking context hooks or models.
-
-The response uses `format:"projected_text"`, `offset_unit:"utf16_code_units"`
-and one item containing text, offset, total units and field/block/section provenance.
-Offsets address decoded JavaScript string units; pages do not split surrogate pairs.
-Continue the cursor with identical selectors, including the initial offset.
-Precise selection is context-only and excludes `query`/`since`.
-Invalid/missing/nontext selection gives an explicit error, not raw fallback.
-An owner ignoring the selector returns `OWNER_READ_REFRESH_REQUIRED`.
-
-**Existing JSON offsets/cursors are unchanged.** Overview excerpt offsets and
-ordinary fragment offsets address serialized JSON, not decoded text. Text cursors
-also bind resolved leaf/revision. Increase the budget on `TEXT_BUDGET_TOO_SMALL`;
-use an independently authorized raw request for original evidence.
-
-#### Status and wait
-
-`read({session_id,view:"status"})` never starts Pi or retrieves entries.
-For a subsequent session-wide settlement, capture `activity.settlement` before
-sending, then request:
-
-```json
-{
-  "session_id":"ps_...",
-  "view":"status",
-  "after_settlement":{"generation":"observed-generation","sequence":0},
-  "wait_ms":10000
-}
-```
-
-Wait is 0–10000 ms. Outcomes distinguish `settled`, `timeout`,
-`generation_changed`, `unavailable` and `not_requested`. Generation replacement
-resets sequence. Settlement is not exclusive request completion or current idle.
-An initial observation is always taken; polling is bounded by wait_ms, while
-in-flight state/ownership I/O can add its normal overhead (state timeout 5 s).
-Permissions are rechecked before returning. Stdio cancellation stops the wait;
-stateless HTTP requires disconnecting the original request rather than sending
-a separate cancellation notification.
-
-### send
-
-Use stable `request_id`, `session_id`, `text` and optional mode:
-
-- `native`: plain Pi prompt; busy prompts may be rejected.
-- `idle_only`: resolve/resume, then skip if streaming/compacting.
-- `steer`: starts idle, steers busy.
-- `queue`: starts idle, follows up busy.
-
-Owned RPC reports `started|queued|handled` admission, not completed output.
-Companion sends report `unknown / PI_ACCEPTANCE_UNOBSERVABLE` because the public
-send API returns void. Idle checks are observational rather than atomic admission gates.
-`timeout_ms` bounds admission ACK wait rather than model execution or the whole request.
-
-Repeat the ID/arguments to replay, or omit text to retrieve the receipt.
-Different text/mode/operation/target conflicts. Unknown never triggers automatic
-resend; a verified late ACK may update it. An unresolved owned prompt ACK blocks
-another prompt (`PROMPT_ADMISSION_PENDING`) until that ACK or exact child exit.
-The session-wide settlement event cannot clear that fence.
-
-### stop and bash
-
-[`stop`](docs/stop.md) cancels current native execution, withdraws queued inputs,
-and returns complete native-joined text while keeping process/session/ownership.
-It is live-only and requires `command` plus `read`. Follow the same request ID's
-cursor until `withdrawn_complete`; replay never cancels a later run.
-
-[`bash`](docs/bash.md) is native `!command`, not a model prompt. Separate
-`bash` permission defaults to deny. It can cold-resume a permitted saved session;
-results retain native exit code, cancellation, truncation and spill-file facts.
-Replay/output pagination use the same ID. ACK timeout does not kill the command.
-Both tools are independent operations, not batch items.
-
-### create and delete
-
-`create` requires `folder_id`, `request_id`, `new_session` and a usable project
-cwd. It durably creates an empty v3 session without a model call or implicit prompt.
-
-`delete` requires independent permission. It confirms owned runtime exit before
-atomically moving only the JSONL to adjacent private `.pi-mcp-trash`, with durable
-restore metadata and a state-directory index. Project files remain unchanged.
-External owners must support safe release/exit; socket closure is not exit proof.
-RPC companion deletion is unsupported. The same ID replays the restore token.
-
-To recover with Bridge stopped, inspect original and trash paths recorded in the state
-directory index or `.pi-mcp-trash`, and restore the JSONL to its recorded original path
-without overwriting existing files. Path and native identity determine public ID and grants.
-Legacy state-directory trash may lack metadata; identify its original path before
-restoring. Permanent deletion and remote restore are outside the remote API.
-
-### batch and receipts
-
-`batch` accepts 1–10 ordered `read|send|create|delete` operations with individual
-arguments. Preflight rejects structural/request-ID conflicts. Read-before-delete
-is valid; delete-before-read and same-session send/delete are contradictions.
-Results stay in input order with per-item errors. Reads are captured once and
-resized without rereading after later mutations; 32768 serialized characters
-bound the whole response. `BATCH_RESULT_OMITTED` explicitly directs a separate
-read or same-ID mutation replay. This is not a transaction.
-
-Once admitted, later batch mutations continue after HTTP disconnect; status
-wait cancellation may produce an item error without stopping the batch.
-
-Mutation receipts persist before dispatch and survive restart. Repeated IDs do
-not execute again; persistence errors are surfaced. Receipt uncertainty is not
-exactly-once delivery or tool rollback. Keep local receipts/recovery output private.
-
-## Verification, research and recovery
-
-`npm test` exercises public Pi/MCP APIs with disposable offline providers,
-including actual RPC, TUI, host IPC, permissions, receipts and pagination.
-Reusable long-session methods are in [research notes](research/long-session-reading.md).
-Generated transcripts, deployment evidence and credentials belong in ignored
-`.local/`; public fixtures use synthetic content.
-
-Optional real-provider research requires explicit consent, destination
-acknowledgement and existing environment credentials:
+## Development
 
 ```sh
-PI_REAL_TEST=1 \
-PI_REAL_BASE_URL=https://example.invalid/v1 \
-PI_REAL_ACK_DESTINATION=https://example.invalid/v1 \
-OPENAI_BASE_URL=https://example.invalid/v1 \
-PI_REAL_MODEL=your-model \
-node research/real-client.mjs
+npm test
+npm run format:check
+npm audit
 ```
 
-Replace the invalid example endpoint deliberately; `OPENAI_API_KEY` is supplied
-through protected environment, not the command/config. The harness uses a
-tool-disabled disposable profile. `PI_REAL_REVIEW=1` reviews public HEAD source;
-`PI_REAL_REVIEW_ONLY=1` skips lifecycle prompts. Review feedback is untrusted and stays local.
-
-Recovery: Bridge/permission-editor locks require owner-confirmed cleanup after
-the relevant processes stop. Registry transactions recover exact-dead-owner locks;
-unknown identities remain blocked. Registered live or transitioning owners block fallback.
-Restarting Bridge does not clear a deliberate no-cold-reacquire marker. Use the
-[owner-local reset procedure](docs/runtime-handoff.md#explicit-return-to-cold-resume)
-only after the local writer closes. Client schema refresh and host adapter reload
-are separate: a Bridge restart cannot update an external owner's cached module.
-
-Optional `PI_MCP_LOG=1` enables content-free stderr timing/correlation diagnostics:
-[boundaries and local/remote comparison](deploy/diagnostics.md).
-[Experience outlook](docs/redesign.md) guides future interaction design alongside
-the current API; it is not a release acceptance checklist.
+Tests use synthetic providers, temporary session stores and isolated Pi profiles, without production sessions, credentials, deployments or paid model calls. Native subprocess/PTY tests need Linux utilities including `script`; the service-unit check needs `systemd-analyze`.
