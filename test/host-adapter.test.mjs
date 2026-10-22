@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { reserveHostSession } from '../src/host-adapter.mjs';
+import { READ_CONTRACT } from '../src/context-read.mjs';
 import {
   readClaim,
   claimFile,
@@ -206,7 +207,10 @@ test('two-phase host reservation blocks another writer before ready and exposes 
   assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'ready');
   const read = await request(f, 'read', { session_id: 'fixture' });
   assert.ok(JSON.stringify(read.data).includes('PUBLIC_FIXTURE'));
-  assert.equal(read.data.contract, 'semantic_units_v2');
+  assert.equal(read.data.contract, READ_CONTRACT);
+  const observed = await request(f, 'read', { session_id: 'fixture', view: 'observed' });
+  assert.equal(observed.data.observation.reason, 'host_observer_unavailable');
+  assert.deepEqual(observed.data.units, []);
   assert.equal((await request(f, 'state')).data.sessionId, f.session.header.id);
   await assert.rejects(
     new AttachedRuntime(
@@ -241,7 +245,7 @@ test('cooperative public reads stay bounded while fork snapshots preserve full n
     f.controller.record,
   );
   const result = await runtime.read({ session_id: 'public-fixture', max_bytes: 4096 });
-  assert.equal(result.contract, 'semantic_units_v2');
+  assert.equal(result.contract, READ_CONTRACT);
   assert.equal(
     result.units.map((unit) => unit.message.content).join(''),
     snapshot.entries[0].message.content,
