@@ -11,14 +11,14 @@ import {
   fauxToolCall,
   fauxProvider,
   InMemoryCredentialStore,
-} from '@earendil-works/pi-ai';
+} from './fixtures/pi.mjs';
 import {
   createAgentSession,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
   SettingsManager,
-} from '@earendil-works/pi-coding-agent';
+} from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { loadSavedSession } from '../src/data.mjs';

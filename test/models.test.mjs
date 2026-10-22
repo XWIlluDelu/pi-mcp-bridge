@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { modelInfo } from '../src/models.mjs';
+import { modelInfo as nativeModelInfo } from '../src/models.mjs';
+import { getSupportedThinkingLevels } from './fixtures/pi.mjs';
+const modelInfo = (model) => nativeModelInfo(model, getSupportedThinkingLevels);
 import { publicSchemas } from '../src/tool-schemas.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
 import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';

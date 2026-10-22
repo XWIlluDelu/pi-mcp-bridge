@@ -1,4 +1,4 @@
-import { fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { fauxProvider, fauxAssistantMessage } from './pi.mjs';
 import { imageEvidence } from './image-input.mjs';
 import fs from 'node:fs/promises';
 

@@ -1,10 +1,5 @@
 import { z } from 'zod';
-import {
-  modelSelectionSchema,
-  thinkingLevelSchema,
-  sameModel,
-  assertThinkingLevel,
-} from './models.mjs';
+import { modelSelectionSchema, thinkingLevelSchema, sameModel } from './models.mjs';
 export const hasPromptSettings = (input) =>
   input.model !== undefined || input.thinking_level !== undefined;
 
@@ -109,7 +104,6 @@ export function assertPromptSelection(input, state) {
     throw new Error('MODEL_SELECTION_CHANGED');
   assertImageModel(input.images, state.model);
   if (input.thinking_level !== undefined) {
-    assertThinkingLevel(state.model, input.thinking_level);
     if (state.thinkingLevel !== input.thinking_level) throw new Error('MODEL_SELECTION_CHANGED');
   }
 }

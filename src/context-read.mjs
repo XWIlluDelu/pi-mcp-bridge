@@ -1,4 +1,3 @@
-import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
 import { readSchema, contextSelection } from './read-schema.mjs';
 import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
@@ -570,7 +569,7 @@ export function appendUnits(target, record) {
     target.units.push(detached);
   }
 }
-export function prepareContextRead(data, rawArgs) {
+export function prepareContextRead(data, rawArgs, { buildSessionProjection }) {
   const parsed = readSchema.safeParse(rawArgs);
   if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
   const args = parsed.data;

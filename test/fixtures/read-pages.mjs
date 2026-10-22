@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { prepareContextRead } from '../../src/context-read.mjs';
+import { prepareContextRead as prepare } from '../../src/context-read.mjs';
+import { sdk } from './pi.mjs';
+export const prepareContextRead = (data, args) => prepare(data, args, sdk);
 import { ContextReadCache } from '../../src/read-cache.mjs';
 
 // Unit-test convenience only: production acquisition and authorization live in Bridge.

@@ -1,3 +1,4 @@
+import { sdkEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -65,7 +66,7 @@ import path from 'node:path';
 import {Bridge} from ${JSON.stringify(moduleUrl('src/bridge.mjs'))};
 import {launchProfile} from ${JSON.stringify(moduleUrl('src/rpc.mjs'))};
 import {denyAllPermissions} from ${JSON.stringify(new URL('./fixtures/permissions.mjs', import.meta.url).href)};
-import {SessionManager, RpcClient} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-coding-agent'))};
+import {SessionManager, RpcClient} from ${JSON.stringify(sdkEntry)};
 const scenario=JSON.parse(process.argv[1]), home=process.env.HOME, project=path.join(home,'project');
 await fs.mkdir(project);
 const nativeAgent=path.join(home,'.pi','agent'), agent=scenario.agentOverride?path.join(home,'profile'):nativeAgent;

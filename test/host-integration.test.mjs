@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -15,7 +15,7 @@ import {
   RpcClient,
   SessionManager,
   SettingsManager,
-} from '@earendil-works/pi-coding-agent';
+} from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';

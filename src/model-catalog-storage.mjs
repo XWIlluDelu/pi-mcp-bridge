@@ -1,67 +1,36 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { z } from 'zod';
-import { getAgentDir, VERSION } from '@earendil-works/pi-coding-agent';
+import { pathToFileURL } from 'node:url';
+import { loadPiSdk } from './pi-installation.mjs';
 
-// SDK 1.3.0's ModelsStore file layout. Model payloads remain native metadata;
-// validate the envelope/identity without reimplementing provider discovery.
-const cachedModel = z
-  .object({
-    provider: z.string().min(1),
-    id: z.string().min(1),
-    api: z.string().min(1),
-    type: z.enum(['chat', 'image', 'classifier']).optional(),
-  })
-  .passthrough();
-const cacheSchema = z
-  .record(
-    z
-      .object({
-        models: z.array(cachedModel),
-        lastModified: z.number().finite().optional(),
-        checkedAt: z.number().finite().optional(),
-        etag: z.string().optional(),
-      })
-      .strict(),
-  )
-  .refine((cache) =>
-    Object.entries(cache).every(([provider, entry]) =>
-      entry.models.every((model) => model.provider === provider),
-    ),
+// Native store interfaces, without creating files, refreshing credentials or
+// duplicating Pi's model schema. Native ModelRuntime interprets cached data.
+export async function catalogStores(installation) {
+  const { getAgentDir } = await loadPiSdk(installation);
+  // Pi exports this read-only CredentialStore from its module, not its SDK root.
+  // Missing native APIs fail the catalog; no bundled or version fallback.
+  const { ReadOnlyAuthStorage } = await import(
+    new URL('./core/auth-storage.js', pathToFileURL(installation.sdkEntry)).href
   );
-
-export async function readOnlyModelsStore(file) {
-  let raw;
+  let contents;
   try {
-    raw = await fs.readFile(file, 'utf8');
+    contents = await fs.readFile(path.join(getAgentDir(), 'models-store.json'), 'utf8');
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const snapshot = cacheSchema.parse(raw ? JSON.parse(raw.replace(/^\uFEFF/, '')) : {});
+  const snapshot = contents ? JSON.parse(contents.replace(/^\uFEFF/, '')) : {};
   const rejectWrite = async () => {
     throw new Error('MODEL_CATALOG_READ_ONLY');
   };
   return {
-    async read(providerId, options) {
-      options?.signal?.throwIfAborted();
-      return Object.hasOwn(snapshot, providerId)
-        ? structuredClone(snapshot[providerId])
-        : undefined;
-    },
-    write: rejectWrite,
-    delete: rejectWrite,
-  };
-}
-
-export async function catalogStores() {
-  // Narrow, fixed-package dependency: 1.3.0 exports this native CredentialStore
-  // from its module, but does not re-export it through dist/index.js.
-  if (VERSION !== '1.3.0') throw new Error('MODEL_CATALOG_UNAVAILABLE');
-  const { ReadOnlyAuthStorage } = await import(
-    new URL('./core/auth-storage.js', import.meta.resolve('@earendil-works/pi-coding-agent')).href
-  );
-  return {
     credentials: new ReadOnlyAuthStorage(),
-    modelsStore: await readOnlyModelsStore(path.join(getAgentDir(), 'models-store.json')),
+    modelsStore: {
+      async read(provider, options) {
+        options?.signal?.throwIfAborted();
+        return Object.hasOwn(snapshot, provider) ? structuredClone(snapshot[provider]) : undefined;
+      },
+      write: rejectWrite,
+      delete: rejectWrite,
+    },
   };
 }

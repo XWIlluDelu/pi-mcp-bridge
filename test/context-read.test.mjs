@@ -5,14 +5,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
-import { SessionManager, buildSessionProjection } from '@earendil-works/pi-coding-agent';
+import { SessionManager, buildSessionProjection } from './fixtures/pi.mjs';
 import {
   readSchema,
   FULL_SELECTION,
   RECENT_SELECTION,
   LATEST_SELECTION,
 } from '../src/read-schema.mjs';
-import { prepareContextRead } from '../src/context-read.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { contextWindow } from './fixtures/context-window.mjs';
 import {
   renderContextRead,

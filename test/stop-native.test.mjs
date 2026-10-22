@@ -1,3 +1,4 @@
+import { aiEntry } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession, savedEntries } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -6,7 +7,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   RpcClient,
   createAgentSession,
@@ -14,7 +15,7 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
-} from '@earendil-works/pi-coding-agent';
+} from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { readClaim, processIdentity } from '../src/attachments.mjs';
@@ -40,7 +41,7 @@ async function fixture(t, owned = false) {
   await fs.writeFile(
     extension,
     `import fs from 'node:fs';
- import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(path.resolve('node_modules/@earendil-works/pi-ai/dist/index.js'))};
+ import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(aiEntry)};
  export default pi=>{
    globalThis.fetch=async()=>{throw new Error('offline fixture blocks network');};
    fs.writeFileSync(${JSON.stringify(pidFile)},JSON.stringify(process.pid));

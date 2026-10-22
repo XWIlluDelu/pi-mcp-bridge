@@ -13,8 +13,8 @@ import {
   ModelRuntime,
   SessionManager,
   SettingsManager,
-} from '@earendil-works/pi-coding-agent';
-import { fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+} from './fixtures/pi.mjs';
+import { fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Bridge } from '../src/bridge.mjs';

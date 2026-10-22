@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { SessionManager, CURRENT_SESSION_VERSION } from '@earendil-works/pi-coding-agent';
+import { resolvePiInstallation, loadPiSdk } from './pi-installation.mjs';
 import { opaqueId, syncDir, assertNativeDirectory } from './storage.mjs';
 import { launchProfile } from './rpc.mjs';
 import { sessionEntryIndex } from './data.mjs';
@@ -14,17 +14,21 @@ const exec = promisify(execFile);
 // in-memory manager forks the native branch and its current labels without opening a writer
 // on the parent's file or switching the parent's live runtime.
 export async function prepareSession(config, project, { name, parent, snapshot } = {}) {
+  const { env } = launchProfile(config);
+  const installation = await resolvePiInstallation(config, env);
+  const { SessionManager, CURRENT_SESSION_VERSION } = await loadPiSdk(installation);
   const { stdout } = await exec(
     process.execPath,
     [
       fileURLToPath(new URL('./native-create.mjs', import.meta.url)),
       JSON.stringify({
+        sdkEntry: installation.sdkEntry,
         roots: config.sessionRoots,
         args: config.piArgs ?? [],
         parentSession: parent?.file,
       }),
     ],
-    { cwd: project, env: launchProfile(config).env, timeout: 10000, maxBuffer: 65536 },
+    { cwd: project, env, timeout: 10000, maxBuffer: 65536 },
   );
   const { file, header, error } = JSON.parse(stdout);
   if (error) throw new Error(error);
