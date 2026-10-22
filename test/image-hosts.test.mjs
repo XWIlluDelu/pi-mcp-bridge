@@ -97,11 +97,10 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       };
       await fs.writeFile(path.join(agentDir, 'settings.json'), JSON.stringify(settingsValue));
       const config = {
-        principal: 'images',
         defaults: denyAllPermissions(),
         stateDir: path.join(dir, 'state'),
         sessionRoots: [path.join(dir, 'sessions')],
-        folders: [{ id: 'p', path: cwd }],
+        folders: [{ path: cwd }],
         grants: [{ folder: cwd, list: true, read: true, send: true, command: true, stop: true }],
         attachmentDir: path.join(dir, 'ipc'),
       };
@@ -241,7 +240,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       if (route.endsWith('companion')) {
         const remoteConfig = { ...config, stateDir: path.join(dir, 'remote-state') },
           file = path.join(dir, 'remote-owner.json');
-        await fs.writeFile(file, JSON.stringify(remoteConfig));
+        await fs.writeFile(file, JSON.stringify(remoteConfig), { mode: 0o600 });
         remote = new Client({ name: 'image-stdio', version: '1' });
         await remote.connect(
           new StdioClientTransport({
@@ -262,10 +261,10 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       assert.ok(Buffer.byteLength(image.data) > 1024 * 1024);
       const sent = await call('send', {
         session_id: saved.id,
-        request_id: 'image-only',
+
         images: [image],
       });
-      assert.equal(sent.status, route === 'rpc-host' ? 'accepted' : 'unknown');
+      assert.equal(sent.status, route === 'rpc-host' ? 'started' : 'unknown');
       const text = await until(async () => {
         const value = sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText();
         return value?.startsWith('IMAGE_CONTEXT:') ? value : null;
@@ -278,86 +277,59 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
           .message.content.filter((c) => c.type === 'image'),
         [image],
       );
-      assert.deepEqual(
-        await call('send', { session_id: saved.id, request_id: 'image-only' }),
-        sent,
-      );
+
       assert.equal(
         (sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries).filter(
           (e) => e.message?.role === 'user',
         ).length,
         1,
       );
-      const models = await call('models', { session_id: saved.id });
-      assert.equal(models.current.id, 'vision');
-      assert.equal(models.source, 'runtime');
+      const status = async () => (await call('list', { session_id: saved.id })).sessions[0].status;
+      const selected = await status();
+      assert.deepEqual(selected.model, {
+        provider: route === 'sdk-host' ? 'image-sdk' : 'image-fixture',
+        id: 'vision',
+      });
+      assert.equal(selected.thinking_level, 'off');
       const rejected = await call('send', {
         session_id: saved.id,
-        request_id: 'no-combined-selection',
+
         text: 'MUST_NOT_SEND',
-        model: { provider: models.current.provider, id: 'text-only' },
+        model: { provider: selected.model.provider, id: 'text-only' },
       });
       assert.equal(rejected.status, 'rejected');
       assert.equal(rejected.reason, 'MODEL_SELECTION_UNSUPPORTED');
-      assert.equal((await call('models', { session_id: saved.id })).current.id, 'vision');
-      const switched = await call('set_model', {
-        session_id: saved.id,
-        request_id: 'standalone-selection',
-        model: { provider: models.current.provider, id: 'text-only' },
-      });
-      assert.equal(switched.status, 'accepted', JSON.stringify(switched));
-      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
-      assert.deepEqual(
-        await call('set_model', { session_id: saved.id, request_id: 'standalone-selection' }),
-        switched,
+      assert.deepEqual((await status()).model, selected.model);
+      for (const settings of [
+        { thinking_level: 'off' },
+        { model: { provider: selected.model.provider, id: 'reasoner' }, thinking_level: 'high' },
+      ]) {
+        const refused = await call('send', {
+          session_id: saved.id,
+
+          text: 'MUST_NOT_SEND',
+          ...settings,
+        });
+        assert.equal(refused.status, 'rejected');
+        assert.equal(refused.reason, 'MODEL_SELECTION_UNSUPPORTED');
+      }
+      assert.deepEqual((await status()).model, selected.model);
+      assert.equal(
+        (sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries).filter(
+          (e) => e.message?.role === 'user',
+        ).length,
+        1,
       );
-      const unavailable = await call('set_model', {
-        session_id: saved.id,
-        request_id: 'missing-selection',
-        model: { provider: models.current.provider, id: 'absent' },
-      });
-      assert.equal(unavailable.status, 'rejected');
-      assert.equal(unavailable.reason, 'MODEL_UNAVAILABLE');
-      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
-      const thinking = await call('set_model', {
-        session_id: saved.id,
-        request_id: 'thinking-off',
-        thinking_level: 'off',
-      });
-      assert.equal(thinking.status, 'accepted', JSON.stringify(thinking));
-      assert.equal(thinking.thinking_level, 'off');
-      const unsupported = await call('set_model', {
-        session_id: saved.id,
-        request_id: 'unsupported-thinking',
-        model: { provider: models.current.provider, id: 'vision' },
-        thinking_level: 'high',
-      });
-      assert.equal(unsupported.status, 'rejected');
-      assert.equal(unsupported.reason, 'THINKING_LEVEL_UNSUPPORTED');
-      assert.equal((await call('models', { session_id: saved.id })).current.id, 'text-only');
-      const reasoning = await call('set_model', {
-        session_id: saved.id,
-        request_id: 'reasoning-selection',
-        model: { provider: models.current.provider, id: 'reasoner' },
-        thinking_level: 'high',
-      });
-      assert.equal(reasoning.status, 'accepted', JSON.stringify(reasoning));
-      assert.equal(reasoning.thinking_level, 'high');
-      const current = (await call('models', { session_id: saved.id })).current;
-      assert.equal(current.id, 'reasoner');
-      assert.equal(current.thinking_level, 'high');
       const publicRead = await call('read', { session_id: saved.id, max_bytes: 65536 });
       assert.ok(JSON.stringify(publicRead.items).includes('IMAGE_CONTEXT:'));
-      for (const op of ['compact', 'reload']) {
-        const denied = await call(op, { session_id: saved.id, request_id: 'unsupported-' + op });
-        assert.equal(denied.status, 'rejected');
-        assert.equal(denied.reason, op.toUpperCase() + '_UNSUPPORTED');
-      }
+      const denied = await call('compact', { session_id: saved.id });
+      assert.equal(denied.status, 'rejected');
+      assert.equal(denied.reason, 'COMPACT_IDLE_UNCONFIRMED');
       if (route.endsWith('companion')) {
         for (const op of ['command', 'stop']) {
           const denied = await call(op, {
             session_id: saved.id,
-            request_id: 'unsupported-' + op,
+
             ...(op === 'command' ? { command: 'printf MUST_NOT_RUN' } : {}),
           });
           assert.equal(denied.status, 'rejected');
@@ -368,9 +340,9 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       assert.equal((await readClaim(config.attachmentDir, saved)).generation, record.generation);
       assert.equal(spawned, 0);
       // Missing capability fails before transport dispatch, never text-only fallback.
-      const old = new AttachedRuntime(config, saved, { ...record, imagesSupported: undefined });
+      const unsupported = new AttachedRuntime(config, saved, { ...record, imagesSupported: false });
       assert.throws(
-        () => old.send({ text: 'must not lose image', images: [image] }),
+        () => unsupported.send({ text: 'must not lose image', images: [image] }),
         /IMAGE_INPUT_UNSUPPORTED/,
       );
     },

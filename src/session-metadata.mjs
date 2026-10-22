@@ -1,5 +1,7 @@
 import fs from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import { uiSnapshot } from './rpc-ui.mjs';
+import { modelState } from './models.mjs';
 
 // Metadata scanning retains at most one JSONL record, never a second full history.
 export async function sessionMetadata(session, cache) {
@@ -44,16 +46,46 @@ export async function sessionMetadata(session, cache) {
   return metadata;
 }
 
-export async function runtimeStatus(pool, session) {
+function runtimeCapabilities(runtime, state) {
+  if (runtime.attached) {
+    const host = runtime.record?.kind === 'host';
+    // Companions and hosts require a send path. Optional host controls must be
+    // declared by the owner; AttachedRuntime's wrappers do not prove support.
+    return {
+      send: true,
+      command: host ? state.capabilities.command : false,
+      stop: host ? state.capabilities.stop : false,
+    };
+  }
+  return {
+    send: typeof runtime.command === 'function',
+    command: typeof runtime.executeBash === 'function',
+    stop: typeof runtime.stopExecution === 'function',
+  };
+}
+
+export async function runtimeMetadata(pool, session) {
   const observed_at = new Date().toISOString();
   try {
     const runtime = await pool.forRead(session);
-    if (!runtime) return { state: 'saved', observed_at, pending_messages: null };
+    if (!runtime)
+      return {
+        status: {
+          state: 'saved',
+          observed_at,
+          pending_messages: null,
+          model: null,
+          thinking_level: null,
+        },
+      };
     const state = await runtime.state();
+    const selection = modelState(state);
     const pending = state.pendingMessageCount ?? state.activity?.pending_message_count;
     const count = Number.isSafeInteger(pending) && pending >= 0 ? pending : null;
     const busy =
       runtime.promptAdmission ||
+      runtime.hasUnsettledWork?.() ||
+      state.isBashRunning === true ||
       state.isStreaming ||
       state.isCompacting ||
       state.isIdle === false ||
@@ -66,15 +98,28 @@ export async function runtimeStatus(pool, session) {
     // Native RPC get_state alone does not prove idle during input preparation.
     const idle = (state.isIdle === true || state.activity?.idle === true) && !busy;
     return {
-      state: busy ? 'busy' : idle ? 'idle' : 'unknown',
-      observed_at,
-      pending_messages: count,
-      capabilities: {
-        command: typeof runtime.executeBash === 'function' && runtime.record?.kind !== 'extension',
-        stop: typeof runtime.stopExecution === 'function' && runtime.record?.kind !== 'extension',
+      ...(Object.hasOwn(state, 'sessionName') || runtime.ownerRecord?.kind === 'rpc'
+        ? { name: typeof state.sessionName === 'string' ? state.sessionName.trim() || null : null }
+        : {}),
+      status: {
+        state: busy ? 'busy' : idle ? 'idle' : 'unknown',
+        observed_at,
+        pending_messages: count,
+        model: selection.model,
+        thinking_level: selection.thinkingLevel,
+        ...uiSnapshot(runtime.uiFacts),
+        capabilities: runtimeCapabilities(runtime, state),
       },
     };
   } catch {
-    return { state: 'unavailable', observed_at, pending_messages: null };
+    return {
+      status: {
+        state: 'unavailable',
+        observed_at,
+        pending_messages: null,
+        model: null,
+        thinking_level: null,
+      },
+    };
   }
 }

@@ -20,6 +20,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
+import attachExtension from '../src/attach-extension.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => {
@@ -43,11 +44,10 @@ async function fixture(t) {
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const config = {
-    principal: 'host-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     attachmentDir: path.join(dir, 'ipc'),
   };
@@ -65,7 +65,7 @@ async function fixture(t) {
     await fs.rm(dir, { recursive: true, force: true });
   });
   const create = async (key) => {
-    const made = await savedSession(bridge, { folder_id: 'project', request_id: key });
+    const made = await savedSession(bridge);
     return bridge.session(made.session_id);
   };
   return { dir, cwd, config, bridge, create, controllers, cleanups, spawned: () => spawned };
@@ -127,10 +127,10 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   });
   const first = await f.bridge.send({
     session_id: saved.id,
-    request_id: 'rpc-first',
+
     text: 'PUBLIC_RPC_INPUT',
   });
-  assert.equal(first.status, 'accepted');
+  assert.ok(['started', 'queued', 'handled'].includes(first.status), JSON.stringify(first));
   assert.equal(submissions, 1);
   await until(async () => !(await client.getState()).isStreaming);
   const raw = await f.bridge.read({ session_id: saved.id });
@@ -139,14 +139,14 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   assert.equal(f.spawned(), 0);
   const delayedArgs = {
     session_id: saved.id,
-    request_id: 'rpc-lost-reply',
+
     text: 'PUBLIC_DELAYED_REPLY',
-    timeout_ms: 30,
+    timeout_ms: 50,
   };
   const delayed = await f.bridge.send(delayedArgs);
   assert.equal(delayed.status, 'unknown');
   assert.equal(submissions, 2);
-  assert.deepEqual(await f.bridge.send(delayedArgs), delayed);
+
   assert.equal(submissions, 2);
   gate.resolve();
   await until(async () => !(await client.getState()).isStreaming);
@@ -159,7 +159,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     ).length,
     1,
   );
-  const denied = await f.bridge.delete({ session_id: saved.id, request_id: 'unsupported-release' });
+  const denied = await f.bridge.delete({ session_id: saved.id });
   assert.equal(denied.status, 'rejected');
   assert.ok(await fs.stat(saved.file));
   assert.equal((await client.getState()).sessionId, saved.header.id);
@@ -171,7 +171,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   await assert.rejects(f.bridge.read({ session_id: saved.id }));
   const unreachable = await f.bridge.send({
     session_id: saved.id,
-    request_id: 'closed-controller',
+
     text: 'MUST_NOT_DISPATCH',
   });
   assert.equal(unreachable.status, 'rejected');
@@ -261,20 +261,20 @@ test('two official SDK sessions in one host PID release independently without sh
   assert.notEqual(claimA.generation, claimB.generation);
   const sentA = await f.bridge.send({
     session_id: savedA.id,
-    request_id: 'sdk-send-a',
+
     text: 'PUBLIC_A_INPUT',
   });
   assert.equal(sentA.status, 'unknown');
   await until(() => !hosts[0].session.isStreaming && faux.state.callCount === 1);
   assert.match(JSON.stringify(await f.bridge.read({ session_id: savedA.id })), /PUBLIC_A_INPUT/);
-  const removed = await f.bridge.delete({ session_id: savedA.id, request_id: 'sdk-delete-a' });
+  const removed = await f.bridge.delete({ session_id: savedA.id });
   assert.equal(removed.status, 'deleted');
   assert.equal(hosts[0].released, 1);
   assert.equal(hosts[1].released, 0);
   assert.equal((await readClaim(f.config.attachmentDir, savedB)).generation, claimB.generation);
   const sentB = await f.bridge.send({
     session_id: savedB.id,
-    request_id: 'sdk-send-b',
+
     text: 'PUBLIC_B_INPUT',
   });
   assert.equal(sentB.status, 'unknown');
@@ -406,19 +406,17 @@ test('SDK async input preparation must finish before host release permits a save
   });
   const sent = await f.bridge.send({
     session_id: saved.id,
-    request_id: 'preparation-send',
+
     text: 'PUBLIC_ASYNC_PREPARATION',
   });
   assert.equal(sent.status, 'unknown');
   await entered.promise;
   assert.equal(pending.size, 1);
   let deletionFinished = false;
-  const deletion = f.bridge
-    .delete({ session_id: saved.id, request_id: 'preparation-delete' })
-    .then((value) => {
-      deletionFinished = true;
-      return value;
-    });
+  const deletion = f.bridge.delete({ session_id: saved.id }).then((value) => {
+    deletionFinished = true;
+    return value;
+  });
   await releasing.promise;
   assert.equal(accepting, false);
   assert.equal(releaseFinished, false);
@@ -437,3 +435,161 @@ test('SDK async input preparation must finish before host release permits a save
   assert.deepEqual(extensionErrors, []);
   assert.equal(f.spawned(), 0);
 });
+
+for (const hosted of [true, false])
+  test(
+    (hosted ? 'SDK host plus companion' : 'SDK companion') +
+      ' blocks remote join and pending idle-only input while preserving local commands',
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(t),
+        a = await f.create('a'),
+        b = await f.create('b');
+      f.config.grants = [{ session_id: a.id, send: true }];
+      const file = path.join(f.dir, 'owner.json');
+      await fs.writeFile(file, JSON.stringify(f.config), { mode: 0o600 });
+      const names = ['PI_MCP_OWNER_CONFIG', 'PI_MCP_ATTACH_DIR'],
+        previous = names.map((name) => process.env[name]);
+      process.env.PI_MCP_OWNER_CONFIG = file;
+      process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+      t.after(() =>
+        names.forEach((name, i) => {
+          if (previous[i] === undefined) delete process.env[name];
+          else process.env[name] = previous[i];
+        }),
+      );
+      const controller = hosted
+        ? await reserveHostSession({
+            attachmentDir: f.config.attachmentDir,
+            session: a,
+          })
+        : null;
+      if (controller) f.controllers.push(controller);
+      const faux = fauxProvider({ provider: 'local-control-fixture' });
+      const modelRuntime = await ModelRuntime.create({
+        credentials: new InMemoryCredentialStore(),
+        modelsPath: null,
+        refreshOnCreate: false,
+        allowModelNetwork: false,
+      });
+      modelRuntime.registerNativeProvider(faux.provider);
+      const settings = SettingsManager.inMemory({
+        cacheWarming: 'off',
+        retry: { enabled: false },
+        compaction: { enabled: false },
+      });
+      let ordinary = 0,
+        switches = 0;
+      const loader = new DefaultResourceLoader({
+        cwd: f.cwd,
+        agentDir: path.join(f.dir, 'agent'),
+        settingsManager: settings,
+        noExtensions: true,
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+        extensionFactories: [
+          (pi) => {
+            pi.registerCommand('bridge-join', { handler: async () => {} });
+            pi.registerCommand('ordinary-remote', {
+              handler: async () => {
+                ordinary++;
+              },
+            });
+          },
+          attachExtension,
+        ],
+        systemPrompt: 'Offline owner-local test.',
+      });
+      await loader.reload();
+      assert.deepEqual(loader.getExtensions().errors, []);
+      const { session } = await createAgentSession({
+        cwd: f.cwd,
+        agentDir: path.join(f.dir, 'agent'),
+        modelRuntime,
+        model: faux.getModel(),
+        thinkingLevel: 'off',
+        tools: [],
+        resourceLoader: loader,
+        settingsManager: settings,
+        sessionManager: SessionManager.open(a.file),
+      });
+      f.cleanups.push(async () => {
+        await session.abort();
+        await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+        session.dispose();
+      });
+      if (controller) await controller.ready(createSdkHostBinding(session));
+      const errors = [];
+      await session.bindExtensions({
+        mode: 'tui',
+        uiContext: { notify() {} },
+        onError: (error) => errors.push(error),
+        commandContextActions: {
+          waitForIdle: async () => {},
+          switchSession: async (file) => {
+            assert.equal(file, b.file);
+            switches++;
+            return { cancelled: true };
+          },
+        },
+      });
+      assert.equal((await readClaim(f.config.attachmentDir, a)).kind, hosted ? 'host' : 'tui');
+      const join = session.extensionRunner
+        .getRegisteredCommands()
+        .find(
+          (c) => c.name === 'bridge-join' && c.description?.startsWith('Join a Bridge session'),
+        );
+      assert.ok(join);
+      assert.match(join.invocationName, /^bridge-join:\d+$/);
+      for (const command of ['bridge-join', join.invocationName]) {
+        const result = await f.bridge.send({ session_id: a.id, text: '/' + command + ' ' + b.id });
+        assert.equal(result.status, 'rejected', JSON.stringify(result));
+        assert.equal(result.reason, 'OWNER_LOCAL_COMMAND_REQUIRED');
+        assert.equal(await readClaim(f.config.attachmentDir, b), null);
+        assert.equal(switches, 0);
+        assert.equal(session.sessionId, a.header.id);
+      }
+      assert.equal(
+        (await f.bridge.send({ session_id: a.id, text: '/ordinary-remote' })).status,
+        'unknown',
+      );
+      await until(() => ordinary === 1);
+      await session.prompt('/' + join.invocationName + ' ' + b.id);
+      assert.equal(switches, 1);
+      assert.equal(session.sessionId, a.header.id);
+      assert.deepEqual(errors, []);
+      assert.equal(faux.state.callCount, 0);
+      const started = Promise.withResolvers();
+      faux.setResponses([
+        async (_context, options) => {
+          started.resolve();
+          await new Promise((resolve) => {
+            if (options.signal.aborted) resolve();
+            else options.signal.addEventListener('abort', resolve, { once: true });
+          });
+          return fauxAssistantMessage('ABORTED_RESPONSE');
+        },
+      ]);
+      const running = session.prompt('FIRST_PENDING');
+      await started.promise;
+      await session.followUp('USER_PENDING_FOLLOWUP');
+      await session.abort();
+      await running.catch(() => {});
+      assert.equal(session.isIdle, true);
+      assert.equal(session.pendingMessageCount, 1);
+      const entries = structuredClone(session.sessionManager.getEntries()),
+        calls = faux.state.callCount;
+      const idle = await f.bridge.send({
+        session_id: a.id,
+        text: 'BRIDGE_IDLE_ONLY',
+        mode: 'idle_only',
+      });
+      assert.deepEqual(idle, { status: 'skipped', reason: 'busy' });
+      assert.equal(session.pendingMessageCount, 1);
+      assert.equal(faux.state.callCount, calls);
+      assert.deepEqual(session.sessionManager.getEntries(), entries);
+      session.clearQueue();
+    },
+  );

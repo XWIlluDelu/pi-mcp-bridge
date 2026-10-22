@@ -56,12 +56,11 @@ async function fixture(t, source = '') {
   );
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'idle-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     attachmentDir: path.join(dir, 'ipc'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [
       { folder: cwd, list: true, read: true, send: true, delete: true, stop: true, create: true },
     ],
@@ -90,9 +89,13 @@ async function fixture(t, source = '') {
   const configFile = path.join(dir, 'owner.json');
   await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const bridge = await new Bridge(config).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const made = await savedSession(bridge),
     session = await bridge.session(made.session_id);
+  const cleanup = [];
   t.after(async () => {
+    // Node runs after hooks in registration order. Release test gates and stop
+    // external fixtures before Bridge drains work or their files are removed.
+    for (const close of cleanup) await close();
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -108,6 +111,7 @@ async function fixture(t, source = '') {
     config,
     configFile,
     bridge,
+    cleanup,
     session,
     id: session.id,
     request,
@@ -128,12 +132,14 @@ test(
     const f = await fixture(
       t,
       `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('settle');});
-    pi.on('session_shutdown',async()=>{await mark('shutdown');await delay(2100);pi.appendEntry('shutdown-history',{complete:true});await mark('shutdown-done');});`,
+    pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');pi.appendEntry('shutdown-history',{complete:true});await mark('shutdown-done');});`,
     );
-    t.after(() => f.mark('settle').catch(() => {}));
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'one', text: 'FIRST_HANDOFF' })).status,
-      'accepted',
+    f.cleanup.push(() => Promise.all([f.mark('settle'), f.mark('shutdown-go')]));
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await f.bridge.send({ session_id: f.id, text: 'FIRST_HANDOFF' })).status,
+      ),
+      'Expected native prompt admission',
     );
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
@@ -147,11 +153,11 @@ test(
       (
         await f.bridge.send({
           session_id: f.id,
-          request_id: 'two',
+
           text: 'QUEUED_HANDOFF',
           mode: 'follow_up',
         })
-      ).disposition,
+      ).status,
       'queued',
     );
     let finished = false;
@@ -163,18 +169,18 @@ test(
     t.mock.method(rpc, 'stopExecution', () =>
       assert.fail('join must reject new stop before native cancellation or withdrawal'),
     );
-    const stopArgs = { session_id: f.id, request_id: 'fenced-stop' },
+    const stopArgs = { session_id: f.id },
       stopReceipt = await f.bridge.stop(stopArgs);
     assert.equal(stopReceipt.status, 'rejected');
     assert.equal(stopReceipt.reason, 'HANDOFF_PENDING');
-    assert.deepEqual(await f.bridge.stop(stopArgs), stopReceipt);
+
     for (const action of ['send', 'delete'])
       assert.equal(
         (
           await f.bridge[action]({
             session_id: f.id,
-            request_id: 'fenced-' + action,
-            text: 'NEVER_SENT',
+
+            ...(action === 'send' ? { text: 'NEVER_SENT' } : {}),
           })
         ).reason,
         'HANDOFF_PENDING',
@@ -186,8 +192,8 @@ test(
         (
           await f.bridge[action]({
             session_id: f.id,
-            request_id: 'denied-' + action,
-            text: 'NEVER_SENT',
+
+            ...(action === 'send' ? { text: 'NEVER_SENT' } : {}),
           })
         ).reason,
         'NOT_FOUND_OR_DENIED',
@@ -202,10 +208,11 @@ test(
     assert.equal(await ownerAlive(old.owner), true);
     await f.mark('settle');
     await until(() => exists(path.join(f.dir, 'shutdown')));
-    await delay(1650);
     assert.equal(finished, false);
     assert.equal(await ownerAlive(old.owner), true);
     assert.equal(killed, false);
+    assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, old.generation);
+    await f.mark('shutdown-go');
     const result = await joined;
     assert.equal(result.status, 'reserved');
     assert.equal(rpc.child.exitCode, 0);
@@ -226,18 +233,17 @@ test(
     const held = await readClaim(f.config.attachmentDir, f.session);
     assert.equal(held.generation, result.generation);
     assert.equal(held.owner.pid, process.pid);
-    assert.equal(held.noColdReacquire, true);
+    assert.equal(held.noColdReacquire, undefined);
     assert.equal(held.phase, 'starting');
     await assert.rejects(
       reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
       /LIVE_OWNER_UNREACHABLE/,
     );
     await cancel(f);
-    assert.equal((await readClaim(f.config.attachmentDir, f.session)).phase, 'released');
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'after-release', text: 'NEVER_SENT' }))
-        .reason,
-      'COLD_REACQUIRE_BLOCKED',
+      (await f.bridge.send({ session_id: f.id, text: 'AFTER_CANCEL' })).status,
+      'started',
     );
   },
 );
@@ -250,19 +256,18 @@ test(
       t,
       "pi.on('agent_before_settle',async()=>{await mark('settling');await wait('settle');});",
     );
-    t.after(() => f.mark('settle').catch(() => {}));
+    f.cleanup.push(() => f.mark('settle'));
+    const rpc = await f.bridge.pool.resolve(f.session);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'first', text: 'FIRST_INPUT' })).status,
-      'accepted',
+      (await rpc.command({ type: 'prompt', message: 'FIRST_INPUT' })).disposition,
+      'started',
     );
-    const rpc = f.bridge.pool.get(f.id);
     assert.equal(
       (
-        await f.bridge.send({
-          session_id: f.id,
-          request_id: 'queued',
-          text: 'QUEUED_INPUT',
-          mode: 'follow_up',
+        await rpc.command({
+          type: 'prompt',
+          message: 'QUEUED_INPUT',
+          streamingBehavior: 'followUp',
         })
       ).disposition,
       'queued',
@@ -279,7 +284,7 @@ test(
         state.pendingMessageCount === 0 &&
         observed.isIdle &&
         !observed.hasPendingMessages &&
-        rpc.settlement.sequence >= rpc.handoffSettlement
+        rpc.settlement.sequence >= rpc.requiredSettlementSequence
       );
     }, 'native settled and queues drained');
     // All queued RPC work is accounted for by ACK and settlement evidence.
@@ -314,14 +319,14 @@ test(
       }
       return dispatch.call(this, command, ...args);
     });
-    const stopped = f.bridge.stop({ session_id: f.id, request_id: 'prior-stop' });
+    const stopped = f.bridge.stop({ session_id: f.id });
     await entered.promise;
     const joined = transfer(f);
     try {
       await until(() => f.bridge.handoffs.has(f.id));
       assert.notEqual(rpc.handoffPending, true);
       assert.equal(rpc.gracefulExitPromise, undefined);
-      const rejected = await f.bridge.stop({ session_id: f.id, request_id: 'later-stop' });
+      const rejected = await f.bridge.stop({ session_id: f.id });
       assert.equal(rejected.status, 'rejected');
       assert.equal(rejected.reason, 'HANDOFF_PENDING');
     } finally {
@@ -354,7 +359,7 @@ test(
       return forRead.call(this, session);
     });
     t.mock.method(rpc, 'stopExecution', () => assert.fail('stop was not yet dispatched'));
-    const args = { session_id: f.id, request_id: 'lookup-race' },
+    const args = { session_id: f.id },
       stopped = f.bridge.stop(args);
     await entered.promise;
     const joined = transfer(f);
@@ -367,7 +372,7 @@ test(
     assert.equal(receipt.status, 'rejected');
     assert.equal(receipt.reason, 'HANDOFF_PENDING');
     assert.equal((await joined).status, 'reserved');
-    assert.deepEqual(await f.bridge.stop(args), receipt);
+
     await cancel(f);
   },
 );
@@ -387,7 +392,7 @@ test(
       }
       return receive.call(this, event, generation);
     });
-    const args = { session_id: f.id, request_id: 'late-stop', timeout_ms: 50 },
+    const args = { session_id: f.id, timeout_ms: 50 },
       receipt = await f.bridge.stop(args);
     assert.equal(receipt.status, 'unknown');
     assert.equal(receipt.reason, 'ACK_TIMEOUT');
@@ -398,7 +403,7 @@ test(
     await delay(100);
     assert.equal(rpc.gracefulExitPromise, undefined);
     assert.equal(rpc.alive, true);
-    assert.deepEqual(await f.bridge.stop(args), receipt);
+
     receive.call(rpc, held.event, held.generation);
     assert.equal((await joined).status, 'reserved');
     assert.equal(rpc.child.exitCode, 0);
@@ -415,14 +420,14 @@ test(
       `pi.on('input',async event=>{if(event.text==='HELD_PREFLIGHT'){
     pi.sendMessage({customType:'unrelated',content:'CUSTOM_TURN',display:false},{triggerTurn:true});await mark('preflight');await wait('preflight-go');}return {action:'continue'};});`,
     );
-    t.after(() => f.mark('preflight-go').catch(() => {}));
+    f.cleanup.push(() => f.mark('preflight-go'));
     assert.equal(
       (
         await f.bridge.send({
           session_id: f.id,
-          request_id: 'held',
+
           text: 'HELD_PREFLIGHT',
-          timeout_ms: 40,
+          timeout_ms: 50,
         })
       ).status,
       'unknown',
@@ -461,9 +466,9 @@ test(
       `pi.registerCommand('custom-turn',{handler:async()=>{pi.sendMessage({customType:'custom',content:'CUSTOM_SETTLED_HOOK',display:false},{triggerTurn:true});}});
     pi.on('agent_settled',async()=>{await mark('settled-hook');await wait('settled-go');});`,
     );
+    f.cleanup.push(() => f.mark('settled-go'));
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'custom', text: '/custom-turn' }))
-        .disposition,
+      (await f.bridge.send({ session_id: f.id, text: '/custom-turn' })).status,
       'handled',
     );
     const rpc = f.bridge.pool.get(f.id);
@@ -494,8 +499,8 @@ test(
       t,
       `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('settle');});`,
     );
-    t.after(() => f.mark('settle').catch(() => {}));
-    await f.bridge.send({ session_id: f.id, request_id: 'one', text: 'CANCEL_WAIT' });
+    f.cleanup.push(() => f.mark('settle'));
+    await f.bridge.send({ session_id: f.id, text: 'CANCEL_WAIT' });
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
     const controller = new AbortController(),
@@ -514,11 +519,11 @@ test(
       (
         await f.bridge.send({
           session_id: f.id,
-          request_id: 'after-cancel',
+
           text: 'PRESERVED_QUEUE',
           mode: 'follow_up',
         })
-      ).disposition,
+      ).status,
       'queued',
     );
     f.request.handoff_id = randomUUID();
@@ -537,6 +542,7 @@ test(
       t,
       `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
     );
+    f.cleanup.push(() => f.mark('shutdown-go'));
     const rpc = await f.bridge.pool.resolve(f.session),
       old = structuredClone(rpc.ownerRecord),
       controller = new AbortController();
@@ -550,7 +556,7 @@ test(
     await f.mark('shutdown-go');
     await until(() => !f.bridge.handoffs.has(f.id));
     assert.equal(rpc.child.exitCode, 0);
-    assert.equal((await readClaim(f.config.attachmentDir, f.session)).phase, 'released');
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
   },
 );
 
@@ -560,6 +566,7 @@ test('independent extension input is refused without shutdown', { timeout: 15000
     `pi.registerCommand('start-external',{handler:async()=>{pi.sendUserMessage('EXTERNAL_HELD');}});
     pi.on('before_agent_start',async event=>{if(event.prompt==='EXTERNAL_HELD'){await mark('external');await wait('external-go');}});`,
   );
+  f.cleanup.push(() => f.mark('external-go'));
   const rpc = await f.bridge.pool.resolve(f.session);
   await rpc.command({ type: 'prompt', message: '/start-external' });
   await until(() => exists(path.join(f.dir, 'external')));
@@ -572,6 +579,147 @@ test('independent extension input is refused without shutdown', { timeout: 15000
   await f.mark('external-go');
   await refused;
   await until(() => rpc.settlement.sequence === 1);
+});
+
+test(
+  'owned RPC cancels unsupported dialogs and reports them without approving',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('input',async(event,ctx)=>{
+    if(event.text!=='DIALOGS')return {action:'handled'};
+    ctx.ui.notify('unattended notice');
+    const values=[ctx.hasUI,await ctx.ui.confirm('Approval','Allow?'),await ctx.ui.select('Choice',['yes']),await ctx.ui.input('Text'),await ctx.ui.editor('Edit','draft')];
+    pi.appendEntry('dialog-results',values.map(v=>v??null));
+    return {action:'handled'};
+  });`,
+    );
+    const sent = await f.bridge.send({
+      session_id: f.id,
+
+      text: 'DIALOGS',
+      timeout_ms: 500,
+    });
+    assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
+    assert.equal(sent.status, 'handled');
+    assert.equal(sent.reason, 'EXTENSION_UI_CANCEL_SENT');
+    assert.equal(sent.ui, undefined);
+    await until(async () => (await f.bridge.pool.get(f.id).idleSnapshot()).status === 'idle');
+    assert.deepEqual(
+      (await fs.readFile(f.session.file, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .find((e) => e.customType === 'dialog-results').data,
+      [true, false, null, null, null],
+    );
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await f.bridge.send({ session_id: f.id, text: 'NO_DIALOG' })).status,
+      ),
+      'Expected native prompt admission',
+    );
+  },
+);
+
+test(
+  'CLI input hooks cannot hide independent preflight from the RPC observer',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `
+    pi.registerCommand('start-independent',{handler:async()=>{pi.sendUserMessage('INDEPENDENT_INPUT');}});
+    pi.on('input',async event=>{if(event.text==='INDEPENDENT_INPUT'){await mark('input-held');await wait('input-go');}return {action:'continue'};});
+  `,
+    );
+    f.cleanup.push(() => f.mark('input-go'));
+    const rpc = await f.bridge.pool.resolve(f.session);
+    assert.equal(
+      (await rpc.command({ type: 'prompt', message: '/start-independent' })).disposition,
+      'handled',
+    );
+    await until(() => exists(path.join(f.dir, 'input-held')));
+    assert.equal(rpc.promptAdmission, null);
+    assert.equal((await rpc.state()).isStreaming, false);
+    const observer = new AttachedRuntime(f.config, f.session, rpc.ownerRecord);
+    assert.equal((await observer.state()).nonRpcInputSeen, true);
+    await assert.rejects(transfer(f), /RUNTIME_IDLE_UNCONFIRMED/);
+    assert.equal(rpc.child.stdin.writableEnded, false);
+    await f.mark('input-go');
+    await until(() => rpc.settlement.sequence > 0);
+    assert.ok(
+      (await rpc.entries()).entries.some(
+        (e) =>
+          e.message?.role === 'user' &&
+          JSON.stringify(e.message.content).includes('INDEPENDENT_INPUT'),
+      ),
+    );
+    // Ordering observes admission; it does not invent completion correlation.
+    assert.equal((await rpc.idleSnapshot()).status, 'unconfirmed');
+  },
+);
+
+for (const settings of [false, true])
+  test(
+    settings
+      ? 'prompt settings cannot queue when an input hook starts concurrent work'
+      : 'idle_only cannot queue when an input hook starts concurrent work',
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `
+    pi.on('input',async event=>{if(event.text==='IDLE_RACE'){
+      pi.sendMessage({customType:'race',content:'CONCURRENT',display:false},{triggerTurn:true});
+      await wait('concurrent-started');
+    }return {action:'continue'};});
+    pi.on('before_agent_start',async()=>{await mark('concurrent-started');await wait('concurrent-go');});
+  `,
+      );
+      f.cleanup.push(() => f.mark('concurrent-go'));
+      const result = await f.bridge.send({
+        session_id: f.id,
+
+        text: 'IDLE_RACE',
+        mode: settings ? 'default' : 'idle_only',
+        ...(settings ? { thinking_level: 'off' } : {}),
+      });
+      assert.equal(result.status, 'rejected');
+      assert.equal(result.reason, 'PI_REJECTED');
+      assert.equal((await f.bridge.pool.get(f.id).state()).pendingMessageCount, 0);
+      await f.mark('concurrent-go');
+    },
+  );
+
+test('cancel during pre-EOF recovery drain keeps the writer', { timeout: 15000 }, async (t) => {
+  const f = await fixture(t),
+    rpc = await f.bridge.pool.resolve(f.session),
+    controller = new AbortController();
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers(),
+    drain = rpc.drainAcks;
+  let first = true;
+  f.cleanup.push(() => resume.resolve());
+  t.mock.method(rpc, 'drainAcks', async function () {
+    if (first) {
+      first = false;
+      entered.resolve();
+      await resume.promise;
+    }
+    return drain.call(this);
+  });
+  const joined = transfer(f, { signal: controller.signal }),
+    rejected = assert.rejects(joined, /HANDOFF_CANCELLED/);
+  await entered.promise;
+  await cancel(f); // Observe server-side cancellation before allowing EOF preparation to resume.
+  resume.resolve();
+  await rejected;
+  await until(() => !f.bridge.handoffs.has(f.id));
+  assert.equal(rpc.child.stdin.writableEnded, false);
+  assert.notEqual((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
+  assert.equal(rpc.alive, true);
 });
 
 test(
@@ -594,7 +742,7 @@ test(
     rpc.dispatch = dispatch;
     await assert.rejects(transfer(f), /RUNTIME_EXIT_ABNORMAL/);
     assert.equal(rpc.child.exitCode, 7);
-    assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     const retry = await transfer(f);
     await ownerRequest(f.config, { ...f.request, op: 'handoff_cancel', handoff_id: randomUUID() });
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, retry.generation);
@@ -656,7 +804,7 @@ test('cancel during reservation validation never starts native switching and rel
     release.resolve();
     await joined;
     assert.equal(switches, 0);
-    assert.equal((await readClaim(f.config.attachmentDir, f.session)).phase, 'released');
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
   } finally {
     release.resolve();
     t.mock.restoreAll();
@@ -694,7 +842,7 @@ test('an uncertain native switch exception retains its live reservation instead 
     const held = await readClaim(f.config.attachmentDir, f.session);
     assert.equal(held.phase, 'starting');
     assert.equal(held.owner.pid, process.pid);
-    assert.equal(held.noColdReacquire, true);
+    assert.equal(held.noColdReacquire, undefined);
     assert.ok(notices.some((x) => x.includes('reservation is retained')));
     await assert.rejects(
       reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
@@ -726,13 +874,16 @@ for (const mode of [
       `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('settle');});
     pi.on('session_shutdown',()=>{pi.appendEntry('final-owned-history',{latest:true});});`,
     );
-    const other = await savedSession(f.bridge, { folder_id: 'project', request_id: 'other' }),
+    f.cleanup.push(() => f.mark('settle'));
+    const other = await savedSession(f.bridge),
       sessionB = await f.bridge.session(other.session_id);
     const tuiExtension = path.join(f.dir, 'tui.mjs');
     await fs.writeFile(
       tuiExtension,
       `import fs from 'node:fs/promises';const dir=${JSON.stringify(f.dir)};let veto=${laterVeto};
     export default pi=>{pi.on('session_start',async(event,ctx)=>{if(event.reason==='resume')await fs.writeFile(dir+'/opened.json',JSON.stringify(ctx.sessionManager.getEntries()));});
+      pi.registerCommand('fixture-switch-back',{handler:async(_args,ctx)=>{await ctx.switchSession(${JSON.stringify(sessionB.file)});await fs.writeFile(dir+'/switched-back','yes');}});
+      pi.registerCommand('fixture-switch-conflict',{handler:async(_args,ctx)=>{const result=await ctx.switchSession(${JSON.stringify(f.session.file)});await fs.writeFile(dir+'/conflict.json',JSON.stringify({result,file:ctx.sessionManager.getSessionFile()}));}});
       pi.on('session_before_switch',async event=>{if(event.targetSessionFile===${JSON.stringify(f.session.file)}&&veto){veto=false;return {cancel:true};}});};`,
     );
     const args = [
@@ -778,7 +929,7 @@ for (const mode of [
       owner;
     tui.stdout.on('data', (x) => (terminal += x.toString()));
     tui.stderr.on('data', (x) => (terminal += x.toString()));
-    t.after(async () => {
+    f.cleanup.push(async () => {
       if (owner && (await ownerAlive(owner.owner))) {
         process.kill(owner.owner.pid, 'SIGTERM');
         await waitOwnerExit(owner.owner);
@@ -793,15 +944,28 @@ for (const mode of [
     for (const command of ['bridge-join', 'bridge-join:1']) {
       const denied = await f.bridge.send({
         session_id: sessionB.id,
-        request_id: command,
+
         text: `/${command} ${f.id}`,
       });
       assert.equal(denied.status, 'rejected');
       assert.equal(denied.reason, 'OWNER_LOCAL_COMMAND_REQUIRED');
     }
-    await f.bridge.send({ session_id: f.id, request_id: 'owned', text: 'NATIVE_JOIN_LATEST' });
+    await f.bridge.send({ session_id: f.id, text: 'NATIVE_JOIN_LATEST' });
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
+    if (!laterVeto && !cancelWait) {
+      tui.stdin.write('/fixture-switch-conflict\r');
+      await until(() => exists(path.join(f.dir, 'conflict.json')), 'conflict cancellation');
+      assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.dir, 'conflict.json'), 'utf8')), {
+        result: { cancelled: true },
+        file: sessionB.file,
+      });
+      assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, old.generation);
+      assert.equal(
+        (await readClaim(f.config.attachmentDir, sessionB)).generation,
+        owner.generation,
+      );
+    }
     tui.stdin.write(`/bridge-join ${f.id}\r`);
     await until(() => f.bridge.handoffs.has(f.id), 'join fence');
     await until(() => exists(path.join(f.dir, 'settling')));
@@ -821,7 +985,7 @@ for (const mode of [
       await until(() => terminal.includes('Session switch cancelled'), 'later veto');
       await until(async () => {
         const r = await readClaim(f.config.attachmentDir, f.session);
-        return r?.phase === 'released';
+        return r === null;
       }, 'reservation cleanup');
       // A cancelled native switch is an explicit new request, never an automatic
       // retry loop. The second request opens saved history without another child.
@@ -851,7 +1015,137 @@ for (const mode of [
     assert.equal(local.kind, 'tui');
     assert.equal(local.phase, 'ready');
     assert.equal(local.owner.pid, owner.owner.pid);
-    assert.equal(local.noColdReacquire, true);
+    assert.equal(local.noColdReacquire, undefined);
     assert.equal(f.bridge.pool.get(f.id), null);
     assert.ok((await f.bridge.read({ session_id: f.id })).items.length > 0);
+    if (!laterVeto && !cancelWait) {
+      tui.stdin.write('/fixture-switch-back\r');
+      await until(() => exists(path.join(f.dir, 'switched-back')), 'native switch-away');
+      assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+      assert.equal(
+        (await f.bridge.send({ session_id: f.id, text: 'AFTER_SWITCH_AWAY' })).status,
+        'started',
+      );
+      await until(async () => (await f.bridge.pool.get(f.id).idleSnapshot()).status === 'idle');
+      await f.bridge.pool.stop(f.id);
+      process.kill(owner.owner.pid, 'SIGTERM');
+      await waitOwnerExit(owner.owner);
+      assert.equal(
+        (await f.bridge.send({ session_id: f.id, text: 'AFTER_B_EXIT' })).status,
+        'started',
+      );
+    }
   });
+
+test(
+  'exit during pre-EOF recovery is observed without waiting for another exit event',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(t),
+      rpc = await f.bridge.pool.resolve(f.session);
+    t.mock.method(rpc, 'drainAcks', async () => {
+      if (rpc.exited) return;
+      await new Promise((resolve) => {
+        rpc.child.once('exit', resolve);
+        rpc.child.kill('SIGTERM');
+      });
+    });
+    await assert.rejects(rpc.gracefulExit(), /RUNTIME_EXIT_BEFORE_EOF|RUNTIME_SESSION_CHANGED/);
+    assert.equal(rpc.exited, true);
+    assert.equal(rpc.child.stdin.writableEnded, false);
+  },
+);
+
+test(
+  'startup UI fails with a lifecycle reason before a reader can consume cancellation',
+  { timeout: 20000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_start',async(_event,ctx)=>{await ctx.ui.confirm('Startup','Continue?');await mark('startup-after');});`,
+    );
+    await assert.rejects(f.bridge.pool.resolve(f.session), (error) => {
+      assert.equal(error.code, 'EXTENSION_UI_STARTUP_UNAVAILABLE');
+      assert.deepEqual(error.ui, {
+        cancel_sent: [],
+        completion: 'unconfirmed',
+        unavailable: [{ phase: 'startup', methods: ['confirm'] }],
+      });
+      return true;
+    });
+    const receipt = await f.bridge.create({
+      project: f.cwd,
+
+      text: 'x',
+    });
+    assert.equal(receipt.send.reason, 'EXTENSION_UI_STARTUP_UNAVAILABLE');
+    assert.equal(receipt.send.ui, undefined);
+    assert.equal(await exists(path.join(f.dir, 'startup-after')), false);
+  },
+);
+for (const timeout of [undefined, 100])
+  test(
+    `shutdown UI cannot be confirmed complete after EOF (${timeout})`,
+    { timeout: 10000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `pi.on('session_shutdown',async(_event,ctx)=>{await mark('shutdown-before');await ctx.ui.confirm('Shutdown','Continue?',${timeout === undefined ? 'undefined' : JSON.stringify({ timeout })});await mark('shutdown-after');});`,
+      );
+      const rpc = await f.bridge.pool.resolve(f.session);
+      await assert.rejects(rpc.gracefulExit(), (error) => {
+        assert.equal(error.code, 'EXTENSION_UI_SHUTDOWN_UNAVAILABLE');
+        assert.deepEqual(error.ui.cancel_sent, []);
+        assert.deepEqual(error.ui.unavailable, [{ phase: 'shutdown', methods: ['confirm'] }]);
+        return true;
+      });
+      assert.equal(rpc.exited, true);
+      assert.equal(await exists(path.join(f.dir, 'shutdown-after')), timeout !== undefined);
+    },
+  );
+
+test(
+  'create and late recovery retain observed UI facts while admission remains unknown',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('input',async(event,ctx)=>{await ctx.ui.confirm('Input','Continue?');if(event.text==='LATE_UI'){await mark('ui-held');await wait('ui-go');}return {action:'handled'};});`,
+    );
+    f.cleanup.push(() => f.mark('ui-go'));
+    const success = await f.bridge.create({
+      project: f.cwd,
+
+      text: 'NORMAL_UI',
+    });
+    assert.equal(success.send.reason, 'EXTENSION_UI_CANCEL_SENT');
+    const first = await f.bridge.create({
+      project: f.cwd,
+
+      text: 'LATE_UI',
+      timeout_ms: 50,
+    });
+    assert.equal(first.status, 'unknown');
+    assert.equal(first.send.reason, 'ACK_TIMEOUT');
+    assert.equal(first.send.ui, undefined);
+    await f.mark('ui-go');
+    await until(() => !f.bridge.pool.get(first.session_id)?.promptAdmission);
+  },
+);
+
+test(
+  'shutdown UI refuses a handoff reservation even when the native child exits zero',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async(_event,ctx)=>{await ctx.ui.confirm('Shutdown','Continue?');await mark('unfinished-hook');});`,
+    );
+    const rpc = await f.bridge.pool.resolve(f.session);
+    await assert.rejects(transfer(f), /EXTENSION_UI_SHUTDOWN_UNAVAILABLE/);
+    const claim = await readClaim(f.config.attachmentDir, f.session);
+    assert.equal(rpc.child.exitCode, 0);
+    assert.equal(claim, null);
+    assert.equal(await exists(path.join(f.dir, 'unfinished-hook')), false);
+  },
+);

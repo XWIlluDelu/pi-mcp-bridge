@@ -9,6 +9,7 @@ import {
   privateDirectory,
   processIdentity,
   readClaim,
+  readOwnerRecord,
 } from '../src/attachments.mjs';
 
 async function fixture(t) {
@@ -106,4 +107,32 @@ test('direct lookup still rejects a record for a different native session identi
   const f = await fixture(t);
   await fs.writeFile(f.file, JSON.stringify({ ...f.record, sessionId: 'different' }));
   await assert.rejects(readClaim(f.dir, f.session), { code: 'INVALID_ATTACHMENT_RECORD' });
+});
+
+test('protocol mismatches stay local to their path or exact process identity', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.file, JSON.stringify({ ...f.record, unexpected: true }));
+  await assert.rejects(readClaim(f.dir, f.session), {
+    code: 'ATTACHMENT_PROTOCOL_MISMATCH',
+  });
+  await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), {
+    code: 'ATTACHMENT_PROTOCOL_MISMATCH',
+  });
+  const unrelated = { file: path.join(f.dir, 'unrelated.jsonl') };
+  await assertNoOtherLiveOwner(f.dir, unrelated);
+  const differentOwner = { ...f.record.owner, start: 'different-process-start' };
+  assert.equal(await readOwnerRecord(f.dir, f.file, undefined, { owner: differentOwner }), null);
+  await assert.rejects(readOwnerRecord(f.dir, f.file, undefined, { owner: f.record.owner }), {
+    code: 'ATTACHMENT_PROTOCOL_MISMATCH',
+  });
+  // Unprovable scope must never hide a possible writer.
+  for (const record of [
+    { ...f.record, file: null },
+    { ...f.record, owner: null },
+  ]) {
+    await fs.writeFile(f.file, JSON.stringify(record));
+    await assert.rejects(assertNoOtherLiveOwner(f.dir, unrelated), {
+      code: 'INVALID_ATTACHMENT_RECORD',
+    });
+  }
 });

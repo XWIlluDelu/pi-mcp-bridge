@@ -46,7 +46,7 @@ export default function ownerPermissions(pi) {
         let snapshot = await readOwnerConfig(file);
         const cwd = await fs.realpath(ctx.cwd);
         const choice = await ctx.ui.select(
-          `MCP permissions — ${snapshot.config.principal}`,
+          'MCP permissions',
           ['This session', 'This project', 'Another configured project', 'Defaults'],
           options,
         );

@@ -38,6 +38,8 @@ export function isolatedRuntime(dir) {
     piExecutable: nativePiCli,
     piRuntime: { agentDir: path.join(dir, 'isolated-agent'), inheritEnv: [], tools: [] },
     piArgs: [
+      '--session-dir',
+      path.join(dir, 'sessions'),
       '--offline',
       '--no-context-files',
       '--no-skills',

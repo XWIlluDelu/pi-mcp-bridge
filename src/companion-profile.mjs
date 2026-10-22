@@ -1,6 +1,5 @@
 // Daily native startup reads the existing owner scope; explicit IPC remains
 // available for hosts that supply their own registration/admission contract.
-import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { readOwnerConfig } from './owner-config.mjs';
@@ -24,9 +23,6 @@ export async function companionProfile(env = process.env) {
     if (!explicitFile && error.code === 'ENOENT') return null;
     throw error;
   }
-  const stat = await fs.stat(file);
-  if ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid())
-    throw new Error('OWNER_CONFIG_NOT_PRIVATE');
   const dir = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
   if (env.PI_MCP_ATTACH_DIR && env.PI_MCP_ATTACH_DIR !== dir)
     throw new Error('HANDOFF_DIRECTORY_MISMATCH');

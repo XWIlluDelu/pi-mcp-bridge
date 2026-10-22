@@ -1,22 +1,29 @@
 // Ephemeral text/thinking observation only. Final native entries remain the
 // authority; this is neither a transcript nor a provider-payload reconstruction.
 const MAX_UNITS = 65536;
+const BLOCK_OVERHEAD = 64;
 export class LiveMessageObserver {
   constructor(source) {
     this.source = source;
+    this.epoch = 0;
     this.blocks = new Map();
     this.active = false;
     this.truncated = false;
     this.observedAt = null;
   }
   reset() {
+    this.epoch++;
     this.blocks.clear();
     this.active = false;
     this.truncated = false;
     this.observedAt = new Date().toISOString();
   }
   update(event) {
-    if (event.type === 'agent_settled') {
+    if (
+      event.type === 'agent_start' ||
+      event.type === 'agent_settled' ||
+      (event.type === 'message_start' && event.message?.role === 'user')
+    ) {
       this.reset();
       return;
     }
@@ -33,20 +40,23 @@ export class LiveMessageObserver {
     if (!this.active) return; // Ignore deltas from a stream we did not observe start.
     this.observedAt = new Date().toISOString();
     if (event.message?.role === 'assistant' && Array.isArray(event.message.content)) {
-      this.blocks.clear();
-      event.message.content.forEach((block, index) => {
-        if (block.type === 'text' || block.type === 'thinking')
-          this.replace(index, block.type, block[block.type] ?? '');
-      });
+      const content = event.message.content;
+      // Cumulative snapshots are already in native order. Walk the tail once
+      // rather than sorting/pruning the growing map after every block.
+      this.retain(
+        (function* () {
+          for (let index = content.length - 1; index >= 0; index--) {
+            const block = content[index],
+              text = block[block.type] ?? '';
+            if (['text', 'thinking'].includes(block.type) && typeof text === 'string')
+              yield [index, { type: block.type, text }];
+          }
+        })(),
+      );
       return;
     }
     const update = event.assistantMessageEvent;
-    if (
-      !Number.isSafeInteger(update?.contentIndex) ||
-      update.contentIndex < 0 ||
-      update.contentIndex > 1024
-    )
-      return;
+    if (!Number.isSafeInteger(update?.contentIndex) || update.contentIndex < 0) return;
     const kind = update.type?.startsWith('text_')
       ? 'text'
       : update.type?.startsWith('thinking_')
@@ -64,15 +74,36 @@ export class LiveMessageObserver {
   }
   replace(index, type, text) {
     if (typeof text !== 'string') return;
-    let used = 0;
-    for (const [key, value] of this.blocks) if (key !== index) used += value.text.length;
-    const available = Math.max(0, MAX_UNITS - used),
-      end = Math.min(text.length, available);
-    // Avoid returning half of a surrogate pair at the observation memory cap.
-    const safe =
-      end > 0 && end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]) ? end - 1 : end;
-    if (safe < text.length) this.truncated = true;
-    this.blocks.set(index, { type, text: text.slice(0, safe) });
+    this.blocks.set(index, { type, text });
+    this.retain([...this.blocks].sort(([a], [b]) => b - a));
+  }
+  retain(entries) {
+    const retained = new Map();
+    let remaining = MAX_UNITS;
+    for (const [index, block] of entries) {
+      // Charge block metadata as well as text: even empty blocks consume space.
+      const allowance = remaining - BLOCK_OVERHEAD;
+      if (allowance < 0 || (!allowance && block.text.length)) {
+        this.truncated = true;
+        break;
+      }
+      let text = block.text;
+      if (text.length > allowance) {
+        this.truncated = true;
+        let start = text.length - allowance;
+        if (
+          start > 0 &&
+          /[\uDC00-\uDFFF]/.test(text[start]) &&
+          /[\uD800-\uDBFF]/.test(text[start - 1])
+        )
+          start++;
+        // Detach the tail from the growing cumulative message's backing string.
+        text = structuredClone(text.slice(start));
+      }
+      retained.set(index, { type: block.type, text });
+      remaining -= BLOCK_OVERHEAD + text.length;
+    }
+    this.blocks = retained;
   }
   snapshot() {
     return {

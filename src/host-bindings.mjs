@@ -1,31 +1,29 @@
-// Bind existing owners through Pi 1.1 public APIs. These helpers never open a
+// Bind existing owners through public SDK/RPC APIs. These helpers never open a
 // session, spawn a process, read stdio, or access private admission hooks.
+import { requireInterruptCompaction } from './compact.mjs';
 import { nativeBashResult } from './bash-execution.mjs';
-import { SEND_MODES, assertImageModel } from './prompt-input.mjs';
-import { modelPage, sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
+import {
+  SEND_MODES,
+  assertImageModel,
+  hasPromptSettings,
+  promptOptions as options,
+} from './prompt-input.mjs';
+import { modelState } from './models.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown = () => ({
   status: 'unknown',
-  dispatch: 'submitted',
   reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-  completion: 'not_tracked',
 });
-const options = (mode) =>
-  ['default', 'steer'].includes(mode)
-    ? { streamingBehavior: 'steer' }
-    : mode === 'follow_up'
-      ? { streamingBehavior: 'followUp' }
-      : {};
 const identity = (state) => ({ sessionFile: state.sessionFile, sessionId: state.sessionId });
 function assertIdentity(before, after) {
   if (before.sessionFile !== after.sessionFile || before.sessionId !== after.sessionId)
     throw new Error('RUNTIME_SESSION_CHANGED');
 }
 function tracker(release, onError) {
-  const pending = new Set();
-  function track(work) {
+  const pending = new Map();
+  function track(work, kind) {
     const promise = Promise.resolve(work);
-    pending.add(promise);
+    pending.set(promise, kind);
     promise.then(
       () => pending.delete(promise),
       (error) => {
@@ -40,6 +38,9 @@ function tracker(release, onError) {
   }
   return {
     track,
+    get submitting() {
+      return [...pending.values()].includes('submit');
+    },
     ...(release
       ? {
           release: async () => {
@@ -47,7 +48,7 @@ function tracker(release, onError) {
             // the writer. Waiting only our dispatched promises cannot prove release.
             const outcome = await release();
             if (outcome?.released !== true) throw new Error('HOST_RELEASE_UNCONFIRMED');
-            await Promise.allSettled([...pending]);
+            await Promise.allSettled([...pending.keys()]);
             return { released: true };
           },
         }
@@ -59,73 +60,59 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   const tracked = tracker(release, onError);
   const state = async () => ({
     ...identity(session),
-    isIdle: session.isIdle,
+    ...modelState(session),
+    ...('sessionName' in session ? { sessionName: session.sessionName ?? null } : {}),
+    isIdle: session.isIdle && !tracked.submitting,
     isStreaming: session.isStreaming,
     isCompacting: session.isCompacting,
+    isBashRunning: session.isBashRunning,
     pendingMessageCount: session.pendingMessageCount,
   });
   return {
     state,
     snapshot: async () => {
       const before = identity(session);
-      const entries = structuredClone(session.sessionManager.getEntries()),
+      const entries = session.sessionManager.getEntries(),
         leafId = session.sessionManager.getLeafId();
       assertIdentity(before, identity(session));
       return { ...before, entries, leafId };
     },
     supportsImages: true,
-    models:
-      typeof session.modelRuntime?.getAvailableSnapshot === 'function'
-        ? async (args) =>
-            modelPage(
-              session.modelRuntime.getAvailableSnapshot(),
-              session.model,
-              session.thinkingLevel,
-              args,
-            )
-        : undefined,
-    selectModel:
-      typeof session.setModel === 'function'
-        ? async ({ model, thinking_level, beforeDispatch }) => {
-            const target = session.modelRuntime
-              .getAvailableSnapshot()
-              .find((m) => sameModel(m, model ?? session.model));
-            if (!target) throw new Error('MODEL_UNAVAILABLE');
-            assertThinkingLevel(target, thinking_level);
-            if (thinking_level !== undefined && typeof session.setThinkingLevel !== 'function')
-              throw new Error('THINKING_LEVEL_UNSUPPORTED');
-            const previous = session.thinkingLevel;
-            let mutationStarted = false;
+    compact:
+      typeof session.compact === 'function'
+        ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
+            const before = await state();
+            assertIdentity(expected, before);
+            requireInterruptCompaction({ interrupt }, before);
             beforeDispatch?.();
+            let result;
             try {
-              if (model && !sameModel(session.model, target)) {
-                mutationStarted = true;
-                await session.setModel(target, { persist: false });
-              }
-              beforeDispatch?.();
-              if (thinking_level !== undefined) {
-                mutationStarted = true;
-                session.setThinkingLevel(thinking_level, { persist: false });
-              }
-              return modelSetting(session.model, session.thinkingLevel, previous, thinking_level);
-            } catch (error) {
-              // A failed request may already have changed native settings, even
-              // when each dispatched setter completed successfully.
-              if (!mutationStarted) throw error;
-              throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
+              result = await tracked.track(session.compact(instructions));
+            } catch {
+              throw new Error('PI_REJECTED');
             }
+            assertIdentity(before, await state());
+            return result;
           }
         : undefined,
-    submit: async ({ text, images, model, mode = 'default', beforeDispatch }) => {
-      if (model) throw new Error('MODEL_SELECTION_UNSUPPORTED');
+    submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
+      if (hasPromptSettings({ model, thinking_level }))
+        throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
       assertImageModel(images, session.model);
       beforeDispatch?.();
-      if (mode === 'idle_only' && !session.isIdle) return { status: 'skipped', reason: 'busy' };
+      if (
+        mode === 'idle_only' &&
+        (tracked.submitting || !session.isIdle || session.pendingMessageCount > 0)
+      )
+        return { status: 'skipped', reason: 'busy' };
       // Public prompt() resolves at completion, not at admission. Even a
       // synchronous throw after entering host code cannot prove no side effect.
       try {
-        tracked.track(session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }));
+        tracked.track(
+          session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }),
+          'submit',
+        );
       } catch (error) {
         try {
           onError?.(error);
@@ -167,7 +154,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       }
       assertIdentity(before, identity(session));
       await onResult(nativeBashResult(result));
-      return { completed: true };
+      return nativeBashResult(result);
     },
     stop: async ({ onWithdraw, ...expected } = {}) => {
       if (
@@ -179,12 +166,22 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       assertIdentity(expected, before);
       const withdrawn = session.clearQueue(),
         cancellation = tracked.track(session.abort());
-      session.abortBash();
-      await onWithdraw(withdrawn);
-      await cancellation;
+      try {
+        session.abortBash();
+        await onWithdraw(withdrawn);
+        await cancellation;
+      } finally {
+        // Keep adapter admission/release fenced even when capture fails first.
+        // allSettled preserves that failure if cancellation also rejects.
+        await Promise.allSettled([cancellation]);
+      }
       assertIdentity(before, identity(session));
       await onWithdraw(session.clearQueue());
-      return stopReceipt({ acknowledgement: 'native_ack', coverage: 'agent_and_bash' });
+      return stopReceipt({
+        status: 'accepted',
+        acknowledgement: 'native_ack',
+        coverage: 'agent_and_bash',
+      });
     },
     ...(tracked.release
       ? {
@@ -207,12 +204,13 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
 }
 
 export function createRpcHostBinding(client, { release, onError } = {}) {
-  let selectionUnconfirmed = false;
   const tracked = tracker(release, onError);
   const state = async () => {
     const value = await client.getState();
     return {
       ...identity(value),
+      ...modelState(value),
+      sessionName: value.sessionName ?? null,
       isStreaming: value.isStreaming,
       isCompacting: value.isCompacting,
       pendingMessageCount: value.pendingMessageCount,
@@ -227,70 +225,32 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       assertIdentity(before, after);
       return {
         ...identity(after),
-        entries: structuredClone(snapshot.entries),
+        entries: snapshot.entries,
         leafId: snapshot.leafId,
       };
     },
     supportsImages: true,
-    models:
-      typeof client.getAvailableModels === 'function'
-        ? async (args) => {
-            const models = await client.getAvailableModels(),
-              state = await client.getState();
-            return modelPage(models, state.model, state.thinkingLevel, args);
-          }
-        : undefined,
-    selectModel:
-      typeof client.setModel === 'function'
-        ? async ({ model, thinking_level, beforeDispatch }) => {
-            if (selectionUnconfirmed) throw new Error('MODEL_SELECTION_PENDING');
-            const initial = await client.getState();
-            const target = (await client.getAvailableModels()).find((m) =>
-              sameModel(m, model ?? initial.model),
-            );
-            if (!target) throw new Error('MODEL_UNAVAILABLE');
-            assertThinkingLevel(target, thinking_level);
-            if (thinking_level !== undefined && typeof client.setThinkingLevel !== 'function')
-              throw new Error('THINKING_LEVEL_UNSUPPORTED');
-            let mutationStarted = false;
+    compact:
+      typeof client.compact === 'function'
+        ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
+            const before = await state();
+            assertIdentity(expected, before);
+            requireInterruptCompaction({ interrupt }, before);
             beforeDispatch?.();
+            let result;
             try {
-              if (model && !sameModel(initial.model, target)) {
-                mutationStarted = true;
-                selectionUnconfirmed = true;
-                await tracked.track(client.setModel(target.provider, target.id));
-                selectionUnconfirmed = false;
-              }
-              beforeDispatch?.();
-              if (thinking_level !== undefined) {
-                mutationStarted = true;
-                selectionUnconfirmed = true;
-                await tracked.track(client.setThinkingLevel(thinking_level));
-                selectionUnconfirmed = false;
-              }
-              const selected = await client.getState();
-              return modelSetting(
-                selected.model,
-                selected.thinkingLevel,
-                initial.thinkingLevel,
-                thinking_level,
-              );
-            } catch (error) {
-              // Request outcome and future-input safety are separate: a failed
-              // read/check after an ACK can follow a real change, but only an
-              // unconfirmed setter keeps selectionUnconfirmed fenced.
-              if (!mutationStarted) throw error;
-              // RpcClient's plain Error cannot distinguish a negative ACK from a
-              // timed-out command still running. Don't parse its message or clear
-              // the fence just because a later state read succeeds.
-              throw Object.assign(new Error('MODEL_SELECTION_FAILED'), { uncertain: true });
+              result = await tracked.track(client.compact(instructions));
+            } catch {
+              throw new Error('HOST_COMPACT_UNCERTAIN');
             }
+            assertIdentity(before, await state());
+            return result;
           }
         : undefined,
-    submit: async ({ text, images, model, mode = 'default', beforeDispatch }) => {
-      if (model) throw new Error('MODEL_SELECTION_UNSUPPORTED');
+    submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
+      if (hasPromptSettings({ model, thinking_level }))
+        throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
-      if (selectionUnconfirmed) throw new Error('MODEL_SELECTION_PENDING');
       if (images) assertImageModel(images, (await client.getState()).model);
       if (mode === 'idle_only') {
         const observed = await state();
@@ -303,7 +263,7 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
           client.prompt(text, images, options(mode).streamingBehavior),
         );
         if (!['started', 'queued', 'handled'].includes(disposition)) return unknown();
-        return { status: 'accepted', disposition, completion: 'not_tracked' };
+        return { status: 'accepted', disposition };
       } catch (error) {
         // Official RpcClient exposes both negative ACKs and transport failures
         // as plain Errors. Never infer rejection by parsing a raw error string.
@@ -324,7 +284,7 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       const result = await tracked.track(client.bash(command));
       assertIdentity(before, await state());
       await onResult(nativeBashResult(result));
-      return { completed: true };
+      return nativeBashResult(result);
     },
     stop: async ({ onWithdraw, ...expected } = {}) => {
       if (

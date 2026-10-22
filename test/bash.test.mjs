@@ -11,21 +11,21 @@ import { makeServer } from '../src/server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { validateGrants } from '../src/owner-config.mjs';
+import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-bash-api-')),
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const rule = { folder: cwd, list: true, read: true, send: true, stop: true, create: true },
     config = {
-      principal: 'bash-api',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'project', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [rule],
     };
   const bridge = await new Bridge(config, async () => assert.fail('no fallback writer')).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const made = await savedSession(bridge),
     saved = await bridge.session(made.session_id);
   const controller = await reserveHostSession({
     attachmentDir: bridge.pool.attachmentDir,
@@ -39,13 +39,13 @@ async function fixture(t) {
     submit: async () => ({ status: 'unknown' }),
     stop: async ({ onWithdraw }) => {
       await onWithdraw({ steering: [], followUp: [] });
-      return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+      return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
     },
     bash: async ({ beforeDispatch, onResult }) => {
       beforeDispatch();
       calls++;
       await onResult({ output, exitCode: 0, cancelled: false, truncated: false });
-      return { completed: true };
+      return { output, exitCode: 0, cancelled: false, truncated: false };
     },
   };
   await controller.ready(callbacks);
@@ -64,84 +64,34 @@ async function fixture(t) {
     client.callTool({ name: 'command', arguments: { session_id: saved.id, ...args } });
   return { bridge, config, rule, saved, client, call, calls: () => calls, callbacks, output };
 }
-test('MCP native bash switch is independent, defaults off and gates execution/replay at backend', async (t) => {
+test('MCP command permission is independent and output is bounded without continuation', async (t) => {
   const f = await fixture(t);
-  assert.ok((await f.client.listTools()).tools.some((tool) => tool.name === 'command'));
-  assert.equal((await f.call({ request_id: 'disabled', command: 'must not run' })).isError, true);
+  assert.equal((await f.call({ command: 'must not run' })).isError, true);
   assert.equal(f.calls(), 0);
   validateGrants([
     { folder: f.saved.cwd, command: true },
     { session_id: f.saved.id, command: null },
   ]);
-  assert.throws(() => validateGrants([{ folder: f.saved.cwd, bash: 'enabled' }]));
+  assert.throws(() => validateGrants([{ folder: f.saved.cwd, command: 'enabled' }]));
   Object.assign(f.rule, { command: true, send: false, stop: false, read: false });
-  let response = await f.call({
-    request_id: 'own-result',
-    command: 'native command',
-    max_chars: 512,
-  });
+  const response = await f.call({ command: 'native command', max_chars: 512 });
   assert.ok(!response.isError);
-  let result = response.structuredContent,
-    output = result.output;
+  const result = response.structuredContent;
   assert.equal(result.exitCode, 0);
   assert.equal(result.truncated, false);
-  assert.ok(result.next_cursor);
-  for (const command of [undefined, 'native command']) {
-    const bad = await f.call({ request_id: 'new-binding', command, cursor: result.next_cursor });
-    assert.equal(bad.isError, true);
-    assert.equal(JSON.parse(bad.content[0].text).error.code, 'RECEIPT_NOT_FOUND');
-    assert.equal(f.calls(), 1, 'A misbound continuation must not execute a new command');
-    assert.equal(
-      await f.bridge.journal.get('new-binding'),
-      null,
-      'A missing receipt lookup must not create an uncertain mutation',
-    );
-  }
-  const changed = await f.call({
-    request_id: 'own-result',
-    command: 'different',
-    cursor: result.next_cursor,
-  });
-  assert.equal(changed.isError, true);
-  assert.equal(JSON.parse(changed.content[0].text).error.code, 'REQUEST_ID_CONFLICT');
-  const repeated = await f.call({
-    request_id: 'own-result',
-    command: 'native command',
-    cursor: result.next_cursor,
-    max_chars: 512,
-  });
-  assert.ok(!repeated.isError);
+  assert.equal(result.output_complete, false);
+  assert.ok(f.output.startsWith(result.output));
+  assert.ok(JSON.stringify({ output: result.output }).length <= 512);
+  assert.equal((await f.call({})).isError, true);
   assert.equal(f.calls(), 1);
-  while (result.next_cursor) {
-    response = await f.call({
-      request_id: 'own-result',
-      cursor: result.next_cursor,
-      max_chars: 32768,
-    });
-    assert.ok(!response.isError);
-    result = response.structuredContent;
-    output += result.output;
-  }
-  assert.equal(output, f.output);
-  assert.equal(f.calls(), 1);
-  assert.equal(
-    (await f.bridge.send({ session_id: f.saved.id, request_id: 'prompt-denied', text: 'prompt' }))
-      .status,
-    'rejected',
-  );
   f.rule.command = false;
-  assert.equal((await f.call({ request_id: 'own-result' })).isError, true);
+  assert.equal((await f.call({ command: 'denied' })).isError, true);
   assert.equal(f.calls(), 1);
   f.rule.command = true;
-  assert.equal(
-    (await f.call({ request_id: 'own-result' })).structuredContent.total_text_units,
-    f.output.length,
-  );
-  assert.equal(f.calls(), 1);
-  const wrong = await f.call({ request_id: 'own-result', command: 'different' });
-  assert.equal(wrong.isError, true);
+  assert.equal((await f.call({ command: 'native command', max_chars: 32768 })).isError, undefined);
+  assert.equal(f.calls(), 2);
 });
-test('native bash ACK uncertainty retains captured output and never repeats execution', async (t) => {
+test('connection loss after received native bash output retains it without repeating execution', async (t) => {
   const f = await fixture(t),
     finish = Promise.withResolvers(),
     entered = Promise.withResolvers();
@@ -155,20 +105,30 @@ test('native bash ACK uncertainty retains captured output and never repeats exec
       truncated: false,
     });
     await finish.promise;
-    return { completed: true };
+    return { output: 'result before lost ACK', exitCode: 0, cancelled: false, truncated: false };
   };
+  const received = dropPartialReply(t);
   try {
-    const request = f.call({ request_id: 'slow-ack', command: 'fixture', timeout_ms: 50 });
+    const request = f.client.callTool({
+      name: 'batch',
+      arguments: {
+        operations: [{ op: 'command', args: { session_id: f.saved.id, command: 'fixture' } }],
+      },
+    });
     await entered.promise;
+    assert.equal((await received).output, 'result before lost ACK');
     assert.equal(
-      (await f.call({ request_id: 'concurrent', command: 'do not queue' })).structuredContent
-        .reason,
+      (await f.call({ command: 'do not queue' })).structuredContent.reason,
       'BASH_IN_PROGRESS',
     );
-    const result = (await request).structuredContent;
+    const result = (await request).structuredContent.results[0].result;
     assert.equal(result.status, 'unknown');
     assert.equal(result.output, 'result before lost ACK');
-    assert.deepEqual((await f.call({ request_id: 'slow-ack' })).structuredContent, result);
+    assert.equal(
+      result.output_complete,
+      true,
+      'Known output coverage is distinct from an uncertain final ACK',
+    );
   } finally {
     finish.resolve();
   }
@@ -178,8 +138,7 @@ test('bash respects the handoff fence before and after runtime lookup', async (t
   const f = await fixture(t);
   f.rule.command = true;
   f.bridge.handoffs.set(f.saved.id, {});
-  let result = (await f.call({ request_id: 'join-pending', command: 'not admitted' }))
-    .structuredContent;
+  let result = (await f.call({ command: 'not admitted' })).structuredContent;
   assert.equal(result.status, 'rejected');
   assert.equal(result.reason, 'HANDOFF_PENDING');
   assert.equal(f.calls(), 0);
@@ -193,7 +152,7 @@ test('bash respects the handoff fence before and after runtime lookup', async (t
     await finish.promise;
     return runtime;
   });
-  const pending = f.call({ request_id: 'join-during-lookup', command: 'not admitted' });
+  const pending = f.call({ command: 'not admitted' });
   await entered.promise;
   f.bridge.handoffs.set(f.saved.id, {});
   finish.resolve();
@@ -202,4 +161,31 @@ test('bash respects the handoff fence before and after runtime lookup', async (t
   assert.equal(result.reason, 'HANDOFF_PENDING');
   assert.equal(f.calls(), 0);
   f.bridge.handoffs.delete(f.saved.id);
+});
+
+test('shutdown drains already admitted inline command output instead of discarding it', async (t) => {
+  const f = await fixture(t),
+    entered = Promise.withResolvers(),
+    finish = Promise.withResolvers();
+  f.rule.command = true;
+  f.callbacks.bash = async ({ onResult }) => {
+    const value = {
+      output: 'known during shutdown',
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+    };
+    await onResult(value);
+    entered.resolve();
+    await finish.promise;
+    return value;
+  };
+  const pending = f.call({ command: 'fixture' });
+  await entered.promise;
+  const closing = f.bridge.close();
+  finish.resolve();
+  const result = await pending;
+  assert.equal(result.structuredContent.status, 'accepted');
+  assert.equal(result.structuredContent.output, 'known during shutdown');
+  await closing;
 });

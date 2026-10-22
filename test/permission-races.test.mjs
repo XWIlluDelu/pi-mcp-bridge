@@ -4,18 +4,20 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
+import { withdrawalCollector } from '../src/stop-execution.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { fixture as nativeFixture } from './fixtures/model-runtime.mjs';
+import { callBridgeTool } from '../src/protocol.mjs';
+import { completedEntries, fixture as nativeFixture } from './fixtures/model-runtime.mjs';
 for (const operation of ['send', 'create', 'command'])
   test(
-    operation + ' reauthorizes at native dispatch after a slow identity observation',
+    operation + ' retains admission permissions through slow native identity observation',
     async (t) => {
       const f = await nativeFixture(t),
         { bridge, id } = f;
       f.config.grants[0].command = true;
       await fs.writeFile(f.configFile, JSON.stringify(f.config));
-      await bridge.models({ session_id: id, start: true });
+      await bridge.pool.resolve(await bridge.session(id));
       let revoked = false;
       const dispatched = [];
       function intercept(runtime) {
@@ -39,41 +41,123 @@ for (const operation of ['send', 'create', 'command'])
         };
       } else intercept(bridge.pool.get(id));
       const args = {
-        request_id: 'dispatch-revoke',
         ...(operation === 'create'
-          ? { project: f.cwd, text: 'NEVER' }
+          ? { project: f.cwd, text: 'ADMITTED' }
           : operation === 'send'
-            ? { session_id: id, text: 'NEVER' }
-            : { session_id: id, command: 'printf NEVER' }),
+            ? { session_id: id, text: 'ADMITTED' }
+            : { session_id: id, command: 'printf ADMITTED' }),
       };
-      let result;
-      if (operation === 'command') {
-        await assert.rejects(bridge.command(args), /NOT_FOUND_OR_DENIED/);
-        result = (await bridge.journal.get(args.request_id)).receipt;
-      } else result = await bridge[operation](args);
-      assert.equal(result.status, 'rejected');
-      assert.equal((result.send ?? result).reason, 'NOT_FOUND_OR_DENIED');
-      assert.deepEqual(dispatched, []);
+      const result = await bridge[operation](args);
+      assert.equal(
+        result.status,
+        operation === 'command' ? 'accepted' : 'started',
+        JSON.stringify(result),
+      );
+      assert.deepEqual(dispatched, [operation === 'command' ? 'bash' : 'prompt']);
+      const denied = await callBridgeTool(bridge, operation, { ...args });
+      assert.match(JSON.stringify(denied), /NOT_FOUND_OR_DENIED/);
+      assert.equal(dispatched.length, 1);
       if (operation === 'create') {
         assert.equal(result.created, true);
-        assert.equal(
-          (await bridge.pool.get(result.session_id).entries()).entries.some(
-            (e) => e.message?.role === 'user',
-          ),
-          false,
-        );
+        const entries = await completedEntries(bridge, result.session_id);
+        assert.ok(entries.some((e) => e.message?.role === 'user'));
       }
     },
   );
+for (const operation of ['command', 'stop'])
+  test(
+    operation +
+      ' retains its permission snapshot through inline output delivery; new calls reauthorize',
+    { timeout: 15000 },
+    async (t) => {
+      const f = await nativeFixture(t),
+        { bridge, id } = f,
+        marker = 'SYNTHETIC_' + operation.toUpperCase() + '_SECRET ';
+      f.config.grants[0].command = true;
+      f.config.grants[0].read = false;
+      const allowed = structuredClone(f.config);
+      await fs.writeFile(f.configFile, JSON.stringify(allowed));
+      await bridge.pool.resolve(await bridge.session(id));
+      const runtime = bridge.pool.get(id),
+        dispatch = runtime.dispatch.bind(runtime);
+      let executions = 0;
+      t.mock.method(runtime, 'dispatch', (input, ...rest) => {
+        if (input.type === (operation === 'command' ? 'bash' : 'abort')) executions++;
+        return dispatch(input, ...rest);
+      });
+      if (operation === 'stop') {
+        await bridge.send({ session_id: id, text: 'HOLD_MODEL' });
+        await bridge.send({
+          session_id: id,
+
+          text: marker.repeat(100),
+          mode: 'follow_up',
+        });
+      }
+      const method = operation === 'command' ? 'executeBash' : 'stopExecution',
+        native = runtime[method].bind(runtime);
+      let blocked;
+      t.mock.method(runtime, method, async (...args) => {
+        const result = await native(...args);
+        if (blocked) {
+          const wait = blocked;
+          blocked = null;
+          wait.entered.resolve();
+          await wait.release.promise;
+        }
+        return result;
+      });
+      const base = { session_id: id, max_chars: 256 };
+      const revokeDuringRead = async (args) => {
+        const wait = {
+          entered: Promise.withResolvers(),
+          release: Promise.withResolvers(),
+        };
+        blocked = wait;
+        const pending = callBridgeTool(bridge, operation, args);
+        try {
+          await wait.entered.promise;
+          const revoked = structuredClone(allowed);
+          revoked.grants[0][operation] = false;
+          await fs.writeFile(f.configFile, JSON.stringify(revoked));
+          wait.release.resolve();
+          const response = await pending;
+          assert.ok(!response.isError, JSON.stringify(response));
+          assert.ok(JSON.stringify(response).includes(marker.trim()));
+          const denied = await callBridgeTool(bridge, operation, args);
+          assert.equal(denied.isError, true);
+          assert.equal(JSON.parse(denied.content[0].text).error.code, 'NOT_FOUND_OR_DENIED');
+          assert.ok(!JSON.stringify(denied).includes(marker.trim()));
+        } finally {
+          wait.release.resolve();
+          await pending;
+          await fs.writeFile(f.configFile, JSON.stringify(allowed));
+        }
+      };
+      try {
+        await revokeDuringRead({
+          ...base,
+          ...(operation === 'command'
+            ? { command: "printf '%s' '" + marker.repeat(100) + "'" }
+            : {}),
+        });
+        assert.equal(executions, 1, 'Permission denial must not execute native work');
+      } finally {
+        t.mock.restoreAll();
+      }
+    },
+  );
+
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-permission-race-'),
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const config = {
-    principal: 'test',
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'p', path: cwd }],
+    piRuntime: { agentDir: path.join(dir, 'agent'), inheritEnv: [] },
+    piArgs: ['--session-dir', path.join(dir, 'sessions')],
+    folders: [{ path: cwd }],
     defaults: {
       ...denyAllPermissions(),
       list: true,
@@ -84,7 +168,7 @@ async function fixture(t) {
     },
   };
   const configFile = path.join(dir, 'config.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
+  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const calls = [],
     runtime = {
       alive: true,
@@ -107,7 +191,7 @@ async function fixture(t) {
   };
   return { bridge, cwd, config, runtime, calls, update };
 }
-test('send reauthorizes after a blocked cold-start before native dispatch', async (t) => {
+test('send retains admission permissions through blocked cold startup', async (t) => {
   const f = await fixture(t),
     seed = await savedSession(f.bridge),
     entered = Promise.withResolvers(),
@@ -119,18 +203,25 @@ test('send reauthorizes after a blocked cold-start before native dispatch', asyn
   };
   const pending = f.bridge.send({
     session_id: seed.session_id,
-    request_id: 'revoke',
-    text: 'must not dispatch',
+
+    text: 'admitted before revocation',
   });
   await entered.promise;
   await f.update((c) => {
     c.defaults.send = false;
   });
   release.resolve();
-  assert.equal((await pending).reason, 'NOT_FOUND_OR_DENIED');
-  assert.deepEqual(f.calls, []);
+  assert.ok(
+    ['started', 'queued', 'handled'].includes((await pending).status),
+    'Expected native prompt admission',
+  );
+  assert.deepEqual(f.calls, ['admitted before revocation']);
+  assert.equal(
+    (await f.bridge.send({ session_id: seed.session_id, text: 'denied' })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
 });
-test('list rechecks a parent reference after a slow child status observation', async (t) => {
+test('list keeps parent references from its snapshot through slow child status', async (t) => {
   const f = await fixture(t),
     parent = await savedSession(f.bridge),
     child = await savedSession(f.bridge);
@@ -156,15 +247,17 @@ test('list rechecks a parent reference after a slow child status observation', a
   release.resolve();
   const result = await pending;
   assert.equal(result.sessions.length, 1);
-  assert.equal(result.sessions[0].parent_session_id, null);
+  assert.equal(result.sessions[0].parent_session_id, parent.session_id);
+  const fresh = await f.bridge.list({ session_id: child.session_id });
+  assert.equal(fresh.sessions[0].parent_session_id, null);
 });
 test('deleted-file receipt replay requires current authorization without needing the original file', async (t) => {
   const f = await fixture(t),
     seed = await savedSession(f.bridge),
-    args = { session_id: seed.session_id, request_id: 'delete' };
+    args = { session_id: seed.session_id };
   const first = await f.bridge.delete(args);
   assert.equal(first.status, 'deleted');
-  assert.deepEqual(await f.bridge.delete(args), first);
+
   await f.update((c) => {
     c.defaults.delete = false;
   });
@@ -174,31 +267,34 @@ test('deleted-file receipt replay requires current authorization without needing
   await f.update((c) => {
     c.grants = [{ session_id: seed.session_id, delete: true }];
   });
-  assert.deepEqual(await f.bridge.delete(args), first);
 });
 test('create holds the new session lane until its initial prompt is admitted', async (t) => {
   const f = await fixture(t),
     entered = Promise.withResolvers(),
     release = Promise.withResolvers();
-  const put = f.bridge.journal.put.bind(f.bridge.journal);
-  t.mock.method(f.bridge.journal, 'put', async (id, value) => {
-    if (id === 'create' && value.receipt.send?.phase === 'starting') {
-      entered.resolve(value.receipt.session_id);
-      await release.promise;
-    }
-    return put(id, value);
+  const resolve = f.bridge.pool.resolve.bind(f.bridge.pool);
+  t.mock.method(f.bridge.pool, 'resolve', async (session) => {
+    entered.resolve(session.id);
+    await release.promise;
+    return resolve(session);
   });
-  const creating = f.bridge.create({ project: f.cwd, text: 'initial', request_id: 'create' }),
+  const creating = f.bridge.create({ project: f.cwd, text: 'initial' }),
     id = await entered.promise;
-  const sending = f.bridge.send({ session_id: id, text: 'later', request_id: 'send' });
+  const sending = f.bridge.send({ session_id: id, text: 'later' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(f.calls, []);
   release.resolve();
-  assert.equal((await creating).status, 'accepted');
-  assert.equal((await sending).status, 'accepted');
+  assert.ok(
+    ['started', 'queued', 'handled'].includes((await creating).status),
+    'Expected native prompt admission',
+  );
+  assert.ok(
+    ['started', 'queued', 'handled'].includes((await sending).status),
+    'Expected native prompt admission',
+  );
   assert.deepEqual(f.calls, ['initial', 'later']);
 });
-test('stop rechecks its grant after the durable dispatch receipt', async (t) => {
+test('stop keeps its admission grant through durable dispatch receipt writes', async (t) => {
   const f = await fixture(t),
     seed = await savedSession(f.bridge);
   let stops = 0;
@@ -206,27 +302,34 @@ test('stop rechecks its grant after the durable dispatch receipt', async (t) => 
     c.defaults.stop = true;
   });
   f.runtime.generation = 'native-generation';
-  f.runtime.stopExecution = async () => {
+  const session = await f.bridge.session(seed.session_id);
+  f.runtime.stopExecution = async ({ max_chars }) => {
     stops++;
-    throw Error('UNEXPECTED_STOP');
+    const withdrawn = withdrawalCollector(max_chars);
+    return {
+      status: 'accepted',
+      acknowledgement: 'native_ack',
+      coverage: 'agent_and_bash',
+      withdrawal: withdrawn.add({ steering: ['kept output'], followUp: [] }),
+    };
   };
   f.bridge.pool.instances.set(seed.session_id, f.runtime);
-  const put = f.bridge.journal.put.bind(f.bridge.journal);
-  t.mock.method(f.bridge.journal, 'put', async (id, value) => {
-    await put(id, value);
-    if (value.receipt.status === 'unknown' && value.receipt.generation)
-      await f.update((c) => {
-        c.defaults.stop = false;
-      });
-  });
-  await assert.rejects(
-    f.bridge.stop({ session_id: seed.session_id, request_id: 'stop-revoked' }),
-    /NOT_FOUND_OR_DENIED/,
+  const stop = f.runtime.stopExecution;
+  f.runtime.stopExecution = async (args) => {
+    const result = await stop(args);
+    await f.update((c) => {
+      c.defaults.stop = false;
+    });
+    return result;
+  };
+  assert.equal(
+    (await f.bridge.stop({ session_id: seed.session_id })).withdrawn_text,
+    'kept output',
   );
-  assert.equal(stops, 0);
-  assert.equal((await f.bridge.journal.get('stop-revoked')).receipt.reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal(stops, 1);
+  await assert.rejects(f.bridge.stop({ session_id: seed.session_id }), /NOT_FOUND_OR_DENIED/);
 });
-test('delete rechecks its grant after owner release before moving the file', async (t) => {
+test('delete retains its admission grant through owner release', async (t) => {
   const f = await fixture(t),
     seed = await savedSession(f.bridge),
     session = await f.bridge.session(seed.session_id);
@@ -240,11 +343,13 @@ test('delete rechecks its grant after owner release before moving the file', asy
   });
   const result = await f.bridge.delete({
     session_id: seed.session_id,
-    request_id: 'delete-revoked',
   });
-  assert.equal(result.status, 'rejected');
-  assert.equal(result.reason, 'NOT_FOUND_OR_DENIED');
-  assert.equal((await fs.stat(session.file)).isFile(), true);
+  assert.equal(result.status, 'deleted');
+  await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
+  assert.equal(
+    (await f.bridge.delete({ session_id: seed.session_id })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
 });
 test('prototype property operation names remain invalid individual batch items', async () => {
   let listed = 0;

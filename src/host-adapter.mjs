@@ -4,11 +4,17 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
-import { renderContextRead } from './context-read.mjs';
-import { SEND_MODES, attachedPromptInput } from './prompt-input.mjs';
-import { cleanModelPage, cleanModelSetting, modelSettingsSchema, sameModel } from './models.mjs';
-import { bashCapture } from './bash-execution.mjs';
-import { stopReceipt, withdrawalCapture } from './stop-execution.mjs';
+import { compactInputSchema, compactMetadata } from './compact.mjs';
+import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import {
+  SEND_MODES,
+  attachedPromptInput,
+  hasPromptSettings,
+  remotePromptRejection,
+} from './prompt-input.mjs';
+import { modelState } from './models.mjs';
+import { limitBashResult } from './bash-execution.mjs';
+import { stopReceipt, withdrawalCollector } from './stop-execution.mjs';
 import {
   MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
@@ -28,15 +34,13 @@ const fail = (code) => {
 };
 function receipt(value) {
   if (value?.status === 'accepted' && ['started', 'queued', 'handled'].includes(value.disposition))
-    return { status: 'accepted', disposition: value.disposition, completion: 'not_tracked' };
+    return { status: 'accepted', disposition: value.disposition };
   if (value?.status === 'skipped' && value.reason === 'busy')
     return { status: 'skipped', reason: 'busy' };
   if (value?.status === 'unknown')
     return {
       status: 'unknown',
-      dispatch: 'submitted',
       reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-      completion: 'not_tracked',
     };
   if (
     value?.status === 'rejected' &&
@@ -57,12 +61,12 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     stopping = false,
     stopSequence = 0,
     bashing = false,
-    selecting = false,
-    releasing,
-    closing;
+    compacting = false,
+    releasePromise,
+    closePromise;
   const sockets = new Set(),
     operations = new Set();
-  async function identity(value) {
+  async function assertIdentity(value) {
     if (
       value !== undefined &&
       (value.sessionFile !== target.file || value.sessionId !== target.header.id)
@@ -82,7 +86,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
   async function state() {
     const value = await callbacks.state();
     if (!value || typeof value !== 'object') fail('RUNTIME_SESSION_CHANGED');
-    await identity(value);
+    await assertIdentity(value);
     return value;
   }
   async function retire() {
@@ -92,14 +96,14 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
   }
   async function release() {
     if (!callbacks?.release) fail('HOST_RELEASE_UNSUPPORTED');
-    if (releasing) return releasing;
+    if (releasePromise) return releasePromise;
     ready = false; // Fence admissions before the first awaited lifecycle step.
-    releasing = (async () => {
+    releasePromise = (async () => {
       await retire();
       // Cancellation must precede the operation drain: an active native bash
       // may only settle after the host aborts it. Writer close still happens
       // AFTER every admitted preparation/capture has settled.
-      await identity();
+      await assertIdentity();
       if (callbacks.cancel) await callbacks.cancel();
       else if (bashing && !stopping)
         await callbacks.stop({
@@ -108,7 +112,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
           onWithdraw: async () => {},
         });
       await Promise.allSettled([...operations]);
-      await identity();
+      await assertIdentity();
       const result = await callbacks.release();
       if (result?.released !== true) fail('HOST_RELEASE_FAILED');
       // A shared host may remain alive. The explicit host callback attests the
@@ -121,7 +125,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       server?.close(() => {});
       return { released: true, generation: record.generation };
     })();
-    return releasing;
+    return releasePromise;
   }
   function validateRequest(request) {
     if (
@@ -133,19 +137,35 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     )
       fail('RUNTIME_SESSION_CHANGED');
   }
-  async function operate(request) {
-    const admittedAt = stopSequence,
-      stoppedAtEntry = stopping;
+  async function operate(request, partial) {
+    const entryStopSequence = stopSequence,
+      stoppingAtEntry = stopping;
     const observed = await state(),
       args = request.body ?? {};
+    if (
+      ['bash', 'stop'].includes(request.op) &&
+      (Object.keys(args).some(
+        (key) =>
+          !(
+            request.op === 'bash'
+              ? ['command', 'max_chars', 'timeout_ms']
+              : ['max_chars', 'timeout_ms']
+          ).includes(key),
+      ) ||
+        (args.max_chars !== undefined &&
+          (!Number.isInteger(args.max_chars) || args.max_chars < 256 || args.max_chars > 32768)) ||
+        (args.timeout_ms !== undefined &&
+          (!Number.isInteger(args.timeout_ms) || args.timeout_ms < 50 || args.timeout_ms > 30000)))
+    )
+      fail('INVALID_ARGUMENTS');
     const pendingMessageCount =
       Number.isSafeInteger(observed.pendingMessageCount) && observed.pendingMessageCount >= 0
         ? observed.pendingMessageCount
         : null;
     let data;
-    if (selecting && ['send', 'set_model'].includes(request.op)) fail('MODEL_SELECTION_PENDING');
     const beforeDispatch = () => {
-      if (stoppedAtEntry || stopping || admittedAt !== stopSequence) fail('STOP_IN_PROGRESS');
+      if (stoppingAtEntry || stopping || entryStopSequence !== stopSequence)
+        fail('STOP_IN_PROGRESS');
       if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
     };
     if (request.op === 'state')
@@ -153,39 +173,30 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         sessionFile: target.file,
         sessionId: target.header.id,
         generation: record.generation,
-        isIdle: typeof observed.isIdle === 'boolean' ? observed.isIdle : null,
+        ...(typeof observed.sessionName === 'string' || observed.sessionName === null
+          ? { sessionName: observed.sessionName }
+          : {}),
+        isIdle:
+          bashing || stopping || compacting
+            ? false
+            : typeof observed.isIdle === 'boolean'
+              ? observed.isIdle
+              : null,
         isStreaming: typeof observed.isStreaming === 'boolean' ? observed.isStreaming : null,
         isCompacting: typeof observed.isCompacting === 'boolean' ? observed.isCompacting : null,
+        isBashRunning: typeof observed.isBashRunning === 'boolean' ? observed.isBashRunning : null,
         pendingMessageCount,
+        ...modelState(observed),
+        capabilities: {
+          send: true,
+          command: typeof callbacks.bash === 'function' && typeof callbacks.stop === 'function',
+          stop: typeof callbacks.stop === 'function',
+        },
       };
-    else if (request.op === 'set_model') {
-      if (typeof callbacks.selectModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
-      const parsed = modelSettingsSchema.safeParse(args);
-      if (!parsed.success) fail('INVALID_MODEL_ARGUMENTS');
-      beforeDispatch();
-      selecting = true;
-      try {
-        const selected = cleanModelSetting(
-          await callbacks.selectModel({ ...parsed.data, beforeDispatch }),
-        );
-        await identity();
-        if (parsed.data.model && !sameModel(selected.model, parsed.data.model))
-          throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
-        data = { status: 'accepted', ...selected, scope: 'session' };
-      } catch (error) {
-        // A stop/admission failure between native steps can follow a completed
-        // model change. Do not serialize it as a definite pre-dispatch refusal.
-        if (error.uncertain === true) throw new AttachmentFailure('MODEL_SELECTION_FAILED', true);
-        throw error;
-      } finally {
-        selecting = false;
-      }
-    } else if (request.op === 'models') {
-      if (typeof callbacks.models !== 'function') fail('MODELS_UNSUPPORTED');
-      data = cleanModelPage(await callbacks.models({ offset: args.offset, limit: args.limit }));
-    } else if (['read', 'snapshot'].includes(request.op)) {
-      const snapshot = structuredClone(await callbacks.snapshot());
-      await identity(snapshot);
+    else if (['read', 'snapshot'].includes(request.op)) {
+      const observed = await callbacks.snapshot();
+      const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
+      await assertIdentity(snapshot);
       if (
         !Array.isArray(snapshot?.entries) ||
         !snapshot.entries.every(
@@ -197,7 +208,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         )
       )
         fail('INVALID_HOST_SNAPSHOT');
-      const revisionInput =
+      const snapshotJson =
         request.op === 'snapshot'
           ? JSON.stringify({
               entries: snapshot.entries,
@@ -207,35 +218,62 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
           : null;
       if (
         request.op === 'snapshot' &&
-        Buffer.byteLength(revisionInput) > MAX_ATTACHMENT_SNAPSHOT_BYTES
+        Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
       )
         fail('SESSION_TOO_LARGE');
-      data =
-        request.op === 'snapshot'
-          ? {
-              sessionFile: target.file,
-              sessionId: target.header.id,
+      if (request.op === 'snapshot')
+        data = {
+          sessionFile: target.file,
+          sessionId: target.header.id,
+          entries: snapshot.entries,
+          leafId: snapshot.leafId,
+        };
+      else {
+        data = {
+          sessionFile: target.file,
+          sessionId: target.header.id,
+          ...prepareContextRead(
+            {
+              header: target.header,
               entries: snapshot.entries,
               leafId: snapshot.leafId,
-            }
-          : renderContextRead(
-              {
-                header: target.header,
-                entries: snapshot.entries,
-                leafId: snapshot.leafId,
-                live: snapshot.live ?? { available: false, source: 'host_snapshot' },
-              },
-              args,
-            );
+              live: snapshot.live ?? { available: false, source: 'host_snapshot' },
+            },
+            args,
+          ),
+        };
+      }
+    } else if (request.op === 'compact') {
+      if (typeof callbacks.compact !== 'function') fail('COMPACT_UNSUPPORTED');
+      const input = compactInputSchema.safeParse(args);
+      if (!input.success) fail('INVALID_ARGUMENTS');
+      if (compacting) fail('COMPACTION_PENDING');
+      beforeDispatch();
+      compacting = true;
+      try {
+        data = compactMetadata(
+          await callbacks.compact({
+            ...input.data,
+            sessionFile: target.file,
+            sessionId: target.header.id,
+            beforeDispatch,
+          }),
+        );
+      } finally {
+        compacting = false;
+      }
     } else if (request.op === 'send') {
+      if (compacting) fail('COMPACTION_PENDING');
       beforeDispatch();
       const input = attachedPromptInput(args);
-      if (input.model) fail('MODEL_SELECTION_UNSUPPORTED');
+      if (hasPromptSettings(input)) fail('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(args.mode)) fail('INVALID_ATTACHED_SEND');
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
-      data = receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
+      data =
+        remotePromptRejection(input.text) ??
+        receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
     } else if (request.op === 'bash') {
       if (typeof callbacks.bash !== 'function' || typeof callbacks.stop !== 'function')
         fail('BASH_UNSUPPORTED');
@@ -243,8 +281,6 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         fail('INVALID_ATTACHED_BASH');
       beforeDispatch();
       if (bashing) fail('BASH_IN_PROGRESS');
-      const capture = bashCapture(attachmentDir, target, record.generation, args.recovery_id);
-      let captured = false;
       bashing = true;
       try {
         const result = await callbacks.bash({
@@ -254,20 +290,17 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
           beforeDispatch,
           onResult: async (value) => {
             await state();
-            await capture(value);
-            captured = true;
+            partial(limitBashResult(value, args.max_chars));
           },
         });
-        if (result?.completed !== true || !captured) fail('INVALID_BASH_RESULT');
-        data = { completed: true };
+        data = limitBashResult(result, args.max_chars);
       } finally {
         bashing = false;
       }
     } else if (request.op === 'stop') {
       if (typeof callbacks.stop !== 'function') fail('STOP_UNSUPPORTED');
       if (stopping) fail('STOP_IN_PROGRESS');
-      const capture = withdrawalCapture(attachmentDir, target, record.generation, args.recovery_id);
-      let captured = false;
+      const withdrawn = withdrawalCollector(args.max_chars);
       stopping = true;
       stopSequence++;
       try {
@@ -277,12 +310,12 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
             sessionId: target.header.id,
             onWithdraw: async (value) => {
               await state();
-              await capture(value);
-              captured = true;
+              partial({ withdrawal: { ...withdrawn.add(value), complete: false } });
             },
           }),
         );
-        if (!captured) fail('INVALID_STOP_RECEIPT');
+        if (!withdrawn.value) fail('INVALID_STOP_RECEIPT');
+        data = { ...data, withdrawal: withdrawn.value };
       } finally {
         stopping = false;
       }
@@ -291,10 +324,10 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     return data;
   }
   async function close() {
-    if (closing) return closing;
+    if (closePromise) return closePromise;
     closed = true;
     ready = false;
-    closing = (async () => {
+    closePromise = (async () => {
       try {
         await retire();
       } finally {
@@ -305,14 +338,29 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       // Controller disconnect is not proof the actual writer has exited.
       if (!(await ownerAlive(record.owner))) await releaseOwner(attachmentDir, target, record);
     })();
-    return closing;
+    return closePromise;
   }
   async function publish(value) {
     if (callbacks || closed) fail('HOST_ADAPTER_ALREADY_STARTED');
     if (
       !value ||
+      Object.keys(value).some(
+        (key) =>
+          ![
+            'state',
+            'snapshot',
+            'submit',
+            'supportsImages',
+            'release',
+            'cancel',
+            'stop',
+            'bash',
+            'compact',
+          ].includes(key),
+      ) ||
+      (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
-      ['release', 'cancel', 'stop', 'bash', 'models', 'selectModel'].some(
+      ['release', 'cancel', 'stop', 'bash', 'compact'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
       )
     )
@@ -320,7 +368,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     callbacks = value;
     try {
       await state();
-      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
+      if (closed || releasePromise) fail('RUNTIME_SESSION_CHANGED');
       server = net.createServer((socket) => {
         if (sockets.size >= 16) {
           socket.destroy();
@@ -348,14 +396,20 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
               const request = JSON.parse(buffer.slice(0, end));
               validateRequest(request);
               if (
-                ['stop', 'bash', 'set_model'].includes(request.op) &&
+                ['stop', 'bash'].includes(request.op) &&
                 Number.isInteger(request.body?.timeout_ms)
               )
                 socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
+              if (request.op === 'compact') socket.setTimeout(0);
               let data;
               if (request.op === 'release') data = await release();
               else {
-                const operation = operate(request);
+                const operation = operate(request, (data) => {
+                  if (!socket.destroyed && !socket.writableEnded)
+                    socket.write(
+                      JSON.stringify({ generation: record.generation, partial: true, data }) + '\n',
+                    );
+                });
                 operations.add(operation);
                 try {
                   data = await operation;
@@ -384,15 +438,14 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       });
       await fs.chmod(record.socket, 0o600);
       await state();
-      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
+      if (closed || releasePromise) fail('RUNTIME_SESSION_CHANGED');
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
         releaseSupported: Boolean(callbacks.release),
         imagesSupported: callbacks.supportsImages === true,
-        modelsSupported: typeof callbacks.models === 'function',
-        modelSelectionSupported: typeof callbacks.selectModel === 'function',
+        readContract: READ_CONTRACT,
       });
-      if (closed || releasing) {
+      if (closed || releasePromise) {
         await retire();
         fail('RUNTIME_SESSION_CHANGED');
       }

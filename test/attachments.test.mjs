@@ -16,11 +16,14 @@ import { Bridge } from '../src/bridge.mjs';
 import {
   AttachedRuntime,
   readClaim,
+  claimFile,
+  processIdentity,
   reserveOwner,
   updateOwner,
   releaseOwner,
   ownerAlive,
   privateDirectory,
+  registryTransaction,
   waitOwnerExit,
 } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
@@ -33,17 +36,16 @@ async function fixture(t) {
   await fs.mkdir(cwd);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'attached-test',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     attachmentDir: path.join(dir, 'ipc'),
     attachmentExitTimeoutMs: 4000,
   };
   const bridge = await new Bridge(config).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'create' });
+  const made = await savedSession(bridge);
   const session = await bridge.session(made.session_id);
   t.after(async () => {
     await bridge.close();
@@ -149,7 +151,7 @@ test('private registry rejects group-readable directory and live owner prevents 
   const record = await reserveOwner(f.config.attachmentDir, f.session, 'tui');
   const sent = await f.bridge.send({
     session_id: f.id,
-    request_id: 'blocked',
+
     text: 'never dispatch',
   });
   assert.equal(sent.status, 'rejected');
@@ -185,7 +187,10 @@ test('attached shutdown acknowledgment is insufficient until exact owner process
   const server = net.createServer((socket) =>
     socket.once('data', () =>
       socket.end(
-        JSON.stringify({ generation: record.generation, data: { shutdown: 'requested' } }) + '\n',
+        JSON.stringify({
+          generation: record.generation,
+          data: { shutdown: 'requested' },
+        }) + '\n',
       ),
     ),
   );
@@ -244,6 +249,18 @@ test('attachment deletion timeout is a bounded owner setting', async (t) => {
 
 test('extension uses public dispatch flags, truthful unknown receipts, and idle includes compaction', async (t) => {
   const f = await fixture(t);
+  const unrelated = { file: path.join(f.dir, 'unrelated.jsonl'), header: { id: 'unrelated' } };
+  const unrelatedRecord = {
+    file: unrelated.file,
+    sessionId: unrelated.header.id,
+    kind: 'rpc',
+    generation: 'unrelated-generation',
+    owner: { ...(await processIdentity()), start: 'different-process-start' },
+    phase: 'ready',
+    unexpected: true,
+  };
+  const unrelatedFile = claimFile(f.config.attachmentDir, unrelated);
+  await fs.writeFile(unrelatedFile, JSON.stringify(unrelatedRecord), { mode: 0o600 });
   const original = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {},
@@ -294,7 +311,6 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
       const result = await runtime.send({ text: 'public fixture', mode });
       assert.equal(result.status, 'unknown');
-      assert.equal(result.dispatch, 'submitted');
       assert.equal(result.reason, 'PI_ACCEPTANCE_UNOBSERVABLE');
     }
     assert.deepEqual(
@@ -321,7 +337,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     assert.equal(calls.length, 4);
     const escaped = {
       session_id: f.id,
-      request_id: 'escaped',
+
       text: '\0'.repeat(100000),
       mode: 'default',
     };
@@ -329,7 +345,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
       publicOperationSchemas.send.safeParse({ ...escaped, mode: 'default' }).success,
       true,
     );
-    assert.equal((await runtime.send(escaped)).dispatch, 'submitted');
+    assert.equal((await runtime.send(escaped)).status, 'unknown');
     assert.equal(calls.at(-1).text, escaped.text);
     f.bridge.pool.instances.set(f.id, runtime);
     const connect = t.mock.method(net, 'createConnection', () => {
@@ -339,10 +355,10 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
       await assert.rejects(
         f.bridge.send({
           ...escaped,
-          request_id: 'oversized',
+
           text: '\0'.repeat(200000),
         }),
-        /INVALID_PROMPT_INPUT/,
+        /INVALID_ARGUMENTS/,
       );
       await assert.rejects(
         runtime.send({ ...escaped, text: '\0'.repeat(2 * 1024 * 1024) }),
@@ -352,19 +368,22 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     } finally {
       connect.mock.restore();
     }
-    const page = await runtime.read({ session_id: f.id, max_bytes: 4096 });
-    assert.ok(page.next_cursor);
+    const captured = await runtime.read({ session_id: f.id, max_bytes: 4096 });
+    assert.equal(captured.leaf_id, 'b');
+    assert.ok(Array.isArray(captured.units));
+    const before = JSON.stringify(captured);
     leaf = 'a';
-    const next = await runtime.read({
-      session_id: f.id,
-      max_bytes: 4096,
-      cursor: page.next_cursor,
-    });
-    assert.equal(next.leaf_id, 'b');
+    const next = await runtime.read({ session_id: f.id });
+    assert.equal(next.leaf_id, 'a');
     entries[1].message.content = 'edited';
+    assert.equal(
+      JSON.stringify(captured),
+      before,
+      'Owner snapshots are detached, not moving views',
+    );
     await assert.rejects(
-      runtime.read({ session_id: f.id, max_bytes: 4096, cursor: page.next_cursor }),
-      /STALE_CURSOR/,
+      runtime.read({ session_id: f.id, cursor: 'unsupported-owner-cursor' }),
+      /INVALID_READ_ARGUMENTS/,
     );
     await runtime.stop();
     assert.equal(shutdown, false);
@@ -379,6 +398,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
       (await readClaim(f.config.attachmentDir, f.session)).generation,
       record.generation,
     );
+    assert.deepEqual(JSON.parse(await fs.readFile(unrelatedFile, 'utf8')), unrelatedRecord);
   } finally {
     await handlers.session_shutdown({ reason: 'quit' }, ctx);
     if (original === undefined) delete process.env.PI_MCP_ATTACH_DIR;
@@ -409,12 +429,12 @@ test('same session continues headless after actual TUI exit with history, grants
   const launched = await tui(t, f);
   const first = await f.bridge.send({
     session_id: f.id,
-    request_id: 'tui-history',
+
     text: 'PUBLIC_TUI_HISTORY',
   });
-  assert.equal(first.dispatch, 'submitted');
+  assert.equal(first.dispatch, undefined);
   await until(async () => {
-    const r = await f.bridge.read({ session_id: f.id });
+    const r = await f.bridge.read({ session_id: f.id, preset: 'full' });
     return (
       r.items.some((x) => x.type === 'text') && !(await f.bridge.pool.get(f.id).state()).isStreaming
     );
@@ -427,7 +447,7 @@ test('same session continues headless after actual TUI exit with history, grants
     (
       await f.bridge.send({
         session_id: f.id,
-        request_id: 'denied-after-tui',
+
         text: 'MUST_NOT_DISPATCH',
       })
     ).status,
@@ -438,12 +458,12 @@ test('same session continues headless after actual TUI exit with history, grants
   f.config.grants.push({ session_id: f.id, send: true });
   const second = await f.bridge.send({
     session_id: f.id,
-    request_id: 'headless-same-session',
+
     text: 'PUBLIC_HEADLESS_CONTINUATION',
     mode: 'idle_only',
   });
-  assert.equal(second.status, 'accepted', JSON.stringify(second));
-  assert.equal(second.disposition, 'started');
+  assert.ok(['started', 'queued', 'handled'].includes(second.status), JSON.stringify(second));
+  assert.equal(second.status, 'started');
   const claim = await readClaim(f.config.attachmentDir, f.session);
   assert.equal(claim.kind, 'rpc');
   assert.equal(claim.sessionId, f.session.header.id);
@@ -451,7 +471,7 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.notEqual(claim.generation, launched.record.generation);
   assert.equal(f.bridge.pool.instances.size, 1);
   await until(async () => {
-    const r = await f.bridge.read({ session_id: f.id });
+    const r = await f.bridge.read({ session_id: f.id, preset: 'full' });
     return r.items.filter((x) => x.type === 'text').length === 2;
   });
   const raw = await loadSavedSession(f.session);
@@ -460,24 +480,17 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.ok(history.includes('PUBLIC_TUI_HISTORY'));
   assert.ok(history.includes('PUBLIC_HEADLESS_CONTINUATION'));
   assert.ok(!history.includes('MUST_NOT_DISPATCH'));
-  const beforeClose = await f.bridge.read({ session_id: f.id, max_bytes: 65536 });
+  const beforeClose = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 65536 });
   await f.bridge.close();
   assert.equal(await ownerAlive(claim.owner), false);
   const restarted = await new Bridge(f.config).init();
   try {
-    assert.deepEqual(
-      await restarted.send({ session_id: f.id, request_id: 'headless-same-session' }),
-      second,
-    );
-    await assert.rejects(
-      restarted.send({ session_id: f.id, request_id: 'denied-after-tui' }),
-      /RECEIPT_NOT_FOUND/,
-    );
+    await assert.rejects(restarted.send({ session_id: f.id }), /INVALID_ARGUMENTS/);
     assert.equal(restarted.pool.instances.size, 0);
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     const read = await loadSavedSession(await restarted.session(f.id));
     assert.deepEqual(read.entries, raw.entries);
-    const publicRead = await restarted.read({ session_id: f.id, max_bytes: 65536 });
+    const publicRead = await restarted.read({ session_id: f.id, preset: 'full', max_bytes: 65536 });
     assert.deepEqual(publicRead.items, beforeClose.items);
   } finally {
     await restarted.close();
@@ -493,17 +506,17 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   const launched = await tui(t, f);
   const receipt = await f.bridge.send({
     session_id: f.id,
-    request_id: 'native',
+
     text: 'first public fixture',
     mode: 'default',
   });
   assert.equal(receipt.status, 'unknown');
-  assert.equal(receipt.dispatch, 'submitted');
+  assert.equal(receipt.dispatch, undefined);
   assert.equal(
     (
       await f.bridge.send({
         session_id: f.id,
-        request_id: 'idle-skip',
+
         text: 'must skip',
         mode: 'idle_only',
       })
@@ -513,56 +526,70 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   for (const mode of ['default', 'steer', 'follow_up']) {
     const r = await f.bridge.send({
       session_id: f.id,
-      request_id: 'busy-' + mode,
+
       text: 'busy ' + mode,
       mode,
     });
     assert.equal(r.status, 'unknown');
-    assert.equal(r.dispatch, 'submitted');
+    assert.equal(r.dispatch, undefined);
   }
-  assert.deepEqual(await f.bridge.send({ session_id: f.id, request_id: 'native' }), receipt);
+
+  // Queue consumption may combine inputs in one native loop. Verify native
+  // user history, not one assistant response per external submission.
+  const expectedInputs = ['first public fixture', 'busy default', 'busy steer', 'busy follow_up'];
   await until(async () => {
-    const r = await f.bridge.read({
-      session_id: f.id,
-      max_bytes: 65536,
-    });
-    return r.items.filter((x) => x.type === 'text').length >= 3;
+    const native = await loadSavedSession(f.session);
+    const inputs = native.entries
+      .filter((entry) => entry.type === 'message' && entry.message.role === 'user')
+      .map((entry) => JSON.stringify(entry.message.content));
+    return expectedInputs.every((text) => inputs.some((input) => input.includes(text)));
   });
   assert.equal(f.bridge.pool.get(f.id).attached, true);
+  assert.equal(
+    (await readClaim(f.config.attachmentDir, f.session)).generation,
+    launched.record.generation,
+  );
   await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   for (const mode of ['idle_only', 'steer', 'follow_up']) {
     const r = await f.bridge.send({
       session_id: f.id,
-      request_id: 'idle-' + mode,
+
       text: 'idle ' + mode,
       mode,
     });
     assert.equal(r.status, 'unknown');
     await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   }
-  const page = await f.bridge.read({ session_id: f.id, max_bytes: 4096 });
+  const page = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 4096 });
   assert.ok(page.next_cursor);
-  const beforeReload = await f.bridge.read({ session_id: f.id, cursor: page.next_cursor });
+  const beforeReload = await f.bridge.read({
+    session_id: f.id,
+    preset: 'full',
+    cursor: page.next_cursor,
+  });
   assert.equal(JSON.stringify(await loadSavedSession(f.session)).includes('must skip'), false);
   const oldGeneration = launched.record.generation;
   assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'reload', text: '/fixture-reload' }))
-      .status,
+    (await f.bridge.send({ session_id: f.id, text: '/fixture-reload' })).status,
     'unknown',
   );
   await until(async () => {
     const r = await readClaim(f.config.attachmentDir, f.session);
     return r?.phase === 'ready' && r.generation !== oldGeneration;
   });
-  const afterReload = await f.bridge.read({ session_id: f.id, cursor: page.next_cursor });
+  const afterReload = await f.bridge.read({
+    session_id: f.id,
+    preset: 'full',
+    cursor: page.next_cursor,
+  });
   assert.deepEqual(afterReload.items, beforeReload.items);
   await f.bridge.close();
   assert.equal(await ownerAlive(launched.record.owner), true);
   const restarted = await new Bridge(f.config).init();
   t.after(() => restarted.close());
-  assert.deepEqual(await restarted.send({ session_id: f.id, request_id: 'native' }), receipt);
-  assert.ok((await restarted.read({ session_id: f.id })).items.length > 0);
-  const removed = await restarted.delete({ session_id: f.id, request_id: 'delete' });
+
+  assert.ok((await restarted.read({ session_id: f.id, preset: 'full' })).items.length > 0);
+  const removed = await restarted.delete({ session_id: f.id });
   assert.equal(removed.status, 'deleted');
   assert.equal(await ownerAlive(launched.record.owner), false);
   assert.equal((await restarted.list()).sessions.length, 0);
@@ -673,19 +700,24 @@ test('registry failure during shutdown still closes old socket and retains block
       getSessionId: () => f.session.header.id,
     },
   };
-  const lock = path.join(f.config.attachmentDir, 'registry.lock');
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  let held;
   try {
     await handlers.session_start({ reason: 'startup' }, ctx);
     const record = await readClaim(f.config.attachmentDir, f.session);
-    await fs.writeFile(lock, JSON.stringify({ ...record.owner, start: '0' + record.owner.start }), {
-      mode: 0o600,
+    held = registryTransaction(f.config.attachmentDir, async () => {
+      entered.resolve();
+      await release.promise;
     });
+    await entered.promise;
     await assert.rejects(
       handlers.session_shutdown({ reason: 'reload' }, ctx),
       /ATTACHMENT_REGISTRY_BUSY/,
     );
     await assert.rejects(fs.stat(record.socket), { code: 'ENOENT' });
-    await fs.unlink(lock);
+    release.resolve();
+    await held;
     assert.equal(
       (await readClaim(f.config.attachmentDir, f.session)).generation,
       record.generation,
@@ -696,7 +728,8 @@ test('registry failure during shutdown still closes old socket and retains block
       /LIVE_OWNER_UNREACHABLE/,
     );
   } finally {
-    await fs.unlink(lock).catch(() => {});
+    release.resolve();
+    await held;
     await handlers.session_shutdown({ reason: 'quit' }, ctx);
     if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
     else process.env.PI_MCP_ATTACH_DIR = previous;
@@ -725,12 +758,13 @@ test('socket startup failure retains live ownership and blocks both send fallbac
       shutdown = true;
     },
   };
-  t.mock.method(net, 'createServer', () => {
-    const server = new EventEmitter();
-    server.listen = () =>
-      queueMicrotask(() => server.emit('error', new Error('injected listen failure')));
-    server.close = (done) => done();
-    return server;
+  const listen = net.Server.prototype.listen;
+  t.mock.method(net.Server.prototype, 'listen', function (address, ...args) {
+    if (typeof address === 'string' && address.startsWith('/')) {
+      queueMicrotask(() => this.emit('error', new Error('injected listen failure')));
+      return this;
+    }
+    return listen.call(this, address, ...args);
   });
   try {
     await assert.rejects(
@@ -741,12 +775,12 @@ test('socket startup failure retains live ownership and blocks both send fallbac
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).phase, 'starting');
     const sent = await f.bridge.send({
       session_id: f.id,
-      request_id: 'failed-listen-send',
+
       text: 'must not spawn',
     });
     assert.equal(sent.status, 'rejected');
     assert.equal(sent.reason, 'LIVE_OWNER_UNREACHABLE');
-    const removed = await f.bridge.delete({ session_id: f.id, request_id: 'failed-listen-delete' });
+    const removed = await f.bridge.delete({ session_id: f.id });
     assert.equal(removed.status, 'rejected');
     assert.equal(removed.reason, 'LIVE_OWNER_UNREACHABLE');
     assert.ok(await fs.stat(f.session.file));
@@ -762,13 +796,13 @@ test('socket startup failure retains live ownership and blocks both send fallbac
 test('official TUI session replacement registers a fresh identity and socket loss does not spawn RPC', async (t) => {
   const f = await fixture(t);
   const launched = await tui(t, f);
-  await f.bridge.send({ session_id: f.id, request_id: 'fork-seed', text: 'public fork fixture' });
+  await f.bridge.send({ session_id: f.id, text: 'public fork fixture' });
   await until(async () =>
     (await f.bridge.read({ session_id: f.id })).items.some((x) => x.type === 'text'),
   );
   await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'fork', text: '/fixture-fork' })).status,
+    (await f.bridge.send({ session_id: f.id, text: '/fixture-fork' })).status,
     'unknown',
   );
   const fork = await until(async () => (await f.bridge.sessions()).find((s) => s.id !== f.id));
@@ -784,7 +818,7 @@ test('official TUI session replacement registers a fresh identity and socket los
     (
       await f.bridge.send({
         session_id: fork.id,
-        request_id: 'resume',
+
         text: '/fixture-resume ' + f.session.file,
       })
     ).status,
@@ -798,7 +832,7 @@ test('official TUI session replacement registers a fresh identity and socket los
   await until(async () => (await readClaim(f.config.attachmentDir, fork)) === null);
   const sent = await f.bridge.send({
     session_id: f.id,
-    request_id: 'switch',
+
     text: '/fixture-switch',
   });
   assert.equal(sent.status, 'unknown');
@@ -818,7 +852,7 @@ test('official TUI session replacement registers a fresh identity and socket los
   await fs.unlink(claim.socket);
   const result = await f.bridge.send({
     session_id: replacement.id,
-    request_id: 'unreachable',
+
     text: 'do not start a second process',
     timeout_ms: 100,
   });
@@ -828,7 +862,6 @@ test('official TUI session replacement registers a fresh identity and socket los
   assert.equal(f.bridge.pool.get(replacement.id).attached, true);
   const removed = await f.bridge.delete({
     session_id: replacement.id,
-    request_id: 'blocked-delete',
   });
   assert.equal(removed.status, 'rejected');
   assert.ok(await fs.stat(replacement.file));
@@ -849,7 +882,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
     'off',
   );
   const filename = path.join(f.dir, 'config.json');
-  await fs.writeFile(filename, JSON.stringify(f.config));
+  await fs.writeFile(filename, JSON.stringify(f.config), { mode: 0o600 });
   const client = new Client({ name: 'attached-mcp-fixture', version: '1.0.0' });
   try {
     await client.connect(
@@ -869,11 +902,8 @@ test('standard MCP client attaches to an existing offline TUI through the single
       'delete',
       'health',
       'list',
-      'models',
       'read',
-      'reload',
       'send',
-      'set_model',
       'stop',
     ]);
     const call = async (name, args) => {
@@ -884,31 +914,24 @@ test('standard MCP client attaches to an existing offline TUI through the single
     assert.equal((await call('list', {})).sessions[0].session_id, f.id);
     const receipt = await call('send', {
       session_id: f.id,
-      request_id: 'mcp-send',
+
       text: 'offline MCP TUI fixture',
     });
     assert.equal(receipt.status, 'unknown');
     assert.equal(receipt.reason, 'PI_ACCEPTANCE_UNOBSERVABLE');
-    assert.deepEqual(await call('send', { session_id: f.id, request_id: 'mcp-send' }), receipt);
+
     await until(async () => {
       const r = await call('read', { session_id: f.id });
       return r.items.some((x) => x.type === 'text');
     });
     const created = await call('create', {
       project: f.cwd,
-      request_id: 'mcp-create',
+
       text: 'PUBLIC_CREATED_WORK',
     });
-    assert.equal(created.status, 'accepted');
-    assert.equal(
-      (await call('delete', { session_id: created.session_id, request_id: 'mcp-delete-created' }))
-        .status,
-      'deleted',
-    );
-    assert.equal(
-      (await call('delete', { session_id: f.id, request_id: 'mcp-delete-tui' })).status,
-      'deleted',
-    );
+    assert.ok(['started', 'queued', 'handled'].includes(created.status), JSON.stringify(created));
+    assert.equal((await call('delete', { session_id: created.session_id })).status, 'deleted');
+    assert.equal((await call('delete', { session_id: f.id })).status, 'deleted');
     assert.equal(await ownerAlive(launched.record.owner), false);
   } finally {
     await client.close();

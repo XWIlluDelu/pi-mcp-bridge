@@ -59,8 +59,69 @@ test('transient observation memory is bounded, Unicode-safe and explicitly trunc
   });
   const live = observer.snapshot();
   assert.equal(live.truncated, true);
-  assert.equal(live.message.content[0].text.length, 65535);
+  assert.ok(live.message.content[0].text.length <= 65536);
+  assert.ok(live.message.content[0].text.endsWith('😀overflow'));
   assert.equal(live.message.content[0].text.endsWith('�'), false);
   observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
   assert.equal(observer.snapshot().truncated, false);
+});
+
+for (const cumulative of [false, true])
+  test(`latest multi-block tail survives memory cap (${cumulative ? 'cumulative' : 'delta'})`, () => {
+    const observer = new LiveMessageObserver('events'),
+      content = [];
+    observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    for (let index = 0; index < 60; index++) {
+      const value = '😀'.repeat(899) + 'END-' + index;
+      content.push({ type: 'thinking', thinking: value });
+      observer.update(
+        cumulative
+          ? { type: 'message_update', message: { role: 'assistant', content } }
+          : {
+              type: 'message_update',
+              assistantMessageEvent: { type: 'thinking_delta', contentIndex: index, delta: value },
+            },
+      );
+    }
+    const live = observer.snapshot(),
+      blocks = live.message.content;
+    assert.equal(live.truncated, true);
+    assert.ok(blocks.at(-1).thinking.endsWith('END-59'));
+    assert.ok(blocks.every((b) => b.thinking.isWellFormed()));
+    assert.ok(blocks.reduce((sum, b) => sum + b.thinking.length, 0) <= 65536);
+    observer.update({ type: 'message_start', message: { role: 'user' } });
+    assert.equal(observer.snapshot().message, null);
+    observer.update({
+      type: 'message_update',
+      assistantMessageEvent: { type: 'thinking_delta', contentIndex: 59, delta: 'OLD' },
+    });
+    assert.equal(observer.snapshot().message, null);
+  });
+
+test('tiny and empty cumulative blocks share a bounded tail budget; large native indices remain observable', () => {
+  for (const text of ['x', '']) {
+    const observer = new LiveMessageObserver('events');
+    observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    observer.update({
+      type: 'message_update',
+      message: {
+        role: 'assistant',
+        content: Array.from({ length: 5000 }, () => ({ type: 'text', text })),
+      },
+    });
+    let value = observer.snapshot(),
+      blocks = value.message.content;
+    assert.equal(value.truncated, true);
+    assert.equal(blocks.at(-1).index, 4999);
+    assert.ok(blocks.reduce((sum, block) => sum + block.text.length + 64, 0) <= 65536);
+    observer.update({
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', contentIndex: 100000, delta: 'LATEST' },
+    });
+    value = observer.snapshot();
+    blocks = value.message.content;
+    assert.equal(blocks.at(-1).index, 100000);
+    assert.equal(blocks.at(-1).text, 'LATEST');
+    assert.ok(blocks.reduce((sum, block) => sum + block.text.length + 64, 0) <= 65536);
+  }
 });

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
+import { savedEntries } from './fixtures/saved-session.mjs';
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(check) {
@@ -28,11 +29,10 @@ test(
     process.env.PI_IMAGE_TEST_GATE = gate;
     const config = {
       ...isolatedRuntime(dir),
-      principal: 'images',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'project', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [{ folder: cwd, read: true, send: true, create: true }],
     };
     config.piRuntime.inheritEnv.push('PI_IMAGE_TEST_GATE');
@@ -54,35 +54,35 @@ test(
       if (prior === undefined) delete process.env.PI_IMAGE_TEST_GATE;
       else process.env.PI_IMAGE_TEST_GATE = prior;
     });
-    const made = await bridge.create({ project: cwd, request_id: 'hold', text: 'HOLD_IMAGE_TEST' }),
+    const made = await bridge.create({ project: cwd, text: 'HOLD_IMAGE_TEST' }),
       runtime = bridge.pool.get(made.session_id);
-    assert.equal(made.status, 'accepted');
+    assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
     await until(async () => (await runtime.state()).isStreaming);
     const follow = pngImage(),
       steer = pngImage(),
       skipped = pngImage();
     const args = {
       session_id: made.session_id,
-      request_id: 'queued-image',
+
       mode: 'follow_up',
       images: [follow],
     };
     const queued = await bridge.send(args);
-    assert.equal(queued.status, 'accepted');
-    assert.equal(queued.disposition, 'queued');
+    assert.ok(['started', 'queued', 'handled'].includes(queued.status), JSON.stringify(queued));
+    assert.equal(queued.status, 'queued');
     const steering = await bridge.send({
       session_id: made.session_id,
-      request_id: 'steer-image',
+
       mode: 'default',
       images: [steer],
     });
-    assert.equal(steering.status, 'accepted');
-    assert.equal(steering.disposition, 'queued');
+    assert.ok(['started', 'queued', 'handled'].includes(steering.status), JSON.stringify(steering));
+    assert.equal(steering.status, 'queued');
     assert.equal(
       (
         await bridge.send({
           session_id: made.session_id,
-          request_id: 'skip-image',
+
           mode: 'idle_only',
           images: [skipped],
         })
@@ -90,11 +90,8 @@ test(
       'skipped',
     );
     await fs.writeFile(gate, 'done');
-    await until(async () => {
-      const s = await runtime.state();
-      return !s.isStreaming && s.pendingMessageCount === 0;
-    });
-    const images = (await runtime.entries()).entries
+    await until(async () => (await runtime.idleSnapshot()).status === 'idle');
+    const images = (await savedEntries(bridge, made.session_id))
       .filter((e) => e.message?.role === 'user')
       .flatMap((e) =>
         Array.isArray(e.message.content) ? e.message.content.filter((c) => c.type === 'image') : [],
@@ -105,11 +102,7 @@ test(
     bridge = await new Bridge(config, () => {
       throw Error('REPLAY_STARTED_WRITER');
     }).init();
-    assert.deepEqual(await bridge.send(args), queued);
-    assert.deepEqual(
-      await bridge.send({ session_id: made.session_id, request_id: args.request_id }),
-      queued,
-    );
+
     assert.equal(await fs.readFile((await bridge.session(made.session_id)).file, 'utf8'), before);
   },
 );

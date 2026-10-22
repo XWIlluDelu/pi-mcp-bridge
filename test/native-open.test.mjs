@@ -8,7 +8,6 @@ import { spawn } from 'node:child_process';
 import { Bridge } from '../src/bridge.mjs';
 import { openProfile } from '../src/open.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
 
 const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -22,7 +21,7 @@ async function until(fn, label) {
 }
 
 test(
-  'fresh TUI launcher auto-joins after native work settles, inherits ordinary configuration and resumes headless after quit',
+  'native --session-dir create persists, then the same launcher configuration joins safely and resumes headlessly',
   { timeout: 25000 },
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-native-open-'),
@@ -43,8 +42,10 @@ test(
     const exists=async file=>fs.stat(file).then(()=>true,()=>false);
     export default pi=>{
       pi.on('session_start',async(event,ctx)=>{
-        await fs.writeFile(dir+'/'+(event.reason==='resume'?'resumed.json':'startup-'+process.pid+'.json'),JSON.stringify({
+        const file=dir+'/'+(event.reason==='resume'?'resumed.json':'startup-'+process.pid+'.json');
+        await fs.writeFile(file+'.tmp',JSON.stringify({
           cli:process.argv[1],pid:process.pid,file:ctx.sessionManager.getSessionFile(),tools:pi.getActiveTools(),entries:ctx.sessionManager.getEntries()}));
+        await fs.rename(file+'.tmp',file);
       });
       pi.on('agent_before_settle',async()=>{if(process.env.PI_OPEN_FIXTURE_HOLD==='1'){await fs.writeFile(dir+'/settling','yes');while(!await exists(dir+'/continue'))await new Promise(r=>setTimeout(r,10));}});
     };`,
@@ -69,25 +70,22 @@ test(
       JSON.stringify({ 'bridge-fixture': { type: 'api_key', key: 'synthetic-only' } }),
     );
     const config = {
-      principal: 'native-open',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       attachmentDir: path.join(dir, 'ipc'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'p', path: cwd }],
-      grants: [{ folder: cwd, read: true, send: true }],
+      folders: [{ path: cwd }],
+      grants: [{ folder: cwd, read: true, send: true, create: true }],
       piRuntime: { agentDir: agent, inheritEnv: ['PATH', 'PI_OFFLINE', 'PI_OPEN_FIXTURE_HOLD'] },
-      piArgs: ['--offline'],
+      piArgs: ['--offline', '--session-dir', path.join(dir, 'sessions')],
     };
     const configFile = path.join(dir, 'owner.json');
     await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     const prior = process.env.PI_OPEN_FIXTURE_HOLD,
       priorPath = process.env.PATH;
-    process.env.PI_OPEN_FIXTURE_HOLD = '1';
+    delete process.env.PI_OPEN_FIXTURE_HOLD;
     process.env.PATH = native.PATH;
-    const bridge = await new Bridge(config).init(),
-      made = await savedSession(bridge, { folder_id: 'p' }),
-      session = await bridge.session(made.session_id);
+    const bridge = await new Bridge(config).init();
     let tui, owner;
     t.after(async () => {
       await fs.writeFile(path.join(dir, 'continue'), 'yes').catch(() => {});
@@ -103,10 +101,28 @@ test(
       else process.env.PI_OPEN_FIXTURE_HOLD = prior;
       process.env.PATH = priorPath;
     });
-    assert.equal(
-      (await bridge.send({ session_id: session.id, request_id: 'work', text: 'NATIVE_OPEN_WORK' }))
-        .status,
-      'accepted',
+    const made = await bridge.create({ project: cwd, text: 'NATIVE_CREATE' });
+    assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
+    const session = await bridge.session(made.session_id);
+    await until(
+      async () => (await bridge.pool.get(session.id).idleSnapshot()).status === 'idle',
+      'created RPC completes',
+    );
+    await bridge.pool.stop(session.id);
+    const profile = await openProfile(configFile, session.id, {
+      PATH: process.env.PATH,
+      HOME: dir,
+      TERM: 'xterm-256color',
+      LANG: 'C.UTF-8',
+      PI_OFFLINE: '1',
+    });
+    assert.deepEqual(profile.args.slice(0, 3), config.piArgs);
+    process.env.PI_OPEN_FIXTURE_HOLD = '1';
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await bridge.send({ session_id: session.id, text: 'NATIVE_OPEN_WORK' })).status,
+      ),
+      'Expected native prompt admission',
     );
     const rpc = bridge.pool.get(session.id),
       old = structuredClone(rpc.ownerRecord);
@@ -118,13 +134,6 @@ test(
         ),
       'owned settling',
     );
-    const profile = await openProfile(configFile, session.id, {
-      PATH: process.env.PATH,
-      HOME: dir,
-      TERM: 'xterm-256color',
-      LANG: 'C.UTF-8',
-      PI_OFFLINE: '1',
-    });
     assert.equal(profile.command, native.executable);
     assert.equal(rpc.child.spawnfile, native.executable);
     assert.equal(profile.args.includes('--session'), false);
@@ -176,13 +185,16 @@ test(
     assert.notEqual(initial.file, session.file);
     process.kill(owner.owner.pid, 'SIGTERM');
     await waitOwnerExit(owner.owner);
-    assert.equal((await readClaim(config.attachmentDir, session)).coldReacquireAfterExit, true);
+    assert.equal((await readClaim(config.attachmentDir, session)).noColdReacquire, undefined);
     const resumedHeadless = await bridge.send({
       session_id: session.id,
-      request_id: 'after-quit',
+
       text: 'HEADLESS_AFTER_NATIVE_QUIT',
     });
-    assert.equal(resumedHeadless.status, 'accepted', JSON.stringify(resumedHeadless));
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(resumedHeadless.status),
+      JSON.stringify(resumedHeadless),
+    );
     const next = bridge.pool.get(session.id);
     assert.equal(next.child.spawnfile, native.executable);
     assert.notEqual(next.child.pid, old.owner.pid);
