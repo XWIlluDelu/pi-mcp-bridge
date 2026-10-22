@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { fixture, completedEntries } from './fixtures/model-runtime.mjs';
+import { fixture, releasedEntries } from './fixtures/model-runtime.mjs';
 
 const gate = () => Promise.withResolvers();
 const writePolicy = (f, config) => fs.writeFile(f.configFile, JSON.stringify(config));
@@ -45,13 +45,13 @@ test('receive-time snapshots precede delayed executors and isolate concurrent de
   await snapshots[1];
   release[0].resolve();
   assert.equal((await a).structuredContent.status, 'started');
-  await completedEntries(f.bridge, f.id);
+  await releasedEntries(f.bridge, f.id);
   await writePolicy(f, allowed);
   const c = await f.bridge.send({ session_id: f.id, text: 'ADMITTED_C' });
   assert.ok(['started', 'queued', 'handled'].includes(c.status), JSON.stringify(c));
   release[1].resolve();
   assert.equal((await b).structuredContent.reason, 'NOT_FOUND_OR_DENIED');
-  const entries = await completedEntries(f.bridge, f.id);
+  const entries = await releasedEntries(f.bridge, f.id);
   assert.equal(entries.filter((e) => e.message?.role === 'user').length, 2);
   assert.deepEqual(
     f.config.grants,
@@ -180,7 +180,7 @@ test('one direct batch snapshot covers late lane items, list project filters and
   const fresh = await f.bridge.list({ session_id: f.id });
   assert.deepEqual(fresh.sessions, []);
   assert.deepEqual(fresh.creatable_projects, []);
-  await completedEntries(f.bridge, f.id);
+  await releasedEntries(f.bridge, f.id);
 });
 
 for (const initialRead of [true, false])
@@ -212,7 +212,7 @@ for (const initialRead of [true, false])
       const result = await pending;
       if (initialRead) {
         assert.equal(result.created, true);
-        const entries = await completedEntries(f.bridge, result.session_id);
+        const entries = await releasedEntries(f.bridge, result.session_id);
         assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
       } else {
         assert.equal(result.reason, 'NOT_FOUND_OR_DENIED');

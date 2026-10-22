@@ -400,6 +400,40 @@ test('stdio shutdown drains an admitted SDK history read before closing the Brid
   }
 });
 
+test('stdio EOF settles queued input without starting another writer after a shutdown hook', async (t) => {
+  const f = await fixture(t),
+    shutdown = path.join(f.dir, 'shutdown'),
+    release = path.join(f.dir, 'shutdown-go');
+  await fs.writeFile(
+    path.join(f.dir, 'command.mjs'),
+    `import fs from 'node:fs/promises';export default pi=>{pi.registerCommand('lifecycle-fixture',{handler:async()=>{}});pi.on('session_shutdown',async()=>{if(await fs.stat(${JSON.stringify(shutdown)}).then(()=>true,()=>false))return;await fs.writeFile(${JSON.stringify(shutdown)},'yes');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));});};`,
+  );
+  const server = launch(t, f);
+  try {
+    await server.initialize();
+    assert.equal(
+      (await server.call('send', { session_id: f.id, text: '/lifecycle-fixture' })).status,
+      'handled',
+    );
+    await until(() => exists(shutdown));
+    const owner = (await ownClaim(f)).owner;
+    const pending = server.request('tools/call', {
+      name: 'send',
+      arguments: { session_id: f.id, text: '/lifecycle-fixture' },
+    });
+    server.child.stdin.end();
+    const response = (await pending).result;
+    const result = response.structuredContent ?? JSON.parse(response.content[0].text);
+    assert.equal(result.reason ?? result.error?.code, 'BRIDGE_CLOSING');
+    assert.equal(await server.exit(), 0);
+    await stopped(f, owner);
+  } finally {
+    await fs.writeFile(release, 'go');
+    server.child.stdin.end();
+    await server.done;
+  }
+});
+
 for (const modern of [false, true])
   for (const endInput of [false, true])
     test(
@@ -486,19 +520,16 @@ test(
     try {
       await server.initialize();
       await server.call('send', { session_id: f.id, text: '/lifecycle-fixture' });
+      await until(() => exists(shutdown));
       const owner = (await ownClaim(f)).owner;
       pending = ownerRequest(f.config, { op: 'release', session_id: f.id }).catch((error) => ({
         reason: error.message,
       }));
       await until(() => exists(admitted));
-      await until(() => exists(shutdown));
       server.child.stdin.end();
-      await pending;
+      assert.equal((await pending).reason, 'BRIDGE_CLOSING');
       assert.equal(await server.exit(), 0);
-      assert.equal(await ownerAlive(owner), false);
-      const paused = await readClaim(f.config.attachmentDir, f.session);
-      assert.equal(paused.owner, null);
-      assert.equal(paused.noColdReacquire, true);
+      await stopped(f, owner);
     } finally {
       await fs.writeFile(release, 'go');
       server.child.stdin.end();

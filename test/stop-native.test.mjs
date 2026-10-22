@@ -158,7 +158,7 @@ for (const op of ['send', 'command'])
         JSON.stringify(restarted),
       );
       assert.equal(f.bridge.inputs.size, 0);
-      await until(async () => (await f.bridge.pool.get(id).idleSnapshot()).status === 'idle');
+      await until(() => !f.bridge.pool.get(id) && !f.bridge.autoReleases.size);
       assert.equal((await f.bridge[op](fresh.args)).status, op === 'send' ? 'started' : 'accepted');
     },
   );
@@ -344,7 +344,7 @@ async function exercise(f, native) {
 }
 
 test(
-  'Bridge-owned offline Pi cancels agent and bash, withdraws queued text, retains history and permits a later prompt',
+  'Bridge-owned offline Pi cancels agent and bash, withdraws queued text, then releases and resumes history',
   { timeout: 30000 },
   async (t) => {
     const f = await fixture(t, true),
@@ -352,6 +352,7 @@ test(
     await exerciseBash(f, {
       getEntries: async () => ({ entries: await savedEntries(f.bridge, id) }),
       getState: async () => {
+        await f.bridge.pool.instances.get(id)?.autoReleaseTask;
         return (await f.bridge.pool.resolve(await f.bridge.session(id))).state();
       },
     });
@@ -389,7 +390,9 @@ test(
     assert.ok((steering + '\n\n' + followUp).startsWith(stopped.withdrawn_text));
     assert.equal(stopped.withdrawn_complete, false);
     assert.equal((await bash).cancelled, true);
-    await until(async () => (await runtime.idleSnapshot()).status === 'idle');
+    await until(() => runtime.exited && !f.bridge.autoReleases.size);
+    assert.equal(runtime.child.exitCode, 0);
+    assert.equal(runtime.child.signalCode, null);
     assert.equal(
       (await savedEntries(f.bridge, id)).filter((e) => e.message?.role === 'user').length,
       1,
@@ -401,9 +404,11 @@ test(
       'Expected native prompt admission',
     );
     const next = f.bridge.pool.get(id);
-    assert.equal(next.generation, generation);
-    await until(async () => (await next.idleSnapshot()).status === 'idle');
+    assert.notEqual(next.generation, generation);
+    await until(() => next.exited && !f.bridge.autoReleases.size);
     assert.match(JSON.stringify(await savedEntries(f.bridge, id)), /AFTER_STOP_REPLY/);
+    assert.equal(next.child.exitCode, 0);
+    assert.equal(next.child.signalCode, null);
   },
 );
 

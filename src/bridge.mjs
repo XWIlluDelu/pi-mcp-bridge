@@ -46,6 +46,7 @@ import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { prepareTrash } from './trash.mjs';
 import { idleHandoff, cancelHandoff } from './idle-handoff.mjs';
+import { scheduleAutoRelease } from './auto-release.mjs';
 import { optionalResultFields } from './response-budget.mjs';
 export class Bridge {
   constructor(config, factory, { configFile } = {}) {
@@ -61,6 +62,8 @@ export class Bridge {
     this.sessionFiles = new Map();
     this.titleCache = new Map();
     this.readCache = new ContextReadCache();
+    this.autoReleases = new Set();
+    this.pool.onIdleCandidate = (runtime) => scheduleAutoRelease(this, runtime);
   }
   async init() {
     validateOwnerConfig(this.config);
@@ -93,7 +96,11 @@ export class Bridge {
     try {
       return await next;
     } finally {
-      if (this.locks.get(id) === next) this.locks.delete(id);
+      if (this.locks.get(id) === next) {
+        this.locks.delete(id);
+        if (id.startsWith('stop:') || id.startsWith('bash:'))
+          this.pool.instances.get(id.slice(5))?.onIdleCandidate?.();
+      }
     }
   }
   registerInput(sessionId) {
@@ -122,7 +129,7 @@ export class Bridge {
   }
   async mutationLock(id, action, requestContext, fn, lockId = id) {
     const blockedReason = () =>
-      this.handoffs.has(id)
+      this.handoffs.has(id) && this.handoffs.get(id).kind !== 'auto_release'
         ? 'HANDOFF_PENDING'
         : action === 'send' && this.locks.has(`stop:${id}`)
           ? 'STOP_IN_PROGRESS'
@@ -197,13 +204,28 @@ export class Bridge {
     const parsed = publicOperationSchemas[op].safeParse(input);
     if (!parsed.success) throw new Error('INVALID_ARGUMENTS');
     this.assertOpen();
-    const work = action.call(this, parsed.data, options);
+    let releaseCandidate;
+    const work = (async () => {
+      try {
+        return await action.call(this, parsed.data, {
+          ...options,
+          markForAutoRelease: (runtime) => {
+            if (runtime instanceof PiRpc) releaseCandidate = runtime;
+          },
+        });
+      } finally {
+        if (releaseCandidate) {
+          releaseCandidate.autoReleaseWanted = true;
+          releaseCandidate.onIdleCandidate?.();
+        }
+      }
+    })();
     this.pendingMutations.add(work);
     const settled = () => this.pendingMutations.delete(work);
     work.then(settled, settled);
     return work;
   }
-  async #compact(args, { requestContext, pendingInput } = {}) {
+  async #compact(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
     return this.withInput(args.session_id, pendingInput, async (checkInput) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
@@ -220,6 +242,7 @@ export class Bridge {
             checkInput();
             runtime = await this.pool.resolve(session);
           }
+          markForAutoRelease(runtime);
           if (!runtime.attached && !body.interrupt)
             await runtime.assertIdle({
               busy: 'COMPACT_BUSY',
@@ -400,7 +423,14 @@ export class Bridge {
       });
     }
     args = { ...args, session_id: id };
-    const runtime = await this.pool.forRead(s);
+    let runtime = await this.pool.forRead(s);
+    while (runtime && this.handoffs.get(id)?.runtime === runtime) {
+      await runtime.autoReleaseTask;
+      this.assertOpen();
+      s = await this.session(id);
+      this.check('read', s, requestContext);
+      runtime = await this.pool.forRead(s);
+    }
     diagnostics.emit('read.source', {
       kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
     });
@@ -452,7 +482,7 @@ export class Bridge {
       readPins,
     });
   }
-  async #send(args, { requestContext, pendingInput } = {}) {
+  async #send(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
     if (!SEND_MODES.includes(args.mode ?? 'default')) throw new Error('INVALID_ARGUMENTS');
     return this.withInput(args.session_id, pendingInput, async (beforeDispatch) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
@@ -488,6 +518,7 @@ export class Bridge {
             await validateExecutionCwd(s.cwd);
             await loadSavedSession(s);
             runtime = await this.pool.resolve(s);
+            markForAutoRelease(runtime);
           }
           const authorized = async () => {
             beforeDispatch();
@@ -539,6 +570,8 @@ export class Bridge {
             ...promptOptions(hasPromptSettings(body) ? 'idle_only' : body.mode),
           };
           const late = () => {}; // Keep native late-ACK identity validation.
+          if (!runtime.modelMutation && !runtime.compactionMutation && !runtime.promptAdmission)
+            markForAutoRelease(runtime);
           const result = await runtime.command(command, args.timeout_ms ?? 5000, late, () =>
             beforePromptDispatch(runtime, body, selection, authorized),
           );
@@ -556,7 +589,7 @@ export class Bridge {
       });
     });
   }
-  async #command(args, { requestContext, resultBudget, pendingInput } = {}) {
+  async #command(args, { requestContext, resultBudget, markForAutoRelease, pendingInput } = {}) {
     return this.withInput(args.session_id, pendingInput, async (checkInput) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
@@ -569,6 +602,8 @@ export class Bridge {
         return this.locked(`bash:${session.id}`, async () => {
           let generation;
           try {
+            if (this.handoffs.get(session.id)?.kind === 'auto_release')
+              await this.pool.instances.get(session.id)?.autoReleaseTask;
             const beforeDispatch = async () => {
               checkInput();
               this.check('command', session, requestContext);
@@ -581,6 +616,7 @@ export class Bridge {
               await loadSavedSession(session);
               runtime = await this.pool.resolve(session);
             }
+            markForAutoRelease(runtime);
             await beforeDispatch();
             if (typeof runtime.executeBash !== 'function') throw new Error('BASH_UNSUPPORTED');
             generation = runtime.generation ?? runtime.record?.generation ?? null;
@@ -618,6 +654,8 @@ export class Bridge {
           this.assertOpen();
           for (const input of this.inputs)
             if (input.sessionId === session.id && !retainedInputs?.has(input)) input.stopped = true;
+          if (this.handoffs.get(session.id)?.kind === 'auto_release')
+            return { status: 'skipped', reason: 'not_running' };
           const runtime = await this.pool.forRead(session);
           this.assertOpen();
           this.check('stop', session, requestContext);
@@ -646,7 +684,7 @@ export class Bridge {
       ? withdrawalOutput(receipt, withdrawn, args, resultBudget)
       : { ...receipt, withdrawn_available: false };
   }
-  async #create(args, { requestContext } = {}) {
+  async #create(args, { requestContext, markForAutoRelease } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const folder = this.config.folders.find((folder) => folder.path === args.project);
@@ -671,7 +709,14 @@ export class Bridge {
       if (args.fork_from) {
         parent = await this.session(args.fork_from);
         this.check('read', parent, requestContext);
-        const runtime = await this.pool.forRead(parent);
+        let runtime = await this.pool.forRead(parent);
+        while (runtime && this.handoffs.get(parent.id)?.runtime === runtime) {
+          await runtime.autoReleaseTask;
+          this.assertOpen();
+          parent = await this.session(args.fork_from);
+          this.check('read', parent, requestContext);
+          runtime = await this.pool.forRead(parent);
+        }
         if (runtime?.attached) {
           if (typeof runtime.snapshot !== 'function') throw new Error('SNAPSHOT_UNSUPPORTED');
           snapshot = await runtime.snapshot();
@@ -700,6 +745,7 @@ export class Bridge {
           created = true;
 
           const runtime = await this.pool.resolve(child);
+          markForAutoRelease(runtime);
           await beforeDispatch();
           if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
           if (hasPromptSettings(input)) {
@@ -817,6 +863,7 @@ export class Bridge {
       await closing.stop();
       return { session_id, status: 'released', no_cold_reacquire: true };
     }
+    if (this.handoffs.get(session_id)?.kind === 'auto_release') await closing?.autoReleaseTask;
     if (this.handoffs.has(session_id)) throw new Error('HANDOFF_PENDING');
     const priorStop = this.locks.get(`stop:${session_id}`),
       release = { kind: 'release' };
@@ -931,6 +978,7 @@ export class Bridge {
       while (this.pendingMutations.size) await Promise.allSettled([...this.pendingMutations]);
       await this.pool.drainAcks?.();
       await this.pool.close();
+      await Promise.allSettled([...this.autoReleases]);
       if (this.lock) {
         await this.lock.close();
         this.lock = null;

@@ -90,7 +90,7 @@ test(
       'skipped',
     );
     await fs.writeFile(gate, 'done');
-    await until(async () => (await runtime.idleSnapshot()).status === 'idle');
+    await until(() => runtime.exited && !bridge.autoReleases.size);
     const images = (await savedEntries(bridge, made.session_id))
       .filter((e) => e.message?.role === 'user')
       .flatMap((e) =>

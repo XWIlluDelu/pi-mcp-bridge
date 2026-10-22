@@ -57,13 +57,21 @@ Authorized writer open remains responsible for native persistence. Missing or em
 
 Authorized send, command or compact can cold-start an RPC; stop never does. `list.status` observes a live owner's current model/thinking, or null when the native selection is unobserved. Current custom hosts declare boolean capabilities from the callbacks they implement.
 
-Bridge-owned RPCs remain open between operations. Owner-local release and TUI
-handoff close them through normal EOF. Native launch overrides apply on every cold start.
+After public prompt or control work, a Bridge-owned RPC normally exits by EOF once matching
+prompt ACKs, native settlement, drained queues and the observer prove idle.
+Stop/recovery, in-flight reads and native command output capture finish first. There is no idle timer or new
+cold-resume fence: history stays on disk, and a later send resolves ownership
+again and may cold-start the same session. Native launch overrides still apply
+on every cold start. A send arriving during EOF waits for that exact exit.
 Read/list do not reopen a saved session.
 Companion TUI/RPC instances and supplied hosts retain their own lifecycle.
 On native shutdown/switch, the companion fences admissions and drains its
 admitted manual compaction before allowing a fresh
 session_start to retire the old claim. Socket loss does not settle those calls.
+
+Missing ACKs and observed independent extension preflight without completion correlation keep the owner alive. Automatic release promises to drain observable top-level calls, runs, queues, received ACK checks and native capture, not arbitrary detached extension jobs. A handled slash or ordinary input does not by itself hold the generation forever; nested asynchronous commands may outlive that top-level return and be interrupted by EOF. Extensions needing a longer lifetime must finish it within the observable lifecycle or use an externally managed owner. No quiet-time heuristic can establish detached-job completion.
+
+A cold `command` is also eligible for safe release after bash completion; timeout retains the native pending ACK and late completion reevaluates release. Compaction also enables safe release on completion or refusal; a timed-out compaction keeps its native fence until settlement.
 
 The ordinary companion returns `PI_ACCEPTANCE_UNOBSERVABLE` after
 `sendUserMessage()`; a successful transport write is not an admission ACK.
@@ -321,10 +329,10 @@ already exiting by EOF before draining requests. Already-dispatched inputs,
 history reads and received ACK checks finish before the remaining owned runtimes
 close. Queued operations may return `BRIDGE_CLOSING`; closing never starts a
 replacement writer to run them.
-Both per-request MCP and SDK tools participate in this drain. A normal EOF exit
-checks synchronous activity after the last ACK/process-identity await. Newly
-observed work prevents closing stdin; an owner-local release also withdraws its
-reservation.
+Both per-request MCP and SDK tools participate in this drain. Normal task
+auto-release still uses EOF alone. Its final synchronous activity check follows
+the last ACK/process-identity await. Newly observed work withdraws the temporary
+handoff and waits for a later settlement/ACK check instead of closing stdin.
 
 Bridge process shutdown also waits for SIGTERM termination without automatic
 SIGKILL escalation. A process manager's independent stop timeout still applies;

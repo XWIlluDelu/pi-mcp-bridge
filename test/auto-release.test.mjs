@@ -5,7 +5,8 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { createHttpService } from '../src/http-server.mjs';
+import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
+import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { ownerAlive, readClaim, processIdentity, reserveOwner } from '../src/attachments.mjs';
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -19,7 +20,7 @@ async function until(fn) {
     if (await fn()) return;
     await delay(10);
   }
-  throw Error('RELEASE_TEST_TIMEOUT');
+  throw Error('AUTO_RELEASE_TEST_TIMEOUT');
 }
 const exists = (file) =>
   fs.stat(file).then(
@@ -27,13 +28,13 @@ const exists = (file) =>
     () => false,
   );
 async function fixture(t, source = '') {
-  const dir = await fs.mkdtemp('/tmp/pi-release-'),
+  const dir = await fs.mkdtemp('/tmp/pi-auto-'),
     cwd = dir + '/project';
   await fs.mkdir(cwd);
   const extension = dir + '/fixture.mjs';
   await fs.writeFile(
     extension,
-    `import fs from 'node:fs/promises';const dir=${JSON.stringify(dir)};const delay=ms=>new Promise(r=>setTimeout(r,ms));const mark=name=>fs.writeFile(dir+'/'+name,'yes');async function wait(name){while(!await fs.stat(dir+'/'+name).then(()=>true,()=>false))await delay(10);}export default pi=>{${source}};`,
+    `import fs from 'node:fs/promises';import {fauxProvider} from ${JSON.stringify(path.resolve('node_modules/@earendil-works/pi-ai/dist/index.js'))};const dir=${JSON.stringify(dir)};const delay=ms=>new Promise(r=>setTimeout(r,ms));const mark=name=>fs.writeFile(dir+'/'+name,'yes');async function wait(name){while(!await fs.stat(dir+'/'+name).then(()=>true,()=>false))await delay(10);}export default pi=>{${source}};`,
   );
   const config = {
     ...isolatedRuntime(dir),
@@ -76,7 +77,8 @@ async function fixture(t, source = '') {
   const made = await savedSession(bridge),
     session = await bridge.session(made.session_id);
   t.after(async () => {
-    for (const gate of ['finish', 'shutdown-go']) await fs.writeFile(dir + '/' + gate, 'go');
+    for (const gate of ['finish', 'shutdown-go', 'input-go', 'slash-go'])
+      await fs.writeFile(dir + '/' + gate, 'go');
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -94,7 +96,212 @@ async function fixture(t, source = '') {
     mark: (name) => fs.writeFile(dir + '/' + name, 'yes'),
   };
 }
+async function released(f, rpc) {
+  await until(() => rpc.exited && !f.bridge.autoReleases.size);
+  assert.equal(rpc.child.exitCode, 0);
+  assert.equal(rpc.child.signalCode, null);
+  assert.equal(await readClaim(f.config.attachmentDir, rpc.session), null);
+}
+test(
+  'completed send releases only after normal shutdown; the next send reconnects and preserves history',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');pi.appendEntry('shutdown-saved',{});});`,
+    );
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await f.bridge.send({ session_id: f.id, text: 'FIRST' })).status,
+      ),
+      'Expected native prompt admission',
+    );
+    const first = f.runtimes[0],
+      owner = first.ownerRecord.owner;
+    await until(() => exists(f.dir + '/shutdown'));
+    assert.equal(await ownerAlive(owner), true);
+    let done = false;
+    const second = f.bridge.send({ session_id: f.id, text: 'SECOND' }).then((r) => {
+      done = true;
+      return r;
+    });
+    await delay(30);
+    assert.equal(done, false);
+    assert.equal(f.runtimes.length, 1);
+    await f.mark('shutdown-go');
+    assert.equal((await second).status, 'started');
+    const next = f.runtimes[1];
+    assert.notEqual(next.child.pid, first.child.pid);
+    await released(f, next);
+    const rows = await f.rows();
+    for (const text of ['FIRST', 'SECOND'])
+      assert.equal(
+        rows.filter(
+          (e) => e.message?.role === 'user' && JSON.stringify(e.message.content).includes(text),
+        ).length,
+        1,
+      );
+    assert.equal(rows.filter((e) => e.message?.role === 'assistant').length, 2);
+    assert.equal(rows.filter((e) => e.customType === 'shutdown-saved').length, 2);
+  },
+);
+test(
+  'steering and follow-up queues drain before release; idle_only resumes a later round',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('finish');});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'ONE' });
+    const rpc = f.runtimes[0];
+    await until(() => exists(f.dir + '/settling'));
+    for (const mode of ['steer', 'follow_up'])
+      assert.equal((await f.bridge.send({ session_id: f.id, text: mode, mode })).status, 'queued');
+    assert.equal(
+      (
+        await f.bridge.send({
+          session_id: f.id,
 
+          text: 'SKIP',
+          mode: 'idle_only',
+        })
+      ).status,
+      'skipped',
+    );
+    assert.equal(rpc.child.stdin.writableEnded, false);
+    await f.mark('finish');
+    await released(f, rpc);
+    for (const text of ['ONE', 'steer', 'follow_up'])
+      assert.ok(
+        (await f.rows()).some(
+          (e) => e.message?.role === 'user' && JSON.stringify(e.message.content).includes(text),
+        ),
+      );
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (
+          await f.bridge.send({
+            session_id: f.id,
+
+            text: 'IDLE_NEW',
+            mode: 'idle_only',
+          })
+        ).status,
+      ),
+      'Expected native prompt admission',
+    );
+    await released(f, f.runtimes[1]);
+  },
+);
+test(
+  'create handled by a plain input hook releases without requiring an agent run',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('input',()=>{pi.appendEntry('handled-input',{saved:true});return {action:'handled'};});`,
+    );
+    const made = await f.bridge.create({
+      project: f.cwd,
+
+      text: 'HANDLED',
+    });
+    assert.equal(made.send.status, 'handled');
+    const rpc = f.runtimes[0];
+    await released(f, rpc);
+    assert.equal(rpc.settlement.sequence, 0);
+    const rows = (await fs.readFile(rpc.session.file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.ok(rows.some((e) => e.customType === 'handled-input'));
+  },
+);
+test(
+  'unknown preflight retains ownership until its matching late ACK and run settle',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('input',async()=>{await mark('input-held');await wait('input-go');return {action:'continue'};});`,
+    );
+    const first = await f.bridge.send({
+      session_id: f.id,
+
+      text: 'LATE',
+      timeout_ms: 50,
+    });
+    assert.equal(first.status, 'unknown');
+    const rpc = f.runtimes[0];
+    assert.ok(rpc.promptAdmission);
+    assert.equal(rpc.child.stdin.writableEnded, false);
+    await f.mark('input-go');
+    await released(f, rpc);
+    assert.equal(f.runtimes.length, 1);
+  },
+);
+for (const slash of [false, true])
+  test(
+    `handled ${slash ? 'slash' : 'input'} releases observable work without promising detached nested command lifetime`,
+    { timeout: 10000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `
+    pi.registerCommand('inner',{handler:async()=>{await mark('slash-held');await wait('slash-go');await mark('slash-finished');}});
+    ${
+      slash
+        ? "pi.registerCommand('outer',{handler:async()=>pi.sendUserMessage('/inner',{expandPromptTemplates:true})});"
+        : "pi.on('input',()=>{pi.sendUserMessage('/inner',{expandPromptTemplates:true});return {action:'handled'};});"
+    }
+    pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+      );
+      assert.equal(
+        (await f.bridge.send({ session_id: f.id, text: slash ? '/outer' : 'HANDLED' })).status,
+        'handled',
+      );
+      const rpc = f.runtimes[0];
+      await until(() => exists(f.dir + '/shutdown'));
+      assert.equal(rpc.child.stdin.writableEnded, true);
+      assert.equal(await exists(f.dir + '/slash-finished'), false);
+      await f.mark('shutdown-go');
+      await released(f, rpc);
+    },
+  );
+test(
+  'read waits for automatic EOF and then remains saved without reopening a writer',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'READ_AFTER' });
+    await until(() => exists(f.dir + '/shutdown'));
+    const reading = f.bridge.read({ session_id: f.id });
+    await f.mark('shutdown-go');
+    assert.ok((await reading).items.some((i) => i.type === 'text'));
+    assert.equal(f.runtimes.length, 1);
+    assert.equal(f.bridge.pool.get(f.id), null);
+    await f.bridge.read({ session_id: f.id });
+    assert.equal(f.runtimes.length, 1);
+  },
+);
+test(
+  'a cancelled run finishes stop recovery before automatic release',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('finish');});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'CANCEL' });
+    const rpc = f.runtimes[0];
+    const stopping = f.bridge.stop({ session_id: f.id });
+    await f.mark('finish');
+    assert.equal((await stopping).status, 'accepted');
+    await released(f, rpc);
+    assert.equal((await f.bridge.stop({ session_id: f.id })).status, 'skipped');
+  },
+);
 test(
   'an attached host remains registered after a handled prompt',
   { timeout: 10000 },
@@ -135,6 +342,98 @@ test(
 );
 
 test(
+  'settlement cannot release a prompt whose matching ACK is still missing',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t);
+    const rpc = await f.bridge.pool.resolve(f.session),
+      receive = rpc.receiveResponse.bind(rpc);
+    let held;
+    t.mock.method(rpc, 'receiveResponse', (event, generation) => {
+      if (event.type === 'response' && event.command === 'prompt') {
+        held = [event, generation];
+        return;
+      }
+      return receive(event, generation);
+    });
+    const receipt = await f.bridge.send({
+      session_id: f.id,
+
+      text: 'SETTLED',
+      timeout_ms: 50,
+    });
+    assert.equal(receipt.status, 'unknown');
+    await until(() => rpc.settlement.sequence > 0);
+    await rpc.autoReleaseTask;
+    assert.ok(held);
+    assert.ok(rpc.promptAdmission);
+    assert.equal(rpc.child.stdin.writableEnded, false);
+    receive(...held);
+    await released(f, rpc);
+  },
+);
+
+test(
+  'failed native provider run is saved and normally released after create',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `const faux=fauxProvider({provider:'bridge-fixture',models:[{id:'deterministic'}]});faux.setResponses([()=>{throw new Error('FIXTURE_PROVIDER_FAILURE');}]);pi.registerProvider(faux.provider);`,
+    );
+    const made = await f.bridge.create({
+      project: f.cwd,
+
+      text: 'FAIL',
+    });
+    assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
+    const rpc = f.runtimes[0];
+    await released(f, rpc);
+    const rows = (await fs.readFile(rpc.session.file, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.ok(
+      rows.some((e) => e.message?.role === 'assistant' && e.message.stopReason === 'error'),
+    );
+    assert.equal(rows.filter((e) => e.message?.role === 'user').length, 1);
+  },
+);
+
+test(
+  'stop during automatic EOF cancels input waiting behind it without dispatching into shutdown',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'FINISHED' });
+    await until(() => exists(f.dir + '/shutdown'));
+    const rpc = f.runtimes[0];
+    const queued = f.bridge.send({
+      session_id: f.id,
+
+      text: 'MUST_NOT_START',
+    });
+    await until(() => f.bridge.inputs.size === 1);
+    const stopped = await f.bridge.stop({ session_id: f.id });
+    assert.equal(stopped.status, 'skipped');
+    assert.equal(stopped.reason, 'not_running');
+    await f.mark('shutdown-go');
+    const cancelled = await queued;
+    assert.equal(cancelled.status, 'rejected');
+    assert.equal(cancelled.reason, 'STOP_IN_PROGRESS');
+    await released(f, rpc);
+    assert.equal(f.runtimes.length, 1);
+    assert.ok(
+      !(await f.rows()).some(
+        (e) =>
+          e.message?.role === 'user' &&
+          JSON.stringify(e.message.content).includes('MUST_NOT_START'),
+      ),
+    );
+  },
+);
+
+test(
   'an existing native RPC host keeps its process and pipes after Bridge prompt completion',
   { timeout: 15000 },
   async (t) => {
@@ -171,6 +470,7 @@ test(
       );
       await until(async () => !(await client.getState()).isStreaming);
       assert.equal(f.runtimes.length, 0);
+      assert.equal(f.bridge.autoReleases.size, 0);
       assert.equal(await ownerAlive(owner), true);
       await f.bridge.close();
       assert.equal((await client.getState()).sessionId, f.session.header.id);
@@ -178,6 +478,109 @@ test(
     } finally {
       await client.stop();
       await controller.close();
+    }
+  },
+);
+
+test(
+  'on-time native bash keeps ownership through identity validation and inline result delivery',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('finish');});`,
+    );
+    f.config.grants[0].command = true;
+    await f.bridge.send({ session_id: f.id, text: 'PROMPT' });
+    const rpc = f.runtimes[0],
+      dispatch = rpc.dispatch.bind(rpc),
+      checking = Promise.withResolvers(),
+      identityGo = Promise.withResolvers();
+    let bashReturned = false,
+      held = false;
+    t.mock.method(rpc, 'dispatch', async (command, ...args) => {
+      if (command.type === 'get_state' && bashReturned && !held) {
+        held = true;
+        checking.resolve();
+        await identityGo.promise;
+      }
+      const result = await dispatch(command, ...args);
+      if (command.type === 'bash') bashReturned = true;
+      return result;
+    });
+    try {
+      const args = { session_id: f.id },
+        running = f.bridge.command({ ...args, command: 'printf "NATIVE_OUTPUT"' });
+      await checking.promise;
+      await f.mark('finish');
+      await until(() => rpc.settlement.sequence > 0);
+      await rpc.autoReleaseTask;
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      identityGo.resolve();
+      const result = await running;
+      assert.equal(result.status, 'accepted');
+      assert.equal(result.output, 'NATIVE_OUTPUT');
+      await released(f, rpc);
+      assert.equal(f.runtimes.length, 1, 'output recovery never reruns or cold-starts the command');
+    } finally {
+      identityGo.resolve();
+    }
+  },
+);
+
+test(
+  'fork during automatic EOF waits for the final native tail without reopening the parent',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');pi.appendEntry('shutdown-saved',{saved:true});});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'PARENT' });
+    await until(() => exists(f.dir + '/shutdown'));
+    const parent = f.runtimes[0],
+      args = { project: f.cwd, fork_from: f.id, text: 'CHILD' };
+    const observed = Promise.withResolvers(),
+      forRead = f.bridge.pool.forRead.bind(f.bridge.pool);
+    t.mock.method(f.bridge.pool, 'forRead', async (session) => {
+      const runtime = await forRead(session);
+      if (session.id === f.id && f.bridge.handoffs.get(f.id)?.runtime === runtime)
+        observed.resolve();
+      return runtime;
+    });
+    let completed = false;
+    const forking = f.bridge.create(args).then((result) => {
+      completed = true;
+      return result;
+    });
+    try {
+      await observed.promise;
+      assert.equal(completed, false);
+      assert.equal(f.runtimes.length, 1);
+      assert.equal(await ownerAlive(parent.ownerRecord.owner), true);
+      await f.mark('shutdown-go');
+      const result = await forking;
+      assert.equal(result.status, 'started', JSON.stringify(result));
+      assert.equal(result.created, true);
+      const child = f.runtimes[1];
+      assert.notEqual(child.session.header.id, parent.session.header.id);
+      await released(f, child);
+      assert.equal(parent.exited, true);
+      const parentRows = await f.rows(),
+        childRows = (await fs.readFile(child.session.file, 'utf8'))
+          .trim()
+          .split('\n')
+          .map(JSON.parse),
+        sourceTail = parentRows.find((entry) => entry.customType === 'shutdown-saved');
+      assert.ok(sourceTail);
+      assert.ok(childRows.some((entry) => entry.id === sourceTail.id));
+      assert.equal(parentRows.filter((entry) => entry.message?.role === 'user').length, 1);
+      assert.equal(childRows.filter((entry) => entry.message?.role === 'user').length, 2);
+
+      assert.equal(f.runtimes.length, 2, 'fork and replay never reopen the parent');
+    } finally {
+      await f.mark('shutdown-go');
+      await forking;
     }
   },
 );
@@ -191,11 +594,10 @@ for (const method of ['interrupt', 'stop'])
         t,
         `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
       );
-      const rpc = await f.bridge.pool.resolve(f.session),
+      await f.bridge.send({ session_id: f.id, text: 'CLOSING' });
+      const rpc = f.runtimes[0],
         signals = [],
         kill = rpc.child.kill.bind(rpc.child);
-      const exiting = rpc.gracefulExit();
-      void exiting.catch(() => {});
       await until(() => exists(f.dir + '/shutdown'));
       assert.equal(rpc.child.stdin.writableEnded, true);
       await assert.rejects(
@@ -215,9 +617,40 @@ for (const method of ['interrupt', 'stop'])
       assert.deepEqual(signals, ['SIGTERM']);
       assert.equal(rpc.exited, true);
       assert.equal(rpc.child.signalCode, 'SIGTERM');
-      await assert.rejects(exiting, /RUNTIME_EXIT_ABNORMAL/);
+      await rpc.autoReleaseTask;
       const claim = await readClaim(f.config.attachmentDir, f.session);
       assert.equal(claim?.noColdReacquire ?? false, method === 'interrupt');
+    },
+  );
+
+for (const slow of [false, true])
+  test(
+    `cold command auto-releases after native bash completion (${slow ? 'late ACK' : 'normal'})`,
+    { timeout: 10000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        slow
+          ? `pi.on('user_bash',async()=>{await mark('bash-held');await wait('finish');return {result:{output:'late-ok',exitCode:0,cancelled:false,truncated:false}};});`
+          : '',
+      );
+      f.config.grants[0].command = true;
+      const result = await f.bridge.command({
+        session_id: f.id,
+        command: 'printf audit-ok',
+        timeout_ms: slow ? 50 : 5000,
+      });
+      const rpc = f.runtimes[0];
+      if (slow) {
+        assert.equal(result.status, 'unknown');
+        assert.equal(rpc.child.stdin.writableEnded, false);
+        assert.equal((await f.bridge.list({ session_id: f.id })).sessions[0].status.state, 'busy');
+        await f.mark('finish');
+      } else {
+        assert.equal(result.status, 'accepted');
+        assert.equal(result.output, 'audit-ok');
+      }
+      await released(f, rpc);
     },
   );
 
@@ -250,7 +683,96 @@ for (const batch of [false, true])
         : [await first, await second];
       assert.equal(new Set(made.map((item) => item.session_id)).size, 2);
       assert.ok(made.every((item) => item.created && item.status === 'handled'));
+      await until(() => f.runtimes.every((rpc) => rpc.exited) && !f.bridge.autoReleases.size);
       assert.notEqual(f.runtimes[0].session.file, f.runtimes[1].session.file);
+    },
+  );
+
+test(
+  'a command arriving during automatic EOF waits for exact exit and starts only its own next writer',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+    );
+    f.config.grants[0].command = true;
+    assert.equal(
+      (await f.bridge.command({ session_id: f.id, command: 'printf FIRST' })).output,
+      'FIRST',
+    );
+    await until(() => exists(f.dir + '/shutdown'));
+    const first = f.runtimes[0];
+    const next = f.bridge.command({ session_id: f.id, command: 'printf SECOND' });
+    await f.mark('shutdown-go');
+    assert.equal((await next).output, 'SECOND');
+    assert.equal(first.exited, true);
+    assert.notEqual(f.runtimes[1].child.pid, first.child.pid);
+    await released(f, f.runtimes[1]);
+  },
+);
+
+for (const route of ['direct', 'http'])
+  test(
+    'shutdown settles input queued behind automatic EOF without a replacement writer (' +
+      route +
+      ')',
+    { timeout: 20000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `pi.on('input',()=>({action:'handled'}));pi.on('session_shutdown',async()=>{if(!await fs.stat(dir+'/shutdown').then(()=>true,()=>false)){await mark('shutdown');await wait('shutdown-go');}});`,
+      );
+      assert.equal((await f.bridge.send({ session_id: f.id, text: 'FIRST' })).status, 'handled');
+      await until(() => exists(f.dir + '/shutdown'));
+      const token = 'a'.repeat(40),
+        service = route === 'http' ? createHttpService(f.bridge, { token }) : null,
+        previous = f.bridge.locks.get(f.id);
+      t.after(() => service?.close());
+      let input;
+      if (service) {
+        const url = await service.listen();
+        input = fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            [TOKEN_HEADER]: token,
+            'mcp-protocol-version': MODERN_VERSION,
+            'Mcp-Method': 'tools/call',
+            'Mcp-Name': 'send',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: {
+              name: 'send',
+              arguments: { session_id: f.id, text: 'SECOND' },
+              _meta: {
+                [META + 'protocolVersion']: MODERN_VERSION,
+                [META + 'clientCapabilities']: {},
+              },
+            },
+          }),
+        }).then((r) => r.json());
+      } else input = f.bridge.send({ session_id: f.id, text: 'SECOND' });
+      void input.catch(() => {});
+      await until(() => f.bridge.inputs.size === 1 && f.bridge.locks.get(f.id) !== previous);
+      let complete = false;
+      const close = (service ? service.close() : f.bridge.close()).then(() => (complete = true));
+      try {
+        await until(() => complete);
+        const result = await input;
+        assert.equal(service ? result.result.structuredContent.status : result.status, 'rejected');
+        assert.equal(f.runtimes.length, 1);
+        assert.ok(f.runtimes.every((runtime) => runtime.exited));
+        assert.equal(f.runtimes[0].child.signalCode, 'SIGTERM');
+        assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+      } finally {
+        await f.mark('shutdown-go');
+        await close;
+        await input;
+      }
     },
   );
 
@@ -265,7 +787,7 @@ for (const route of ['direct', 'http'])
       async (t) => {
         const f = await fixture(
           t,
-          'pi.on("session_shutdown",async()=>{await mark("shutdown");await wait("shutdown-go");});',
+          'pi.on("input",()=>({action:"handled"}));pi.on("session_shutdown",async()=>{await mark("shutdown");await wait("shutdown-go");});',
         );
         const runtime = await f.bridge.pool.resolve(f.session),
           owner = runtime.ownerRecord.owner,
@@ -295,6 +817,9 @@ for (const route of ['direct', 'http'])
           await service.listen();
           t.after(() => service.close());
         }
+        await f.bridge.send({ session_id: f.id, text: 'START' });
+        if (enteredEof) await until(() => exists(f.dir + '/shutdown'));
+        else await checking.promise;
         const admitted = Promise.withResolvers(),
           release = f.bridge.releaseForLocal.bind(f.bridge);
         t.mock.method(f.bridge, 'releaseForLocal', (...args) => {
@@ -305,8 +830,6 @@ for (const route of ['direct', 'http'])
           (error) => ({ error: error.message }),
         );
         await admitted.promise;
-        if (enteredEof) await until(() => exists(f.dir + '/shutdown'));
-        else await checking.promise;
         assert.equal(await ownerAlive(owner), true);
         let complete = false;
         const closing = (service ? service.close() : f.bridge.close()).then(() => {
@@ -339,30 +862,34 @@ const independentWorkSource =
   ').then(module=>module.default(pi));';
 for (const window of ['ack', 'identity'])
   test(
-    'normal EOF exit rechecks observed native work after the final ' + window + ' await',
+    'normal release rechecks observed native work after the final ' + window + ' await',
     { timeout: 15000 },
     async (t) => {
       const f = await fixture(t, independentWorkSource),
         rpc = await f.bridge.pool.resolve(f.session);
-      await rpc.command({ type: 'prompt', message: 'FIRST' });
-      await until(() => rpc.settlement.sequence === 1);
       const observed = Promise.withResolvers(),
         go = Promise.withResolvers();
-      let held = false;
+      const idleSnapshot = rpc.idleSnapshot.bind(rpc);
+      let idle = false,
+        held = false;
+      t.mock.method(rpc, 'idleSnapshot', async () => {
+        const value = await idleSnapshot();
+        if (value.status === 'idle') idle = true;
+        return value;
+      });
       const name = window === 'ack' ? 'drainAcks' : 'assertProcessIdentity',
         original = rpc[name].bind(rpc);
       t.mock.method(rpc, name, async (...args) => {
         const value = await original(...args);
-        if (!held) {
+        if (idle && !held) {
           held = true;
           observed.resolve();
           await go.promise;
         }
         return value;
       });
-      const exiting = rpc.gracefulExit();
-      void exiting.catch(() => {});
       try {
+        await f.bridge.send({ session_id: f.id, text: 'FIRST' });
         await observed.promise;
         await f.mark('new-run');
         await until(
@@ -372,8 +899,9 @@ for (const window of ['ack', 'identity'])
         );
         assert.equal((await rpc.state()).isStreaming, true);
         go.resolve();
-        await assert.rejects(exiting, /RUNTIME_BUSY/);
+        await until(() => !f.bridge.autoReleases.size);
         assert.equal(rpc.child.stdin.writableEnded, false);
+        assert.equal(f.bridge.handoffs.has(f.id), false);
         assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
         await f.mark('finish');
         await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
@@ -383,7 +911,6 @@ for (const window of ['ack', 'identity'])
       } finally {
         go.resolve();
         await f.mark('finish');
-        await exiting.catch(() => {});
       }
     },
   );

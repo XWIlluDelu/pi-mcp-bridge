@@ -5,7 +5,7 @@ import { pngImage } from './fixtures/image-input.mjs';
 import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { fixture, choice, savedEntries, completedEntries } from './fixtures/model-runtime.mjs';
+import { fixture, choice, savedEntries, releasedEntries } from './fixtures/model-runtime.mjs';
 
 test(
   'HTTP create selects the session model and preserves native defaults',
@@ -45,7 +45,7 @@ test(
     const made = await call('create', args);
     assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
     assert.deepEqual(made.send.model_selection.model, choice('vision'));
-    const snapshot = await completedEntries(bridge, made.session_id);
+    const snapshot = await releasedEntries(bridge, made.session_id);
     assert.equal(snapshot.filter((e) => e.message?.role === 'user').length, 1);
     const reply = snapshot
       .findLast((e) => e.message?.role === 'assistant')
@@ -58,6 +58,7 @@ test(
       (await savedEntries(bridge, made.session_id)).filter((e) => e.type === 'model_change').length,
       snapshot.filter((e) => e.type === 'model_change').length,
     );
+    assert.equal(bridge.pool.instances.size, 0);
     const sent = await call('send', {
       session_id: made.session_id,
 
@@ -65,7 +66,7 @@ test(
       model: choice('alpha'),
     });
     assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
-    const updated = await completedEntries(bridge, made.session_id);
+    const updated = await releasedEntries(bridge, made.session_id);
     assert.equal(
       JSON.parse(
         updated
@@ -110,7 +111,7 @@ test(
     }
     assert.equal((await runtime.state()).model.id, 'alpha');
     await fs.writeFile(f.gate, 'go');
-    const entries = await completedEntries(bridge, id);
+    const entries = await releasedEntries(bridge, id);
     assert.equal(entries.filter((e) => e.message?.role === 'user').length, 2);
     assert.ok(
       entries
@@ -157,7 +158,7 @@ test(
     assert.equal((await b).reason, 'MODEL_SELECTION_BUSY');
     assert.equal((await runtime.state()).model.id, 'vision');
     await fs.writeFile(f.gate, 'go');
-    await completedEntries(bridge, id);
+    await releasedEntries(bridge, id);
   },
 );
 
