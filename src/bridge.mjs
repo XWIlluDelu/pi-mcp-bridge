@@ -465,7 +465,8 @@ export class Bridge {
       kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
     });
     let captured;
-    if (runtime?.attached) captured = await runtime.read(args);
+    if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
+      captured = await runtime.read(args);
     else {
       if (runtime) {
         const active = await runtime.entries();
@@ -480,7 +481,7 @@ export class Bridge {
         )
           throw new Error('INVALID_RUNTIME_ENTRIES');
         s = { ...s, entries: active.entries, leafId: active.leafId, live: active.live };
-      } else s = await loadSavedSession(s);
+      } else s = await loadSavedSession(s, { omitImageData: true });
       captured = prepareContextRead(s, args);
     }
     const current = await this.session(id);
