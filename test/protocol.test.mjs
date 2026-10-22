@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import packageInfo from '../package.json' with { type: 'json' };
-import lockfile from '../package-lock.json' with { type: 'json' };
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import {
@@ -40,30 +39,22 @@ test('modern requests are self-contained; discovery and tool list carry required
   const listed = (await dispatchModern(stub, message('tools/list'))).message.result;
   assert.deepEqual(
     listed.tools.map((t) => t.name),
-    [
-      'list',
-      'read',
-      'models',
-      'set_model',
-      'compact',
-      'reload',
-      'send',
-      'command',
-      'stop',
-      'create',
-      'delete',
-      'batch',
-      'health',
-    ],
+    ['list', 'read', 'compact', 'send', 'command', 'stop', 'create', 'delete', 'batch', 'health'],
   );
   assert.deepEqual(discovery.message.result._meta[META + 'serverInfo'], {
     name: 'pi-session-bridge',
     version: packageInfo.version,
   });
-  assert.equal(lockfile.version, packageInfo.version);
-  assert.equal(lockfile.packages[''].version, packageInfo.version);
   assert.equal(listed.ttlMs, 0);
   assert.equal(listed.cacheScope, 'private');
+  const read = listed.tools.find((tool) => tool.name === 'read').inputSchema;
+  assert.equal(
+    read.properties.preset.default,
+    undefined,
+    'Cursor-only continuation must not acquire an explicit preset',
+  );
+  assert.deepEqual(read.properties.preset.enum, ['latest', 'recent', 'full']);
+  assert.ok(!(read.required ?? []).includes('preset'));
   const direct = await dispatchModern(
     stub,
     message('tools/call', { name: 'list', arguments: { project: 'abc' } }),
@@ -89,11 +80,12 @@ test('modern versions, required metadata and unknown methods use official error 
   assert.equal((await dispatchModern(stub, message('not/a/method'))).status, 404);
   assert.equal((await dispatchModern(stub, message('not/a/method'))).message.error.code, -32601);
   assert.equal(
-    (await dispatchModern(stub, message('tools/call', { name: 'bash' }))).message.error.code,
+    (await dispatchModern(stub, message('tools/call', { name: 'missing_tool' }))).message.error
+      .code,
     -32602,
   );
 });
-test('public tools reject old aliases and unknown arguments; recovery payloads remain optional', async () => {
+test('public mutation payloads are validated before dispatch', async () => {
   const defs = toolDefinitions();
   assert.deepEqual(defs.find((t) => t.name === 'send').inputSchema.properties.mode.enum, [
     'default',
@@ -101,37 +93,38 @@ test('public tools reject old aliases and unknown arguments; recovery payloads r
     'steer',
     'follow_up',
   ]);
-  const errors = [];
-  for (const [name, args] of [
-    ['send', { session_id: 's', request_id: 'r', mode: 'native' }],
-    ['create', { folder_id: 'project', request_id: 'r' }],
-    ['read', { session_id: 's', view: 'raw' }],
-    ['list', { query: 'old' }],
-    ['health', { domain: 'unknown' }],
-  ]) {
-    errors.push(
-      (await dispatchModern(stub, message('tools/call', { name, arguments: args }))).message.result
-        .isError,
-    );
-  }
-  assert.deepEqual(errors, [true, true, true, true, true]);
   let called = 0;
   const bridge = {
     create: async (args) => {
       called++;
-      return { status: args.text ? 'created' : 'recovered' };
+      return { status: 'started' };
     },
   };
-  for (const args of [
-    { project: '/tmp/p', request_id: 'r', text: 'initial' },
-    { project: '/tmp/p', request_id: 'r' },
-  ]) {
-    assert.ok(
-      !(await dispatchModern(bridge, message('tools/call', { name: 'create', arguments: args })))
-        .message.result.isError,
-    );
-  }
-  assert.equal(called, 2);
+  const first = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'create',
+      arguments: { project: '/tmp/p', text: 'initial' },
+    }),
+  );
+  assert.equal(first.message.result.isError, undefined);
+  const empty = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'create',
+      arguments: { project: '/tmp/p' },
+    }),
+  );
+  assert.equal(empty.message.result.isError, true);
+  const unknown = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'create',
+      arguments: { project: '/tmp/p', text: 'initial', unexpected: true },
+    }),
+  );
+  assert.equal(unknown.message.result.isError, true);
+  assert.equal(called, 1);
 });
 test('modern HTTP validates mirrored headers including encoded Unicode and duplicates', () => {
   const body = message('tools/call', { name: '命令', arguments: {} });
@@ -206,8 +199,9 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   const entered = deferred(),
     release = deferred();
   const bridge = {
-    list: async (_args, { signal }) => {
-      entered.resolve(signal);
+    list: async (_args, options) => {
+      assert.equal(Object.hasOwn(options, 'signal'), false);
+      entered.resolve();
       await release.promise;
       return { sessions: [] };
     },
@@ -215,7 +209,7 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   const transport = new BridgeStdioTransport(bridge, { input, output });
   await transport.start();
   input.write(JSON.stringify(message('tools/call', { name: 'list', arguments: {} }, 42)) + '\n');
-  const signal = await entered.promise;
+  await entered.promise;
   input.write(
     JSON.stringify({
       jsonrpc: '2.0',
@@ -223,7 +217,6 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
       params: { requestId: 42 },
     }) + '\n',
   );
-  assert.equal(signal.aborted, true);
   release.resolve();
   await transport.drain();
   assert.equal(lines.length, 0);

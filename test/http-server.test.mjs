@@ -84,11 +84,10 @@ async function fixture(t, serviceOptions = {}) {
   await fs.mkdir(cwd);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'http-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true, delete: true }],
   };
   const runtime = {
@@ -104,7 +103,7 @@ async function fixture(t, serviceOptions = {}) {
     },
   };
   const bridge = await new Bridge(config, async () => runtime).init();
-  const created = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' });
+  const created = await savedSession(bridge);
   const service = createHttpService(bridge, { token, ...serviceOptions });
   const url = await service.listen();
   const cleanup = [];
@@ -129,7 +128,6 @@ async function fixture(t, serviceOptions = {}) {
     call,
     cleanup,
     id: created.session_id,
-    lock: path.join(config.stateDir, 'bridge.lock'),
   };
 }
 const deferred = () => {
@@ -196,7 +194,7 @@ test('modern HTTP has no handshake, required discovery/meta, mirrored headers an
   assert.equal(notFound.status, 404);
   assert.equal(notFound.body.error.code, -32601);
 });
-test('HTTP response deadline preserves admitted work and same-ID recovery without replay', async (t) => {
+test('HTTP response deadline reports uncertainty and does not replay admitted work', async (t) => {
   const f = await fixture(t, { waitTimeoutMs: 30 }),
     entered = deferred(),
     release = deferred();
@@ -209,7 +207,7 @@ test('HTTP response deadline preserves admitted work and same-ID recovery withou
   };
   const body = modern('tools/call', {
     name: 'send',
-    arguments: { session_id: f.id, request_id: 'deadline', text: 'fixture' },
+    arguments: { session_id: f.id, text: 'fixture' },
   });
   const pending = request(f.url, body, { headers: modernHeaders(body) }).response;
   await entered.promise;
@@ -218,18 +216,9 @@ test('HTTP response deadline preserves admitted work and same-ID recovery withou
   assert.equal(expired.body.error.message, 'REQUEST_WAIT_EXPIRED');
   assert.equal(f.runtime.calls.length, 1);
   assert.equal(f.bridge.closing, undefined);
-  // Exercise recovery with the normal HTTP budget, not the deliberately tiny
-  // expiry budget: filesystem settlement on a loaded runner may exceed 30 ms.
-  const recoveryService = createHttpService(f.bridge, { token });
-  const recoveryUrl = await recoveryService.listen();
-  f.cleanup.push(() => recoveryService.close());
+  assert.match(JSON.stringify(expired.body), /OUTCOME_UNKNOWN/);
   release.resolve();
-  const recovered = await request(
-    recoveryUrl,
-    rpc('send', { session_id: f.id, request_id: 'deadline' }),
-  ).response;
-  assert.equal(recovered.status, 200, recovered.text);
-  assert.equal(recovered.body.result.structuredContent.status, 'accepted');
+  await Promise.allSettled([...f.bridge.pendingMutations]);
   assert.equal(f.runtime.calls.length, 1);
 });
 test('HTTP measures complete Unicode MCP response including both payload representations', async (t) => {
@@ -251,7 +240,7 @@ test('HTTP initialize and independent requests use JSON without MCP sessions or 
   assert.match(response.headers['content-type'], /application\/json/);
   assert.equal(response.headers['access-control-allow-origin'], undefined);
   assert.equal((await f.call('list')).sessions[0].session_id, f.id);
-  assert.equal((await f.call('read', { session_id: f.id })).format, 'context_timeline');
+  assert.equal((await f.call('read', { session_id: f.id })).session_id, f.id);
   for (const method of ['GET', 'DELETE', 'OPTIONS'])
     assert.equal((await request(f.url, '', { method }).response).status, 405);
 });
@@ -322,21 +311,23 @@ test('HTTP bounds declared and chunked bodies and accepts ten maximally escaped 
     401,
   );
   const text = '\u0000'.repeat(100000);
-  assert.equal(
-    (await f.call('send', { session_id: f.id, request_id: 'escaped-large', text })).status,
-    'accepted',
+  assert.ok(
+    ['started', 'queued', 'handled'].includes(
+      (await f.call('send', { session_id: f.id, text })).status,
+    ),
+    'Expected native prompt admission',
   );
   assert.equal(f.runtime.calls[0].message.length, 100000);
   const batch = await f.call('batch', {
     operations: Array.from({ length: 10 }, (_, i) => ({
       op: 'send',
-      args: { session_id: f.id, request_id: `large-batch-${i}`, text },
+      args: { session_id: f.id, text },
     })),
   });
   assert.equal(batch.status, 'processed');
   assert.equal(batch.results.length, 10);
   assert.equal(
-    batch.results.every((item) => item.result.status === 'accepted'),
+    batch.results.every((item) => item.result.status === 'started'),
     true,
   );
   assert.equal(f.runtime.calls.length, 11);
@@ -363,7 +354,7 @@ test('same JSON-RPC IDs on concurrent HTTP requests never cross responses', asyn
   );
 });
 
-test('lost HTTP response recovers same request_id without resend or closing Bridge', async (t) => {
+test('lost HTTP response does not replay work or close the Bridge', async (t) => {
   const f = await fixture(t),
     entered = deferred(),
     release = deferred();
@@ -374,105 +365,89 @@ test('lost HTTP response recovers same request_id without resend or closing Brid
     return { disposition: 'started' };
   };
   f.cleanup.push(() => release.resolve());
-  const original = request(
-    f.url,
-    rpc('send', { session_id: f.id, request_id: 'lost', text: 'fixture' }),
-  );
+  const original = request(f.url, rpc('send', { session_id: f.id, text: 'fixture' }));
   const lost = original.response.catch(() => null);
   await entered.promise;
   original.req.destroy();
   await lost;
   assert.equal(f.bridge.closing, undefined);
-  assert.equal((await fs.stat(f.lock)).isFile(), true);
+  assert.ok(f.bridge.lock);
   release.resolve();
-  const recovered = await f.call('send', { session_id: f.id, request_id: 'lost' });
-  assert.equal(recovered.status, 'accepted');
+  await Promise.allSettled([...f.bridge.pendingMutations]);
   assert.equal(f.runtime.calls.length, 1);
   assert.equal((await f.call('list')).sessions.length, 1);
 });
 
 for (const first of ['send', 'read'])
-  test(`HTTP disconnect during pending ${first} preserves later admitted batch mutations`, async (t) => {
-    const f = await fixture(t),
-      entered = deferred(),
-      release = deferred();
-    let signal, readError;
-    f.cleanup.push(() => release.resolve());
-    const method = first === 'send' ? 'send' : 'read',
-      original = f.bridge[method].bind(f.bridge);
-    f.bridge[method] = async (args, options) => {
-      signal = options.signal;
-      try {
-        return await original(args, options);
-      } catch (error) {
-        readError = error;
-        throw error;
+  test(
+    `HTTP disconnect during pending ${first} preserves later admitted batch mutations`,
+    { timeout: 10000 },
+    async (t) => {
+      const f = await fixture(t),
+        entered = deferred(),
+        release = deferred(),
+        completed = deferred();
+      const create = f.bridge.create.bind(f.bridge);
+      t.mock.method(f.bridge, 'create', async (...args) => {
+        const result = await create(...args);
+        completed.resolve(result);
+        return result;
+      });
+      let readCompleted = false;
+      f.cleanup.push(() => release.resolve());
+      let initial;
+      if (first === 'send') {
+        f.runtime.command = async (command) => {
+          f.runtime.calls.push(command);
+          entered.resolve();
+          await release.promise;
+          return { disposition: 'started' };
+        };
+        initial = {
+          op: 'send',
+          args: { session_id: f.id, text: 'fixture' },
+        };
+      } else {
+        f.bridge.read = async (_args, options) => {
+          assert.equal(Object.hasOwn(options, 'signal'), false);
+          entered.resolve();
+          await release.promise;
+          readCompleted = true;
+          return { items: [] };
+        };
+        initial = { op: 'read', args: { session_id: f.id } };
       }
-    };
-    let initial;
-    if (first === 'send') {
-      f.runtime.command = async (command) => {
-        f.runtime.calls.push(command);
-        entered.resolve();
-        await release.promise;
-        return { disposition: 'started' };
-      };
-      initial = {
-        op: 'send',
-        args: { session_id: f.id, request_id: 'disconnect-send', text: 'fixture' },
-      };
-    } else {
-      f.bridge.read = async (_args, options) => {
-        signal = options.signal;
-        entered.resolve();
-        await new Promise((resolve, reject) => {
-          if (signal.aborted) reject(new Error('READ_CANCELLED'));
-          else
-            signal.addEventListener('abort', () => reject(new Error('READ_CANCELLED')), {
-              once: true,
-            });
-        }).catch((error) => {
-          readError = error;
-          throw error;
-        });
-      };
-      initial = { op: 'read', args: { session_id: f.id } };
-    }
-    const batch = request(
-      f.url,
-      rpc('batch', {
-        operations: [
-          initial,
-          {
-            op: 'create',
-            args: {
-              project: f.config.folders[0].path,
-              request_id: 'disconnect-create',
-              text: 'fixture',
-            },
-          },
-        ],
-      }),
-    );
-    const lost = batch.response.catch(() => null);
-    await entered.promise;
-    assert.equal(signal.aborted, false);
-    const aborted = new Promise((resolve) =>
-      signal.addEventListener('abort', resolve, { once: true }),
-    );
-    batch.req.destroy();
-    await lost;
-    await aborted;
-    release.resolve();
-    await f.service.close(); // Drain the admitted tool before inspecting durable receipts.
-    assert.equal((await f.bridge.journal.get('disconnect-create'))?.receipt.status, 'accepted');
-    if (first === 'send') {
-      assert.equal((await f.bridge.journal.get('disconnect-send')).receipt.status, 'accepted');
-      assert.equal(f.runtime.calls.length, 2); // original send plus create's initial prompt
-    } else assert.equal(readError?.message, 'READ_CANCELLED');
-  });
+      const batch = request(
+        f.url,
+        rpc('batch', {
+          operations: [
+            initial,
+            {
+              op: 'create',
+              args: {
+                project: f.config.folders[0].path,
 
-test('HTTP shutdown drains admitted batch and receipt before releasing owner lock', async (t) => {
+                text: 'fixture',
+              },
+            },
+          ],
+        }),
+      );
+      const lost = batch.response.catch(() => null);
+      await entered.promise;
+      batch.req.destroy();
+      await lost;
+      release.resolve();
+      await completed.promise; // Disconnect is not service shutdown.
+      assert.ok((await f.bridge.sessions()).length >= 2);
+      if (first === 'send') {
+        assert.ok(f.runtime.calls.length >= 1);
+        assert.equal(f.runtime.calls.length, 2); // original send plus create's initial prompt
+      } else assert.equal(readCompleted, true);
+    },
+  );
+
+test('HTTP shutdown drains input ACKs without publishing a later batch create', async (t) => {
   const f = await fixture(t),
     entered = deferred(),
     release = deferred();
@@ -487,10 +462,10 @@ test('HTTP shutdown drains admitted batch and receipt before releasing owner loc
     f.url,
     rpc('batch', {
       operations: [
-        { op: 'send', args: { session_id: f.id, request_id: 'drain-send', text: 'fixture' } },
+        { op: 'send', args: { session_id: f.id, text: 'fixture' } },
         {
           op: 'create',
-          args: { project: f.config.folders[0].path, request_id: 'drain-create', text: 'fixture' },
+          args: { project: f.config.folders[0].path, text: 'fixture' },
         },
       ],
     }),
@@ -499,14 +474,15 @@ test('HTTP shutdown drains admitted batch and receipt before releasing owner loc
   await entered.promise;
   const close = f.service.close();
   assert.equal(close, f.service.close());
-  assert.equal((await fs.stat(f.lock)).isFile(), true);
+  assert.ok(f.bridge.lock);
   release.resolve();
   await close;
-  await response;
-  assert.equal((await f.bridge.journal.get('drain-send')).receipt.status, 'accepted');
-  assert.equal((await f.bridge.journal.get('drain-create')).receipt.status, 'accepted');
+  const results = (await response).body.result.structuredContent.results;
+  assert.equal(results[0].result.status, 'started');
+  assert.equal(results[1].result.created, false);
+  assert.equal(results[1].result.send.reason, 'BRIDGE_CLOSING');
+  assert.equal((await f.bridge.sessions()).length, 1);
   assert.equal(f.runtime.alive, false);
-  await assert.rejects(fs.stat(f.lock), { code: 'ENOENT' });
 });
 
 test('two standard stdio proxies share one HTTP runtime and closing either preserves service and receipts', async (t) => {
@@ -539,21 +515,18 @@ test('two standard stdio proxies share one HTTP runtime and closing either prese
     clients.map((client, index) =>
       client.callTool({
         name: 'send',
-        arguments: { session_id: f.id, request_id: 'proxy-' + index, text: 'fixture-' + index },
+        arguments: { session_id: f.id, text: 'fixture-' + index },
       }),
     ),
   );
-  assert.ok(results.every((result) => result.structuredContent.status === 'accepted'));
+  assert.ok(results.every((result) => result.structuredContent.status === 'started'));
   assert.equal(f.runtime.calls.length, 2);
   assert.equal(f.bridge.pool.instances.size, 1);
   await clients[0].close();
   assert.equal(f.bridge.closing, undefined);
-  assert.equal((await fs.stat(f.lock)).isFile(), true);
-  const recovered = await clients[1].callTool({
-    name: 'send',
-    arguments: { session_id: f.id, request_id: 'proxy-0' },
-  });
-  assert.deepEqual(recovered.structuredContent, results[0].structuredContent);
+  assert.ok(f.bridge.lock);
+  const observed = await clients[1].callTool({ name: 'list', arguments: { session_id: f.id } });
+  assert.equal(observed.structuredContent.sessions[0].session_id, f.id);
   assert.equal(f.runtime.calls.length, 2);
   assert.equal(
     (await clients[1].callTool({ name: 'list', arguments: {} })).structuredContent.sessions.length,
@@ -572,7 +545,7 @@ test('HTTP owner configuration requires canonical private token and config files
   await assert.rejects(loadHttpConfig(file), /INVALID_PRIVATE_FILE/);
   await fs.chmod(tokenFile, 0o600);
   await fs.chmod(file, 0o644);
-  await assert.rejects(loadHttpConfig(file), /INVALID_PRIVATE_FILE/);
+  await assert.rejects(loadHttpConfig(file), /OWNER_CONFIG_NOT_PRIVATE/);
   await fs.chmod(file, 0o600);
   const link = path.join(f.dir, 'token-link');
   await fs.symlink(tokenFile, link);
@@ -641,10 +614,9 @@ test('independent HTTP CLI survives caller exit and closed stdio; SIGTERM releas
   assert.equal((await request(f.url, rpc('list')).response).status, 200);
   child.kill('SIGTERM');
   assert.deepEqual(await done, { code: 0, signal: null }, stderr);
-  await assert.rejects(fs.stat(f.lock), { code: 'ENOENT' });
 });
 
-for (const stage of ['before-open', 'after-open'])
+for (const stage of ['before-acquire', 'after-acquire'])
   test(`HTTP startup stop waits for ${stage} lock acquisition without opening a listener`, async (t) => {
     const f = await fixture(t),
       port = Number(new URL(f.url).port);
@@ -660,16 +632,7 @@ for (const stage of ['before-open', 'after-open'])
     });
     await fs.writeFile(
       preload,
-      `import fs from 'node:fs/promises';
-const open=fs.open.bind(fs);
-fs.open=async function(file,...args){
- if(file!==${JSON.stringify(f.lock)})return open(file,...args);
- let fd;
- if(${JSON.stringify(stage)}==='after-open')fd=await open(file,...args);
- await fs.writeFile(${JSON.stringify(reached)},'ready');
- while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,5));
- return fd??open(file,...args);
-};`,
+      `import {holdInit} from ${JSON.stringify(new URL('./fixtures/init-gate.mjs', import.meta.url).href)};holdInit(${JSON.stringify({ config: f.config, stage, reached, release })});`,
     );
     const child = spawn(
       process.execPath,
@@ -707,5 +670,4 @@ fs.open=async function(file,...args){
     await assert.rejects(request(f.url, initialize).response, { code: 'ECONNREFUSED' });
     await fs.writeFile(release, 'release');
     assert.deepEqual(await done, { code: 0, signal: null }, stderr);
-    await assert.rejects(fs.stat(f.lock), { code: 'ENOENT' });
   });

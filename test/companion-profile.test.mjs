@@ -12,10 +12,9 @@ async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-companion-profile-');
   const file = path.join(dir, '.config/pi-mcp-bridge/owner.json');
   const config = {
-    principal: 'profile',
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'p', path: dir }],
+    folders: [{ path: dir }],
     defaults: denyAllPermissions(),
     grants: [],
   };

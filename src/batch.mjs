@@ -1,39 +1,39 @@
 import { batchSchema, publicOperationSchemas } from './tool-schemas.mjs';
-import { rebudgetContextRead } from './context-read.mjs';
-import { TOOL_RESULT_LIMIT, toolResultBytes } from './response-budget.mjs';
+import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
 
 export const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
-export const BATCH_INPUT_LIMIT = 6100000;
-const size = (value) => Buffer.byteLength(JSON.stringify(value));
 const code = (error) =>
   /^[A-Z][A-Z_]{2,60}$/.test(error.message) ? error.message : 'OPERATION_FAILED';
+const envelope = (results) => ({
+  status: 'processed',
+  response_max_bytes: BATCH_RESPONSE_LIMIT,
+  results,
+});
 
 export function preflightBatch(input) {
   const parsed = batchSchema.safeParse(input);
   if (!parsed.success)
     return { error: { status: 'rejected', error: { code: 'INVALID_BATCH' }, results: [] } };
-  if (size(input) > BATCH_INPUT_LIMIT)
-    return { error: { status: 'rejected', error: { code: 'BATCH_INPUT_TOO_LARGE' }, results: [] } };
   return { operations: parsed.data.operations };
 }
 
-export async function executeBatch(bridge, input, { signal } = {}) {
-  const { operations, error } = preflightBatch(input);
-  if (error) return error;
-  const lanes = new Map(),
-    results = new Array(operations.length);
-  const jobs = operations.map((item, index) => {
+function planBatch(operations) {
+  const frame = envelope(operations.map(() => null)),
+    count = operations.length,
+    share = Math.floor((BATCH_RESPONSE_LIMIT - jsonBytes(frame)) / count),
+    wireShare = Math.floor((TOOL_RESULT_LIMIT - toolResultBytes(frame)) / count);
+  return operations.map((item, index) => {
     const op = item?.op,
-      schema = Object.hasOwn(publicOperationSchemas, op) ? publicOperationSchemas[op] : null;
-    const parsed = schema?.safeParse(item?.args);
+      schema = Object.hasOwn(publicOperationSchemas, op) ? publicOperationSchemas[op] : null,
+      parsed = schema?.safeParse(item?.args);
     if (
       !item ||
       typeof item !== 'object' ||
       Array.isArray(item) ||
       Object.keys(item).some((key) => !['op', 'args'].includes(key)) ||
       !parsed?.success
-    ) {
-      results[index] = {
+    )
+      return {
         index,
         op: typeof op === 'string' ? op.slice(0, 64) : null,
         error: {
@@ -41,34 +41,107 @@ export async function executeBatch(bridge, input, { signal } = {}) {
           ...(typeof op === 'string' && op.length > 64 ? { op_truncated: true } : {}),
         },
       };
+    // Costs are additive at each null placeholder, including MCP's escaped text
+    // copy. Subtract the item wrapper before giving its renderer a budget.
+    // At most 10 items leave >19 KiB JSON and >24 KiB duplicated wire per result.
+    // Required metadata fits: two <=256-unit model strings cost <=6656 wire bytes;
+    // reason <=128, entry ID <=128, UUIDs and safe counters leave ample room.
+    // See models.mjs, prompt-input.mjs, compact.mjs, storage.mjs and trash.mjs.
+    // Unbounded auxiliary filesystem paths are optional in budgeted renderers.
+    const empty = { index, op, result: null };
+    return {
+      index,
+      op,
+      args: parsed.data,
+      resultBudget: {
+        maxBytes: share + 4 - (jsonBytes(empty) - 4),
+        maxWireBytes:
+          wireShare + toolResultBytes(null) - (toolResultBytes(empty) - toolResultBytes(null)),
+      },
+    };
+  });
+}
+
+function fitQuery(op, result, args, budget) {
+  if (fitsResult(result, budget)) return result;
+  if (op === 'list') {
+    const rows = result.sessions;
+    for (let count = rows.length - 1; count > 0; count--) {
+      const page = {
+        ...result,
+        sessions: rows.slice(0, count),
+        next_offset: (args.offset ?? 0) + count,
+      };
+      page.creatable_projects = result.creatable_projects.filter((project) =>
+        page.sessions.some((row) => row.project === project),
+      );
+      if (fitsResult(page, budget)) return page;
+    }
+  }
+  throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
+}
+
+export async function executeBatch(bridge, input, { requestContext } = {}) {
+  const { operations, error } = preflightBatch(input);
+  if (error) return error;
+  const plan = planBatch(operations);
+  requestContext ??= bridge.captureRequestContext?.();
+  void requestContext?.catch?.(() => {});
+  const lanes = new Map(),
+    readPins = [],
+    inputs = new Set(),
+    results = new Array(operations.length);
+  const jobs = plan.map((item) => {
+    const { index, op, args, resultBudget, error } = item;
+    if (error) {
+      results[index] = { index, op, error };
       return Promise.resolve();
     }
-    const args = parsed.data;
-    // Creates with a source share its lane so a preceding parent mutation/read
-    // has the same ordering as standalone operations. Independent creates share
-    // the project's creation lane; no additional authorization is introduced.
-    const lane =
-      args.session_id ??
-      args.fork_from ??
-      (op === 'create' ? `project:${args.project}` : `independent:${index}`);
+    let sessionId = args.session_id;
+    if (op === 'read' && !sessionId && args.cursor) {
+      try {
+        sessionId = bridge.readCache.identity(args.cursor).session_id;
+      } catch (error) {
+        results[index] = { index, op, error: { code: code(error) } };
+        return Promise.resolve();
+      }
+    }
+    const pendingInput = ['send', 'command', 'compact'].includes(op)
+      ? bridge.registerInput(sessionId)
+      : undefined;
+    if (pendingInput) inputs.add(pendingInput);
+    const lane = sessionId ?? args.fork_from ?? `independent:${index}`;
     const previous = lanes.get(lane) ?? Promise.resolve();
     const job = previous
       .catch(() => {})
       .then(async () => {
         try {
-          results[index] = {
-            index,
-            op,
-            result: structuredClone(await bridge[op](args, { signal })),
-          };
+          let result = structuredClone(
+            await bridge[op](args, {
+              requestContext,
+              resultBudget,
+              readPins,
+              pendingInput,
+              // An explicit ordered restart is not withdrawn by its own Stop.
+              // Exemption never clears cancellation by an external Stop.
+              retainedInputs: op === 'stop' ? inputs : undefined,
+            }),
+          );
+          if (['read', 'list', 'health'].includes(op))
+            result = fitQuery(op, result, args, resultBudget);
+          results[index] = { index, op, result };
         } catch (error) {
           results[index] = {
             index,
             op,
             error: {
               code: code(error),
+              ...(error.minimum_max_bytes ? { minimum_max_bytes: error.minimum_max_bytes } : {}),
               ...(error?.uncertain
-                ? { uncertain: true, recovery: 'SAME_REQUEST_ID', request_id: args.request_id }
+                ? {
+                    uncertain: true,
+                    recovery: 'OUTCOME_UNKNOWN; inspect list/read. Do not automatically resubmit.',
+                  }
                 : {}),
             },
           };
@@ -77,48 +150,12 @@ export async function executeBatch(bridge, input, { signal } = {}) {
     lanes.set(lane, job);
     return job;
   });
-  await Promise.all(jobs);
-  const response = { status: 'processed', response_max_bytes: BATCH_RESPONSE_LIMIT, results };
-  // Resize captured reads, never reread after a later mutation. Account for
-  // JSON escaping and text/structured duplication, not just the inner object.
-  while (size(response) > BATCH_RESPONSE_LIMIT || toolResultBytes(response) > TOOL_RESULT_LIMIT) {
-    const largest = results
-      .filter((item) => item.result !== undefined)
-      .sort((a, b) => size(b.result) - size(a.result))[0];
-    if (!largest) throw new Error('BATCH_RESPONSE_LIMIT');
-    if (largest.op === 'read') {
-      const current = size(largest.result),
-        smaller = rebudgetContextRead(
-          largest.result,
-          operations[largest.index].args,
-          Math.floor(current * 0.65),
-        );
-      if (smaller && size(smaller) < current) {
-        largest.result = smaller;
-        continue;
-      }
-    }
-    delete largest.result;
-    const args = operations[largest.index].args;
-    const mutation = [
-      'send',
-      'set_model',
-      'compact',
-      'reload',
-      'command',
-      'stop',
-      'create',
-      'delete',
-    ].includes(largest.op);
-    largest.recovery = {
-      ...(mutation ? { request_id: args.request_id } : {}),
-      ...(args.session_id ? { session_id: args.session_id } : {}),
-      ...(args.project ? { project: args.project } : {}),
-    };
-    largest.error = {
-      code: 'BATCH_RESULT_OMITTED',
-      retry: mutation ? 'SAME_REQUEST_ID' : 'READ_SEPARATELY',
-    };
+  try {
+    await Promise.all(jobs);
+    await requestContext;
+    return envelope(results);
+  } finally {
+    for (const release of readPins) release();
+    for (const input of inputs) bridge.inputs.delete(input);
   }
-  return response;
 }

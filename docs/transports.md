@@ -16,11 +16,14 @@ Configure a standard MCP command:
 }
 ```
 
-The client owns this Bridge process. Closing stdin, SIGINT, or SIGTERM drains
-admitted receipts, closes owned RPC processes and releases the Bridge lock.
+The client owns this Bridge process. Closing stdin, SIGINT, or SIGTERM stops new
+business dispatch, drains already-dispatched requests, closes owned RPC processes
+and releases the Bridge lock. Queued mutations, including later same-session
+batch items, may return `BRIDGE_CLOSING` before native dispatch.
 Attached external Pi instances are disconnected, not terminated. Startup and
 shutdown share one cleanup path, including a signal arriving while the owner
-lock is being acquired. A crash lock is not silently stolen.
+lock is being acquired. The kernel releases the service mutex on process death;
+surviving Pi writers retain their separate identity-checked claims.
 
 Each line is one UTF-8 JSON-RPC message. Protocol stdout contains no logs.
 Input lines are bounded at 8 MiB; an oversized line is rejected and discarded
@@ -78,7 +81,7 @@ configuration and forwards to its loopback endpoint. It does **not** acquire a
 Bridge lock, spawn Pi, retain a work queue or retry requests. All proxies share
 the service's single RuntimePool. Closing a proxy aborts its network waits, not
 the backend or another client. Network failures return
-`BRIDGE_CONNECTION_LOST` with same-request-ID recovery guidance. Each proxy
+`BRIDGE_CONNECTION_LOST` with outcome-unknown guidance. Each proxy
 permits at most 16 concurrent forwards, matching the backend's request cap;
 excess requests return `PROXY_BUSY` with `NOT_FORWARDED` and are not queued.
 Notifications never receive JSON-RPC responses.
@@ -146,33 +149,34 @@ the server never silently substitutes a modern version. Missing required
 metadata produces HTTP 400 / `-32602`. An unknown modern method produces HTTP
 404 / `-32601`. These errors identify a modern server for dual-era clients.
 
-### Legacy clients
+### MCP SDK clients
 
-A separate SDK-backed compatibility path supports handshake-based revisions
-`2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` on stdio.
-Legacy HTTP uses the supported Streamable HTTP revisions; old HTTP+SSE is not
-implemented. Legacy clients still initialize and receive the redesigned tools,
-not the obsolete Bridge API. On stdio, a legacy initialize selects legacy
-semantics for subsequent requests without modern metadata. Modern requests can
-still be served independently on the same process.
+The pinned MCP SDK uses initialization-based protocol revisions
+`2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` on stdio,
+and its supported Streamable HTTP bindings. HTTP+SSE is not implemented.
+SDK clients initialize before their tool requests; per-request protocol clients
+carry the metadata described above. On HTTP, header handling follows the SDK's
+standard negotiation, including its specified behavior when a version header is
+absent.
 
-On HTTP, requests without a version header retain compatibility with pre-header
-legacy clients. Requests carrying modern metadata always pass modern validation.
-The modern adapter and legacy SDK share business schemas and tool dispatch.
+These are MCP transport bindings for current clients, not old Bridge business
+contracts. Both paths use the same strict current tool schemas and dispatcher;
+neither accepts retired Bridge arguments or translates old tool results.
 
-## Timeouts, disconnects and receipts
+## Timeouts and disconnects
 
-A JSON-RPC `id` identifies **one communication exchange**. A mutation's tool
-argument `request_id` identifies **one durable business operation**. Reusing a
-JSON-RPC ID on a different HTTP connection does not make work idempotent.
+A JSON-RPC `id` identifies **one communication exchange**, not a mutation.
+Reusing it does not make work idempotent. Public tools accept no mutation
+identifier, result handle or lookup/replay parameters.
 
-Once a tool is admitted, a lost HTTP response does not replay or roll back it.
-Recover a mutation with the **same** business `request_id`, using that
-operation's recovery parameters in the [API reference](api.md). A create
-receipt preserves an already-created child and its initial-send outcome,
-including partial/unknown outcomes. Never replace an unknown operation with a
-new ID just to retry. Batch disconnects do not cancel later admitted items;
-each item has its normal receipt.
+Once a tool is admitted, a lost response does not replay or roll back it.
+Every new call is an independent operation, even with identical input.
+Batch disconnects do not cancel later admitted items. A partial create result
+includes its chosen child session and initial-send status when available.
+If that response is lost, there is no safe automatic retry or result lookup:
+inspect `list` for sessions/activity and authorized `read` for native
+history before deciding whether to submit again. Coarse activity is not
+per-prompt completion tracking.
 
 There are distinct time budgets:
 
@@ -183,10 +187,15 @@ There are distinct time budgets:
   or a shell kill deadline.
 - Proxy network wait: 40 seconds, exceeding the backend response wait.
 
-A tunnel/client can impose a shorter deadline. Query the existing receipt after
-reconnecting; no SSE Last-Event-ID recovery or hidden work replay is implemented.
-Protocol cancellation aborts request-related reads/waits, not Pi execution.
-Use `stop` for execution and queue cancellation.
+A tunnel/client can impose a shorter deadline. Reconnecting does not recover a
+lost result or replay work. No SSE Last-Event-ID recovery is implemented.
+While the service remains running, protocol cancellation, HTTP disconnect or a
+proxy's exit suppresses reply delivery without cancelling admitted calls or
+batch items. Direct stdio EOF instead shuts down the owned service: dispatched
+calls finish ACK/result capture, but not-yet-dispatched operations may return
+`BRIDGE_CLOSING`.
+There is no public business-operation AbortSignal. Use `stop` for Pi execution
+and queue cancellation.
 On modern stdio, `notifications/cancelled` suppresses subsequent messages for
 that request. This server uses JSON HTTP responses, not SSE response streams.
 
@@ -201,7 +210,7 @@ most 16 concurrent requests/admitted waiters and 32 connections. Responses use
 The global response limit is **256 KiB UTF-8 for the entire JSON-RPC envelope**,
 including metadata, request ID, text encoding/escaping and structured content.
 The server never cuts JSON or splits a Unicode sequence. Oversized exceptional
-results become an explicit `RESPONSE_TOO_LARGE` tool error with recovery
+results become an explicit `RESPONSE_TOO_LARGE` tool error with outcome-unknown
 guidance, rather than silently dropping a mutation's status or replaying work.
 Read selection and continuations handle normal history pagination. Read's
 `max_bytes` counts its complete structured JSON result (default 24,000 bytes,

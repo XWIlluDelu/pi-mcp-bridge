@@ -29,11 +29,10 @@ async function fixture(t, extraArgs = []) {
   await fs.mkdir(cwd);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'handoff-test',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
     piArgs: [
       '--offline',
@@ -55,7 +54,7 @@ async function fixture(t, extraArgs = []) {
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const made = await savedSession(bridge),
     session = await bridge.session(made.session_id);
   return {
     dir,
@@ -80,13 +79,16 @@ test(
     const f = await fixture(t),
       marker = 'GENERIC_RELEASE_RESUME_PROOF';
     assert.equal((await fs.stat(ownerSocket(f.config))).mode & 0o777, 0o600);
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'owned', text: marker })).status,
-      'accepted',
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await f.bridge.send({ session_id: f.id, text: marker })).status,
+      ),
+      'Expected native prompt admission',
     );
     const owned = f.bridge.pool.get(f.id);
+    const owner = owned.ownerRecord.owner;
+    const generation = owned.ownerRecord.generation;
     await until(() => owned.settlement.sequence === 1);
-    const old = await readClaim(f.bridge.pool.attachmentDir, f.session);
     const result = await exec(process.execPath, [
       path.join(base, 'src/owner-runtime.mjs'),
       f.file,
@@ -94,14 +96,13 @@ test(
       f.id,
     ]);
     assert.equal(JSON.parse(result.stdout).status, 'released');
-    assert.equal(await ownerAlive(old.owner), false);
+    assert.equal(await ownerAlive(owner), false);
     let held = await readClaim(f.bridge.pool.attachmentDir, f.session);
     assert.equal(held.phase, 'released');
     assert.equal(held.owner, null);
     assert.equal(held.noColdReacquire, true);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'blocked', text: 'NEVER_ADMITTED' }))
-        .reason,
+      (await f.bridge.send({ session_id: f.id, text: 'NEVER_ADMITTED' })).reason,
       'COLD_REACQUIRE_BLOCKED',
     );
     assert.ok(JSON.stringify(await f.bridge.read({ session_id: f.id })).includes(marker));
@@ -110,7 +111,7 @@ test(
       (
         await f.bridge.send({
           session_id: f.id,
-          request_id: 'blocked-after-restart',
+
           text: 'NEVER_ADMITTED',
         })
       ).reason,
@@ -142,7 +143,7 @@ test(
     held = await readClaim(f.bridge.pool.attachmentDir, f.session);
     assert.equal(held.kind, 'extension');
     assert.equal(held.noColdReacquire, true);
-    assert.notEqual(held.generation, old.generation);
+    assert.notEqual(held.generation, generation);
     for (const interrupt of [false, true])
       await assert.rejects(
         ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
@@ -157,13 +158,16 @@ test(
       (
         await f.bridge.send({
           session_id: f.id,
-          request_id: 'attached',
+
           text: 'ATTACHED_HANDOFF_PROOF',
         })
       ).dispatch,
-      'submitted',
+      undefined,
     );
-    await until(async () => (await attached.state()).activity?.settlement?.sequence > 0);
+    await until(async () => {
+      const { activity } = await attached.state();
+      return activity?.idle === true && activity.pending_messages === false;
+    });
     const entries = (await local.getEntries()).entries;
     for (const text of [marker, 'ATTACHED_HANDOFF_PROOF'])
       assert.equal(
@@ -181,16 +185,13 @@ test(
     await local.stop();
     await waitOwnerExit(held.owner);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'still-held', text: 'NEVER_ADMITTED' }))
-        .reason,
+      (await f.bridge.send({ session_id: f.id, text: 'NEVER_ADMITTED' })).reason,
       'COLD_REACQUIRE_BLOCKED',
     );
     await assert.rejects(
       ownerRequest(f.config, { op: 'reset', session_id: f.id }),
       /LOCAL_CLOSE_CONFIRMATION_REQUIRED/,
     );
-    const lock = path.join(f.bridge.pool.attachmentDir, 'registry.lock');
-    await fs.writeFile(lock, JSON.stringify(held.owner), { mode: 0o600 }); // Interrupted registry cleanup from the now-dead native owner.
     const reset = await exec(process.execPath, [
       path.join(base, 'src/owner-runtime.mjs'),
       f.file,
@@ -199,16 +200,18 @@ test(
       '--confirm-local-closed',
     ]);
     assert.equal(JSON.parse(reset.stdout).status, 'reset');
-    await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
-    assert.equal(
-      (
-        await f.bridge.send({
-          session_id: f.id,
-          request_id: 'resumed',
-          text: 'COLD_RESUME_AFTER_RESET',
-        })
-      ).status,
-      'accepted',
+    assert.ok(!(await fs.readdir(f.bridge.pool.attachmentDir)).includes('registry.lock'));
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (
+          await f.bridge.send({
+            session_id: f.id,
+
+            text: 'COLD_RESUME_AFTER_RESET',
+          })
+        ).status,
+      ),
+      'Expected native prompt admission',
     );
     assert.equal((await f.bridge.pool.get(f.id).state()).sessionId, f.session.header.id);
   },
@@ -349,10 +352,10 @@ for (const overlap of [false, true])
         (
           await f.bridge.send({
             session_id: f.id,
-            request_id: 'prepare',
+
             text: '/autonomous-preflight',
           })
-        ).disposition,
+        ).status,
         'handled',
       );
       await until(() =>
@@ -418,20 +421,21 @@ for (const overlap of [false, true])
       assert.equal(await ownerAlive(owner), false);
       assert.notEqual(owned.child.signalCode, 'SIGKILL');
       await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
-      assert.equal(
-        (
-          await f.bridge.send({
-            session_id: f.id,
-            request_id: 'recovered',
-            text: 'AFTER_MAINTENANCE',
-          })
-        ).status,
-        'accepted',
+      assert.ok(
+        ['started', 'queued', 'handled'].includes(
+          (
+            await f.bridge.send({
+              session_id: f.id,
+
+              text: 'AFTER_MAINTENANCE',
+            })
+          ).status,
+        ),
+        'Expected native prompt admission',
       );
       const fresh = f.bridge.pool.get(f.id);
       assert.notEqual(fresh.generation, owned.generation);
-      await until(() => fresh.settlement.sequence === 1);
-      await fresh.assertReleasable();
+      await until(async () => (await fresh.idleSnapshot()).status === 'idle');
       const projected = await f.bridge.read({ session_id: f.id });
       assert.ok(JSON.stringify(projected).includes('AFTER_MAINTENANCE'));
     },
@@ -448,9 +452,66 @@ test('release of saved session and reset serialize with sends; pending startup i
   await release;
   const sends = await Promise.all(
     Array.from({ length: 3 }, (_, i) =>
-      f.bridge.send({ session_id: f.id, request_id: 'race-' + i, text: 'NEVER_ADMITTED' }),
+      f.bridge.send({ session_id: f.id, text: 'NEVER_ADMITTED' }),
     ),
   );
   assert.ok(sends.every((s) => s.reason === 'COLD_REACQUIRE_BLOCKED'));
   assert.equal(f.bridge.pool.instances.size, 0);
 });
+
+test(
+  'owned RPC vetoes cross-file resume/new/fork before open while keeping its claim and read-only route',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t, [
+      '-e',
+      path.join(base, 'test/fixtures/native-session-boundary.mjs'),
+    ]);
+    const marker = path.join(f.dir, 'boundary');
+    const other = await savedSession(f.bridge),
+      b = await f.bridge.session(other.session_id);
+    const bytes = await fs.readFile(b.file);
+    await fs.appendFile(
+      f.session.file,
+      JSON.stringify({
+        type: 'message',
+        id: 'fork-source',
+        parentId: null,
+        message: { role: 'user', content: 'BOUNDARY_SOURCE', timestamp: 0 },
+      }) + '\n',
+    );
+    const runtime = await f.bridge.pool.resolve(f.session),
+      generation = runtime.ownerRecord.generation;
+    // A manually retained writer makes the native lifecycle itself observable.
+    for (const [command, suffix] of [
+      ['/boundary-switch ' + b.file, '.switch'],
+      ['/boundary-new', '.new'],
+      ['/boundary-fork', '.fork'],
+    ]) {
+      assert.equal(
+        (await runtime.command({ type: 'prompt', message: command })).disposition,
+        'handled',
+      );
+      await until(() =>
+        fs.stat(marker + suffix).then(
+          () => true,
+          () => false,
+        ),
+      );
+      assert.equal(JSON.parse(await fs.readFile(marker + suffix, 'utf8')).cancelled, true);
+      assert.equal((await runtime.state()).sessionId, f.session.header.id);
+      assert.equal(runtime.child.exitCode, null);
+      const claim = await readClaim(f.bridge.pool.attachmentDir, f.session);
+      assert.equal(claim.generation, generation);
+      assert.equal(await ownerAlive(claim.owner), true);
+      assert.equal(await readClaim(f.bridge.pool.attachmentDir, b), null);
+    }
+    await assert.rejects(fs.stat(marker + '.with-session'), { code: 'ENOENT' });
+    await assert.rejects(fs.stat(marker + '.setup'), { code: 'ENOENT' });
+    assert.deepEqual(await fs.readFile(b.file), bytes);
+    f.config.grants = [{ session_id: f.id, list: true, read: true }];
+    await f.bridge.read({ session_id: f.id });
+    await f.bridge.list({ session_id: f.id });
+    assert.equal(runtime.child.exitCode, null);
+  },
+);

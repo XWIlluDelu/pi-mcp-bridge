@@ -1,4 +1,3 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -14,6 +13,7 @@ import {
   publicError,
 } from './protocol.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { readOwnerConfig } from './owner-config.mjs';
 export function makeServer(bridge, { execute = (run) => run() } = {}) {
   const server = new McpServer(SERVER_INFO);
   for (const name of toolNames)
@@ -23,7 +23,6 @@ export function makeServer(bridge, { execute = (run) => run() } = {}) {
       (args, extra) =>
         callBridgeTool(bridge, name, args, {
           execute,
-          signal: extra.signal,
           requestId: extra.requestId,
         }),
     );
@@ -33,7 +32,7 @@ async function main() {
   const configFile = process.argv[2];
   if (!configFile)
     throw new Error('Usage: node src/server.mjs /absolute/path/to/owner-config.json');
-  const config = JSON.parse(await fs.readFile(configFile, 'utf8'));
+  const { config } = await readOwnerConfig(path.resolve(configFile));
   const bridge = new Bridge(config, undefined, { configFile: path.resolve(configFile) });
   let server,
     transport,
@@ -45,12 +44,12 @@ async function main() {
     if (closing) return closing;
     diagnostics.emit('service.stopping', { transport: 'stdio' });
     process.stdin.pause();
-    bridge.closing = true;
     // Init may still acquire its lock after a stop arrives. Wait for it to settle
     // before cleanup; never let init create resources after close has finished.
     closing = (async () => {
       await initializing?.catch(() => {});
       try {
+        await bridge.prepareClose();
         await transport?.drain();
         await bridge.close();
       } catch {
@@ -91,7 +90,13 @@ async function main() {
     initializing = bridge.init();
     await initializing;
     if (closing) return closing;
-    server = makeServer(bridge);
+    server = makeServer(bridge, {
+      execute: (run) => {
+        const task = Promise.resolve().then(run);
+        transport.track(task);
+        return task;
+      },
+    });
     server.server.onclose = () => {
       void close();
     };

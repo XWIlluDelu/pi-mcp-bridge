@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { sessionMetadata, runtimeStatus } from '../src/session-metadata.mjs';
+import { sessionMetadata, runtimeMetadata } from '../src/session-metadata.mjs';
 
 test('title cache reuses only unchanged files; append, incomplete record, truncation and replacement invalidate', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-metadata-');
@@ -49,7 +49,61 @@ test('title cache has a fixed retention bound and never retains history', async 
   assert.equal(JSON.stringify([...cache]).includes('NOT_A_TITLE'), false);
 });
 
-test('runtime status uses companion idle evidence but does not infer native RPC idle from no streaming', async () => {
+test('list model/thinking metadata comes only from live state, independently of idle certainty', async () => {
+  const model = {
+    provider: 'p',
+    id: 'm',
+    headers: { Authorization: 'SECRET' },
+    apiKey: 'SECRET',
+    baseUrl: 'SECRET',
+  };
+  for (const [runtime, expectedState] of [
+    [{ state: async () => ({ model, thinkingLevel: 'xhigh', isIdle: true }) }, 'idle'],
+    [{ state: async () => ({ model, thinkingLevel: 'xhigh' }) }, 'unknown'],
+    [
+      {
+        attached: true,
+        record: { kind: 'extension' },
+        state: async () => ({ model, thinkingLevel: 'xhigh', activity: { idle: false } }),
+      },
+      'busy',
+    ],
+  ]) {
+    const { status } = await runtimeMetadata({ forRead: async () => runtime }, {});
+    assert.equal(status.state, expectedState);
+    assert.deepEqual(status.model, { provider: 'p', id: 'm' });
+    assert.equal(status.thinking_level, 'xhigh');
+    assert.ok(!JSON.stringify(status).includes('SECRET'));
+  }
+  for (const [runtime, expectedState] of [
+    [null, 'saved'],
+    [
+      {
+        state: async () => {
+          throw Error('UNREACHABLE');
+        },
+      },
+      'unavailable',
+    ],
+    [{ state: async () => ({}) }, 'unknown'],
+    [
+      { state: async () => ({ model: { provider: 1, id: 'm' }, thinkingLevel: 'invalid' }) },
+      'unknown',
+    ],
+  ]) {
+    const { status } = await runtimeMetadata(
+      { forRead: async () => runtime },
+      { model, thinkingLevel: 'high' },
+    );
+    assert.equal(status.state, expectedState);
+    assert.equal(status.model, null);
+    assert.equal(status.thinking_level, null);
+    if (runtime === null || expectedState === 'unavailable')
+      assert.equal(Object.hasOwn(status, 'capabilities'), false);
+  }
+});
+
+test('runtime capabilities stay supported across busy and unknown activity observations', async () => {
   for (const [state, expected, count] of [
     [{ isStreaming: false, activity: { idle: true, pending_message_count: 0 } }, 'idle', 0],
     [{ isStreaming: false, activity: { idle: true, pending_messages: true } }, 'busy', null],
@@ -57,8 +111,19 @@ test('runtime status uses companion idle evidence but does not infer native RPC 
     [{ isStreaming: false, isCompacting: false, pendingMessageCount: 0 }, 'unknown', 0],
     [{ isStreaming: false, pendingMessageCount: -1 }, 'unknown', null],
   ]) {
-    const result = await runtimeStatus({ forRead: async () => ({ state: async () => state }) }, {});
+    const { status: result } = await runtimeMetadata(
+      {
+        forRead: async () => ({
+          state: async () => state,
+          command() {},
+          executeBash() {},
+          stopExecution() {},
+        }),
+      },
+      {},
+    );
     assert.equal(result.state, expected);
     assert.equal(result.pending_messages, count);
+    assert.deepEqual(result.capabilities, { send: true, command: true, stop: true });
   }
 });

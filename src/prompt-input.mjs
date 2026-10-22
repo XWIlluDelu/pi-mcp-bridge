@@ -1,10 +1,30 @@
 import { z } from 'zod';
-import { modelSelectionSchema } from './models.mjs';
+import {
+  modelSelectionSchema,
+  thinkingLevelSchema,
+  sameModel,
+  assertThinkingLevel,
+} from './models.mjs';
+export const hasPromptSettings = (input) =>
+  input.model !== undefined || input.thinking_level !== undefined;
 
 // Fit a complete base64 prompt (including text/JSON overhead) into the existing
 // 8 MiB MCP/IPC request bound. No URL fetching or local-path access is implied.
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const SEND_MODES = ['default', 'idle_only', 'steer', 'follow_up'];
+// Native slash dispatch precedes input events. Owner-local control must be
+// refused at remote admission, including Pi's command collision suffixes.
+export function remotePromptRejection(text) {
+  return /^\/bridge-join(?::\d+)?(?:\s|$)/.test(text)
+    ? { status: 'rejected', reason: 'OWNER_LOCAL_COMMAND_REQUIRED' }
+    : null;
+}
+export const promptOptions = (mode) =>
+  ['default', 'steer'].includes(mode)
+    ? { streamingBehavior: 'steer' }
+    : mode === 'follow_up'
+      ? { streamingBehavior: 'followUp' }
+      : {};
 const MAX_BASE64 = 4 * Math.ceil(MAX_IMAGE_BYTES / 3);
 const mimeTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
 function matchesMime(bytes, mime) {
@@ -54,37 +74,67 @@ const promptSchema = z.object({
   text: z.string().min(1).max(100000).optional(),
   images: imagesSchema.optional(),
   model: modelSelectionSchema.optional(),
+  thinking_level: thinkingLevelSchema.optional(),
 });
 export function promptInput(args) {
   const parsed = promptSchema.safeParse({
     text: args.text,
     images: args.images,
     model: args.model,
+    thinking_level: args.thinking_level,
   });
   if (!parsed.success) throw new Error('INVALID_PROMPT_INPUT');
-  const { text, images, model } = parsed.data;
+  const { text, images, model, thinking_level } = parsed.data;
   if (text === undefined && images === undefined) {
-    if (model) throw new Error('MODEL_REQUIRES_PROMPT');
+    if (hasPromptSettings(parsed.data)) throw new Error('MODEL_REQUIRES_PROMPT');
     return undefined;
   }
-  // Pi 1.1 removes consumed queue entries only for nonempty message text.
+  // Native queues remove consumed entries only for nonempty message text.
   // Give image-only prompts a neutral label so completed steering/follow-up
   // input cannot leave a phantom pending queue that blocks idle handoff.
   return {
     text: text ?? '[Image attachment]',
     ...(images ? { images } : {}),
     ...(model ? { model } : {}),
+    ...(thinking_level !== undefined ? { thinking_level } : {}),
   };
 }
-// Accept normalized image-only IPC input as well as a direct owner's input.
 export function attachedPromptInput(args) {
-  const input = promptInput({
-    ...args,
-    text: args.text === '' && args.images ? undefined : args.text,
-  });
+  const input = promptInput(args);
   if (!input) throw new Error('INVALID_ATTACHED_SEND');
   return input;
 }
+export function assertPromptSelection(input, state) {
+  if (input.model && !sameModel(input.model, state.model))
+    throw new Error('MODEL_SELECTION_CHANGED');
+  assertImageModel(input.images, state.model);
+  if (input.thinking_level !== undefined) {
+    assertThinkingLevel(state.model, input.thinking_level);
+    if (state.thinkingLevel !== input.thinking_level) throw new Error('MODEL_SELECTION_CHANGED');
+  }
+}
 export function assertImageModel(images, model) {
   if (images && !model?.input?.includes('image')) throw new Error('MODEL_IMAGE_INPUT_UNSUPPORTED');
+}
+
+// Public admission results are not completion tracking. Only a validated native
+// disposition establishes started/queued/handled. Unknown native admission stays unknown.
+export function promptResult(result) {
+  if (!result.ok) return { status: result.uncertain ? 'unknown' : 'rejected', reason: result.code };
+  if (!['started', 'queued', 'handled'].includes(result.data?.disposition))
+    throw Object.assign(new Error('INVALID_PROMPT_RESULT'), { uncertain: true });
+  const ui = result.ui ?? result.data?.ui;
+  return {
+    status: result.data.disposition,
+    ...(ui?.cancel_sent?.length ? { reason: 'EXTENSION_UI_CANCEL_SENT' } : {}),
+  };
+}
+export function attachedPromptResult(value) {
+  if (value?.status === 'accepted') return promptResult({ ok: true, data: value });
+  if (
+    ['skipped', 'rejected', 'unknown'].includes(value?.status) &&
+    (value.reason === undefined || (typeof value.reason === 'string' && value.reason.length <= 128))
+  )
+    return { status: value.status, ...(value.reason ? { reason: value.reason } : {}) };
+  throw Object.assign(new Error('INVALID_PROMPT_RESULT'), { uncertain: true });
 }

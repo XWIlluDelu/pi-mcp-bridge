@@ -3,7 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
-import { hash, syncDir } from './storage.mjs';
+import { hash, syncDir, readPrivateFile } from './storage.mjs';
+import { kernelLock } from './kernel-lock.mjs';
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
@@ -24,13 +25,29 @@ export function validatePiRuntime(profile = {}) {
     throw new Error('INVALID_PI_RUNTIME');
   return profile;
 }
+// Both launchers own session selection and mode. Native resource/model/storage
+// options remain available; a saved session may only be opened after reservation.
+export function validateLaunchArgs(args = [], code = 'UNSAFE_PI_ARGS') {
+  if (
+    !Array.isArray(args) ||
+    args.some(
+      (arg) =>
+        typeof arg !== 'string' ||
+        arg.includes('\0') ||
+        /^(?:--(?:session(?:-id)?|continue|resume|fork|no-session|mode|print|export)|-[crp])(?:=|$)/.test(
+          arg,
+        ) ||
+        arg.startsWith('@') ||
+        arg === '--',
+    )
+  )
+    throw new Error(code);
+}
 // Shape validation is shared by initialization, file reload and both transports.
 // Filesystem existence/privacy and execution-time cwd checks remain separate.
 export function validateOwnerConfig(config) {
   if (
     !object(config) ||
-    typeof config.principal !== 'string' ||
-    !config.principal.trim() ||
     !absolute(config.stateDir) ||
     !Array.isArray(config.sessionRoots) ||
     !config.sessionRoots.length ||
@@ -39,7 +56,6 @@ export function validateOwnerConfig(config) {
   )
     throw new Error('INVALID_OWNER_CONFIG');
   const fields = new Set([
-    'principal',
     'stateDir',
     'sessionRoots',
     'attachmentDir',
@@ -53,18 +69,16 @@ export function validateOwnerConfig(config) {
     'piRuntime',
   ]);
   if (Object.keys(config).some((key) => !fields.has(key))) throw new Error('INVALID_OWNER_CONFIG');
-  const ids = new Set();
+  const paths = new Set();
   for (const folder of config.folders) {
     if (
       !object(folder) ||
-      typeof folder.id !== 'string' ||
-      !folder.id.trim() ||
-      ids.has(folder.id) ||
-      Object.keys(folder).some((key) => !['id', 'path'].includes(key)) ||
+      paths.has(folder.path) ||
+      Object.keys(folder).some((key) => key !== 'path') ||
       !absolute(folder.path)
     )
       throw new Error('INVALID_PROJECT_FOLDER');
-    ids.add(folder.id);
+    paths.add(folder.path);
   }
   validatePermissionValues(config.defaults);
   // An explicit baseline for every right distinguishes shell from stop without
@@ -142,15 +156,10 @@ export function validateGrants(grants = []) {
 export async function readOwnerConfig(file) {
   if (typeof file !== 'string' || !path.isAbsolute(file))
     throw new Error('INVALID_OWNER_CONFIG_PATH');
-  const stat = await fs.lstat(file);
-  if (
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.size > 1024 * 1024 ||
-    (await fs.realpath(file)) !== file
-  )
-    throw new Error('INVALID_OWNER_CONFIG_PATH');
-  const raw = await fs.readFile(file, 'utf8');
+  const { text: raw, mode } = await readPrivateFile(file, 1024 * 1024, {
+    pathError: 'INVALID_OWNER_CONFIG_PATH',
+    privacyError: 'OWNER_CONFIG_NOT_PRIVATE',
+  });
   let config;
   try {
     config = JSON.parse(raw);
@@ -158,7 +167,7 @@ export async function readOwnerConfig(file) {
     throw new Error('INVALID_OWNER_CONFIG');
   }
   validateOwnerConfig(config);
-  return { config, revision: hash(raw), mode: stat.mode & 0o777 };
+  return { config, revision: hash(raw), mode };
 }
 export function permissionDetails(config, action, target) {
   const { allowed, explicit, sourceScope } = resolvePermission(config, action, target);
@@ -187,13 +196,8 @@ export async function editPermission(file, revision, target, action, value) {
   else validateGrants([{ ...scope, [action]: value }]);
   if (scope.folder && (await fs.realpath(scope.folder)) !== scope.folder)
     throw new Error('INVALID_PROJECT_FOLDER');
-  let lock;
-  try {
-    lock = await fs.open(`${file}.permissions.lock`, 'wx', 0o600);
-  } catch (e) {
-    if (e.code === 'EEXIST') throw new Error('OWNER_CONFIG_BUSY');
-    throw e;
-  }
+  await readOwnerConfig(file); // Validate the canonical private namespace first.
+  const lock = await kernelLock('permissions:' + file, { busy: 'OWNER_CONFIG_BUSY' });
   let temporary;
   try {
     const current = await readOwnerConfig(file);
@@ -233,6 +237,5 @@ export async function editPermission(file, revision, target, action, value) {
   } finally {
     if (temporary) await fs.unlink(temporary).catch(() => {});
     await lock.close();
-    await fs.unlink(`${file}.permissions.lock`);
   }
 }

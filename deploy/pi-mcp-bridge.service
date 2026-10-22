@@ -6,7 +6,6 @@ StartLimitBurst=3
 [Service]
 Type=exec
 WorkingDirectory=%h/.local/share/pi-mcp-bridge
-ExecStartPre=/usr/bin/node %h/.local/share/pi-mcp-bridge/deploy/check-owner.mjs %h/.config/pi-mcp-bridge/owner.json
 ExecStart=/usr/bin/node %h/.local/share/pi-mcp-bridge/src/http-server.mjs %h/.config/pi-mcp-bridge/owner.json
 EnvironmentFile=-%h/.config/pi-mcp-bridge/service.env
 UMask=0077

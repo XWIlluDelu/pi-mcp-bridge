@@ -27,12 +27,11 @@ async function fixture(t) {
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const config = {
-    principal: 'fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     attachmentDir: path.join(dir, 'ipc'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'p', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
   };
   let spawns = 0;
@@ -40,7 +39,7 @@ async function fixture(t) {
     spawns++;
     throw Error('UNEXPECTED_SPAWN');
   }).init();
-  const created = await savedSession(bridge, { folder_id: 'p', request_id: 'seed' }),
+  const created = await savedSession(bridge),
     session = await bridge.session(created.session_id);
   t.after(async () => {
     await bridge.close();
@@ -106,18 +105,20 @@ test('profile companion leaves the same-process host controller and its shutdown
 });
 test('host close cleans up its listener on registry failure without releasing the live writer', async (t) => {
   const f = await fixture(t),
-    createServer = net.createServer;
+    listen = net.Server.prototype.listen;
   let listener, connection;
-  t.mock.method(net, 'createServer', (...args) => {
-    listener = createServer(...args);
-    return listener;
+  t.mock.method(net.Server.prototype, 'listen', function (address, ...args) {
+    if (typeof address === 'string' && address.startsWith('/')) listener = this;
+    return listen.call(this, address, ...args);
   });
   const host = await reserveHostSession({
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     }),
     id = identity(f.session);
-  const lock = path.join(f.config.attachmentDir, 'registry.lock');
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  let held;
   try {
     await host.ready({
       state: async () => id,
@@ -133,7 +134,11 @@ test('host close cleans up its listener on registry failure without releasing th
       connection.once('error', reject);
     });
     const disconnected = new Promise((resolve) => connection.once('close', resolve));
-    await fs.writeFile(lock, 'interrupted owner registry update', { mode: 0o600 });
+    held = registryTransaction(f.config.attachmentDir, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
     await assert.rejects(host.close(), /ATTACHMENT_REGISTRY_BUSY/);
     assert.equal(
       listener.listening,
@@ -146,14 +151,15 @@ test('host close cleans up its listener on registry failure without releasing th
     assert.equal(await ownerAlive(claim.owner), true);
     const sent = await f.bridge.send({
       session_id: f.session.id,
-      request_id: 'closed-host',
+
       text: 'must not cold-start',
     });
     assert.equal(sent.status, 'rejected');
     assert.equal(sent.reason, 'LIVE_OWNER_UNREACHABLE');
     assert.equal(f.spawns(), 0);
   } finally {
-    await fs.rm(lock, { force: true });
+    release.resolve();
+    await held;
     // Keep a failing lifecycle regression from leaving a listener in the test runner.
     connection?.destroy();
     if (listener) await new Promise((resolve) => listener.close(resolve));
@@ -178,7 +184,7 @@ test('a new owner in the release/reclaim gap blocks deletion without moving the 
       await stop();
       competitor = await reserveOwner(f.config.attachmentDir, f.session, 'rpc');
     };
-    const result = await f.bridge.delete({ session_id: f.session.id, request_id: 'delete' });
+    const result = await f.bridge.delete({ session_id: f.session.id });
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
     assert.ok(await fs.stat(f.session.file));
@@ -212,7 +218,6 @@ test('released-for-local host deletion accepts only the terminal generation and 
     assert.equal(host.record.noColdReacquire, true);
     const result = await f.bridge.delete({
       session_id: f.session.id,
-      request_id: 'delete-released-host',
     });
     assert.equal(result.status, 'deleted', JSON.stringify(result));
     const terminal = await readClaim(f.config.attachmentDir, f.session);
@@ -334,7 +339,7 @@ test('controller death preserves the surviving writer claim and prevents bridge 
     await assert.rejects(f.bridge.read({ session_id: f.session.id }), /LIVE_OWNER_UNREACHABLE/);
     const result = await f.bridge.send({
       session_id: f.session.id,
-      request_id: 'after-crash',
+
       text: 'public fixture',
     });
     assert.equal(result.status, 'rejected');

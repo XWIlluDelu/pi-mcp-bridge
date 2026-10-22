@@ -7,7 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
-import { withdrawalCapture, requestRpcStop } from '../src/stop-execution.mjs';
+import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
+import { withdrawalCollector, requestRpcStop } from '../src/stop-execution.mjs';
 import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { makeServer } from '../src/server.mjs';
@@ -20,11 +21,10 @@ async function fixture(t) {
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
   const config = {
-    principal: 'stop-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, stop: true, create: true }],
   };
   let spawned = 0;
@@ -41,18 +41,18 @@ async function fixture(t) {
     spawned++;
     return runtime;
   }).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const made = await savedSession(bridge),
     saved = await bridge.session(made.session_id);
   let stops = 0;
-  runtime.stopExecution = async ({ recovery_id }) => {
+  runtime.stopExecution = async ({ max_chars }) => {
     stops++;
-    await withdrawalCapture(
-      bridge.pool.attachmentDir,
-      saved,
-      runtime.generation,
-      recovery_id,
-    )({ steering: ['one'], followUp: ['two'] });
-    return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+    const withdrawn = withdrawalCollector(max_chars);
+    return {
+      status: 'accepted',
+      acknowledgement: 'native_ack',
+      coverage: 'agent_and_bash',
+      withdrawal: withdrawn.add({ steering: ['one'], followUp: ['two'] }),
+    };
   };
   const cleanup = [];
   t.after(async () => {
@@ -74,103 +74,60 @@ async function fixture(t) {
 }
 test('stop is independently authorized, live-only, replay-safe and retains session/process', async (t) => {
   const f = await fixture(t);
-  assert.equal(
-    (await f.bridge.stop({ session_id: f.id, request_id: 'idle' })).reason,
-    'not_running',
-  );
+  assert.equal((await f.bridge.stop({ session_id: f.id })).reason, 'not_running');
   assert.equal(f.spawned(), 0);
-  await f.bridge.send({ session_id: f.id, request_id: 'start', text: 'start' });
-  const args = { session_id: f.id, request_id: 'once' };
+  await f.bridge.send({ session_id: f.id, text: 'start' });
+  const args = { session_id: f.id };
   const replies = await Promise.all(Array.from({ length: 5 }, () => f.bridge.stop(args)));
   assert.equal(replies[0].withdrawn_text, 'one\n\ntwo');
-  assert.equal(f.stops(), 1);
+  assert.equal(f.stops(), 5);
   assert.equal(f.runtime.alive, true);
-  assert.deepEqual(await f.bridge.stop(args), replies[0]);
+
   f.config.grants.push({ session_id: f.id, stop: false });
-  await assert.rejects(
-    f.bridge.stop({ ...args, request_id: 'prompt-only' }),
-    /NOT_FOUND_OR_DENIED/,
-  );
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'prompt-allowed', text: 'later' })).status,
-    'accepted',
+  await assert.rejects(f.bridge.stop({ ...args }), /NOT_FOUND_OR_DENIED/);
+  assert.ok(
+    ['started', 'queued', 'handled'].includes(
+      (await f.bridge.send({ session_id: f.id, text: 'later' })).status,
+    ),
+    'Expected native prompt admission',
   );
   f.config.grants.push({ session_id: f.id, stop: true, send: false });
-  assert.equal((await f.bridge.stop({ ...args, request_id: 'command-only' })).status, 'accepted');
+  assert.equal((await f.bridge.stop({ ...args })).status, 'accepted');
   assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'prompt-blocked', text: 'no' })).reason,
+    (await f.bridge.send({ session_id: f.id, text: 'no' })).reason,
     'NOT_FOUND_OR_DENIED',
   );
   f.config.grants.push({ session_id: f.id, read: false });
-  assert.equal(
-    (await f.bridge.stop({ ...args, request_id: 'no-content-grant' })).withdrawn_text,
-    'one\n\ntwo',
-  );
+  assert.equal((await f.bridge.stop({ ...args })).withdrawn_text, 'one\n\ntwo');
   assert.equal((await f.bridge.stop(args)).withdrawn_text, 'one\n\ntwo');
-  assert.equal(f.stops(), 3);
+  assert.equal(f.stops(), 8);
   assert.throws(
     () => validateGrants([{ folder: f.saved.cwd, command: 'yes' }]),
     /INVALID_OWNER_CONFIG/,
   );
 });
-test('stop pages complete native joined text without truncation and replays after Bridge restart', async (t) => {
+test('stop bounds withdrawn text honestly', async (t) => {
   const f = await fixture(t),
     text = 'Unicode 😀 quote " slash \\ newline\n'.repeat(2500),
     tail = 'later prompt';
   let stops = 0;
   f.bridge.pool.instances.set(f.id, f.runtime);
-  f.runtime.stopExecution = async ({ recovery_id }) => {
+  f.runtime.stopExecution = async ({ max_chars }) => {
     stops++;
-    await withdrawalCapture(
-      f.bridge.pool.attachmentDir,
-      f.saved,
-      f.runtime.generation,
-      recovery_id,
-    )({ steering: [text], followUp: [tail] });
-    return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+    const withdrawn = withdrawalCollector(max_chars);
+    return {
+      status: 'accepted',
+      acknowledgement: 'native_ack',
+      coverage: 'agent_and_bash',
+      withdrawal: withdrawn.add({ steering: [text], followUp: [tail] }),
+    };
   };
-  const args = { session_id: f.id, request_id: 'paged', max_chars: 256 };
-  let cursor,
-    out = '',
-    offset = 0;
-  do {
-    const page = await f.bridge.stop({ ...args, cursor });
-    assert.equal(page.text_offset, offset);
-    assert.ok(JSON.stringify({ withdrawn_text: page.withdrawn_text }).length <= 256);
-    out += page.withdrawn_text;
-    offset = out.length;
-    cursor = page.next_cursor;
-  } while (cursor);
-  assert.equal(out, text + '\n\n' + tail);
-  const first = await f.bridge.stop(args);
-  for (const cursor of [first.next_cursor, '']) {
-    await assert.rejects(
-      f.bridge.stop({ ...args, request_id: 'wrong', cursor }),
-      /RECEIPT_NOT_FOUND/,
-    );
-    assert.equal(stops, 1, 'Continuation cannot issue another cancellation');
-    assert.equal(await f.bridge.journal.get('wrong'), null);
-  }
-  await f.bridge.stop({ ...args, request_id: 'other' });
-  await assert.rejects(
-    f.bridge.stop({ ...args, request_id: 'other', cursor: first.next_cursor }),
-    /STALE_CURSOR/,
-  );
-  const broken = JSON.parse(Buffer.from(first.next_cursor, 'base64url'));
-  broken.revision = 'stale';
-  await assert.rejects(
-    f.bridge.stop({ ...args, cursor: Buffer.from(JSON.stringify(broken)).toString('base64url') }),
-    /STALE_CURSOR/,
-  );
-  await f.bridge.close();
-  const reopened = await new Bridge(f.config, async () =>
-    assert.fail('replay must not start Pi'),
-  ).init();
-  try {
-    assert.deepEqual(await reopened.stop(args), first);
-  } finally {
-    await reopened.close();
-  }
+  const args = { session_id: f.id, max_chars: 256 };
+  const result = await f.bridge.stop(args);
+  assert.equal(result.withdrawn_complete, false);
+  assert.ok((text + '\n\n' + tail).startsWith(result.withdrawn_text));
+  assert.ok(JSON.stringify({ withdrawn_text: result.withdrawn_text }).length <= 256);
+  assert.equal(stops, 1);
 });
 test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK, never retries control', async (t) => {
   const f = await fixture(t),
@@ -179,31 +136,27 @@ test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK,
   f.bridge.pool.instances.set(f.id, f.runtime);
   f.cleanup.push(() => finish.resolve());
   let calls = 0;
-  f.runtime.stopExecution = async ({ recovery_id }) => {
+  f.runtime.stopExecution = async () => {
     calls++;
-    await withdrawalCapture(
-      f.bridge.pool.attachmentDir,
-      f.saved,
-      f.runtime.generation,
-      recovery_id,
-    )({ steering: ['recover me'], followUp: [] });
     entered.resolve();
     await finish.promise;
-    throw Object.assign(new Error('ACK_TIMEOUT'), { uncertain: true });
+    throw Object.assign(new Error('ACK_TIMEOUT'), {
+      uncertain: true,
+      result: { withdrawal: { text: 'recover me', includesEditorDraft: false, complete: false } },
+    });
   };
-  const args = { session_id: f.id, request_id: 'uncertain' },
+  const args = { session_id: f.id },
     pending = f.bridge.stop(args);
   await entered.promise;
   assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'during-stop', text: 'must not run' }))
-      .reason,
+    (await f.bridge.send({ session_id: f.id, text: 'must not run' })).reason,
     'STOP_IN_PROGRESS',
   );
   finish.resolve();
   const receipt = await pending;
   assert.equal(receipt.status, 'unknown');
   assert.equal(receipt.withdrawn_text, 'recover me');
-  assert.deepEqual(await f.bridge.stop(args), receipt);
+
   assert.equal(calls, 1);
   assert.equal(f.runtime.alive, true);
 });
@@ -241,15 +194,15 @@ test('stop rejects sends arriving behind an earlier prompt lock instead of defer
   });
   const first = f.bridge.send({
     session_id: f.id,
-    request_id: 'first',
+
     text: 'already entering Pi',
   });
   await admitted.promise;
-  const cancel = f.bridge.stop({ session_id: f.id, request_id: 'stop' });
+  const cancel = f.bridge.stop({ session_id: f.id });
   await stopping.promise;
   const later = f.bridge.send({
     session_id: f.id,
-    request_id: 'later',
+
     text: 'must not run after stop',
   });
   await queued.promise;
@@ -260,72 +213,21 @@ test('stop rejects sends arriving behind an earlier prompt lock instead of defer
   const refusal = await later;
   assert.equal(refusal.reason, 'STOP_IN_PROGRESS');
   assert.equal(sends, 1);
-  assert.deepEqual(await f.bridge.send({ session_id: f.id, request_id: 'later' }), refusal);
-  assert.equal(sends, 1);
-  assert.equal(
-    (
-      await f.bridge.send({
-        session_id: f.id,
-        request_id: 'after-stop',
-        text: 'explicit new prompt',
-      })
-    ).status,
-    'accepted',
+  assert.ok(
+    ['started', 'queued', 'handled'].includes(
+      (
+        await f.bridge.send({
+          session_id: f.id,
+
+          text: 'explicit new prompt',
+        })
+      ).status,
+    ),
+    'Expected native prompt admission',
   );
   assert.equal(sends, 2);
 });
-test('input arriving during stop stays rejected when receipt persistence outlasts cancellation', async (t) => {
-  const f = await fixture(t),
-    stopping = gate(),
-    finishStop = gate(),
-    writing = gate(),
-    finishWrite = gate();
-  f.cleanup.push(() => {
-    finishStop.resolve();
-    finishWrite.resolve();
-  });
-  f.bridge.pool.instances.set(f.id, f.runtime);
-  let sends = 0;
-  f.runtime.command = async () => {
-    sends++;
-    return { disposition: 'started' };
-  };
-  const stop = f.runtime.stopExecution;
-  f.runtime.stopExecution = async (args) => {
-    stopping.resolve();
-    await finishStop.promise;
-    return stop(args);
-  };
-  const put = f.bridge.journal.put.bind(f.bridge.journal);
-  t.mock.method(f.bridge.journal, 'put', async (id, value) => {
-    if (id === 'during-stop') {
-      writing.resolve();
-      await finishWrite.promise;
-    }
-    return put(id, value);
-  });
-  const cancel = f.bridge.stop({ session_id: f.id, request_id: 'stop' });
-  await stopping.promise;
-  const input = f.bridge.send({
-    session_id: f.id,
-    request_id: 'during-stop',
-    text: 'must stay with caller',
-  });
-  await writing.promise;
-  finishStop.resolve();
-  await cancel;
-  finishWrite.resolve();
-  const result = await input;
-  assert.equal(result.reason, 'STOP_IN_PROGRESS');
-  assert.equal(sends, 0);
-  assert.deepEqual(await f.bridge.send({ session_id: f.id, request_id: 'during-stop' }), result);
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'after-stop', text: 'new input' })).status,
-    'accepted',
-  );
-  assert.equal(sends, 1);
-});
-for (const op of ['send', 'bash'])
+for (const op of ['send', 'command'])
   for (const stopFirst of [false, true])
     test(`owned ${op} refuses delayed dispatch ${stopFirst ? 'after' : 'during'} stop`, async (t) => {
       const f = await fixture(t),
@@ -342,6 +244,8 @@ for (const op of ['send', 'bash'])
       Object.assign(f.runtime, {
         command: PiRpc.prototype.command,
         executeBash: PiRpc.prototype.executeBash,
+        assertSessionIdentity: PiRpc.prototype.assertSessionIdentity,
+        activeBashes: 0,
         config: { attachmentDir: f.bridge.pool.attachmentDir },
         session: f.saved,
       });
@@ -369,12 +273,12 @@ for (const op of ['send', 'bash'])
       };
       const args = {
         session_id: f.id,
-        request_id: 'pending',
+
         ...(op === 'send' ? { text: 'not dispatched' } : { command: 'not dispatched' }),
       };
       const input = f.bridge[op](args);
       await observing.promise;
-      const cancel = f.bridge.stop({ session_id: f.id, request_id: 'stop' });
+      const cancel = f.bridge.stop({ session_id: f.id });
       await stopping.promise;
       if (stopFirst) {
         finishStop.resolve();
@@ -386,11 +290,14 @@ for (const op of ['send', 'bash'])
       await cancel;
       assert.equal(result.reason, 'STOP_IN_PROGRESS');
       assert.equal(dispatches, 0);
-      assert.deepEqual(await f.bridge[op]({ session_id: f.id, request_id: 'pending' }), result);
-      assert.equal((await f.bridge[op]({ ...args, request_id: 'after-stop' })).status, 'accepted');
+
+      assert.equal(
+        (await f.bridge[op]({ ...args })).status,
+        op === 'send' ? 'started' : 'accepted',
+      );
       assert.equal(dispatches, 1);
     });
-for (const op of ['send', 'bash'])
+for (const op of ['send', 'command'])
   for (const stopFirst of [false, true])
     test(`host ${op} refuses delayed dispatch ${stopFirst ? 'after' : 'during'} stop`, async (t) => {
       const f = await fixture(t),
@@ -445,19 +352,19 @@ for (const op of ['send', 'bash'])
           await onWithdraw({ steering: [], followUp: [] });
           stopping.resolve();
           await finishStop.promise;
-          return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+          return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
         },
       });
       const args = {
         session_id: f.id,
-        request_id: 'pending',
+
         ...(op === 'send'
           ? { text: 'not dispatched', mode: 'idle_only' }
           : { command: 'not dispatched' }),
       };
       const input = f.bridge[op](args);
       await observing.promise;
-      const cancel = f.bridge.stop({ session_id: f.id, request_id: 'stop' });
+      const cancel = f.bridge.stop({ session_id: f.id });
       await stopping.promise;
       if (stopFirst) {
         finishStop.resolve();
@@ -469,8 +376,11 @@ for (const op of ['send', 'bash'])
       await cancel;
       assert.equal(result.reason, 'STOP_IN_PROGRESS');
       assert.equal(dispatches, 0);
-      assert.deepEqual(await f.bridge[op]({ session_id: f.id, request_id: 'pending' }), result);
-      assert.equal((await f.bridge[op]({ ...args, request_id: 'after-stop' })).status, 'accepted');
+
+      assert.equal(
+        (await f.bridge[op]({ ...args })).status,
+        op === 'send' ? 'started' : 'accepted',
+      );
       assert.equal(dispatches, 1);
     });
 test('native RPC withdrawal and both cancellation requests are submitted before waiting; settling inputs recovered', async () => {
@@ -505,6 +415,117 @@ test('native RPC withdrawal and both cancellation requests are submitted before 
     ['early', 'during'],
   );
 });
+for (const failure of ['clear', 'capture'])
+  test('RPC Stop drains dispatched cancellations after ' + failure + ' failure', async () => {
+    const abort = gate(),
+      bash = gate(),
+      failed = gate(),
+      error = new Error('WITHDRAWAL_FAILED');
+    let settled = false,
+      clears = 0;
+    const stopping = requestRpcStop(
+      {
+        clearQueue: async () => {
+          clears++;
+          if (failure === 'clear') {
+            failed.resolve();
+            throw error;
+          }
+          return { steering: [], followUp: [] };
+        },
+        abort: () => abort.promise,
+        abortBash: () => bash.promise,
+      },
+      async () => {
+        failed.resolve();
+        throw error;
+      },
+    );
+    const rejected = assert.rejects(stopping, (value) => value === error);
+    void stopping
+      .finally(() => {
+        settled = true;
+      })
+      .catch(() => {});
+    try {
+      await failed.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, 'withdrawal failure must not finish active cancellation');
+      abort.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, 'bash cancellation must drain too');
+    } finally {
+      abort.resolve();
+      bash.resolve();
+      await rejected;
+    }
+    assert.equal(clears, 1, 'failure must not replay withdrawal');
+  });
+
+test('SDK host keeps Stop admission fenced when withdrawal capture fails during cancellation', async (t) => {
+  const f = await fixture(t),
+    cancellation = gate(),
+    capturing = gate(),
+    controller = await reserveHostSession({
+      attachmentDir: f.bridge.pool.attachmentDir,
+      session: f.saved,
+    });
+  f.cleanup.push(() => controller.close());
+  const state = {
+    sessionFile: f.saved.file,
+    sessionId: f.saved.header.id,
+    isIdle: true,
+    pendingMessageCount: 0,
+  };
+  let prompts = 0,
+    settled = false;
+  const binding = createSdkHostBinding({
+    ...state,
+    prompt: async () => {
+      prompts++;
+    },
+    clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
+    abort: () => cancellation.promise,
+    abortBash: () => {},
+  });
+  await controller.ready({
+    state: binding.state,
+    snapshot: async () => ({ ...state, entries: [], leafId: null }),
+    submit: binding.submit,
+    stop: (args) =>
+      binding.stop({
+        ...args,
+        onWithdraw: async (value) => {
+          await args.onWithdraw(value);
+          capturing.resolve();
+          throw new Error('CAPTURE_FAILED');
+        },
+      }),
+  });
+  const stopping = f.bridge.stop({ session_id: f.id }).finally(() => {
+    settled = true;
+  });
+  try {
+    await capturing.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    const sent = await f.bridge.send({ session_id: f.id, text: 'must not overlap cancellation' });
+    assert.equal(sent.reason, 'STOP_IN_PROGRESS', JSON.stringify(sent));
+    assert.equal(prompts, 0);
+    assert.equal(settled, false);
+  } finally {
+    cancellation.resolve();
+    await stopping;
+  }
+  const stopped = await stopping;
+  assert.equal(stopped.status, 'unknown');
+  assert.equal(stopped.withdrawn_text, 'withdrawn');
+  assert.equal(
+    (await f.bridge.send({ session_id: f.id, text: 'after cancellation' })).status,
+    'unknown',
+  );
+  assert.equal(prompts, 1);
+});
+
 test('generic public SDK and RPC bindings withdraw and cancel without invoking release', async () => {
   const state = { sessionFile: '/synthetic/session.jsonl', sessionId: 'native' },
     captured = [],
@@ -570,21 +591,20 @@ test('generic host IPC and actual MCP return joined editor recovery; missing cal
   });
   const tools = await client.listTools();
   assert.ok(tools.tools.find((tool) => tool.name === 'stop'));
-  assert.equal(tools.tools.length, 13);
-  const call = async (request_id, extra = {}) =>
-    (await client.callTool({ name: 'stop', arguments: { session_id: f.id, request_id, ...extra } }))
+  const call = async (label, extra = {}) =>
+    (await client.callTool({ name: 'stop', arguments: { session_id: f.id, ...extra } }))
       .structuredContent;
   assert.equal((await call('unsupported')).reason, 'STOP_UNSUPPORTED');
   assert.equal(f.spawned(), 0);
   callbacks.stop = async ({ onWithdraw }) => {
     await onWithdraw({ text: 'first\n\nsecond\n\nexisting draft', includesEditorDraft: true });
-    return { acknowledgement: 'requested', coverage: 'agent_and_bash' };
+    return { status: 'accepted', acknowledgement: 'requested', coverage: 'agent_and_bash' };
   };
   const result = await call('host-stop');
   assert.equal(result.withdrawn_text, 'first\n\nsecond\n\nexisting draft');
   assert.equal(result.includes_editor_draft, true);
   assert.equal(result.acknowledgement, 'requested');
-  assert.equal(result.completion, 'not_tracked');
+  assert.equal(result.completion, undefined);
   assert.equal(f.spawned(), 0);
   const finished = gate();
   let calls = 0;
@@ -593,17 +613,19 @@ test('generic host IPC and actual MCP return joined editor recovery; missing cal
     calls++;
     await onWithdraw({ steering: ['withdrawn before socket timeout'], followUp: [] });
     await finished.promise;
-    return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+    return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
   };
+  const received = dropPartialReply(t);
   try {
-    const lost = await call('socket-lost', { timeout_ms: 50 });
+    const pending = call('socket-lost');
+    assert.equal((await received).withdrawal.text, 'withdrawn before socket timeout');
+    const lost = await pending;
     assert.equal(lost.status, 'unknown');
     assert.equal(lost.withdrawn_text, 'withdrawn before socket timeout');
-    assert.deepEqual(await call('socket-lost'), lost);
+
     assert.equal(calls, 1);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'host-fenced', text: 'no admission' }))
-        .reason,
+      (await f.bridge.send({ session_id: f.id, text: 'no admission' })).reason,
       'STOP_IN_PROGRESS',
     );
   } finally {

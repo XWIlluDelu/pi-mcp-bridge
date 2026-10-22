@@ -12,6 +12,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
+import { savedEntries } from './fixtures/saved-session.mjs';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(check) {
   const end = Date.now() + 10000;
@@ -23,16 +24,17 @@ async function until(check) {
   throw Error('IMAGE_TEST_TIMEOUT');
 }
 const parseEvidence = (text) => JSON.parse(text.slice('IMAGE_CONTEXT:'.length));
+const lastText = (entries) =>
+  entries
+    .findLast((e) => e.message?.role === 'assistant')
+    .message.content.find((c) => c.type === 'text').text;
 const token = 'synthetic-image-test-token-not-a-real-credential';
 
 test('image schemas expose native blocks and reject malformed, mislabeled and oversized data', () => {
   const image = pngImage();
   for (const tool of ['send', 'create']) {
     const identity = tool === 'send' ? { session_id: 'session' } : { project: '/project' };
-    assert.ok(
-      publicSchemas[tool].safeParse({ ...identity, request_id: 'image-only', images: [image] })
-        .success,
-    );
+    assert.ok(publicSchemas[tool].safeParse({ ...identity, images: [image] }).success);
     assert.ok(toolDefinitions().find((t) => t.name === tool).inputSchema.properties.images);
   }
   assert.deepEqual(promptInput({ images: [image] }), {
@@ -66,19 +68,18 @@ test('image schemas expose native blocks and reject malformed, mislabeled and ov
 });
 
 test(
-  'HTTP create/send/batch deliver images to the native provider; replay, fork and recovery retain image identity',
-  { timeout: 30000 },
+  'HTTP create/send/batch and fork retain native image identity',
+  { timeout: 90000 }, // Multiple cold starts and two near-limit image round trips.
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-image-http-'),
       cwd = path.join(dir, 'project');
     await fs.mkdir(cwd);
     const config = {
       ...isolatedRuntime(dir),
-      principal: 'images',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'project', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
     };
     await fs.mkdir(config.piRuntime.agentDir, { recursive: true });
@@ -120,70 +121,50 @@ test(
       assert.ok(!r.isError, JSON.stringify(r));
       return r.structuredContent;
     };
+    const completed = async (id) => {
+      await until(async () => (await bridge.pool.get(id).idleSnapshot()).status === 'idle');
+      return savedEntries(bridge, id);
+    };
     const image = pngImage(),
       changed = pngImage(),
-      initial = { project: cwd, request_id: 'create-image', images: [image] };
+      initial = { project: cwd, images: [image] };
     const made = await call('create', initial);
-    assert.equal(made.status, 'accepted');
-    const runtime = bridge.pool.get(made.session_id);
-    await until(async () => !(await runtime.state()).isStreaming);
-    assert.deepEqual(
-      parseEvidence((await runtime.command({ type: 'get_last_assistant_text' })).text),
-      [imageEvidence(image)],
-    );
-    const entries = (await runtime.entries()).entries;
+    assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
+    const entries = await completed(made.session_id);
+    assert.deepEqual(parseEvidence(lastText(entries)), [imageEvidence(image)]);
     assert.deepEqual(
       entries
         .find((e) => e.message?.role === 'user')
         .message.content.filter((c) => c.type === 'image'),
       [image],
     );
-    assert.deepEqual(await call('create', initial), made);
-    assert.deepEqual(await call('create', { project: cwd, request_id: initial.request_id }), made);
-    const conflict = await client.callTool({
-      name: 'create',
-      arguments: { ...initial, images: [changed] },
-    });
-    assert.equal(conflict.isError, true);
-    assert.match(JSON.stringify(conflict), /REQUEST_ID_CONFLICT/);
-    assert.equal((await bridge.sessions()).length, 1);
+
     for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
       const args = {
         session_id: made.session_id,
-        request_id: 'image-' + mode,
+
         text: mode,
         images: mode === 'follow_up' ? Array(40).fill(image) : [image],
         mode,
       };
       const sent = await call('send', args);
-      assert.equal(sent.status, 'accepted');
-      await until(async () => !(await runtime.state()).isStreaming);
-      assert.deepEqual(
-        parseEvidence((await runtime.command({ type: 'get_last_assistant_text' })).text),
-        args.images.map(imageEvidence),
-      );
-      assert.deepEqual(
-        await call('send', { session_id: made.session_id, request_id: args.request_id }),
-        sent,
-      );
+      assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
+      const current = await completed(made.session_id);
+      assert.deepEqual(parseEvidence(lastText(current)), args.images.map(imageEvidence));
     }
     const fork = await call('create', {
       project: cwd,
-      request_id: 'image-fork',
+
       fork_from: made.session_id,
       text: 'child',
       images: [changed],
     });
-    assert.equal(fork.status, 'accepted');
-    const child = bridge.pool.get(fork.session_id);
-    await until(async () => !(await child.state()).isStreaming);
-    assert.deepEqual(
-      parseEvidence((await child.command({ type: 'get_last_assistant_text' })).text),
-      [imageEvidence(changed)],
-    );
+    assert.ok(['started', 'queued', 'handled'].includes(fork.status), JSON.stringify(fork));
+    const child = await completed(fork.session_id);
+    assert.deepEqual(parseEvidence(lastText(child)), [imageEvidence(changed)]);
     assert.equal(
-      (await runtime.state()).sessionId,
-      (await bridge.session(made.session_id)).header.id,
+      (await bridge.session(fork.session_id)).header.parentSession,
+      (await bridge.session(made.session_id)).file,
     );
     const response = await fetch(url, {
       method: 'POST',
@@ -208,11 +189,11 @@ test(
                 op: 'send',
                 args: {
                   session_id: made.session_id,
-                  request_id: 'modern-image',
+
                   images: [changed],
                 },
               },
-              { op: 'health', args: { domain: 'permissions' } },
+              { op: 'health', args: {} },
             ],
           },
         },
@@ -220,31 +201,79 @@ test(
     });
     assert.equal(response.status, 200);
     const batch = (await response.json()).result.structuredContent;
-    assert.equal(batch.results[0].result.status, 'accepted');
-    await until(async () => !(await runtime.state()).isStreaming);
-    assert.deepEqual(
-      parseEvidence((await runtime.command({ type: 'get_last_assistant_text' })).text),
-      [imageEvidence(changed)],
-    );
-    const page = await call('read', { session_id: made.session_id, max_bytes: 65536 });
-    assert.ok(JSON.stringify(page).includes(image.data));
+    assert.equal(batch.results[0].result.status, 'started');
+    const finalEntries = await completed(made.session_id);
+    assert.deepEqual(parseEvidence(lastText(finalEntries)), [imageEvidence(changed)]);
+    const page = await call('read', {
+      session_id: made.session_id,
+      preset: 'full',
+      max_bytes: 65536,
+    });
+    assert.ok(!JSON.stringify(page).includes(image.data));
+    const descriptor = page.items
+      .flatMap((item) => item.message?.content ?? [])
+      .find((block) => block.type === 'image');
+    assert.deepEqual(descriptor, { type: 'image', mime_type: image.mimeType, data_omitted: true });
+    const owners = bridge.pool.instances.size;
     const invalid = await client.callTool({
       name: 'send',
       arguments: {
         session_id: made.session_id,
-        request_id: 'bad-image',
+
         images: [{ ...image, mimeType: 'image/jpeg' }],
       },
     });
     assert.equal(invalid.isError, true);
-    assert.equal(await bridge.journal.get('bad-image'), null);
-    await runtime.command({ type: 'set_model', provider: 'image-fixture', modelId: 'text-only' });
+    assert.equal(bridge.pool.instances.size, owners);
     const denied = await call('send', {
       session_id: made.session_id,
-      request_id: 'text-model',
+
+      model: { provider: 'image-fixture', id: 'text-only' },
       images: [image],
     });
     assert.equal(denied.status, 'rejected');
     assert.equal(denied.reason, 'MODEL_IMAGE_INPUT_UNSUPPORTED');
+    const large = pngImage(1126, 1126),
+      evidence = imageEvidence(large);
+    assert.ok(evidence.bytes < MAX_IMAGE_BYTES);
+    assert.ok(Buffer.byteLength(large.data) > 6100000);
+    const largeArgs = { session_id: made.session_id, images: [large] };
+    const direct = await call('send', largeArgs);
+    assert.equal(direct.status, 'started');
+    assert.deepEqual(parseEvidence(lastText(await completed(made.session_id))), [evidence]);
+    const batched = await call('batch', { operations: [{ op: 'send', args: largeArgs }] });
+    assert.equal(batched.results[0].result.status, 'started', JSON.stringify(batched));
+    assert.deepEqual(parseEvidence(lastText(await completed(made.session_id))), [evidence]);
+    const before = await fs.stat((await bridge.session(made.session_id)).file);
+    const oversized = await fetch(url, {
+      method: 'POST',
+      headers: {
+        [TOKEN_HEADER]: token,
+        'content-type': 'application/json',
+        accept: 'application/json',
+        'MCP-Protocol-Version': MODERN_VERSION,
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': 'batch',
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 12,
+        method: 'tools/call',
+        params: {
+          name: 'batch',
+          arguments: {
+            operations: [
+              { op: 'send', args: largeArgs },
+              { op: 'send', args: largeArgs },
+            ],
+          },
+          _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
+        },
+      }),
+    });
+    assert.equal(oversized.status, 413);
+    await oversized.arrayBuffer();
+    assert.equal(bridge.pool.instances.size, owners);
+    assert.equal((await fs.stat((await bridge.session(made.session_id)).file)).size, before.size);
   },
 );

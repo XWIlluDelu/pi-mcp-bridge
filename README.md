@@ -4,9 +4,9 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 
 ## What it does
 
-- **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Pages start with the newest selected content and continue backwards.
+- **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Reads default to `latest`: the last prompt, all assistant text and first/last two thinking blocks, without summary, tools or commands. Explicit `recent` includes summaries and the last three prompts; selectors can override either preset, and `full` selects everything. Pages start with the newest selected content and continue backwards.
 - **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
-- **Control:** discover runtime-available models, set a session's model and thinking level, compact context (idle by default), or reopen an idle owned RPC. Stop execution and withdraw queued input, with its complete text available in pages.
+- **Control:** apply model and thinking settings with prompts, compact context (idle by default). Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
 - **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
 - **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
 - **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
@@ -26,13 +26,7 @@ chmod 600 /absolute/private/path/owner.json
 
 Replace every example path and add only the grants you intend. The example denies every operation until you grant it.
 
-Review existing `sessionRoots`, `stateDir` and `attachmentDir` directories: they must be owned by the service user, canonical (not symlink aliases), and private. Pi can create session directories as **0755** under a normal umask; Bridge requires no group/other access. After reviewing the selected existing directories, the owner can use `chmod 700 /absolute/path/to/selected/directory`. Apply it only to those directories, not recursively to all Pi data. See [storage requirements](docs/configuration.md#storage-and-project-paths).
-
-Then run the read-only preflight:
-
-```sh
-node deploy/check-owner.mjs /absolute/private/path/owner.json
-```
+Bridge state and IPC directories must be canonical, user-owned and private. Native session storage follows Pi's umask: 0755 directories below a private ancestor are supported without chmod. The Bridge checks native path/file integrity separately and rejects replaceable storage rather than repairing permissions. See [storage requirements](docs/configuration.md#storage-and-project-paths). Startup performs these checks directly.
 
 For a single stdio MCP client:
 
@@ -47,23 +41,22 @@ For multiple clients, start one shared HTTP service; each stdio-only client can 
 
 ### Tools at a glance
 
-| Tool        | Main arguments                                                       | Permission                              |
-| ----------- | -------------------------------------------------------------------- | --------------------------------------- |
-| `list`      | Optional project/name/time/ID filters; offset/limit                  | `list` per returned session             |
-| `read`      | `session_id`; optional preset/select/cursor/max_bytes                | `read`                                  |
-| `models`    | Known `session_id`; optional start/offset/limit                      | `send`                                  |
-| `set_model` | `session_id`, `request_id`, model and/or thinking_level              | `send`                                  |
-| `compact`   | `session_id`, `request_id`; optional instructions/interrupt          | `send`; explicit interrupt also `stop`  |
-| `reload`    | `session_id`, `request_id`; idle owned RPC reopen                    | `send`                                  |
-| `send`      | `session_id`, `request_id`, text/images; optional mode/model         | `send`                                  |
-| `command`   | `session_id`, `request_id`, `command`                                | `command`                               |
-| `stop`      | `session_id`, `request_id`                                           | `stop` only                             |
-| `create`    | `project`, `request_id`, text and/or images; optional name/fork_from | Target `create`; source `read` for fork |
-| `delete`    | `session_id`, `request_id`                                           | `delete`                                |
-| `batch`     | 1–10 `{op,args}` items                                               | Each wrapped operation's own permission |
-| `health`    | Optional known `session_id`; permissions by default                  | Diagnostics; does not change grants     |
+| Tool      | Main arguments                                                              | Permission                              |
+| --------- | --------------------------------------------------------------------------- | --------------------------------------- |
+| `list`    | Optional project/name/time/ID filters; offset/limit                         | `list` per returned session             |
+| `read`    | `session_id`; optional preset/select/cursor/max_bytes                       | `read`                                  |
+| `compact` | `session_id`; optional instructions/interrupt                               | `send`; explicit interrupt also `stop`  |
+| `send`    | `session_id`, text/images; optional mode/model/thinking_level               | `send`                                  |
+| `command` | `session_id`, `command`                                                     | `command`                               |
+| `stop`    | `session_id`                                                                | `stop` only                             |
+| `create`  | `project`, text and/or images; optional name/fork_from/model/thinking_level | Target `create`; source `read` for fork |
+| `delete`  | `session_id`                                                                | `delete`                                |
+| `batch`   | 1–10 `{op,args}` items                                                      | Each wrapped operation's own permission |
+| `health`  | Optional known `session_id`; permissions by default                         | Issues only; does not change grants     |
 
-Every mutation requires a `request_id`. Native acceptance is not model completion, and a timeout can leave the outcome `unknown`: recover using the same `request_id` rather than submitting the work again. See [API](docs/api.md) and [reading](docs/reading.md).
+Current session model/thinking belongs to `list.status`. `list.creatable_projects` contains only configured, create-permitted projects represented on the returned session page; it is not the full set of allowed create destinations.
+
+Every mutation call is a new operation, without caller-generated IDs or a result lookup API. Identical calls are not deduplicated. Send returns one of `started`, `queued`, `handled`, `skipped`, `rejected`, or `unknown`, not model completion. After a lost or unknown result, inspect `list/read` before deciding whether to submit again; never automatically replay work. Command and stop return bounded output prefixes with explicit completeness flags, without continuation. See [API](docs/api.md) and [reading](docs/reading.md).
 
 ## Native Pi integration
 
@@ -79,18 +72,20 @@ node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
 
 The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits for admitted work and a normal EOF exit, then switches to the saved session. The session file is not opened before negotiation. Ordinary TUI/RPC instances participate by loading the companion extension. See [runtime integration](docs/runtime.md).
 
+Bridge-owned RPCs remain open between operations. Owner-local release and TUI handoff close them through normal EOF. External TUI/RPC hosts manage their own lifecycle.
+
 **Native boundaries:**
 
 - An unregistered RPC process cannot be attached to by PID.
-- The companion supports reading, text/images and standalone model/thinking settings. Remote command, stop, compact, reload and combined prompt+model require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
+- The companion supports reading, live model/thinking metadata and text/images. Explicit interrupting compaction is supported; remote command, stop and prompt settings require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
 - Closing a native TUI interrupts its running task; it does not transfer that task to a background process. After a graceful close, cold resume is allowed only once exact process death is established.
 - Host applications with their own controller can supply native capabilities.
 
 ## Documentation
 
 - [Configuration and permissions](docs/configuration.md)
-- [API and recovery contracts](docs/api.md)
-- [Runtime models, thinking, compaction and reload](docs/model-control.md)
+- [API and timeout behavior](docs/api.md)
+- [Model settings, thinking and compaction](docs/model-control.md)
 - [Context selection, pagination and live observation](docs/reading.md)
 - [Runtime ownership, TUI handoff and capabilities](docs/runtime.md)
 - [MCP protocols and transports](docs/transports.md)
