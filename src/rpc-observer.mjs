@@ -3,6 +3,7 @@ import net from 'node:net';
 import { loadPiSdk } from './pi-installation.mjs';
 import fs from 'node:fs/promises';
 import { prepareContextRead } from './context-read.mjs';
+import { ContextObservation } from './context-observation.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
 export default async function rpcObserver(pi) {
@@ -29,7 +30,13 @@ export default async function rpcObserver(pi) {
       : (globalThis[key] = {
           generation,
           nonRpcInputSeen: false,
+          captureSequence: 0,
         });
+  // Preserve capture ordering across reload within this same owner generation.
+  const observation = new ContextObservation(generation, preflight);
+  // Pi dispatches every context handler (including MC) before this phase,
+  // irrespective of extension load order. Later full-context hooks can still change it.
+  pi.on('context_with_system', (event, ctx) => observation.capture(event, ctx));
   // ctx.isIdle() omits prompt preflight. Only the pipe owner has RPC ACKs;
   // independent extension inputs need an explicit interrupting owner release
   // if their completion cannot be established through the native interface.
@@ -48,6 +55,7 @@ export default async function rpcObserver(pi) {
   pi.on('session_before_fork', () => ({ cancel: true }));
   pi.on('session_start', async (_event, ctx) => {
     context = ctx;
+    observation.reset();
     if (server) return;
     server = net.createServer((connection) => {
       connections.add(connection);
@@ -85,15 +93,17 @@ export default async function rpcObserver(pi) {
                 : {
                     sessionFile: request.file,
                     sessionId: request.sessionId,
-                    ...prepareContextRead(
-                      {
-                        entries: context.sessionManager.getEntries(),
-                        leafId: context.sessionManager.getLeafId(),
-                        live: live.snapshot(),
-                      },
-                      request.body,
-                      sdk,
-                    ),
+                    ...(request.body?.view === 'observed'
+                      ? observation.read(request.body, context)
+                      : prepareContextRead(
+                          {
+                            entries: context.sessionManager.getEntries(),
+                            leafId: context.sessionManager.getLeafId(),
+                            live: live.snapshot(),
+                          },
+                          request.body,
+                          sdk,
+                        )),
                   },
           };
         } catch (error) {
@@ -111,6 +121,7 @@ export default async function rpcObserver(pi) {
   pi.on('session_shutdown', async () => {
     context = null;
     live.reset();
+    observation.reset();
     // Reload/replacement recreates factories after shutdown handlers finish.
     // Close the owning listener (which unlinks its Unix socket) before rebinding.
     for (const connection of connections) connection.destroy();

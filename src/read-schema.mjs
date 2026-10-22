@@ -18,6 +18,7 @@ export const contextSelectSchema = z
 export const readSchema = z
   .object({
     session_id: z.string().min(1).max(256).optional(),
+    view: z.enum(['native', 'observed']).optional(),
     preset: z.enum(['latest', 'recent', 'full']).optional(),
     select: contextSelectSchema.optional(),
     leaf_id: z.string().min(1).max(128).nullable().optional(),
@@ -27,7 +28,13 @@ export const readSchema = z
   .strict()
   .refine((args) => args.session_id !== undefined || args.cursor !== undefined, {
     message: 'Session ID or cursor required',
-  });
+  })
+  .refine(
+    (args) =>
+      args.view !== 'observed' ||
+      [args.preset, args.select, args.leaf_id].every((value) => value === undefined),
+    { message: 'Observed reads do not accept native selection or leaf overrides' },
+  );
 
 export const FULL_SELECTION = Object.freeze({
   summary: -1,

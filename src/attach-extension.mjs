@@ -26,6 +26,7 @@ import {
 import joinExtension from './join-extension.mjs';
 import { companionProfile, companionIncludes } from './companion-profile.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
+import { ContextObservation } from './context-observation.mjs';
 import {
   privateDirectory,
   processIdentity,
@@ -147,6 +148,9 @@ export default async function attachExtension(pi) {
     pi.on(event, (value) => {
       active?.liveMessage.update(value);
     });
+  // All context transforms have finished before this phase, including MC even
+  // when it loaded after the companion. Never mutate the observed event.
+  pi.on('context_with_system', (event, ctx) => active?.observation.capture(event, ctx));
   // These events occur after the relevant persistence; every IPC request also
   // validates, including the first request after a previously absent file appears.
   pi.on('agent_settled', async () => {
@@ -163,6 +167,7 @@ export default async function attachExtension(pi) {
     active = undefined;
     if (!runtime) return;
     runtime.ready = false; // Retire captured callbacks before the first asynchronous lifecycle step.
+    runtime.observation.reset();
     try {
       await updateOwner(dir, runtime.session, runtime.record, { phase: 'transitioning' });
     } finally {
@@ -241,6 +246,7 @@ export default async function attachExtension(pi) {
         ctx,
         fileObserved,
         liveMessage: new LiveMessageObserver('extension_message_events'),
+        observation: new ContextObservation(record.generation),
       };
       const activity = () => ({
         idle: ctx.isIdle() && runtime.mutations.size === 0,
@@ -320,7 +326,8 @@ export default async function attachExtension(pi) {
                 activity: activity(),
               };
             else if (['read', 'snapshot'].includes(request.op)) {
-              const sdk = request.op === 'read' ? await nativeSdk(profile) : null;
+              const sdk =
+                request.op === 'read' && args.view !== 'observed' ? await nativeSdk(profile) : null;
               const entries = ctx.sessionManager.getEntries(),
                 leafId = ctx.sessionManager.getLeafId();
               const snapshotJson =
@@ -338,11 +345,13 @@ export default async function attachExtension(pi) {
                 data = {
                   sessionFile: file,
                   sessionId: header.id,
-                  ...prepareContextRead(
-                    { header, entries, leafId, live: runtime.liveMessage.snapshot() },
-                    args,
-                    sdk,
-                  ),
+                  ...(args.view === 'observed'
+                    ? runtime.observation.read(args, ctx)
+                    : prepareContextRead(
+                        { header, entries, leafId, live: runtime.liveMessage.snapshot() },
+                        args,
+                        sdk,
+                      )),
                 };
               }
             } else if (request.op === 'set_model') {

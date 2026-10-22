@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
-import { fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
+import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSessionRuntime,
   createAgentSessionServices,
@@ -145,6 +145,45 @@ async function fixture(t, { hosted = false, extension } = {}) {
   if (controller) await controller.ready(binding);
   return { dir, config, bridge, a, b, runtime, modelRuntime, faux, finishers, binding, errors };
 }
+
+test('companion observed contexts follow session replacement and never leak the previous session', async (t) => {
+  const f = await fixture(t, {
+    extension: (pi) => {
+      pi.on('context', (event) => ({
+        messages: [{ role: 'user', content: 'RUNTIME_SUMMARY', timestamp: 1 }, ...event.messages],
+      }));
+    },
+  });
+  const read = (target) =>
+    f.bridge.read({ session_id: target.id, view: 'observed', max_bytes: 65536 });
+  assert.equal((await read(f.a)).observation.reason, 'no_observation');
+  f.faux.setResponses([
+    fauxAssistantMessage('FIRST_ANSWER'),
+    fauxAssistantMessage('SECOND_ANSWER'),
+  ]);
+  await f.runtime.session.prompt('FIRST_SESSION_INPUT');
+  const first = await read(f.a);
+  assert.equal(first.source, 'tui');
+  assert.equal(first.observation.owner_active, true);
+  assert.ok(JSON.stringify(first).includes('RUNTIME_SUMMARY'));
+  assert.ok(JSON.stringify(first).includes('FIRST_SESSION_INPUT'));
+  assert.ok(!JSON.stringify(first.items).includes('FIRST_ANSWER'));
+  await f.runtime.switchSession(f.b.file);
+  const empty = await read(f.b);
+  assert.equal(empty.observation.available, false);
+  assert.deepEqual(empty.items, []);
+  await f.runtime.session.prompt('SECOND_SESSION_INPUT');
+  const second = await read(f.b);
+  assert.notEqual(second.observation.owner_generation, first.observation.owner_generation);
+  assert.ok(JSON.stringify(second).includes('SECOND_SESSION_INPUT'));
+  assert.ok(!JSON.stringify(second).includes('FIRST_SESSION_INPUT'));
+  // The first session's retained observation is still useful after switch-away.
+  const retained = await read(f.a);
+  assert.equal(retained.source, 'retained');
+  assert.equal(retained.observation.owner_active, false);
+  assert.equal(retained.observation.id, first.observation.id);
+  assert.deepEqual(f.errors, []);
+});
 
 test(
   'ordinary companion RPC refuses an existing writer before native open; unowned and same-process resumes remain valid',

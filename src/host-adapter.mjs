@@ -7,6 +7,7 @@ import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { unavailableObservation } from './context-observation.mjs';
 import {
   SEND_MODES,
   attachedPromptInput,
@@ -195,6 +196,12 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
           command: typeof callbacks.bash === 'function' && typeof callbacks.stop === 'function',
           stop: typeof callbacks.stop === 'function',
         },
+      };
+    else if (request.op === 'read' && args.view === 'observed')
+      data = {
+        sessionFile: target.file,
+        sessionId: target.header.id,
+        ...unavailableObservation(args.session_id, 'host_observer_unavailable'),
       };
     else if (['read', 'snapshot'].includes(request.op)) {
       const sdk = request.op === 'read' ? await nativeSdk({ piExecutable }) : null;
