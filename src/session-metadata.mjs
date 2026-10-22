@@ -13,7 +13,7 @@ export async function sessionMetadata(session, cache) {
     fragments = [];
   const consume = (line) => {
     // Metadata is authorized by list, not read. Ignore incomplete/corrupt body
-    // records here; a content read still validates the complete native tree.
+    // records here; content reads validate identity and the selected branch.
     if (!line.includes('"session_info"')) return;
     try {
       const entry = JSON.parse(line);

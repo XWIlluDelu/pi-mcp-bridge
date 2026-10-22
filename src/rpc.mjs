@@ -5,6 +5,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
+import { RetainedObservations } from './context-observation.mjs';
 import { sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
 import { assertImageModel } from './prompt-input.mjs';
 import { randomUUID } from 'node:crypto';
@@ -715,6 +716,9 @@ export class PiRpc {
       record = this.ownerRecord,
       exit = this.observeExit();
     await this.assertProcessIdentity(child, record);
+    // Preserve the last cleaned request before the short-lived child exits.
+    // This precedes the final drain/guard; capture cannot bypass in-flight work.
+    await this.retainObservation?.();
     await this.drainAcks();
     signal?.throwIfAborted();
     if (exit.result || this.exited || !this.alive) throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
@@ -827,6 +831,7 @@ export class RuntimePool {
     // Keep the latest owned generation's bounded observations through normal
     // release, without persisting native notifications into session history.
     this.runtimeEvents = new Map();
+    this.observations = new RetainedObservations();
     this.starting = new Map();
   }
   watchRuntime(runtime) {
@@ -837,6 +842,18 @@ export class RuntimePool {
       if (this.runtimeEvents.size > 16)
         this.runtimeEvents.delete(this.runtimeEvents.keys().next().value);
       runtime.onIdleCandidate = () => this.onIdleCandidate?.(runtime);
+      runtime.retainObservation = async () => {
+        let snapshot;
+        try {
+          snapshot = await runtime.read({ session_id: runtime.session.id, view: 'observed' });
+        } catch {
+          // An unavailable observer does not erase a dated request snapshot.
+          // Late public reads remain fenced by handoff and the runtime identity.
+          return;
+        }
+        if (this.instances.get(runtime.session.id) === runtime)
+          this.observations.put(runtime.session, snapshot, runtime);
+      };
     }
     return runtime;
   }
@@ -919,6 +936,7 @@ export class RuntimePool {
       await runtime.stopForDelete();
       this.instances.delete(session.id);
     } else await this.stop(session.id);
+    this.observations.delete(session.id);
     if (this.attachmentDir) {
       // Keep a cooperative owner claim across the filesystem move, including saved-session deletes.
       const deletion = await reserveOwner(this.attachmentDir, session, 'delete');
@@ -955,5 +973,6 @@ export class RuntimePool {
     await Promise.all(
       [...new Set([...this.instances.keys(), ...this.starting.keys()])].map((id) => this.stop(id)),
     );
+    this.observations.clear();
   }
 }

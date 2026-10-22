@@ -425,7 +425,6 @@ export class AttachedRuntime {
                   'READ_BUDGET_TOO_SMALL',
                   'READ_SNAPSHOT_TOO_LARGE',
                   'INVALID_OWNER_READ',
-                  'READ_SNAPSHOT_CHANGED',
                   'INVALID_HOST_SNAPSHOT',
                 ].includes(response.error)
                   ? response.error
@@ -461,7 +460,13 @@ export class AttachedRuntime {
     const result = await this.request('read', args);
     if (result?.sessionFile !== this.session.file || result?.sessionId !== this.session.header.id)
       throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-    return assertReadSnapshot(result, args);
+    const snapshot = assertReadSnapshot(result, args);
+    if (
+      snapshot.observation?.available &&
+      snapshot.observation.owner_generation !== this.record.generation
+    )
+      throw new AttachmentFailure('INVALID_OWNER_READ');
+    return snapshot;
   }
   async snapshot() {
     const result = await this.request('snapshot');
