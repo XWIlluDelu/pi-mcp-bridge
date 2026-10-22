@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import { resolvePiInstallation } from './pi-installation.mjs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { findHerdr } from './herdr-control.mjs';
+import { HerdrRpcTransport } from './herdr-rpc-transport.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
@@ -109,9 +111,9 @@ export class PiRpc {
       // reservation may have taken time since discovery verified this path.
       await validateExecutionCwd(this.session.cwd);
       // Native environment/settings by default; only owner-selected overrides apply.
-      this.child = spawn(
-        executable.command,
-        [
+      const launch = {
+        command: executable.command,
+        args: [
           ...(this.ownerRecord
             ? ['-e', fileURLToPath(new URL('./rpc-observer.mjs', import.meta.url))]
             : []),
@@ -122,8 +124,17 @@ export class PiRpc {
           ...toolArgs,
           ...(this.config.piArgs ?? []),
         ],
-        { cwd: this.session.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] },
-      );
+        cwd: this.session.cwd,
+        env,
+      };
+      const herdr = this.config.herdr ? await findHerdr() : null;
+      this.child = herdr
+        ? new HerdrRpcTransport(herdr, launch)
+        : spawn(launch.command, launch.args, {
+            cwd: launch.cwd,
+            env: launch.env,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
     } catch (error) {
       if (this.ownerRecord)
         await releaseOwner(this.config.attachmentDir, this.session, this.ownerRecord);
@@ -150,7 +161,7 @@ export class PiRpc {
       this.pending.clear();
     };
     this.child.once('error', () => {
-      if (!this.child.pid) this.exited = true;
+      if (!this.child.pid && !this.child.ready) this.exited = true;
       fail();
     });
     this.child.once('exit', () => {
@@ -171,6 +182,7 @@ export class PiRpc {
       this.receiveResponse(event, generation);
     });
     try {
+      await this.child.ready;
       this.childIdentity = await processIdentity(this.child.pid);
       if (this.ownerRecord) {
         const owner = this.childIdentity;
@@ -184,9 +196,16 @@ export class PiRpc {
       await this.state(15000);
       this.phase = 'running';
       return this;
-    } catch {
+    } catch (error) {
+      if (this.child.abortStartup && !this.childIdentity) {
+        await this.child.abortStartup();
+        this.exited = true;
+      }
       await this.stop();
-      throw this.startFailure ?? new RpcFailure('RUNTIME_START_FAILED');
+      throw (
+        this.startFailure ??
+        new RpcFailure(error.message?.startsWith('HERDR_') ? error.message : 'RUNTIME_START_FAILED')
+      );
     }
   }
   receiveResponse(event, generation) {
@@ -695,7 +714,8 @@ export class PiRpc {
   observeExit() {
     if (this.exitObservation?.child === this.child) return this.exitObservation;
     const observation = { child: this.child, result: null };
-    observation.promise = new Promise((resolve) => {
+    observation.promise = new Promise((resolve, reject) => {
+      this.child.once('exitError', reject);
       this.child.once('exit', (code, signal) => {
         observation.result = { code, signal };
         this.exited = true;
@@ -703,9 +723,14 @@ export class PiRpc {
         resolve(observation.result);
       });
     });
+    observation.promise.catch(() => {});
     observation.closed = this.child.stdout
-      ? new Promise((resolve) => this.child.once('close', resolve))
+      ? new Promise((resolve, reject) => {
+          this.child.once('close', resolve);
+          this.child.once('exitError', reject);
+        })
       : observation.promise;
+    observation.closed.catch(() => {});
     this.exitObservation = observation;
     return observation;
   }
@@ -792,7 +817,8 @@ export class PiRpc {
           if (!exit.result && (!owner || (await ownerAlive(owner)))) throw error;
           await exit.promise;
         }
-        if (!exit.result && child.kill('SIGTERM') === false) {
+        if (!exit.result && child.terminate) await child.terminate();
+        if (!exit.result && !child.terminate && child.kill('SIGTERM') === false) {
           const owner = record?.owner ?? this.childIdentity;
           if (!exit.result && (!owner || (await ownerAlive(owner))))
             throw new RpcFailure('RUNTIME_STOP_FAILED');
@@ -827,6 +853,8 @@ export class RuntimePool {
     this.factory =
       factory ??
       (async (session) => {
+        // Placement is sampled only after reuse has been ruled out. It does not
+        // alter the receive-time authorization snapshot or a running writer.
         const desired = configFile ? (await readOwnerConfig(configFile)).config : config;
         const desiredRegistry =
           desired.attachmentDir ??
@@ -834,7 +862,8 @@ export class RuntimePool {
         // A different namespace cannot prove this target has no writer. This
         // affects only acquisition, not reads or reuse of an existing owner.
         if (desiredRegistry !== this.attachmentDir) throw new RpcFailure('CONFIG_RESTART_REQUIRED');
-        return new PiRpc({ ...config, attachmentDir: this.attachmentDir }, session).start();
+        const herdr = desired.herdr;
+        return new PiRpc({ ...config, herdr, attachmentDir: this.attachmentDir }, session).start();
       });
     this.instances = new Map();
     // Keep the latest owned generation's bounded observations through normal

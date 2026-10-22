@@ -46,6 +46,7 @@ test(
       }),
     );
     const config = {
+      herdr: true,
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],

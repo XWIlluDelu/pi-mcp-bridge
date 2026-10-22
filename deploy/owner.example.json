@@ -15,5 +15,6 @@
     "create": false,
     "delete": false
   },
-  "grants": []
+  "grants": [],
+  "herdr": false
 }

@@ -29,6 +29,8 @@ test('configuration shape errors agree across init, reload reader and HTTP', asy
   const f = await fixture(t);
   const invalid = [
     { arbitrary: 'unknown' },
+    { herdr: 'true' },
+    { herdr: null },
     { defaults: undefined, grants: [{ folder: f.dir, command: true }] },
     { defaults: { command: true }, grants: [{ folder: f.dir, command: true }] },
     { defaults: { read: true, send: true } },
