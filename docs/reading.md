@@ -26,13 +26,13 @@ To continue, pass the returned cursor alone; the byte budget may change:
 | `session_id` | Required for the first read; optional with a cursor. Knowing an ID is not permission.         |
 | `view`       | `native` (default) or `observed`. Omitted on continuation: inherit.                           |
 | `preset`     | Initial default `latest`; alternatives `recent` and `full`. Omitted on continuation: inherit. |
-| `select`     | Overrides for the seven selectors below. Omitted continuation fields inherit.                 |
+| `select`     | Overrides for the eight selectors below. Omitted continuation fields inherit.                 |
 | `max_bytes`  | UTF-8 limit for the entire structured page: default 24000, range 4096–65536.                  |
 | `cursor`     | Opaque backward continuation of one captured snapshot.                                        |
 | `leaf_id`    | Optional native leaf. Explicit `null` means the empty root, not the last file entry.          |
 
 An explicit continuation preset, merged with its explicit selectors, must match
-all seven captured values. Without a preset, only explicitly supplied selector
+all eight captured values. Without a preset, only explicitly supplied selector
 fields are checked. An explicit session or leaf must also match; mismatches
 return `STALE_CURSOR`. Defaults are not applied before deciding what to inherit.
 
@@ -108,18 +108,20 @@ observations; an already-running old companion must be updated with the Bridge.
 
 ## Native selection
 
-| Selector           | Counting and selection                                                                                                 |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
-| `summary`          | `0` omits summaries; `1` or `-1` includes all active summaries at their native positions.                              |
-| `recent_prompts`   | Last N user entries, or all with `-1`.                                                                                 |
-| `earliest_prompts` | First N user entries, or all with `-1`.                                                                                |
-| `text`             | Per selected prompt, first N **and** last N assistant text blocks; union by source position.                           |
-| `thinking`         | Per selected prompt, first N **and** last N native thinking blocks.                                                    |
-| `tools`            | Per selected prompt, first N **and** last N logical tool units (a call with its result, or an unresolved/orphan unit). |
-| `commands`         | Last N native `bashExecution` messages, independently of prompt selection.                                             |
+| Selector           | Counting and selection                                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `system`           | `0` omits native system instructions/sections; `-1` includes them in native order. Tool declarations also require nonzero `tools`. |
+| `summary`          | `0` omits summaries; `1` or `-1` includes all active summaries at their native positions.                                          |
+| `recent_prompts`   | Last N user entries, or all with `-1`.                                                                                             |
+| `earliest_prompts` | First N user entries, or all with `-1`.                                                                                            |
+| `text`             | Per selected prompt, first N **and** last N assistant text blocks; union by source position.                                       |
+| `thinking`         | Per selected prompt, first N **and** last N native thinking blocks.                                                                |
+| `tools`            | Per selected prompt, first N **and** last N logical tool units (a call with its result, or an unresolved/orphan unit).             |
+| `commands`         | Last N native `bashExecution` messages, independently of prompt selection.                                                         |
 
 For all count selectors, `0` means none and `-1` means all. Counts are
-nonnegative safe integers or `-1`; `summary` only accepts `-1`, `0` or `1`.
+nonnegative safe integers or `-1`; `summary` only accepts `-1`, `0` or `1`, and
+`system` only accepts `-1` or `0`.
 First/last overlap is included once, so a bidirectional count N selects at most
 2N units per prompt. Text that happens to be identical is not deduplicated.
 
@@ -127,6 +129,7 @@ For an initial read, omitting `preset` is equivalent to `preset:"latest"`:
 
 ```json
 {
+  "system": 0,
   "summary": 0,
   "recent_prompts": 1,
   "earliest_prompts": 0,
@@ -138,13 +141,19 @@ For an initial read, omitting `preset` is equivalent to `preset:"latest"`:
 ```
 
 This selects the last prompt with all assistant text and the first/last two
-thinking blocks. It omits summaries, extra earliest prompts, tool units and
-direct shell commands.
+thinking blocks. It omits system instructions, summaries, extra earliest prompts,
+tool units and direct shell commands. Native system records can be large repeated
+background, so they do not consume the default conversation page. Their omission
+is counted in `omissions.selection.system`, not silently truncated. Use
+`select:{system:-1}` to include them, or `preset:"full"` for all effective context.
+Omitting system does not hide custom messages or affect the observed view.
+Active summaries remain controlled by `summary`.
 
 Explicit `preset:"recent"` uses:
 
 ```json
 {
+  "system": 0,
   "summary": 1,
   "recent_prompts": 3,
   "earliest_prompts": 0,
@@ -157,7 +166,7 @@ Explicit `preset:"recent"` uses:
 
 This includes active summaries and the last three prompts with all assistant
 text and the first/last three thinking blocks per prompt. It adds no earliest
-prompts and omits tool units and direct shell commands.
+prompts and omits system instructions, tool units and direct shell commands.
 
 To extend the default `latest` with the first/last two tool units and the earliest
 prompt as well:
@@ -171,16 +180,18 @@ calls and orphan results retain their pairing status. Selected records remain
 subject to capacity paging. Set `select.tools:-1` for all tools in the selected
 prompts.
 
-With `tools:0`, native system `toolsAdded`/`toolsRemoved` declarations are
-omitted, as are records containing nothing else. System instruction text and
-section updates/removals remain; custom messages still follow their prompt
-windows. Any nonzero `tools` selection includes those global declarations; declarations do not count
-as per-prompt tool units.
+When system records are included, `tools:0` omits their
+`toolsAdded`/`toolsRemoved` declarations and records containing nothing else;
+instruction text and section updates/removals remain. Nonzero `tools` includes
+those declarations only when `system:-1`; tool calls/results remain independently
+selectable. Declarations do not count as per-prompt tool units. Custom messages
+still follow their prompt windows.
 
 Explicit `preset:"full"` selects everything:
 
 ```json
 {
+  "system": -1,
   "summary": -1,
   "recent_prompts": -1,
   "earliest_prompts": -1,
@@ -205,6 +216,11 @@ Saved v1/v2 histories are normalized in memory with native pure parsing/migratio
 A page contains `session_id`, `view`, acquisition `source`, captured `leaf_id`,
 resolved `selection`, chronological `items`, `omissions`, `live` and
 `next_cursor`. Runtime extension observations may appear in `runtime_events`.
+
+The MCP envelope carries this same result as JSON text in `content` and as
+`structuredContent`, for text-consuming and structured clients respectively.
+Consume either representation, not both as separate history. `max_bytes` bounds
+the structured page; the separate wire budget includes both copies.
 
 Units retain their native source entry/message/block positions and `prompt_id`.
 Ordinary message data is in `message`; assistant blocks are in `block`, with

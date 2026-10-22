@@ -36,6 +36,7 @@ test('observations are detached request-stage data with honest identity, updates
   assert.equal(empty.observation.current_leaf_id, 'u');
   const messages = [
     { role: 'user', content: 'INPUT' },
+    { role: 'system', content: '', sections: { memory: 'REQUEST_STAGE_MEMORY' } },
     {
       role: 'assistant',
       content: [text('BODY'), { type: 'image', mimeType: 'image/png', data: 'BASE64' }],
@@ -54,6 +55,7 @@ test('observations are detached request-stage data with honest identity, updates
   assert.ok(!JSON.stringify(first).includes('SECRET'));
   assert.ok(!JSON.stringify(first).includes('BASE64'));
   assert.equal(first.units[0].message.content, 'INPUT');
+  assert.deepEqual(first.units[1].message.sections, { memory: 'REQUEST_STAGE_MEMORY' });
   assert.equal(first.units[0].source.entry_id, undefined);
   assert.equal(first.units[0].source.observation_index, 0);
   data.entries.push({ id: 'other', parentId: null });

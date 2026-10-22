@@ -123,6 +123,7 @@ function selectTimeline(projected, selection) {
   ]);
   const chosen = new Set();
   const totals = {
+    system: records.filter((r) => r.type === 'system').length,
     summary: records.some((r) => r.type === 'summary') ? 1 : 0,
     prompts: prompts.length,
     text: 0,
@@ -131,6 +132,7 @@ function selectTimeline(projected, selection) {
     commands: 0,
   };
   const included = {
+    system: 0,
     summary: 0,
     prompts: selectedPrompts.size,
     text: 0,
@@ -175,21 +177,26 @@ function selectTimeline(projected, selection) {
     included.commands++;
   }
   for (const record of records) {
-    if (record.type === 'system' && selection.tools === 0) {
-      // Tool declarations follow tools selection; instructions remain global.
-      const { toolsAdded, toolsRemoved, ...message } = record.message;
-      if (!message.content?.length && !Object.keys(message.sections ?? {}).length) continue;
-      record.message = message;
+    if (record.type === 'system') {
+      if (selection.system === 0) continue;
+      if (selection.tools === 0) {
+        const { toolsAdded, toolsRemoved, ...message } = record.message;
+        if (!message.content?.length && !Object.keys(message.sections ?? {}).length) continue;
+        record.message = message;
+      }
+      chosen.add(record);
+      included.system++;
+      continue;
     }
     if (record.type === 'prompt' && selectedPrompts.has(record.prompt_id)) chosen.add(record);
     if (record.type === 'summary' && selection.summary !== 0) {
       chosen.add(record);
       included.summary = 1;
     }
-    // System/context prefixes are global. Custom and unknown native records
-    // after a prompt belong to that prompt's window, just like its text.
+    // Custom/unknown context prefixes remain global; later records belong to
+    // their prompt's window. System selection must not hide extension content.
     if (
-      ['system', 'custom', 'native'].includes(record.type) &&
+      ['custom', 'native'].includes(record.type) &&
       (record.prompt_id === null || selectedPrompts.has(record.prompt_id))
     )
       chosen.add(record);
@@ -814,7 +821,7 @@ export function assertReadSnapshot(value, args) {
     !Array.isArray(value.units) ||
     (observed
       ? value.selection !== null || value.omissions !== null
-      : ['summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
+      : ['system', 'summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
           (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
         )) ||
     !(value.leaf_id === null || typeof value.leaf_id === 'string') ||
