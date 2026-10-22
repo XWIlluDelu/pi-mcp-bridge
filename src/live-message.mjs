@@ -5,14 +5,12 @@ const BLOCK_OVERHEAD = 64;
 export class LiveMessageObserver {
   constructor(source) {
     this.source = source;
-    this.epoch = 0;
     this.blocks = new Map();
     this.active = false;
     this.truncated = false;
     this.observedAt = null;
   }
   reset() {
-    this.epoch++;
     this.blocks.clear();
     this.active = false;
     this.truncated = false;

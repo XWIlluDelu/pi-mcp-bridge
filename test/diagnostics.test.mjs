@@ -140,13 +140,14 @@ test('enabled HTTP, RPC and timeout diagnostics remain private and correlated', 
     'permission.snapshot.end',
     'permission.check',
     'read.source',
-    'rpc.command.end',
+    'attached.request.end',
     'tool.end',
   ])
     assert.ok(
       related.some((r) => r.event === event),
       event,
     );
+  assert.ok(related.some((r) => r.event === 'attached.request.end' && r.op === 'read'));
   assert.ok(rows.some((r) => r.event === 'session.discover.end')); // Initial cold lookup.
   assert.equal(
     related.some((r) => r.event === 'session.discover.end'),

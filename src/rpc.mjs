@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
-import { LiveMessageObserver } from './live-message.mjs';
+import { READ_CONTRACT } from './context-read.mjs';
 import { sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
 import { assertImageModel } from './prompt-input.mjs';
 import { randomUUID } from 'node:crypto';
@@ -118,7 +118,6 @@ export class PiRpc {
     this.uiFacts = uiFacts();
     this.phase = 'startup';
     this.ackTasks = new Set();
-    this.liveMessage = new LiveMessageObserver('rpc_message_events');
     this.alive = false;
     this.exited = false;
     this.generation = randomUUID();
@@ -232,6 +231,7 @@ export class PiRpc {
         await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
           owner,
           phase: 'ready',
+          readContract: READ_CONTRACT,
         });
       }
       await this.state(15000);
@@ -286,7 +286,6 @@ export class PiRpc {
       }
       return;
     }
-    this.liveMessage.update(event);
     if (event.type === 'agent_start')
       this.requiredSettlementSequence = this.settlement.sequence + 1;
     if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
@@ -416,7 +415,6 @@ export class PiRpc {
       });
     await beforeDispatch?.();
     let result, rejection;
-    const liveEpoch = command.type === 'get_entries' ? this.liveMessage.epoch : null;
     try {
       result = await this.dispatch(command, timeout, late, allowBusySelection);
     } catch (error) {
@@ -433,18 +431,6 @@ export class PiRpc {
       throw error;
     }
     if (rejection) throw rejection;
-    if (command.type === 'get_entries')
-      return {
-        ...result,
-        live:
-          liveEpoch === this.liveMessage.epoch
-            ? this.liveMessage.snapshot()
-            : {
-                available: false,
-                source: 'rpc_message_events',
-                reason: 'context_changed_during_read',
-              },
-      };
     return result;
   }
   dispatch(command, timeout = 5000, onLate, allowBusySelection = false) {
@@ -548,6 +534,11 @@ export class PiRpc {
       this.activeReads--;
       this.onIdleCandidate?.();
     }
+  }
+  read(args) {
+    return this.observeRead(() =>
+      new AttachedRuntime(this.config, this.session, this.ownerRecord).read(args),
+    );
   }
   entries() {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
