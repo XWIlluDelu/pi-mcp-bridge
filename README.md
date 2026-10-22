@@ -74,6 +74,8 @@ node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
 
 The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits for admitted work and a normal EOF exit, then switches to the saved session. The session file is not opened before negotiation. Ordinary TUI/RPC instances participate by loading the companion extension. See [runtime integration](docs/runtime.md).
 
+The optional global [`herdr` switch](docs/configuration.md#herdr-process-placement) places new RPC writers in local Herdr, including cold resumes. It hot-updates without moving existing writers; connected owners are reused first.
+
 Bridge-owned prompt runtimes also release normally after their run and queues finish and idle is proven. Saved history remains available; the next send can resume the session. Unconfirmed work stays owned, and external TUI/RPC hosts manage their own lifecycle.
 
 **Native boundaries:**
