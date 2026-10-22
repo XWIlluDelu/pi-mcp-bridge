@@ -128,9 +128,19 @@ Every continuation is a new request and reauthorizes read. Each call uses its
 [receive-time permission snapshot](configuration.md#request-permission-snapshots)
 through execution and response delivery.
 
-### Model settings and compact
+### Models, set_model and compact
 
-See [native controls](model-control.md) for prompt model/thinking settings and manual compaction.
+See [model discovery and native controls](model-control.md) for `models`,
+standalone `set_model`, prompt model/thinking settings and `compact`, including
+permissions, lifecycle and timeout behavior.
+
+### Set model
+
+`set_model({session_id, model?, thinking_level?})` requires at least one setting
+and the target's `send` permission. It changes the current native selection,
+including while busy, without sending a prompt. Success contains only
+`{model:{provider,id},thinking_level}`, with actual native adjustments.
+Unsupported owners return a tool error. See [selection and owner support](model-control.md#standalone-selection-set_model).
 
 ### Send
 

@@ -434,6 +434,26 @@ test(
 );
 
 test(
+  'model catalog queries do not wait for session shutdown or start a writer',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+    );
+    await f.bridge.send({ session_id: f.id, text: 'DONE' });
+    await until(() => exists(f.dir + '/shutdown'));
+    const page = await f.bridge.models({});
+    assert.deepEqual(Object.keys(page).sort(), ['models', 'next_offset']);
+    await f.mark('shutdown-go');
+    await released(f, f.runtimes[0]);
+    assert.equal(f.runtimes.length, 1);
+    assert.equal((await f.bridge.list({})).sessions[0].status.state, 'saved');
+    assert.equal(f.runtimes.length, 1);
+  },
+);
+
+test(
   'an existing native RPC host keeps its process and pipes after Bridge prompt completion',
   { timeout: 15000 },
   async (t) => {

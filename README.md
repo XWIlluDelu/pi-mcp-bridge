@@ -6,7 +6,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 
 - **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Reads default to `latest`: the last prompt, all assistant text and first/last two thinking blocks, without summary, tools or commands. Explicit `recent` includes summaries and the last three prompts; selectors can override either preset, and `full` selects everything. Pages start with the newest selected content and continue backwards.
 - **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
-- **Control:** apply model and thinking settings with prompts, compact context (idle by default). Owned RPCs release safely between tasks and cold-resume when later work needs them. Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
+- **Control:** discover native configured models independently of sessions, set a session's model and thinking level, compact context (idle by default). Owned RPCs release safely between tasks and cold-resume when later work needs them. Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
 - **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
 - **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
 - **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
@@ -41,20 +41,22 @@ For multiple clients, start one shared HTTP service; each stdio-only client can 
 
 ### Tools at a glance
 
-| Tool      | Main arguments                                                              | Permission                              |
-| --------- | --------------------------------------------------------------------------- | --------------------------------------- |
-| `list`    | Optional project/name/time/ID filters; offset/limit                         | `list` per returned session             |
-| `read`    | `session_id`; optional preset/select/cursor/max_bytes                       | `read`                                  |
-| `compact` | `session_id`; optional instructions/interrupt                               | `send`; explicit interrupt also `stop`  |
-| `send`    | `session_id`, text/images; optional mode/model/thinking_level               | `send`                                  |
-| `command` | `session_id`, `command`                                                     | `command`                               |
-| `stop`    | `session_id`                                                                | `stop` only                             |
-| `create`  | `project`, text and/or images; optional name/fork_from/model/thinking_level | Target `create`; source `read` for fork |
-| `delete`  | `session_id`                                                                | `delete`                                |
-| `batch`   | 1–10 `{op,args}` items                                                      | Each wrapped operation's own permission |
-| `health`  | Optional known `session_id`; permissions by default                         | Issues only; does not change grants     |
+| Tool        | Main arguments                                                              | Permission                                                                                              |
+| ----------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `list`      | Optional project/name/time/ID filters; offset/limit                         | `list` per returned session                                                                             |
+| `read`      | `session_id`; optional preset/select/cursor/max_bytes                       | `read`                                                                                                  |
+| `models`    | Optional offset/limit; returns models/next_offset                           | Effective `send`/`command`/`create` on a configured project, or `send`/`command` on an in-scope session |
+| `set_model` | `session_id`; model and/or thinking_level; busy supported                   | `send`                                                                                                  |
+| `compact`   | `session_id`; optional instructions/interrupt                               | `send`; explicit interrupt also `stop`                                                                  |
+| `send`      | `session_id`, text/images; optional mode/model/thinking_level               | `send`                                                                                                  |
+| `command`   | `session_id`, `command`                                                     | `command`                                                                                               |
+| `stop`      | `session_id`                                                                | `stop` only                                                                                             |
+| `create`    | `project`, text and/or images; optional name/fork_from/model/thinking_level | Target `create`; source `read` for fork                                                                 |
+| `delete`    | `session_id`                                                                | `delete`                                                                                                |
+| `batch`     | 1–10 `{op,args}` items                                                      | Each wrapped operation's own permission                                                                 |
+| `health`    | Optional known `session_id`; permissions by default                         | Issues only; does not change grants                                                                     |
 
-Current session model/thinking belongs to `list.status`. `list.creatable_projects` contains only configured, create-permitted projects represented on the returned session page; it is not the full set of allowed create destinations.
+`models` lists the native agent-configuration catalog without loading sessions or extensions. Current session model/thinking belongs to `list.status`; `set_model` changes that selection without a prompt and returns its actual model and thinking level. `list.creatable_projects` contains only configured, create-permitted projects represented on the returned session page; it is not the full set of allowed create destinations.
 
 Every mutation call is a new operation, without caller-generated IDs or a result lookup API. Identical calls are not deduplicated. Send returns one of `started`, `queued`, `handled`, `skipped`, `rejected`, or `unknown`, not model completion. After a lost or unknown result, inspect `list/read` before deciding whether to submit again; never automatically replay work. Command and stop return bounded output prefixes with explicit completeness flags, without continuation. See [API](docs/api.md) and [reading](docs/reading.md).
 
@@ -77,7 +79,7 @@ Bridge-owned prompt runtimes also release normally after their run and queues fi
 **Native boundaries:**
 
 - An unregistered RPC process cannot be attached to by PID.
-- The companion supports reading, live model/thinking metadata and text/images. Explicit interrupting compaction is supported; remote command, stop and prompt settings require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
+- The companion supports reading, live model/thinking metadata, standalone `set_model` and text/images. Explicit interrupting compaction is supported; remote command, stop and prompt settings require stronger control; see the [capability table](docs/runtime.md#runtime-capabilities).
 - Closing a native TUI interrupts its running task; it does not transfer that task to a background process. After a graceful close, cold resume is allowed only once exact process death is established.
 - Host applications with their own controller can supply native capabilities.
 
@@ -85,7 +87,7 @@ Bridge-owned prompt runtimes also release normally after their run and queues fi
 
 - [Configuration and permissions](docs/configuration.md)
 - [API and timeout behavior](docs/api.md)
-- [Model settings, thinking and compaction](docs/model-control.md)
+- [Model catalog, thinking and compaction](docs/model-control.md)
 - [Context selection, pagination and live observation](docs/reading.md)
 - [Runtime ownership, TUI handoff and capabilities](docs/runtime.md)
 - [MCP protocols and transports](docs/transports.md)

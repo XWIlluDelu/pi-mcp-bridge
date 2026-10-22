@@ -2,6 +2,7 @@
 import fs from 'node:fs/promises';
 import { compactInputSchema, compactMetadata, requireInterruptCompaction } from './compact.mjs';
 import { modelState } from './models.mjs';
+import { createModelSetter } from './set-model.mjs';
 import net from 'node:net';
 import path from 'node:path';
 import { homedir } from 'node:os';
@@ -264,6 +265,20 @@ export default async function attachExtension(pi) {
         )
           throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
       }
+      const setModel = createModelSetter({
+        state: () => {
+          check({ generation: record.generation, file, sessionId: header.id });
+          return {
+            sessionFile: file,
+            sessionId: header.id,
+            model: ctx.model,
+            thinkingLevel: pi.getThinkingLevel(),
+          };
+        },
+        models: () => ctx.modelRegistry.getAvailable(),
+        setModel: (model) => pi.setModel(model),
+        setThinkingLevel: (level) => pi.setThinkingLevel(level),
+      });
       const server = net.createServer((socket) => {
         if (connections.size >= 16) {
           socket.destroy();
@@ -327,6 +342,19 @@ export default async function attachExtension(pi) {
                   ),
                 };
               }
+            } else if (request.op === 'set_model') {
+              if (typeof pi.setModel !== 'function' || typeof pi.setThinkingLevel !== 'function')
+                throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
+              data = await trackMutation(
+                setModel({
+                  model: args.model,
+                  thinking_level: args.thinking_level,
+                  sessionFile: file,
+                  sessionId: header.id,
+                  beforeDispatch: () => check(request),
+                }),
+              );
+              check(request);
             } else if (request.op === 'compact') {
               if (typeof ctx.compact !== 'function')
                 throw new AttachmentFailure('COMPACT_UNSUPPORTED');
@@ -357,6 +385,7 @@ export default async function attachExtension(pi) {
               }
             } else if (request.op === 'send') {
               if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
+              if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
               const input = attachedPromptInput(args);
               if (hasPromptSettings(input))
                 throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');

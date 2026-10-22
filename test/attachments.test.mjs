@@ -185,11 +185,13 @@ test('attached shutdown acknowledgment is insufficient until exact owner process
   const f = await fixture(t);
   const record = await reserveOwner(f.config.attachmentDir, f.session, 'tui');
   const server = net.createServer((socket) =>
-    socket.once('data', () =>
+    socket.once('data', (chunk) =>
       socket.end(
         JSON.stringify({
           generation: record.generation,
-          data: { shutdown: 'requested' },
+          ...(JSON.parse(chunk.toString()).op === 'set_model'
+            ? { error: 'MODEL_SELECTION_UNSUPPORTED' }
+            : { data: { shutdown: 'requested' } }),
         }) + '\n',
       ),
     ),
@@ -201,6 +203,10 @@ test('attached shutdown acknowledgment is insufficient until exact owner process
     { ...f.config, attachmentExitTimeoutMs: 40 },
     f.session,
     record,
+  );
+  await assert.rejects(
+    runtime.selectModel(undefined, { thinkingLevel: 'high' }),
+    (e) => e.message === 'MODEL_SELECTION_UNSUPPORTED' && e.uncertain === false,
   );
   await assert.rejects(runtime.stopForDelete(), /OWNER_STILL_ALIVE/);
   assert.equal(await ownerAlive(record.owner), true);
@@ -902,8 +908,10 @@ test('standard MCP client attaches to an existing offline TUI through the single
       'delete',
       'health',
       'list',
+      'models',
       'read',
       'send',
+      'set_model',
       'stop',
     ]);
     const call = async (name, args) => {

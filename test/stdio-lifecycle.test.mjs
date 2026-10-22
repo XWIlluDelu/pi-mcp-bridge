@@ -199,7 +199,7 @@ test('modern stdio discovers without initialize and EOF drains native input befo
   const missing = await server.request('tools/list', {});
   assert.equal(missing.error.code, -32602);
   const listed = await server.request('tools/list', { _meta });
-  assert.ok(listed.result.tools.some((tool) => tool.name === 'compact'));
+  assert.ok(listed.result.tools.some((tool) => tool.name === 'set_model'));
   const pending = server.request('tools/call', {
     name: 'send',
     arguments: { session_id: f.id, text: '/lifecycle-fixture' },

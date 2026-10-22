@@ -96,6 +96,8 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
       '-e',
       path.join(base, 'test/fixtures/faux-extension.mjs'),
       '-e',
+      path.join(base, 'test/fixtures/model-provider.mjs'),
+      '-e',
       extension,
     ],
   });
@@ -125,6 +127,21 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
       return result;
     },
   });
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: saved.id,
+      model: { provider: 'model-fixture', id: 'vision' },
+      thinking_level: 'high',
+    }),
+    { model: { provider: 'model-fixture', id: 'vision' }, thinking_level: 'high' },
+  );
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: saved.id,
+      model: { provider: 'bridge-fixture', id: 'deterministic' },
+    }),
+    { model: { provider: 'bridge-fixture', id: 'deterministic' }, thinking_level: 'off' },
+  );
   const first = await f.bridge.send({
     session_id: saved.id,
 
@@ -185,7 +202,13 @@ test('two official SDK sessions in one host PID release independently without sh
   const f = await fixture(t),
     savedA = await f.create('sdk-a'),
     savedB = await f.create('sdk-b');
-  const faux = fauxProvider({ provider: 'host-sdk-fixture' });
+  const faux = fauxProvider({
+    provider: 'host-sdk-fixture',
+    models: [
+      { id: 'a', reasoning: false, input: ['text'] },
+      { id: 'b', reasoning: true, input: ['text'] },
+    ],
+  });
   faux.setResponses([
     fauxAssistantMessage('PUBLIC_A_REPLY'),
     fauxAssistantMessage('PUBLIC_B_REPLY'),
@@ -259,6 +282,66 @@ test('two official SDK sessions in one host PID release independently without sh
   assert.equal(claimA.owner.pid, process.pid);
   assert.equal(claimB.owner.pid, process.pid);
   assert.notEqual(claimA.generation, claimB.generation);
+  const neighbor = { model: hosts[1].session.model, level: hosts[1].session.thinkingLevel };
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: savedA.id,
+      model: { provider: 'host-sdk-fixture', id: 'b' },
+      thinking_level: 'high',
+    }),
+    {
+      model: { provider: hosts[0].session.model.provider, id: hosts[0].session.model.id },
+      thinking_level: 'high',
+    },
+  );
+  assert.equal(hosts[1].session.model, neighbor.model);
+  assert.equal(hosts[1].session.thinkingLevel, neighbor.level);
+  assert.equal(faux.state.callCount, 0);
+  assert.equal(hosts[0].released, 0);
+  assert.equal(hosts[1].released, 0);
+  // A local owner changes model after the first reduced state observation.
+  // Thinking-only must not feed that old identity-only value to SDK setModel.
+  const session = hosts[0].session,
+    models = modelRuntime.getAvailableSnapshot();
+  const fullA = models.find((m) => m.id === 'a'),
+    fullB = models.find((m) => m.id === 'b');
+  await session.setModel(fullA);
+  const setter = t.mock.method(session, 'setModel', session.setModel.bind(session));
+  let switched = false;
+  Object.defineProperty(session, 'isIdle', {
+    configurable: true,
+    get() {
+      if (!switched) {
+        switched = true;
+        session.agent.state.model = fullB;
+      }
+      return true;
+    },
+  });
+  const binding = createSdkHostBinding(session);
+  try {
+    assert.deepEqual(
+      await binding.setModel({
+        sessionFile: savedA.file,
+        sessionId: savedA.header.id,
+        thinking_level: 'high',
+      }),
+      { model: { provider: fullB.provider, id: fullB.id }, thinking_level: 'high' },
+    );
+    assert.equal(setter.mock.calls.length, 0);
+    assert.equal(session.model, fullB);
+    assert.ok(Number.isFinite(session.model.contextWindow));
+    await binding.setModel({
+      sessionFile: savedA.file,
+      sessionId: savedA.header.id,
+      model: { provider: fullA.provider, id: fullA.id },
+    });
+    assert.equal(setter.mock.calls.length, 1);
+    assert.deepEqual(setter.mock.calls[0].arguments[0], fullA);
+    assert.deepEqual(session.model, fullA);
+  } finally {
+    delete session.isIdle;
+  }
   const sentA = await f.bridge.send({
     session_id: savedA.id,
 
