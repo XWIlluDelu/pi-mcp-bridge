@@ -222,7 +222,7 @@ batch result. A page containing everything needs no cached snapshot.
 
 Snapshots have no inactivity timeout. LRU/capacity eviction or Bridge restart returns `STALE_CURSOR`; start a fresh read. The Bridge
 does not recreate an old cursor from mutable history. Once captured, normal
-appends, owner exit or a new owner generation do not change
+appends, owner exit, automatic release or a new owner generation do not change
 the frozen history. Each continuation rechecks read permission and native identity,
 including the header cwd; changing that identity invalidates the cursor.
 

@@ -21,7 +21,7 @@ async function until(fn, label) {
 }
 
 test(
-  'native --session-dir create persists, then the same launcher configuration joins safely and resumes headlessly',
+  'native --session-dir create releases, then the same launcher configuration joins safely and resumes headlessly',
   { timeout: 25000 },
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-native-open-'),
@@ -105,10 +105,10 @@ test(
     assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
     const session = await bridge.session(made.session_id);
     await until(
-      async () => (await bridge.pool.get(session.id).idleSnapshot()).status === 'idle',
-      'created RPC completes',
+      () => !bridge.pool.instances.has(session.id) && !bridge.autoReleases.size,
+      'created RPC release',
     );
-    await bridge.pool.stop(session.id);
+    assert.equal(await readClaim(config.attachmentDir, session), null);
     const profile = await openProfile(configFile, session.id, {
       PATH: process.env.PATH,
       HOME: dir,

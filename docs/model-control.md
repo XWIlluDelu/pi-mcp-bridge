@@ -17,8 +17,8 @@ release the next cold resume still chooses native defaults instead of restoring
 them. A session with context messages follows the normal restoration path.
 
 This is a Pi SDK/CLI startup limitation, not a missing Bridge write. Bridge
-does not insert messages, keep a separate preference store or turn saved
-selections into launch overrides. Correcting
+retains normal automatic release and does not insert messages, keep a separate
+preference store or turn saved selections into launch overrides. Correcting
 startup semantics requires a native Pi fix and validation of the actual CLI;
 changing only Bridge's SDK dependency is insufficient.
 
