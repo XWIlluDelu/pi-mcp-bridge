@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { resolvePiInstallation } from './pi-installation.mjs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -55,60 +55,6 @@ export function launchProfile(config, hostEnv = process.env) {
       tools === undefined ? [] : tools.length ? ['--tools', tools.join(',')] : ['--no-tools'],
   };
 }
-async function executableFile(file) {
-  let stat;
-  try {
-    stat = await fs.stat(file);
-  } catch (error) {
-    throw new Error(
-      ['ENOENT', 'ENOTDIR'].includes(error.code)
-        ? 'PI_EXECUTABLE_NOT_FOUND'
-        : 'PI_EXECUTABLE_NOT_EXECUTABLE',
-    );
-  }
-  if (!stat.isFile()) throw new Error('PI_EXECUTABLE_NOT_EXECUTABLE');
-  await fs.access(file, fsConstants.X_OK).catch(() => {
-    throw new Error('PI_EXECUTABLE_NOT_EXECUTABLE');
-  });
-}
-async function bridgeDependency(file) {
-  // npm scripts prepend node_modules/.bin to PATH. That must not turn the
-  // development SDK (including another Bridge checkout) into the user's Pi.
-  const bundled = fileURLToPath(
-    new URL('../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js', import.meta.url),
-  );
-  if (file === (await fs.realpath(bundled).catch(() => bundled))) return true;
-  const index = file.indexOf(`${path.sep}node_modules${path.sep}`);
-  if (index < 0) return false;
-  const manifest = await fs
-    .readFile(path.join(file.slice(0, index), 'package.json'), 'utf8')
-    .then(JSON.parse)
-    .catch(() => null);
-  return manifest?.name === 'pi-mcp-bridge';
-}
-export async function piCommand(config, env = process.env, cwd = process.cwd()) {
-  if (config.piExecutable !== undefined) {
-    if (
-      typeof config.piExecutable !== 'string' ||
-      !path.isAbsolute(config.piExecutable) ||
-      config.piExecutable.includes('\0')
-    )
-      throw new Error('INVALID_PI_EXECUTABLE');
-    await executableFile(config.piExecutable);
-    return { command: config.piExecutable, args: [] };
-  }
-  for (const directory of (env.PATH ?? '/usr/bin:/bin').split(path.delimiter)) {
-    const command = path.resolve(cwd, directory, 'pi');
-    try {
-      await executableFile(command);
-      if (await bridgeDependency(await fs.realpath(command))) continue;
-      return { command, args: [] };
-    } catch {
-      /* Try the next executable on the native PATH, never the SDK. */
-    }
-  }
-  throw new Error('PI_EXECUTABLE_NOT_FOUND');
-}
 export class PiRpc {
   constructor(config, session) {
     this.config = config;
@@ -139,7 +85,7 @@ export class PiRpc {
     const { env, toolArgs } = launchProfile(this.config);
     if (this.config.piRuntime?.agentDir)
       await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
-    const executable = await piCommand(this.config, env, this.session.cwd);
+    const executable = await resolvePiInstallation(this.config, env);
     try {
       if (this.config.attachmentDir) {
         this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
@@ -155,6 +101,7 @@ export class PiRpc {
         env.PI_MCP_RPC_OBSERVER = JSON.stringify({
           socket: this.ownerRecord.socket,
           generation: this.ownerRecord.generation,
+          sdkEntry: executable.sdkEntry,
         });
       }
       // Recheck at the actual launch boundary: content preflight and owner
@@ -167,7 +114,6 @@ export class PiRpc {
           ...(this.ownerRecord
             ? ['-e', fileURLToPath(new URL('./rpc-observer.mjs', import.meta.url))]
             : []),
-          ...executable.args,
           '--mode',
           'rpc',
           '--session',
@@ -627,13 +573,13 @@ export class PiRpc {
     let target = model ? models?.find((m) => sameModel(m, model)) : initial.model;
     if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
     assertImageModel(images, target);
-    if (!nativeThinking) assertThinkingLevel(target, thinkingLevel);
+    if (!nativeThinking) await assertThinkingLevel(target, thinkingLevel, this.config);
     const state = idle ? await this.assertIdle() : await this.state();
     await beforeDispatch?.();
     if (!model) {
       target = state.model;
       assertImageModel(images, target);
-      if (!nativeThinking) assertThinkingLevel(target, thinkingLevel);
+      if (!nativeThinking) await assertThinkingLevel(target, thinkingLevel, this.config);
     }
     if (model && !sameModel(state.model, target)) {
       // A timed-out setter keeps input fenced until its matching native ACK.
@@ -651,7 +597,7 @@ export class PiRpc {
     if (model && !sameModel(selected.model, target))
       throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     assertImageModel(images, selected.model);
-    if (!nativeThinking) assertThinkingLevel(selected.model, thinkingLevel);
+    if (!nativeThinking) await assertThinkingLevel(selected.model, thinkingLevel, this.config);
     if (thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel) {
       await this.command(
         { type: 'set_thinking_level', level: thinkingLevel },

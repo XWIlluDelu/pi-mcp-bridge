@@ -28,5 +28,10 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - name: Prepare external test Pi
+        run: |
+          npm install --prefix "$RUNNER_TEMP/test-pi" --no-save @earendil-works/pi-coding-agent@1.4.0
+          echo "$RUNNER_TEMP/test-pi/node_modules/.bin" >> "$GITHUB_PATH"
+          echo "BRIDGE_TEST_PI_CLI=$RUNNER_TEMP/test-pi/node_modules/.bin/pi" >> "$GITHUB_ENV"
       - run: npm run format:check
       - run: npm test

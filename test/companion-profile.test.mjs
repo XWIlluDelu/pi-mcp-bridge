@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { companionProfile, companionIncludes } from '../src/companion-profile.mjs';
 import attachExtension from '../src/attach-extension.mjs';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { SessionManager } from './fixtures/pi.mjs';
 import { readClaim, reserveOwner, claimFile } from '../src/attachments.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 

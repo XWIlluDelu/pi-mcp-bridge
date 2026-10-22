@@ -6,6 +6,7 @@ import path from 'node:path';
 import { openProfile, openSession } from '../src/open.mjs';
 import { opaqueId } from '../src/storage.mjs';
 import { PiRpc } from '../src/rpc.mjs';
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 test('open starts a fresh native TUI with normal configuration and automatic safe join, never the target file', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-open-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -30,8 +31,8 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   const binary = path.join(dir, 'pi'),
     explicit = path.join(dir, 'selected-pi');
-  await fs.writeFile(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
-  await fs.writeFile(explicit, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  await fs.symlink(nativePiCli, binary);
+  await fs.symlink(nativePiCli, explicit);
   const host = { HOME: dir, PATH: dir, SYNTHETIC_NATIVE_VALUE: 'retained' };
   const profile = await openProfile(file, id, host);
   assert.equal(profile.cwd, cwd);

@@ -6,19 +6,19 @@ Use a canonical JSON file owned by the service user with no group/other permissi
 
 Only the fields below are accepted. Unknown fields and incomplete baseline permissions are rejected. Project and session grants can override subsets of their applicable rights. Projects use canonical paths, not folder IDs; there is no caller `principal` field. Use the current example when updating a configuration, and update Bridge, companion and host bindings together.
 
-| Key                       | Meaning                                                                                                                       |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `stateDir`                | Private Bridge state and recoverable session trash; also the namespace for service exclusivity.                               |
-| `sessionRoots`            | Nonempty array of absolute native session storage directories.                                                                |
-| `folders`                 | Authorized configuration scope, each `{path}`; `path` is the absolute project cwd. Inclusion alone grants nothing.            |
-| `defaults`                | Required baseline with all seven permission keys. Each value is boolean or `null`; `null` denies at this scope.               |
-| `grants`                  | Project/session permission overrides.                                                                                         |
-| `attachmentDir`           | Optional shared private registry directory; every cooperating owner must use the same canonical directory.                    |
-| `attachmentExitTimeoutMs` | Optional 50–30000 ms owner-exit verification budget.                                                                          |
-| `piExecutable`            | Optional absolute path to your Pi executable; otherwise resolved from the child environment's PATH, never the SDK dependency. |
-| `piArgs`                  | Optional additional native CLI arguments; the launcher and runtime reject incompatible ownership/selection flags.             |
-| `piRuntime`               | Explicit launch overrides, described below.                                                                                   |
-| `http`                    | Optional `{port,tokenFile}`; required for HTTP/proxy entry points.                                                            |
+| Key                       | Meaning                                                                                                                                                                                                                                        |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stateDir`                | Private Bridge state and recoverable session trash; also the namespace for service exclusivity.                                                                                                                                                |
+| `sessionRoots`            | Nonempty array of absolute native session storage directories.                                                                                                                                                                                 |
+| `folders`                 | Authorized configuration scope, each `{path}`; `path` is the absolute project cwd. Inclusion alone grants nothing.                                                                                                                             |
+| `defaults`                | Required baseline with all seven permission keys. Each value is boolean or `null`; `null` denies at this scope.                                                                                                                                |
+| `grants`                  | Project/session permission overrides.                                                                                                                                                                                                          |
+| `attachmentDir`           | Optional shared private registry directory; every cooperating owner must use the same canonical directory.                                                                                                                                     |
+| `attachmentExitTimeoutMs` | Optional 50–30000 ms owner-exit verification budget.                                                                                                                                                                                           |
+| `piExecutable`            | Optional absolute path to your installed Pi CLI (symlinks allowed); otherwise the launch environment's PATH selects Pi. The same installation supplies its SDK and dependencies. Missing/unidentifiable installations fail without a fallback. |
+| `piArgs`                  | Optional additional native CLI arguments; the launcher and runtime reject incompatible ownership/selection flags.                                                                                                                              |
+| `piRuntime`               | Explicit launch overrides, described below.                                                                                                                                                                                                    |
+| `http`                    | Optional `{port,tokenFile}`; required for HTTP/proxy entry points.                                                                                                                                                                             |
 
 ### Storage and project paths
 

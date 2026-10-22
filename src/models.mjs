@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { getSupportedThinkingLevels } from '@earendil-works/pi-ai/compat';
+import { resolvePiInstallation, loadPiAi } from './pi-installation.mjs';
 
 const identifier = z.string().min(1).max(256);
 export const modelSelectionSchema = z.object({ provider: identifier, id: identifier }).strict();
@@ -12,9 +12,10 @@ export const thinkingLevelSchema = z.enum([
   'xhigh',
   'max',
 ]);
-export function assertThinkingLevel(model, level) {
+export async function assertThinkingLevel(model, level, config) {
   if (level === undefined) return;
   if (typeof model?.reasoning !== 'boolean') throw new Error('THINKING_SUPPORT_UNKNOWN');
+  const { getSupportedThinkingLevels } = await loadPiAi(await resolvePiInstallation(config));
   if (!getSupportedThinkingLevels(model).includes(level))
     throw new Error('THINKING_LEVEL_UNSUPPORTED');
 }
@@ -50,7 +51,7 @@ const textOrNull = (value) => (typeof value === 'string' && value.length <= 256 
 
 // Allowlist only. Full native Model objects can carry endpoint headers and
 // arbitrary provider configuration; never pass them to MCP or owner IPC.
-export function modelInfo(model) {
+export function modelInfo(model, getSupportedThinkingLevels) {
   if (!modelSelectionSchema.safeParse({ provider: model?.provider, id: model?.id }).success)
     throw new Error('INVALID_MODEL_METADATA');
   const input =
@@ -74,10 +75,10 @@ export function modelInfo(model) {
     },
   };
 }
-export function catalogPage(models, args = {}) {
+export function catalogPage(models, args = {}, getSupportedThinkingLevels) {
   if (!Array.isArray(models)) throw new Error('INVALID_MODEL_METADATA');
   const ordered = models
-    .map(modelInfo)
+    .map((model) => modelInfo(model, getSupportedThinkingLevels))
     .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
   const offset = args.offset ?? 0,
     limit = args.limit ?? 30;

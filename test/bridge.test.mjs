@@ -11,7 +11,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { SessionManager } from './fixtures/pi.mjs';
 
 test('listing respects the latest native title including an explicit clear', async (t) => {
   const f = await fixture(t),

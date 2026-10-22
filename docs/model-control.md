@@ -19,7 +19,7 @@ Model discovery is independent of sessions. Standalone selection, prompt setting
 
 A short-lived helper uses native `ModelRuntime.create({allowModelNetwork:false})` with the owner's existing launch-profile agent directory and inherited environment. It inherits the trusted Bridge process cwd, not a project/session cwd. It reads the native catalog from that agent's model/provider/auth configuration and locally cached catalog data, without network refresh or model calls. It does not create, find, read, observe or start a session, or load resource/extension factories. The caller cannot choose an agent directory, project or environment.
 
-**Pinned native read-only storage.** The dependency is fixed at SDK 1.3.0. `model-catalog-storage.mjs` resolves that package's root entry and loads the fixed same-package `./core/auth-storage.js` module for its exported native `ReadOnlyAuthStorage` implementation; the root does not re-export this class. A version mismatch fails safely. Native code alone parses auth. A small injected `ModelsStore` adapter reads the existing `models-store.json` cache using the 1.3.0 provider-entry layout. Missing files mean empty data; corrupt/unknown layouts fail safely. Both stores reject mutations: discovery never initializes auth/cache files, locks them, changes permissions or writes credentials. This narrow module/layout dependency must be revalidated when upgrading the pinned SDK.
+**User Pi, read-only storage.** The helper loads `ModelRuntime`, thinking capabilities and native credential parsing from the same user installation selected for CLI execution. `model-catalog-storage.mjs` loads that installation's exported `ReadOnlyAuthStorage` from `./core/auth-storage.js` (not re-exported at the SDK root). A small read-only `ModelsStore` adapter passes existing JSON cache entries to native `ModelRuntime` without copying its model schema or pinning a provider-entry version. Both stores reject mutations: discovery never initializes auth/cache files, locks them, changes permissions or writes credentials. Missing native modules or loading failures report an unavailable catalog; Bridge never substitutes its own Pi.
 
 This catalog works even when there are no sessions. It excludes models registered only by extensions or a session at runtime; it is not a live owner's complete catalog. Native loading failures return `MODEL_CATALOG_UNAVAILABLE`, without underlying error text.
 
@@ -89,9 +89,9 @@ applying another setting or sending input. Inspect `list.status` and authorized
 `read` before deciding whether another call is appropriate. HTTP/stdio never
 automatically replay it.
 
-### Pi 1.3.0 empty-context resume limitation
+### Empty-context resume limitation
 
-Pi 1.3.0 restores saved model/thinking only when the current branch already
+Verified in Pi 1.3.0 and 1.4.0: native startup restores saved model/thinking only when the current branch already
 produces context messages. A published session whose first input was handled
 without a run, or refused before dispatch, can have no such messages. In that
 case a successful `set_model` writes native selection entries, but after normal
@@ -102,7 +102,7 @@ This is a Pi SDK/CLI startup limitation, not a missing Bridge write. Bridge
 retains normal automatic release and does not insert messages, keep a separate
 preference store or turn saved selections into launch overrides. Correcting
 startup semantics requires a native Pi fix and validation of the actual CLI;
-changing only Bridge's SDK dependency is insufficient.
+the fix must be present in the user's actual Pi installation.
 
 ## Prompt model and thinking settings
 
@@ -120,7 +120,7 @@ Both `send` and `create` accept `model` and/or `thinking_level`, including creat
 - Model only: Pi selects the model and preserves or adjusts thinking natively. The result reports the verified effective model and thinking level.
 - Thinking only: validate against the current native model and change its level.
 - Both: validate the requested level against the target model before changing either.
-- Neither: keep native session behavior. A cold start normally restores saved selection, subject to explicit launch overrides, model availability and the [Pi 1.3.0 empty-context limitation](#pi-130-empty-context-resume-limitation).
+- Neither: keep native session behavior. A cold start normally restores saved selection, subject to explicit launch overrides, model availability and the [native empty-context limitation](#empty-context-resume-limitation).
 
 Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, restricted to the native target's supported set. Unsupported explicit levels return `THINKING_LEVEL_UNSUPPORTED`; unknown reasoning support returns `THINKING_SUPPORT_UNKNOWN`. Global user defaults are unchanged.
 

@@ -1,3 +1,4 @@
+import { aiEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -11,7 +12,7 @@ import { ownerAlive, readClaim, processIdentity, reserveOwner } from '../src/att
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
-import { RpcClient } from '@earendil-works/pi-coding-agent';
+import { RpcClient } from './fixtures/pi.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/host-bindings.mjs';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,7 +35,7 @@ async function fixture(t, source = '') {
   const extension = dir + '/fixture.mjs';
   await fs.writeFile(
     extension,
-    `import fs from 'node:fs/promises';import {fauxProvider} from ${JSON.stringify(path.resolve('node_modules/@earendil-works/pi-ai/dist/index.js'))};const dir=${JSON.stringify(dir)};const delay=ms=>new Promise(r=>setTimeout(r,ms));const mark=name=>fs.writeFile(dir+'/'+name,'yes');async function wait(name){while(!await fs.stat(dir+'/'+name).then(()=>true,()=>false))await delay(10);}export default pi=>{${source}};`,
+    `import fs from 'node:fs/promises';import {fauxProvider} from ${JSON.stringify(aiEntry)};const dir=${JSON.stringify(dir)};const delay=ms=>new Promise(r=>setTimeout(r,ms));const mark=name=>fs.writeFile(dir+'/'+name,'yes');async function wait(name){while(!await fs.stat(dir+'/'+name).then(()=>true,()=>false))await delay(10);}export default pi=>{${source}};`,
   );
   const config = {
     ...isolatedRuntime(dir),
