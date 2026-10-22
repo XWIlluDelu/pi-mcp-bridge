@@ -110,20 +110,26 @@ pages; list is not a frozen export.
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-See [reading](reading.md) for the single timeline format, seven selectors,
-sanitized content, newest-first capacity paging, cursor-only continuation
-and transient readable live output. Omitting `preset` selects
-`latest`: the last prompt, all assistant text and first/last two thinking blocks,
-without summary, extra earliest prompts, tool units or commands. Explicit
-`preset:"recent"` includes active summaries and the last three prompts with
-first/last three thinking blocks per prompt, still without tools or commands.
-Use `select.tools` to include calls and paired outputs, or explicit
-`preset:"full"` to select the full effective context. Capacity and selection
-omissions are separate. Images are descriptors without base64. Long text uses
-readable paragraphs/lines, not JSON fragments. A continuation can send only
-`cursor` (and a different `max_bytes`); selection, session and frozen leaf inherit.
-Explicit conflicting overrides reject. Expired/evicted/restarted snapshots return
-`STALE_CURSOR`; start a fresh read. Snapshot cache memory is bounded.
+`view:"native"` is the default. Explicit `view:"observed"` reads the
+latest captured request-stage context, including MC transformations when
+observed; it has no native selectors or leaf override. Missing observations are
+explicitly unavailable, never recreated by running Pi. Owned observations survive
+normal RPC release in a bounded Bridge-memory cache. See
+[observed context](reading.md#observed-request-context) for stage, freshness and
+retention semantics.
+
+Native reads default to `preset:"latest"`: the last prompt, all assistant text
+and first/last two thinking blocks, without summaries, tools or commands.
+Use `preset:"recent"` for the last three prompts with summaries,
+`select.tools` for calls and paired outputs, or `preset:"full"` for all effective
+context. See [reading](reading.md) for the seven selectors, sanitized content,
+byte budgets and live output.
+
+Pages start with the newest selected content and continue backwards. Continue
+with `cursor` alone (and optionally a different `max_bytes`); the view, session,
+selection and leaf stay frozen. Conflicting overrides return `STALE_CURSOR`.
+Snapshots have no inactivity timeout; cache eviction or Bridge restart also
+returns `STALE_CURSOR`, requiring a fresh read.
 Every continuation is a new request and reauthorizes read. Each call uses its
 [receive-time permission snapshot](configuration.md#request-permission-snapshots)
 through execution and response delivery.

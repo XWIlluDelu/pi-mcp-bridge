@@ -41,7 +41,7 @@ outside the cooperative registry.
 
 | Capability              | Bridge-owned RPC                              | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings            |
 | ----------------------- | --------------------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
-| Read context            | Yes                                           | Yes                                                   | Native snapshot                           |
+| Read context            | Native + observed                             | Native + observed                                     | Native snapshot; observed unavailable     |
 | Live text/thinking      | Native delta events                           | Public extension events                               | When the host supplies live observation   |
 | Send text/images        | Native ACK                                    | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
 | Standalone `set_model`  | Native setters; busy supported                | Public extension setters; busy supported              | Native setters; busy supported            |

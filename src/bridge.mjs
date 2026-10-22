@@ -5,7 +5,7 @@ import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema, contextSelection } from './read-schema.mjs';
+import { readSchema } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted, permissionsHealth } from './permissions.mjs';
@@ -23,6 +23,7 @@ import {
 } from './prompt-input.mjs';
 import { ContextReadCache } from './read-cache.mjs';
 import { prepareContextRead } from './context-read.mjs';
+import { checkObservation, unavailableObservation } from './context-observation.mjs';
 import {
   discover,
   readSessionIdentity,
@@ -465,10 +466,16 @@ export class Bridge {
     diagnostics.emit('read.source', {
       kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
     });
-    let captured;
+    let captured,
+      retained = false;
     if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
       captured = await runtime.read(args);
-    else {
+    else if (args.view === 'observed') {
+      captured = runtime
+        ? unavailableObservation(id, 'runtime_observer_unavailable')
+        : this.pool.observations.get(s);
+      retained = !runtime;
+    } else {
       if (runtime) {
         const active = await runtime.entries();
         if (
@@ -489,6 +496,22 @@ export class Bridge {
         await nativeSdk(this.config, launchProfile(this.config).env),
       );
     }
+    const runtimeObservation = runtime && captured.view === 'observed' ? captured : null;
+    let currentLeaf;
+    if (runtimeObservation?.observation.reason === 'no_observation') {
+      const previous = this.pool.observations.get(s);
+      if (previous.observation.available) {
+        currentLeaf = runtimeObservation.observation.current_leaf_id;
+        captured = previous;
+        retained = true;
+      }
+    }
+    if (retained && captured.observation.available) {
+      s = await loadSavedSession(s, { omitImageData: true, config: this.config });
+      captured = checkObservation(captured, runtime ? { ...s, leafId: currentLeaf } : s, {
+        ownerActive: false,
+      });
+    }
     const current = await this.session(id);
     if (
       current.file !== identity.file ||
@@ -497,15 +520,30 @@ export class Bridge {
     )
       throw new Error('RUNTIME_SESSION_CHANGED');
     this.check('read', current, requestContext);
+    if (
+      runtimeObservation &&
+      runtime?.alive &&
+      !runtime.handoffPending &&
+      this.pool.instances.get(id) === runtime
+    )
+      this.pool.observations.put(current, runtimeObservation, runtime);
     const live = captured.live,
       snapshot = {
         session_id: id,
+        view: captured.view,
+        ...(captured.observation ? { observation: captured.observation } : {}),
         leaf_id: captured.leaf_id,
         selection: captured.selection,
         omissions: captured.omissions,
         ...(captured.history ? { history: captured.history } : {}),
         units: captured.units,
-        source: runtime ? (runtime.attached ? runtime.record.kind : 'rpc') : 'saved',
+        source: retained
+          ? 'retained'
+          : runtime
+            ? runtime.attached
+              ? runtime.record.kind
+              : 'rpc'
+            : 'saved',
       };
     const events = (runtime?.runtimeEvents ?? this.pool.runtimeEvents.get(id))?.snapshot(
       Math.min(4096, Math.floor((args.max_bytes ?? 24000) / 4)),

@@ -1,7 +1,7 @@
 # Reading a Pi session
 
-`read` presents Pi's effective session projection as readable, prompt-linked
-semantic units. Pi's native `buildSessionProjection` determines branch ancestry,
+`read` defaults to `view:"native"`: Pi's persisted session projection as readable,
+prompt-linked semantic units. Pi's native `buildSessionProjection` determines branch ancestry,
 compaction checkpoints and context edits. The Bridge pairs tools and applies
 selectors **before** sanitizing and segmenting selected records.
 
@@ -24,6 +24,7 @@ To continue, pass the returned cursor alone; the byte budget may change:
 | Argument     | Meaning                                                                                       |
 | ------------ | --------------------------------------------------------------------------------------------- |
 | `session_id` | Required for the first read; optional with a cursor. Knowing an ID is not permission.         |
+| `view`       | `native` (default) or `observed`. Omitted on continuation: inherit.                           |
 | `preset`     | Initial default `latest`; alternatives `recent` and `full`. Omitted on continuation: inherit. |
 | `select`     | Overrides for the seven selectors below. Omitted continuation fields inherit.                 |
 | `max_bytes`  | UTF-8 limit for the entire structured page: default 24000, range 4096–65536.                  |
@@ -39,7 +40,73 @@ Every read, including a cursor-only read, uses its own receive-time permission
 snapshot and validates the current canonical file/native session identity.
 A cursor is not authorization. It cannot be reused across Bridge instances.
 
-### Selection
+## Observed request context
+
+```json
+{ "session_id": "ps_...", "view": "observed", "max_bytes": 24000 }
+```
+
+This view reads the latest passively captured `context_with_system` event,
+including request-local memory transforms. Every `context` handler runs before
+this phase, so Magic Context's tags, drops and injected Historian summaries are
+observed even when MC loads after the Bridge observer. Later
+`context_with_system` handlers, Pi projections and provider conversion may still
+change the request. This is a request-stage observation, not final provider
+payload or confirmation that dispatch succeeded.
+
+The entire captured array is eligible for paging, without native
+`preset`, `select` or `leaf_id` overrides. These arguments reject rather than
+misidentifying synthetic history as native prompts. `selection` and
+`omissions.selection` are null. Items use `source.observation_index`, with
+content/part positions where split; no native entry or prompt IDs are invented.
+The same sanitization, Unicode-safe semantic paging, byte and batch budgets apply
+to both views. Cursor-only continuation inherits the view and freezes all
+observation metadata; conflicting view or native-selector overrides reject.
+
+`observation.available:true` carries:
+
+- `id`, `observed_at`, `owner_generation` and
+  `phase:"context_with_system_observer"`.
+- `input_leaf_id` (also the page's `leaf_id`): the native leaf at capture.
+- `current_leaf_id`, `later_committed_entries` and `checked_at`: branch ancestry
+  and intervening native commits checked at the first read.
+- `owner_active`: whether the capture came from the current live observer, rather
+  than retained data. `false` does not mean that no process currently owns the session.
+
+An answer generated after capture is not part of that observation. Read the
+native view for subsequent committed answers. An observation remains a dated
+request snapshot even when no new native entries appeared; idle memory changes
+are not recomputed by reading.
+
+Updated companions and Bridge-owned RPCs capture one bounded cleaned snapshot
+per runtime. Before normal owned RPC exit, Bridge retains the snapshot when
+available, without needing a prior external read. Bridge keeps at most 16 sessions and
+approximately 32 MiB of accounted observation data, latest per session, in
+addition to the existing frozen-page cache. The observer also has a 32 MiB
+accounted capture limit. Retention does not keep the writer alive or persist observations to disk. A successful observed read from a companion is also retained
+for later switch-away/exit. A new live owner is queried first. If it has not
+captured a request yet, an existing successful capture remains readable as
+`source:"retained"`, with its original ID, time, owner generation and input leaf,
+and `owner_active:false`. The current leaf and intervening commits are checked
+against the new owner's reported active branch, not merely the saved file's tail.
+No-prompt operations such as model changes or a rejected compact do not erase a
+capture when their cold-started owner exits.
+
+Only a successful capture replaces retained content. Failed live captures remain
+explicitly unavailable in that read; an unavailable reply or transport failure
+does not erase an older retained capture. Publication ordering still fences delayed
+reads from an older capture or a retired owner. Without a live owner, saved reads
+check the captured input leaf still belongs to the saved branch.
+
+No available capture, a failed/oversized live capture or a changed branch returns
+`observation.available:false` with a reason and empty items. Retained observations
+are lost on eviction or Bridge restart; an available live observer can still
+supply its snapshot. A host without an observer returns
+`host_observer_unavailable`; its native view remains available. Reads never start Pi, call a model, rerun context hooks,
+write session history or access MC's database. Normal agent work creates the
+observations; an already-running old companion must be updated with the Bridge.
+
+## Native selection
 
 | Selector           | Counting and selection                                                                                                 |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
@@ -135,7 +202,7 @@ Saved v1/v2 histories are normalized in memory with native pure parsing/migratio
 
 ## Readable content
 
-A page contains `session_id`, acquisition `source`, captured `leaf_id`,
+A page contains `session_id`, `view`, acquisition `source`, captured `leaf_id`,
 resolved `selection`, chronological `items`, `omissions`, `live` and
 `next_cursor`. Runtime extension observations may appear in `runtime_events`.
 
@@ -149,6 +216,9 @@ than being copied into every text segment.
 - Native image blocks become
   `{type:"image",mime_type:"image/png",data_omitted:true}`.
   No base64, image decoding or invented image link is returned.
+- Assistant text/thinking parts retain `stopReason` in both views, so an error or
+  cancellation remains visible on the latest page. Large error details stay in
+  shared metadata instead of repeating with each part.
 - Native text/thinking signatures, response IDs, replay metadata, usage/cost
   and diagnostics are excluded. Tool arguments and business `details` are not
   recursively stripped because a key happens to be called `signature`.
@@ -257,7 +327,7 @@ and committed projection are captured together. No extra history index is kept.
 Continuations read only the captured snapshot: they do not fetch entries or
 compute full-history fingerprints.
 
-Owner `op:read` replies contain only selected, sanitized snapshots;
+Owner `op:read` replies contain only selected native or observed sanitized snapshots;
 Bridge paginates them uniformly. Their read IPC ceiling applies to the cleaned
 snapshot, not unselected raw history. Attached fork still uses the raw `snapshot`
 operation with its 32 MiB bound; owned fork uses native `get_entries`.

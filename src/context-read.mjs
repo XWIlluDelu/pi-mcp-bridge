@@ -3,7 +3,7 @@ import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
 
-export const READ_CONTRACT = 'semantic_units_v2';
+export const READ_CONTRACT = 'semantic_units_v5';
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 export const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;
@@ -297,7 +297,13 @@ function cleanRecord(record) {
       'in_model_context',
     ]),
   };
-  const sourceFields = ['entry_id', 'entry_index', 'message_index', 'block_index'];
+  const sourceFields = [
+    'entry_id',
+    'entry_index',
+    'message_index',
+    'block_index',
+    'observation_index',
+  ];
   if (record.source) result.source = pick(record.source, sourceFields);
   if (record.call_source) result.call_source = pick(record.call_source, sourceFields);
   if (record.block) {
@@ -389,7 +395,14 @@ function* splitText(record, text, replace) {
 // Nested calls are saved native records, not fabricated tool results.
 function* splitMessage(record, message, replace) {
   const bodyKeys = ['content', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'];
-  const essentials = pick(message, ['role', 'toolCallId', 'toolName', 'isError', 'customType']);
+  const essentials = pick(message, [
+    'role',
+    'toolCallId',
+    'toolName',
+    'isError',
+    'customType',
+    'stopReason',
+  ]);
   if (message.role === 'bashExecution') {
     // Repeat small execution facts, not arbitrary command/path metadata.
     Object.assign(essentials, pick(message, ['exitCode', 'cancelled', 'truncated']));
@@ -573,7 +586,8 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection }) {
   const parsed = readSchema.safeParse(rawArgs);
   if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
   const args = parsed.data;
-  if (args.cursor !== undefined) throw new Error('INVALID_READ_ARGUMENTS');
+  if (args.cursor !== undefined || args.view === 'observed')
+    throw new Error('INVALID_READ_ARGUMENTS');
   const selection = contextSelection(args),
     leaf =
       args.leaf_id === undefined
@@ -589,6 +603,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection }) {
   for (const record of selected.records) appendUnits(target, record);
   return {
     contract: READ_CONTRACT,
+    view: 'native',
     session_id: args.session_id,
     leaf_id: leaf,
     selection,
@@ -701,13 +716,15 @@ export function renderPreparedContextRead(
   if (end < 0 || end > snapshot.units.length) throw new Error('INVALID_CURSOR');
   const base = {
     session_id: snapshot.session_id,
+    view: snapshot.view ?? 'native',
+    ...(snapshot.observation ? { observation: snapshot.observation } : {}),
     source: snapshot.source ?? 'session_projection',
     leaf_id: snapshot.leaf_id,
     selection: snapshot.selection,
     omissions: { selection: snapshot.omissions },
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
-    ...(!cursor && args.leaf_id === undefined && runtimeEvents
+    ...(snapshot.view !== 'observed' && !cursor && args.leaf_id === undefined && runtimeEvents
       ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
       : {}),
   };
@@ -761,18 +778,57 @@ export function renderPreparedContextRead(
 }
 export function assertReadSnapshot(value, args) {
   if (value?.contract !== READ_CONTRACT) throw new Error('OWNER_READ_REFRESH_REQUIRED');
+  const observed = args.view === 'observed';
+  if (
+    observed &&
+    (!Number.isSafeInteger(value.capture_sequence) ||
+      value.capture_sequence < 0 ||
+      typeof value.observation?.available !== 'boolean' ||
+      (value.observation.available &&
+        (value.observation.phase !== 'context_with_system_observer' ||
+          typeof value.observation.id !== 'string' ||
+          typeof value.observation.owner_generation !== 'string' ||
+          typeof value.observation.observed_at !== 'string' ||
+          typeof value.observation.checked_at !== 'string' ||
+          typeof value.observation.owner_active !== 'boolean' ||
+          !(
+            value.observation.current_leaf_id === null ||
+            typeof value.observation.current_leaf_id === 'string'
+          ) ||
+          !Number.isSafeInteger(value.observation.later_committed_entries) ||
+          value.observation.later_committed_entries < 0 ||
+          value.observation.input_leaf_id !== value.leaf_id)) ||
+      (!value.observation.available &&
+        (typeof value.observation.reason !== 'string' ||
+          value.units?.length ||
+          (value.observation.reason === 'no_observation' &&
+            !(
+              value.observation.current_leaf_id === null ||
+              typeof value.observation.current_leaf_id === 'string'
+            )))))
+  )
+    throw new Error('INVALID_OWNER_READ');
   if (
     value.session_id !== args.session_id ||
+    value.view !== (observed ? 'observed' : 'native') ||
     !Array.isArray(value.units) ||
-    ['summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
-      (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
-    ) ||
+    (observed
+      ? value.selection !== null || value.omissions !== null
+      : ['summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
+          (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
+        )) ||
     !(value.leaf_id === null || typeof value.leaf_id === 'string') ||
     (args.leaf_id !== undefined && value.leaf_id !== args.leaf_id) ||
-    JSON.stringify(value.selection) !== JSON.stringify(contextSelection(args)) ||
+    (!observed && JSON.stringify(value.selection) !== JSON.stringify(contextSelection(args))) ||
     jsonBytes(value) > READ_SNAPSHOT_LIMIT ||
     value.units.some(
-      (unit) => typeof unit?.type !== 'string' || typeof unit.source?.entry_id !== 'string',
+      (unit) =>
+        typeof unit?.type !== 'string' ||
+        (observed
+          ? !Number.isSafeInteger(unit.source?.observation_index) ||
+            unit.source.observation_index < 0 ||
+            unit.source.entry_id !== undefined
+          : typeof unit.source?.entry_id !== 'string'),
     )
   )
     throw new Error('INVALID_OWNER_READ');
