@@ -43,6 +43,7 @@ const snapshot = (entries, leafId = entries.at(-1)?.id ?? null) => ({
 const args = { session_id: 'public-session', max_bytes: 65536 };
 const render = (data, options = {}) => renderContextRead(data, { ...args, ...options });
 const zero = {
+  system: 0,
   summary: 0,
   recent_prompts: 0,
   earliest_prompts: 0,
@@ -85,6 +86,7 @@ test('public read schema validates selectors and byte limits', () => {
     { select: { text: 0.5 } },
     { select: { text: Infinity } },
     { select: { summary: 2 } },
+    { select: { system: 1 } },
     { max_bytes: 4095 },
     { max_bytes: 65537 },
     { preset: 'overview' },
@@ -102,6 +104,7 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
     result = render(data);
   assert.equal(readSchema.parse({ session_id: 's' }).preset, undefined);
   assert.deepEqual(result.selection, {
+    system: 0,
     summary: 0,
     recent_prompts: 1,
     earliest_prompts: 0,
@@ -125,6 +128,7 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
     ),
   );
   assert.deepEqual(result.omissions.selection, {
+    system: 0,
     summary: 1,
     prompts: 4,
     text: 32,
@@ -142,6 +146,7 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
 
   const recent = render(data, { preset: 'recent' });
   assert.deepEqual(recent.selection, {
+    system: 0,
     summary: 1,
     recent_prompts: 3,
     earliest_prompts: 0,
@@ -251,7 +256,7 @@ test('recent selector overrides add earliest prompts and whole first/last tool u
   );
 });
 
-test('tools selection omits system declarations, not instructions or custom notices', () => {
+test('system instructions are opt-in outside full; tools and custom notices keep their own selection', () => {
   const definitions = Array.from({ length: 30 }, (_, i) => ({
     name: 'declared_' + i,
     description: ('DECLARATION_' + i + ' ').repeat(300),
@@ -282,9 +287,30 @@ test('tools selection omits system declarations, not instructions or custom noti
     msg('declarations', 'update', 'system', '', { toolsAdded: definitions }),
   ]);
   const before = structuredClone(data);
-  for (const options of [{}, { preset: 'recent' }, { preset: 'full', select: { tools: 0 } }]) {
+  for (const options of [
+    {},
+    { preset: 'recent' },
+    { preset: 'full', select: { system: 0, tools: 0 } },
+  ]) {
     const page = render(data, { max_bytes: 4096, ...options });
-    assert.equal(page.next_cursor, null, 'default pages must not fill with tool definitions');
+    assert.equal(page.next_cursor, null);
+    assert.deepEqual(
+      page.items.map((item) => item.type),
+      ['prompt', 'text', 'custom'],
+    );
+    assert.equal(page.items[0].message.content, 'USER_WORK mentions toolsAdded');
+    assert.equal(page.items[1].block.text, 'ASSISTANT_WORK');
+    assert.equal(page.items[2].message.content, 'CUSTOM_NOTICE');
+    assert.deepEqual(page.items[2].message.details, { toolsAdded: 'BUSINESS_DATA' });
+    assert.equal(page.omissions.selection.system, 3);
+  }
+  for (const options of [
+    { select: { system: -1 } },
+    { preset: 'recent', select: { system: -1 } },
+    { preset: 'full', select: { tools: 0 } },
+  ]) {
+    const page = render(data, { max_bytes: 4096, ...options });
+    assert.equal(page.next_cursor, null, 'instructions do not force tool declarations');
     assert.deepEqual(
       page.items.map((item) => item.type),
       ['system', 'prompt', 'text', 'custom', 'system'],
@@ -303,7 +329,7 @@ test('tools selection omits system declarations, not instructions or custom noti
     }
     assert.equal(page.omissions.selection.tools, 1, 'declarations are not logical tool units');
   }
-  for (const options of [{ preset: 'full' }, { select: { tools: 1 } }]) {
+  for (const options of [{ preset: 'full' }, { select: { system: -1, tools: 1 } }]) {
     const units = chronological(allPages(data, options));
     assert.deepEqual(
       [
@@ -405,6 +431,7 @@ test('full context preserves chronological blocks, native system/custom/images a
   assert.equal(result.items[7].prompt_id, 'user2', 'identical actual inputs are not deduplicated');
   assert.ok(!JSON.stringify(result).includes('private_state'));
   assert.deepEqual(result.omissions.selection, {
+    system: 0,
     summary: 0,
     prompts: 0,
     text: 0,
@@ -686,7 +713,7 @@ test('active summaries keep their native positions and system checkpoints', () =
     },
   ];
   const data = snapshot(entries),
-    result = render(data, { preset: 'recent' });
+    result = render(data, { preset: 'recent', select: { system: -1 } });
   const summary = result.items.filter((r) => r.type === 'summary');
   assert.equal(summary.length, 2);
   assert.deepEqual(
@@ -702,10 +729,8 @@ test('active summaries keep their native positions and system checkpoints', () =
   assert.deepEqual(result.items[0].message, instructions);
   assert.ok(!JSON.stringify(result).includes('SUPERSEDED'));
   const none = render(data, { select: zero });
-  assert.deepEqual(
-    none.items.map((r) => r.type),
-    ['system'],
-  );
+  assert.deepEqual(none.items, []);
+  assert.equal(none.omissions.selection.system, 1);
   assert.equal(none.omissions.selection.summary, 1);
   const projection = buildSessionProjection(entries, data.leafId);
   assert.deepEqual(render(data, { preset: 'full' }).items[0].message, projection.messages[0]);

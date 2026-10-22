@@ -109,7 +109,8 @@ const paragraphs = (n = 80) =>
 
 test('public MCP reads task text plus honest image descriptors, without signatures or internal payload metadata', async (t) => {
   const f = await fixture(t, [
-    message('u', null, 'user', [
+    message('system', null, 'system', '', { sections: { rules: paragraphs() } }),
+    message('u', 'system', 'user', [
       text('IMPORTANT TASK'),
       { type: 'image', mimeType: 'image/png', data: 'A'.repeat(50000) },
     ]),
@@ -137,6 +138,12 @@ test('public MCP reads task text plus honest image descriptors, without signatur
   assert.ok(Buffer.byteLength(JSON.stringify(response.message)) <= MCP_RESPONSE_LIMIT);
   const page = response.message.result.structuredContent;
   assertContextReadResponse(page, { max_bytes: 4096 });
+  assert.equal(
+    page.next_cursor,
+    null,
+    'large system context must not displace the task and answer',
+  );
+  assert.equal(page.omissions.selection.system, 1);
   assert.ok(JSON.stringify(page).includes('IMPORTANT TASK'));
   assert.ok(!JSON.stringify(page).includes('AAAAAAA'));
   assert.ok(!JSON.stringify(page).includes('NATIVE_SECRET'));
@@ -175,7 +182,12 @@ test('cursor-only direct/MCP/batch continuation inherits custom selection and fr
     arguments: { operations: [{ op: 'read', args: { cursor: first.next_cursor } }] },
   });
   assert.deepEqual(batch.structuredContent.results[0].result.selection, first.selection);
-  for (const extra of [{ preset: 'latest' }, { select: { text: 0 } }, { leaf_id: null }])
+  for (const extra of [
+    { preset: 'latest' },
+    { select: { text: 0 } },
+    { select: { system: 0 } },
+    { leaf_id: null },
+  ])
     await f.error({ cursor: first.next_cursor, ...extra }, 'STALE_CURSOR');
   const pages = await allPages(f, first),
     units = chronological(pages);
@@ -283,8 +295,10 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     assert.ok(Array.isArray(captured.units));
     assert.ok(!JSON.stringify(captured).includes('AAAAAAA'));
     assert.ok(!captured.units.some((unit) => unit.message?.toolsAdded));
-    assert.ok(captured.units.some((unit) => unit.message?.content === 'READ_RULES'));
+    assert.equal(captured.omissions.system, 1);
+    assert.ok(!captured.units.some((unit) => unit.type === 'system'));
     const full = await runtime.read({ session_id: f.id, preset: 'full' });
+    assert.ok(full.units.some((unit) => unit.message?.content === 'READ_RULES'));
     assert.ok(full.units.some((unit) => unit.message?.toolsAdded?.[0].name === 'declared'));
     const raw = await runtime.snapshot();
     assert.ok(JSON.stringify(raw).includes('AAAAAAA'));
@@ -432,11 +446,11 @@ test('saved and owned reads omit old image bytes before capture, but raw fork sn
   assert.equal(pages.at(-1).next_cursor, null);
   assert.ok(JSON.stringify(pages).includes('LATEST_TASK'));
   assert.ok(!JSON.stringify(pages).includes(data));
-  assert.ok(
-    pages.flatMap((page) => page.items).some((unit) => unit.message?.content === 'OWNED_RULES'),
-  );
+  assert.ok(pages.every((page) => page.omissions.selection.system === 1));
+  assert.ok(!pages.flatMap((page) => page.items).some((unit) => unit.type === 'system'));
   assert.ok(!pages.flatMap((page) => page.items).some((unit) => unit.message?.toolsAdded));
   const full = await rpc.read({ session_id: f.id, preset: 'full' });
+  assert.ok(full.units.some((unit) => unit.message?.content === 'OWNED_RULES'));
   assert.ok(full.units.some((unit) => unit.message?.toolsAdded?.[0].name === 'owned_tool'));
   assert.deepEqual(await fs.readFile(f.saved.file), before);
   const fork = await rpc.entries();

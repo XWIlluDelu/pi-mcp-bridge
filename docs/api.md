@@ -120,10 +120,12 @@ normal RPC release in a bounded Bridge-memory cache. See
 retention semantics.
 
 Native reads default to `preset:"latest"`: the last prompt, all assistant text
-and first/last two thinking blocks, without summaries, tools or commands.
-Use `preset:"recent"` for the last three prompts with summaries,
-`select.tools` for calls and paired outputs, or `preset:"full"` for all effective
-context. See [reading](reading.md) for the seven selectors, sanitized content,
+and first/last two thinking blocks, without system instructions, summaries, tools
+or commands. Use `preset:"recent"` for the last three prompts with summaries,
+`select.tools` for calls and paired outputs, `select.system:-1` to include system
+instructions, or `preset:"full"` for all effective context. System omissions are
+counted; custom messages are not hidden by this selector. See
+[reading](reading.md) for the eight selectors, sanitized content,
 byte budgets and live output.
 
 Pages start with the newest selected content and continue backwards. Continue
