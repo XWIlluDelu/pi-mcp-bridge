@@ -118,6 +118,64 @@ function request(f, op, body = {}, changes = {}) {
     });
   });
 }
+test('optional host setter verifies actual values while busy and fences unresolved native work', async (t) => {
+  const f = await fixture(t),
+    entered = gate(),
+    release = gate(),
+    stopEntered = gate(),
+    stopRelease = gate();
+  const actual = { model: { provider: 'fixture', id: 'a' }, thinkingLevel: 'off' };
+  t.after(() => release.resolve());
+  await f.controller.ready({
+    ...f.callbacks,
+    state: () => ({ ...f.callbacks.state(), ...actual, isStreaming: true }),
+    stop: async ({ onWithdraw }) => {
+      await onWithdraw({ steering: [], followUp: [] });
+      stopEntered.resolve();
+      await stopRelease.promise;
+      return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
+    },
+    setModel: async ({ model, thinking_level, beforeDispatch }) => {
+      entered.resolve();
+      await release.promise;
+      beforeDispatch();
+      actual.model = model;
+      actual.thinkingLevel = thinking_level;
+      return { model, thinking_level, ignoredPrivateMetadata: 'never transported' };
+    },
+  });
+  const runtime = new AttachedRuntime(
+    { attachmentDir: f.attachmentDir },
+    f.session,
+    f.controller.record,
+  );
+  const first = runtime.selectModel({ provider: 'fixture', id: 'b' }, { thinkingLevel: 'high' });
+  await entered.promise;
+  await assert.rejects(runtime.send({ text: 'NEVER_SUBMITTED' }), /MODEL_SELECTION_PENDING/);
+  await assert.rejects(
+    runtime.selectModel(undefined, { thinkingLevel: 'off' }),
+    /MODEL_SELECTION_PENDING/,
+  );
+  release.resolve();
+  assert.deepEqual(await first, {
+    model: { provider: 'fixture', id: 'b' },
+    thinking_level: 'high',
+  });
+  assert.equal((await runtime.state()).isStreaming, true);
+  const stopping = runtime.stopExecution();
+  await stopEntered.promise;
+  try {
+    assert.deepEqual(
+      await runtime.selectModel({ provider: 'fixture', id: 'a' }, { thinkingLevel: 'off' }),
+      { model: { provider: 'fixture', id: 'a' }, thinking_level: 'off' },
+    );
+    await assert.rejects(runtime.send({ text: 'NEVER_SUBMITTED' }), /STOP_IN_PROGRESS/);
+  } finally {
+    stopRelease.resolve();
+    await stopping;
+  }
+});
+
 test('a protocol mismatch blocks attachment and replacement without retiring the live claim', async (t) => {
   const f = await fixture(t);
   await f.controller.ready(f.callbacks);
@@ -150,6 +208,14 @@ test('two-phase host reservation blocks another writer before ready and exposes 
   assert.ok(JSON.stringify(read.data).includes('PUBLIC_FIXTURE'));
   assert.equal(read.data.contract, 'semantic_units_v2');
   assert.equal((await request(f, 'state')).data.sessionId, f.session.header.id);
+  await assert.rejects(
+    new AttachedRuntime(
+      { attachmentDir: f.attachmentDir },
+      f.session,
+      f.controller.record,
+    ).selectModel(undefined, { thinkingLevel: 'high' }),
+    /MODEL_SELECTION_UNSUPPORTED/,
+  );
   assert.equal(
     (await request(f, 'send', { text: 'fixture', mode: 'unknown' })).error,
     'INVALID_ATTACHED_SEND',

@@ -69,7 +69,9 @@ for (const mode of ['tui', 'rpc'])
       await fs.writeFile(
         probe,
         `import fs from 'node:fs/promises';
+import {fauxProvider} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-ai'))};
 export default pi=>{
+ pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']}]}).provider);
  pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile)},JSON.stringify({
   pid:process.pid,file:ctx.sessionManager.getSessionFile(),header:ctx.sessionManager.getHeader(),
   joinCommands:pi.getCommands().filter(c=>c.name==='bridge-join').length
@@ -184,6 +186,27 @@ export default pi=>{
       const status = (await bridge.list({ session_id: saved.id })).sessions[0].status;
       assert.equal(claim.kind, mode === 'tui' ? 'tui' : 'extension');
       assert.deepEqual(status.capabilities, { send: true, command: false, stop: false });
+      const defaultsBeforeSelection = await fs.readFile(path.join(agent, 'settings.json'), 'utf8');
+      const selected = await bridge.set_model({
+        session_id: saved.id,
+        model: { provider: 'selection-fixture', id: 'other' },
+        thinking_level: 'high',
+      });
+      assert.deepEqual(selected, {
+        model: { provider: 'selection-fixture', id: 'other' },
+        thinking_level: 'high',
+      });
+      assert.deepEqual(
+        await bridge.set_model({
+          session_id: saved.id,
+          model: { provider: 'bridge-fixture', id: 'deterministic' },
+        }),
+        { model: { provider: 'bridge-fixture', id: 'deterministic' }, thinking_level: 'off' },
+      );
+      assert.equal(
+        await fs.readFile(path.join(agent, 'settings.json'), 'utf8'),
+        defaultsBeforeSelection,
+      );
       assert.equal((await readClaim(config.attachmentDir, session)).owner.pid, meta.pid);
       assert.equal(
         (await fs.readFile(meta.file, 'utf8'))

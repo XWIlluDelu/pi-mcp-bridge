@@ -89,6 +89,14 @@ test(
       'COMPACTION_PENDING',
     );
     await until(() => exists(f.gate + '.compact-start'));
+    assert.deepEqual(
+      await f.bridge.set_model({
+        session_id: f.id,
+        model: { provider: 'model-fixture', id: 'vision' },
+        thinking_level: 'high',
+      }),
+      { model: { provider: 'model-fixture', id: 'vision' }, thinking_level: 'high' },
+    );
     assert.ok(runtime.compactionMutation);
     assert.equal(
       (await f.bridge.send({ session_id: f.id, text: 'NEVER', thinking_level: 'off' })).reason,

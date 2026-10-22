@@ -192,8 +192,10 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       'delete',
       'health',
       'list',
+      'models',
       'read',
       'send',
+      'set_model',
       'stop',
     ]);
     const id = made.session_id;

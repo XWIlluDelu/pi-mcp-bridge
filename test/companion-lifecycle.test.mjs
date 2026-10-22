@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import net from 'node:net';
 import { fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import {
   createAgentSessionRuntime,
@@ -80,6 +81,7 @@ async function fixture(t, { hosted = false, extension } = {}) {
     controller = await reserveHostSession({ attachmentDir: config.attachmentDir, session: a });
   const faux = fauxProvider({
     provider: 'bridge-fixture',
+    models: [{ id: 'deterministic' }, { id: 'other' }],
     tokensPerSecond: 10000,
   });
   const modelRuntime = await ModelRuntime.create({
@@ -141,7 +143,7 @@ async function fixture(t, { hosted = false, extension } = {}) {
   await bind(runtime.session);
   const binding = hosted ? createSdkHostBinding(runtime.session) : null;
   if (controller) await controller.ready(binding);
-  return { dir, config, bridge, a, b, runtime, faux, finishers, binding, errors };
+  return { dir, config, bridge, a, b, runtime, modelRuntime, faux, finishers, binding, errors };
 }
 
 test(
@@ -245,6 +247,97 @@ test(
     assert.equal((await readClaim(config.attachmentDir, c)).owner.pid, claimA.owner.pid);
   },
 );
+
+for (const allowed of [true, false])
+  for (const disconnect of [false, true])
+    test(
+      'companion switch drains native auth ' +
+        (allowed ? 'success' : 'refusal') +
+        (disconnect ? ' after client disconnect' : ' with an attached client'),
+      { timeout: 15000 },
+      async (t) => {
+        const f = await fixture(t),
+          entered = Promise.withResolvers(),
+          auth = Promise.withResolvers();
+        f.finishers.push(() => auth.resolve(false));
+        const nativeAuth = f.modelRuntime.checkAuth.bind(f.modelRuntime);
+        let calls = 0;
+        t.mock.method(f.modelRuntime, 'checkAuth', async (provider) => {
+          if (++calls === 1) {
+            entered.resolve();
+            return auth.promise;
+          }
+          return nativeAuth(provider);
+        });
+        const claim = await readClaim(f.config.attachmentDir, f.a);
+        let selection, socket;
+        if (disconnect) {
+          socket = net.createConnection(claim.socket);
+          await new Promise((resolve, reject) => {
+            socket.once('connect', resolve);
+            socket.once('error', reject);
+          });
+          socket.write(
+            JSON.stringify({
+              generation: claim.generation,
+              file: f.a.file,
+              sessionId: f.a.header.id,
+              op: 'set_model',
+              body: { model: { provider: 'bridge-fixture', id: 'other' } },
+            }) + '\n',
+          );
+        } else
+          selection = f.bridge
+            .set_model({
+              session_id: f.a.id,
+              model: { provider: 'bridge-fixture', id: 'other' },
+            })
+            .catch((error) => ({ error: error.message }));
+        await entered.promise;
+        assert.equal(
+          (await f.bridge.list({ session_id: f.a.id })).sessions[0].status.state,
+          'busy',
+        );
+        socket?.destroy();
+        const old = f.runtime.session;
+        let switched = false;
+        const switching = f.runtime.switchSession(f.b.file).then((value) => {
+          switched = true;
+          return value;
+        });
+        f.finishers.push(() => socket?.destroy());
+        await until(
+          async () => (await readClaim(f.config.attachmentDir, f.a))?.phase === 'transitioning',
+        );
+        assert.equal(switched, false);
+        assert.equal(f.runtime.session, old);
+        const refused = await f.bridge.send({
+          session_id: f.a.id,
+          text: 'MUST_NOT_OPEN_SECOND_WRITER',
+        });
+        assert.equal(refused.status, 'rejected', JSON.stringify(refused));
+        assert.ok(await readClaim(f.config.attachmentDir, f.a));
+        assert.ok(![...f.bridge.pool.instances.values()].some((r) => !r.attached));
+        assert.ok(!(await fs.readFile(f.a.file, 'utf8')).includes('MUST_NOT_OPEN_SECOND_WRITER'));
+        auth.resolve(allowed);
+        assert.deepEqual(await switching, { cancelled: false });
+        await selection;
+        assert.equal(calls, 1);
+        assert.equal(await readClaim(f.config.attachmentDir, f.a), null);
+        const entries = SessionManager.open(f.a.file).getEntries();
+        assert.equal(
+          entries.some((e) => e.type === 'model_change' && e.modelId === 'other'),
+          allowed,
+        );
+        const sent = await f.bridge.send({ session_id: f.a.id, text: 'AFTER_SWITCH' });
+        assert.equal(sent.status, 'started', JSON.stringify(sent));
+        await until(() => !f.bridge.pool.get(f.a.id) && !f.bridge.autoReleases.size);
+        const current = await f.bridge.read({ session_id: f.a.id, preset: 'full' });
+        assert.ok(JSON.stringify(current.items).includes('AFTER_SWITCH'));
+        assert.ok(current.items.some((e) => e.type === 'text'));
+        assert.deepEqual(f.errors, []);
+      },
+    );
 
 for (const outcome of ['handled', 'rejected'])
   test(

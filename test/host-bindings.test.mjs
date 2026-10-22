@@ -55,6 +55,41 @@ test('SDK/RPC bindings expose only model identity and a valid native thinking le
   }
 });
 
+test('native setter identity changes block the second step and overlapping setters stay fenced', async () => {
+  const gate = Promise.withResolvers(),
+    entered = Promise.withResolvers();
+  let thinkingCalls = 0;
+  const value = {
+    ...idle,
+    model: { provider: 'p', id: 'a' },
+    thinkingLevel: 'off',
+    modelRuntime: { getAvailableSnapshot: () => [{ provider: 'p', id: 'b' }] },
+    setModel: async (model) => {
+      entered.resolve();
+      await gate.promise;
+      value.model = model;
+      value.sessionId = 'another-session';
+    },
+    setThinkingLevel: () => {
+      thinkingCalls++;
+    },
+  };
+  const binding = createSdkHostBinding(value);
+  const selection = binding.setModel({
+    ...idle,
+    model: { provider: 'p', id: 'b' },
+    thinking_level: 'high',
+  });
+  await entered.promise;
+  await assert.rejects(
+    binding.setModel({ ...idle, thinking_level: 'low' }),
+    /MODEL_SELECTION_PENDING/,
+  );
+  gate.resolve();
+  await assert.rejects(selection, /RUNTIME_SESSION_CHANGED/);
+  assert.equal(thinkingCalls, 0);
+});
+
 test('SDK dispatch reports unknown without waiting for completion and tracks drain', async () => {
   const completion = Promise.withResolvers(),
     calls = [];

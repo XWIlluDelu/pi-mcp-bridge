@@ -43,6 +43,7 @@ A `piRuntime` override changes the runtime environment; it is not a permission g
 
 ### Native control permissions
 
+- `models`: requires effective `send`, `command` or `create` on a configured project, or effective `send`/`command` on an existing in-scope native session. Normal per-right override priority applies; a superseded grant or nonexistent ID is insufficient. Authorization may read identity metadata, never history or owner state. Catalog access neither starts nor binds a session and grants no session operation.
 - Session `send`: model/thinking prompt settings and manual `compact`.
 - `create`: a `create` call's initial model selection.
 - `stop`: required in addition to `send` only for explicit `compact(interrupt:true)`. Default idle compaction does not need it.
@@ -92,7 +93,7 @@ Consequences:
 
 The authoritative Bridge starts one policy read when it receives a complete, schema-valid business request, before executor or session queues. The resulting independent, immutable `defaults`/`grants` snapshot governs that request's checks, execution and returned data, including waits, cold startup, native ACKs and inline output delivery. Later permission edits affect new requests only; they neither revoke nor add rights to an in-flight request. The stdio proxy only forwards requests; client/proxy timestamps and the later native execution time do not select the policy.
 
-All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, page-local `creatable_projects`, health diagnostics also use the request snapshot.
+All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, page-local `creatable_projects`, authorized model catalogs and health diagnostics also use the request snapshot.
 
 Every new call captures a new policy, including every new mutation and each read cursor page. A read cursor is not an authorization token. Late ACKs finish native identity checks without replaying work or acquiring rights from another request; permission snapshots are process-local, not persisted credentials.
 

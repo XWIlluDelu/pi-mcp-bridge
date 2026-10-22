@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { readSchema as publicReadSchema } from './read-schema.mjs';
 import { compactSchema } from './compact.mjs';
 import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
-import { modelSelectionSchema, thinkingLevelSchema } from './models.mjs';
+import { modelSelectionSchema, thinkingLevelSchema, modelsSchema } from './models.mjs';
+import { modelSettingsSchema } from './set-model.mjs';
 const id = z.string().min(1).max(128);
 const executionShape = {
   session_id: id,
@@ -22,6 +23,13 @@ const timeout = z.number().int().min(50).max(30000).optional();
 const directory = z.string().min(1).max(4096);
 const date = z.string().datetime({ offset: true });
 export const publicOperationSchemas = {
+  models: modelsSchema,
+  set_model: z
+    .object({ session_id: id, ...modelSettingsSchema.innerType().shape })
+    .strict()
+    .refine((args) => args.model !== undefined || args.thinking_level !== undefined, {
+      message: 'Model or thinking level required',
+    }),
   compact: compactSchema,
   read: publicReadSchema,
   send: z

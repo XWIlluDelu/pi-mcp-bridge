@@ -404,7 +404,7 @@ export class PiRpc {
     // normal shutdown into an unlimited wait for a disconnected runtime.
     while (this.ackTasks.size) await Promise.allSettled([...this.ackTasks]);
   }
-  async command(command, timeout = 5000, onLate, beforeDispatch) {
+  async command(command, timeout = 5000, onLate, beforeDispatch, allowBusySelection = false) {
     if (command.type === 'get_state') return this.state(timeout);
     await this.state();
     const late =
@@ -418,7 +418,7 @@ export class PiRpc {
     let result, rejection;
     const liveEpoch = command.type === 'get_entries' ? this.liveMessage.epoch : null;
     try {
-      result = await this.dispatch(command, timeout, late);
+      result = await this.dispatch(command, timeout, late, allowBusySelection);
     } catch (error) {
       if (error.code !== 'PI_REJECTED') throw error;
       rejection = error;
@@ -447,14 +447,14 @@ export class PiRpc {
       };
     return result;
   }
-  dispatch(command, timeout = 5000, onLate) {
+  dispatch(command, timeout = 5000, onLate, allowBusySelection = false) {
     return diagnostics.measure(
       'rpc.command',
       { op: command.type, generation: this.generation },
-      () => this.dispatchRequest(command, timeout, onLate),
+      () => this.dispatchRequest(command, timeout, onLate, allowBusySelection),
     );
   }
-  dispatchRequest(command, timeout = 5000, onLate) {
+  dispatchRequest(command, timeout = 5000, onLate, allowBusySelection = false) {
     if (this.startFailure) return Promise.reject(this.startFailure);
     if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
     if (this.handoffPending && !['get_state', 'get_entries'].includes(command.type))
@@ -462,7 +462,8 @@ export class PiRpc {
     if (this.gracefulExitPromise) return Promise.reject(new RpcFailure('RUNTIME_SHUTTING_DOWN'));
     if (
       ['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type) &&
-      this.compactionMutation
+      this.compactionMutation &&
+      !(allowBusySelection && ['set_model', 'set_thinking_level'].includes(command.type))
     )
       return Promise.reject(new RpcFailure('COMPACTION_PENDING'));
     if (
@@ -618,7 +619,14 @@ export class PiRpc {
   // and submission, not the complete run or unrelated native extension work.
   async selectModel(
     model,
-    { images, thinkingLevel, idle = false, timeout = 5000, beforeDispatch } = {},
+    {
+      images,
+      thinkingLevel,
+      idle = false,
+      nativeThinking = false,
+      timeout = 5000,
+      beforeDispatch,
+    } = {},
   ) {
     if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
     if (idle && this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
@@ -628,13 +636,13 @@ export class PiRpc {
     let target = model ? models?.find((m) => sameModel(m, model)) : initial.model;
     if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
     assertImageModel(images, target);
-    assertThinkingLevel(target, thinkingLevel);
+    if (!nativeThinking) assertThinkingLevel(target, thinkingLevel);
     const state = idle ? await this.assertIdle() : await this.state();
     await beforeDispatch?.();
     if (!model) {
       target = state.model;
       assertImageModel(images, target);
-      assertThinkingLevel(target, thinkingLevel);
+      if (!nativeThinking) assertThinkingLevel(target, thinkingLevel);
     }
     if (model && !sameModel(state.model, target)) {
       // A timed-out setter keeps input fenced until its matching native ACK.
@@ -644,6 +652,7 @@ export class PiRpc {
         timeout,
         () => {},
         beforeDispatch,
+        !idle,
       );
       if (!sameModel(changed, target)) throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     }
@@ -651,16 +660,20 @@ export class PiRpc {
     if (model && !sameModel(selected.model, target))
       throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     assertImageModel(images, selected.model);
-    assertThinkingLevel(selected.model, thinkingLevel);
+    if (!nativeThinking) assertThinkingLevel(selected.model, thinkingLevel);
     if (thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel) {
       await this.command(
         { type: 'set_thinking_level', level: thinkingLevel },
         timeout,
         () => {},
         beforeDispatch,
+        !idle,
       );
       selected = await this.state();
-      if ((model && !sameModel(selected.model, target)) || selected.thinkingLevel !== thinkingLevel)
+      if (
+        (model && !sameModel(selected.model, target)) ||
+        (!nativeThinking && selected.thinkingLevel !== thinkingLevel)
+      )
         throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     }
     return modelSetting(selected.model, selected.thinkingLevel);
