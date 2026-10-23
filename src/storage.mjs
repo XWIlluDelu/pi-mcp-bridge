@@ -12,15 +12,23 @@ export const opaqueId = (value) => `ps_${hash(value).slice(0, 32)}`;
 export async function atomicJson(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const h = await fs.open(tmp, 'w', 0o600);
+  const h = await fs.open(tmp, 'wx', 0o600);
+  let published = false;
   try {
-    await h.writeFile(JSON.stringify(value, null, 2));
-    await h.sync();
+    try {
+      await h.writeFile(JSON.stringify(value, null, 2));
+      await h.sync();
+    } finally {
+      await h.close();
+    }
+    await fs.rename(tmp, file);
+    published = true;
+    await syncDir(path.dirname(file));
   } finally {
-    await h.close();
+    // Only this invocation's unpublished file is temporary. A failed directory
+    // sync must not undo the already-published record or mask the original error.
+    if (!published) await fs.unlink(tmp).catch(() => {});
   }
-  await fs.rename(tmp, file);
-  await syncDir(path.dirname(file));
 }
 export async function syncDir(dir) {
   const handle = await fs.open(dir, 'r');
