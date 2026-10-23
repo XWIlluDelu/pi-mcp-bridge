@@ -127,8 +127,10 @@ The protocol version and capabilities are required on every request.
 previous request. `server/discover` returns supported versions and capabilities.
 Results carry `resultType: "complete"` and server identity metadata; discovery
 and `tools/list` also carry `ttlMs: 0` and `cacheScope: "private"`.
-The fixed tool list is deterministic; no subscriptions, elicitation, MRTR input,
-logging stream or other optional capabilities are advertised.
+The fixed tool list is deterministic. Modern discovery also advertises
+[completion events](events.md): events/list, events/subscribe and events/unsubscribe
+use the same endpoint and authentication. Delivery uses outbound signed HTTPS
+webhooks, not SSE. No elicitation, MRTR input or logging stream is advertised.
 
 Modern HTTP also requires:
 

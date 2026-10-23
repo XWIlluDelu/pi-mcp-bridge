@@ -8,6 +8,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 - **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
 - **Control:** discover native configured models independently of sessions, set a session's model and thinking level, compact context (idle by default). Owned RPCs release safely between tasks and cold-resume when later work needs them. Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
 - **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
+- **Notify:** subscribe to a known Bridge-owned session's completion through [MCP Events](docs/events.md). ChatGPT Work chats/dots receive a signed webhook and can read that round's result in the original chat.
 - **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
 - **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
 
@@ -93,6 +94,7 @@ Bridge-owned prompt runtimes also release normally after their run and queues fi
 - [Context selection, pagination and live observation](docs/reading.md)
 - [Runtime ownership, TUI handoff and capabilities](docs/runtime.md)
 - [MCP protocols and transports](docs/transports.md)
+- [Completion events and ChatGPT acceptance](docs/events.md)
 - [Architecture and verification](docs/architecture.md)
 
 ## Development
