@@ -60,7 +60,8 @@ export function launchProfile(config, hostEnv = process.env) {
   };
 }
 export class PiRpc {
-  constructor(config, session, { completionControl } = {}) {
+  constructor(config, session, { completionControl, compatibility } = {}) {
+    this.compatibility = compatibility;
     this.config = config;
     this.completionControl = completionControl;
     this.session = session;
@@ -144,7 +145,10 @@ export class PiRpc {
       const herdr = this.config.herdr ? await findHerdr() : null;
       signal?.throwIfAborted();
       this.child = herdr
-        ? new HerdrRpcTransport(herdr, launch, { signal })
+        ? new HerdrRpcTransport(herdr, launch, {
+            signal,
+            daemonEnvironment: this.compatibility?.daemonEnvironment.apply(process.env),
+          })
         : spawn(launch.command, launch.args, {
             cwd: launch.cwd,
             env: launch.env,
@@ -531,9 +535,16 @@ export class PiRpc {
       this.onIdleCandidate?.();
     }
   }
+  readFeatures() {
+    return this.observeRead(() =>
+      new AttachedRuntime(this.config, this.session, this.ownerRecord).readFeatures(),
+    );
+  }
   read(args) {
     return this.observeRead(() =>
-      new AttachedRuntime(this.config, this.session, this.ownerRecord).read(args),
+      new AttachedRuntime(this.config, this.session, this.ownerRecord, {
+        compatibility: this.compatibility,
+      }).read(args),
     );
   }
   entries() {
@@ -878,7 +889,8 @@ export class PiRpc {
   }
 }
 export class RuntimePool {
-  constructor(config, factory, { configFile, completionControl } = {}) {
+  constructor(config, factory, { configFile, completionControl, compatibility } = {}) {
+    this.compatibility = compatibility;
     this.config = config;
     this.attachmentDir =
       config.attachmentDir ?? (config.stateDir ? path.join(config.stateDir, 'ipc') : undefined);
@@ -900,7 +912,10 @@ export class RuntimePool {
         start.runtime = new PiRpc(
           { ...config, herdr, attachmentDir: this.attachmentDir },
           session,
-          { completionControl },
+          {
+            completionControl,
+            compatibility,
+          },
         );
         return start.runtime.start(start.controller.signal);
       });
@@ -956,6 +971,7 @@ export class RuntimePool {
             { ...this.config, attachmentDir: this.attachmentDir },
             session,
             claim,
+            { compatibility: this.compatibility },
           ).start(),
       );
       this.instances.set(session.id, attached);

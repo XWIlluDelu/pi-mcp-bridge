@@ -8,6 +8,7 @@ import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { assertReadFeatures } from './read-features.mjs';
 import { unavailableObservation } from './context-observation.mjs';
 import {
   SEND_MODES,
@@ -210,7 +211,18 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
           stop: typeof callbacks.stop === 'function',
         },
       };
-    else if (request.op === 'read' && args.view === 'observed')
+    else if (request.op === 'read_features') {
+      const features = callbacks.readFeatures
+        ? assertReadFeatures(await callbacks.readFeatures())
+        : { available: false, tools: [], commands: [], leaf_id: null };
+      await assertIdentity();
+      data = {
+        contract: READ_CONTRACT,
+        sessionFile: target.file,
+        sessionId: target.header.id,
+        ...features,
+      };
+    } else if (request.op === 'read' && args.view === 'observed')
       data = {
         sessionFile: target.file,
         sessionId: target.header.id,
@@ -264,7 +276,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
               live: snapshot.live ?? { available: false, source: 'host_snapshot' },
             },
             args,
-            sdk,
+            { ...sdk, readAdapters: request.readAdapters },
           ),
         };
       }
@@ -400,6 +412,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
           ![
             'state',
             'snapshot',
+            'readFeatures',
             'submit',
             'supportsImages',
             'release',
@@ -412,7 +425,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       ) ||
       (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
-      ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact'].some(
+      ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact', 'readFeatures'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
       )
     )

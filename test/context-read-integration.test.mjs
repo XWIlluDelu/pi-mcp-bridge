@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { SessionManager } from './fixtures/pi.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -27,7 +28,7 @@ const message = (id, parentId, role, content, extra = {}) => ({
   message: { role, content, timestamp: 0, ...extra },
 });
 const text = (value) => ({ type: 'text', text: value });
-async function fixture(t, entries) {
+async function fixture(t, entries, overrides = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-context-mcp-')),
     cwd = path.join(dir, 'project');
   await fs.mkdir(cwd);
@@ -39,6 +40,7 @@ async function fixture(t, entries) {
     sessionRoots: [path.join(dir, 'sessions')],
     folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
+    ...overrides,
   };
   const bridge = await new Bridge(config).init();
   const made = await savedSession(bridge),
@@ -308,6 +310,151 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     );
     assert.equal(raw.leafId, 'a');
   }
+});
+
+test('optional input mappings agree across saved, owned RPC, companion and host reads with frozen paging and raw fork data', async (t) => {
+  const module = fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url));
+  for (const kind of ['saved', 'rpc', 'companion', 'host']) {
+    await t.test(kind, async (t) => {
+      const details = {
+        from: { id: 'sender', cwd: '/project' },
+        message: {
+          id: 'delivery',
+          content: {
+            text: 'INPUT_2',
+            attachments: [{ type: 'snippet', name: 'note', content: 'ATTACHMENT' }],
+          },
+        },
+        bodyText: 'INPUT_2',
+        replyCommand: 'intercom reply',
+      };
+      const entries = [
+        message('human', null, 'user', 'HUMAN_INPUT'),
+        {
+          type: 'custom_message',
+          id: 'i1',
+          parentId: 'human',
+          customType: 'intercom_message',
+          content: 'INPUT_1',
+          display: true,
+          timestamp: '2026-01-01T00:00:00Z',
+        },
+        message('a1', 'i1', 'assistant', [text('PRIOR_ANSWER')]),
+        {
+          type: 'custom_message',
+          id: 'i2',
+          parentId: 'a1',
+          customType: 'intercom_message',
+          content: '**From Sender**\n\nINPUT_2',
+          details,
+          display: true,
+          timestamp: '2026-01-01T00:00:00Z',
+        },
+        message('a2', 'i2', 'assistant', [text(paragraphs(40))]),
+      ];
+      const f = await fixture(t, entries, { compatibilityModules: [{ module }] });
+      if (kind === 'rpc') await f.bridge.pool.resolve(f.saved);
+      else if (kind === 'host') {
+        const owner = await reserveHostSession({
+          attachmentDir: f.config.attachmentDir,
+          session: f.saved,
+        });
+        f.cleanup.push(() => owner.close());
+        await owner.ready({
+          state: () => ({ sessionFile: f.saved.file, sessionId: f.saved.header.id }),
+          snapshot: () => ({
+            sessionFile: f.saved.file,
+            sessionId: f.saved.header.id,
+            entries,
+            leafId: 'a2',
+          }),
+          submit: () => assert.fail('Read must not submit input'),
+        });
+      } else if (kind === 'companion') {
+        const previous = process.env.PI_MCP_ATTACH_DIR,
+          handlers = {};
+        process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+        await attachExtension({
+          getThinkingLevel: () => 'off',
+          on: (event, fn) => {
+            handlers[event] = fn;
+          },
+        });
+        f.cleanup.push(async () => {
+          await handlers.session_shutdown?.({ reason: 'quit' });
+          if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+          else process.env.PI_MCP_ATTACH_DIR = previous;
+        });
+        await handlers.session_start(
+          {},
+          {
+            mode: 'tui',
+            sessionManager: SessionManager.open(f.saved.file),
+            isIdle: () => true,
+            hasPendingMessages: () => false,
+            shutdown: () => assert.fail('Read must not shut down owner'),
+          },
+        );
+      }
+      const fileBefore = await fs.readFile(f.saved.file);
+      const first = await f.ok({ max_bytes: 4096 });
+      assert.equal(first.source, kind === 'companion' ? 'tui' : kind);
+      const units = chronological(await allPages(f, first));
+      assert.ok(units.every((unit) => ['i2', 'a2'].includes(unit.source.entry_id)));
+      const input = units.find((unit) => unit.type === 'prompt');
+      assert.equal(input.source.read_adapter, 'pi-intercom');
+      assert.equal(input.message.role, 'custom');
+      assert.deepEqual(input.message.details, details);
+      assert.ok(units.filter((u) => u.type === 'text').every((u) => u.prompt_id === 'i2'));
+      assert.equal(
+        units
+          .filter((u) => u.type === 'text')
+          .map((u) => u.block.text)
+          .join(''),
+        paragraphs(40),
+      );
+      const native = await loadSavedSession(f.saved);
+      assert.deepEqual(native.entries.find((e) => e.id === 'i2').details, details);
+      if (kind !== 'saved' && kind !== 'rpc') {
+        const raw = await (await f.bridge.pool.forRead(f.saved)).snapshot();
+        assert.deepEqual(
+          raw.entries.find((e) => e.id === 'i2'),
+          entries[3],
+        );
+      }
+      assert.deepEqual(
+        await fs.readFile(f.saved.file),
+        fileBefore,
+        'Read must not rewrite native history',
+      );
+    });
+  }
+});
+
+test('disabled compatibility module leaves native custom reading intact', async (t) => {
+  const module = fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url));
+  const f = await fixture(
+    t,
+    [
+      message('u', null, 'user', 'HUMAN_INPUT'),
+      {
+        type: 'custom_message',
+        id: 'i',
+        parentId: 'u',
+        customType: 'intercom_message',
+        content: 'PLUGIN_INPUT',
+        display: true,
+      },
+      message('a', 'i', 'assistant', [text('answer')]),
+    ],
+    { compatibilityModules: [{ module, enabled: false }] },
+  );
+  const result = await f.ok();
+  const input = result.items.find((item) => item.source.entry_id === 'i');
+  assert.equal(input.type, 'custom');
+  assert.equal(input.prompt_id, 'u');
+  assert.equal(input.source.read_adapter, undefined);
+  assert.equal(result.items.find((item) => item.type === 'text').prompt_id, 'u');
 });
 
 test('batch budgets the first render of captured snapshots and preserves cursor continuity after a later mutation', async (t) => {

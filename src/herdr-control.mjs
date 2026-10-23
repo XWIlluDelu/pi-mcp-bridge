@@ -120,7 +120,6 @@ export class HerdrControl {
     for (const key of Object.keys(env))
       if (
         key.startsWith('PI_MCP_') ||
-        key.startsWith('PI_INTERCOM_') ||
         [
           'HERDR_ENV',
           'HERDR_SESSION',
