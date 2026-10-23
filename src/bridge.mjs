@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { readSchema } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { permitted, permissionsHealth } from './permissions.mjs';
+import { inside, permitted, permissionsHealth } from './permissions.mjs';
 import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
 import {
@@ -40,6 +40,7 @@ import { nativeSdk } from './pi-installation.mjs';
 import {
   privateDirectory,
   readClaim,
+  readOwnerRecord,
   ownerAlive,
   registryTransaction,
   updateOwner,
@@ -52,13 +53,19 @@ import { prepareTrash } from './trash.mjs';
 import { idleHandoff, cancelHandoff } from './idle-handoff.mjs';
 import { scheduleAutoRelease } from './auto-release.mjs';
 import { optionalResultFields } from './response-budget.mjs';
+function scopeSnapshot(config) {
+  const folders = Object.freeze(config.folders.map((folder) => Object.freeze({ ...folder })));
+  const sessionRoots = Object.freeze([...config.sessionRoots]);
+  return Object.freeze({ folders, sessionRoots });
+}
+
 export class Bridge {
   constructor(config, factory, { configFile } = {}) {
     this.config = config;
     this.configFile = configFile;
-    const { grants, defaults, ...settings } = config;
+    const { grants, defaults, folders, sessionRoots, ...settings } = config;
     this.ownerSettings = structuredClone(settings);
-    this.pool = new RuntimePool(config, factory);
+    this.pool = new RuntimePool(config, factory, { configFile });
     this.pendingMutations = new Set();
     this.locks = new Map();
     this.handoffs = new Map();
@@ -126,8 +133,16 @@ export class Bridge {
       this.inputs.delete(input);
     }
   }
-  async sessions() {
-    const sessions = await diagnostics.measure('session.discover', {}, () => discover(this.config));
+  async sessions(requestContext) {
+    // Owner-local identity lookup is not business admission and remains available
+    // during cleanup. Unknown identities use current scope, not startup roots.
+    const scope =
+      requestContext?.scope ??
+      scopeSnapshot(
+        this.configFile ? (await readOwnerConfig(this.configFile)).config : this.config,
+      );
+    const config = { ...this.config, ...scope };
+    const sessions = await diagnostics.measure('session.discover', {}, () => discover(config));
     this.sessionFiles = new Map(sessions.map((s) => [s.id, s.file]));
     return sessions;
   }
@@ -140,7 +155,7 @@ export class Bridge {
           : null;
     const blocked = async (reason) => {
       try {
-        this.check(action, await this.session(id), requestContext);
+        this.check(action, await this.session(id, requestContext), requestContext);
         return { status: 'rejected', reason };
       } catch (error) {
         return { status: 'rejected', reason: safeReason(error) };
@@ -157,26 +172,50 @@ export class Bridge {
     this.assertOpen();
     return diagnostics.measure('permission.snapshot', {}, async () => {
       let policy = this.config;
+      let restartRequired = [];
       if (this.configFile) {
         const { config } = await readOwnerConfig(this.configFile);
-        const { grants, defaults, ...settings } = config;
-        if (!isDeepStrictEqual(settings, this.ownerSettings))
-          throw new Error('CONFIG_RESTART_REQUIRED');
+        const { grants, defaults, folders, sessionRoots, ...settings } = config;
+        restartRequired = [
+          ...new Set([...Object.keys(this.ownerSettings), ...Object.keys(settings)]),
+        ].filter((key) => !isDeepStrictEqual(settings[key], this.ownerSettings[key]));
+        // Hot scope must remain valid against ACTIVE storage, not just a
+        // proposed stateDir that will only take effect after restart.
+        validateOwnerConfig({ ...this.config, grants, defaults, folders, sessionRoots });
         policy = config;
       }
       const defaults = Object.freeze({ ...policy.defaults });
       const grants = Object.freeze((policy.grants ?? []).map((rule) => Object.freeze({ ...rule })));
-      return Object.freeze({ permissions: Object.freeze({ defaults, grants }) });
+      const scope = scopeSnapshot(policy);
+      return Object.freeze({
+        permissions: Object.freeze({ defaults, grants }),
+        scope,
+        restartRequired: Object.freeze(restartRequired),
+      });
     });
   }
-  async session(id) {
-    const file = this.sessionFiles.get(id);
-    if (file) {
+  async session(id, requestContext) {
+    let file = this.sessionFiles.get(id) ?? this.pool.instances.get(id)?.session?.file;
+    // Owner-local cleanup may outlive both scope membership and the discovery cache.
+    // Reuse the existing claim's identity, never a previous permission policy.
+    if (!requestContext && !file && /^ps_[a-f0-9]{32}$/.test(id)) {
+      await privateDirectory(this.pool.attachmentDir);
+      file = (
+        await readOwnerRecord(
+          this.pool.attachmentDir,
+          path.join(this.pool.attachmentDir, `${id}.owner.json`),
+        )
+      )?.file;
+    }
+    if (
+      file &&
+      (!requestContext || requestContext.scope.sessionRoots.some((root) => inside(file, root)))
+    ) {
       const current = await readSessionIdentity(file).catch(() => null);
       if (current?.id === id) return current;
       this.sessionFiles.delete(id);
     }
-    const s = (await this.sessions()).find((s) => s.id === id);
+    const s = (await this.sessions(requestContext)).find((s) => s.id === id);
     if (!s) throw new Error('NOT_FOUND_OR_DENIED');
     return s;
   }
@@ -190,7 +229,7 @@ export class Bridge {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const policy = requestContext.permissions;
-    let allowed = this.config.folders.some((folder) =>
+    let allowed = requestContext.scope.folders.some((folder) =>
       ['send', 'command', 'create'].some((action) =>
         permitted(policy, action, { cwd: folder.path }),
       ),
@@ -202,7 +241,7 @@ export class Bridge {
     if (!allowed && mayExecuteSession) {
       // folders configures creation targets, not the universe of native history.
       // Discover identity metadata once; no transcript or owner is acquired.
-      allowed = (await this.sessions()).some((session) =>
+      allowed = (await this.sessions(requestContext)).some((session) =>
         ['send', 'command'].some((action) => permitted(policy, action, session)),
       );
     }
@@ -261,7 +300,7 @@ export class Bridge {
     return this.withInput(args.session_id, pendingInput, async (checkInput) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
-      const session = await this.session(args.session_id);
+      const session = await this.session(args.session_id, requestContext);
       this.check('send', session, requestContext);
       if (args.interrupt) this.check('stop', session, requestContext);
       const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
@@ -314,19 +353,19 @@ export class Bridge {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const sessions = args.session_id
-      ? await this.session(args.session_id).then(
+      ? await this.session(args.session_id, requestContext).then(
           (s) => [s],
           (error) => {
             if (error.message === 'NOT_FOUND_OR_DENIED') return [];
             throw error;
           },
         )
-      : await this.sessions();
+      : await this.sessions(requestContext);
     if (args.session_id && sessions[0]?.header.parentSession) {
       const parentId = [...this.sessionFiles].find(
         ([, file]) => file === sessions[0].header.parentSession,
       )?.[0];
-      const parent = parentId && (await this.session(parentId).catch(() => null));
+      const parent = parentId && (await this.session(parentId, requestContext).catch(() => null));
       if (parent) sessions.push(parent);
     }
     const matches = (value, query) =>
@@ -409,7 +448,7 @@ export class Bridge {
       next_offset: hasMore ? offset + limit : null,
       creatable_projects: [...new Set(selected.map((row) => row.project))].filter(
         (project) =>
-          this.config.folders.some((folder) => folder.path === project) &&
+          requestContext.scope.folders.some((folder) => folder.path === project) &&
           permitted(requestContext.permissions, 'create', { cwd: project }),
       ),
     };
@@ -420,13 +459,24 @@ export class Bridge {
     this.assertOpen();
     // Diagnose only the requested session, without its metadata or source paths.
     if (session_id) {
-      const target = await this.session(session_id).catch(() => ({ id: session_id, cwd: null }));
+      const target = await this.session(session_id, requestContext).catch(() => ({
+        id: session_id,
+        cwd: null,
+      }));
       return permissionsHealth(
-        { ...requestContext.permissions, folders: this.config.folders },
+        { ...requestContext.permissions, folders: requestContext.scope.folders },
         { session_id, cwd: target.cwd },
       );
     }
-    return permissionsHealth({ ...requestContext.permissions, folders: this.config.folders });
+    return {
+      ...permissionsHealth({
+        ...requestContext.permissions,
+        folders: requestContext.scope.folders,
+      }),
+      ...(requestContext.restartRequired?.length
+        ? { restart_required: requestContext.restartRequired }
+        : {}),
+    };
   }
   async read(args, { requestContext, resultBudget, readPins } = {}) {
     const parsed = readSchema.safeParse(args);
@@ -437,7 +487,7 @@ export class Bridge {
     // Routing metadata only. Cached content is accessed after authorization and
     // today's canonical path/native identity check; a cursor is never a grant.
     const id = args.session_id ?? this.readCache.identity(args.cursor).session_id;
-    let s = await this.session(id);
+    let s = await this.session(id, requestContext);
     this.check('read', s, requestContext);
     const identity = {
       session_id: id,
@@ -459,7 +509,7 @@ export class Bridge {
     while (runtime && this.handoffs.get(id)?.runtime === runtime) {
       await runtime.autoReleaseTask;
       this.assertOpen();
-      s = await this.session(id);
+      s = await this.session(id, requestContext);
       this.check('read', s, requestContext);
       runtime = await this.pool.forRead(s);
     }
@@ -512,7 +562,7 @@ export class Bridge {
         ownerActive: false,
       });
     }
-    const current = await this.session(id);
+    const current = await this.session(id, requestContext);
     if (
       current.file !== identity.file ||
       current.header.id !== identity.native_id ||
@@ -558,7 +608,7 @@ export class Bridge {
   }
   async #setModel(args, { requestContext, markForAutoRelease } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
-    const target = await this.session(args.session_id);
+    const target = await this.session(args.session_id, requestContext);
     this.check('send', target, requestContext);
     return this.locked(target.id, async () => {
       let runtime;
@@ -566,7 +616,7 @@ export class Bridge {
         this.assertOpen();
         if (this.handoffs.has(target.id) && this.handoffs.get(target.id).kind !== 'auto_release')
           throw new Error('HANDOFF_PENDING');
-        const current = await this.session(target.id);
+        const current = await this.session(target.id, requestContext);
         if (
           current.file !== target.file ||
           current.header.id !== target.header.id ||
@@ -603,7 +653,7 @@ export class Bridge {
       const body = input === undefined ? undefined : { ...input, mode: args.mode ?? 'default' };
       let target;
       try {
-        target = await this.session(args.session_id);
+        target = await this.session(args.session_id, requestContext);
       } catch {
         return {
           status: 'rejected',
@@ -620,7 +670,7 @@ export class Bridge {
         let runtime;
         try {
           beforeDispatch();
-          const s = await this.session(args.session_id);
+          const s = await this.session(args.session_id, requestContext);
           this.check('send', s, requestContext);
           // Existing owners remain readable/controllable independently of whether
           // their original working directory still exists. Only a new execution
@@ -705,7 +755,7 @@ export class Bridge {
     return this.withInput(args.session_id, pendingInput, async (checkInput) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
-      const session = await this.session(args.session_id);
+      const session = await this.session(args.session_id, requestContext);
       this.check('command', session, requestContext);
       let output;
       const receipt = await (async () => {
@@ -753,7 +803,7 @@ export class Bridge {
   async #stop(args, { requestContext, resultBudget, retainedInputs } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    const session = await this.session(args.session_id);
+    const session = await this.session(args.session_id, requestContext);
     this.check('stop', session, requestContext);
     let withdrawn;
     const receipt = await this.mutationLock(
@@ -799,7 +849,7 @@ export class Bridge {
   async #create(args, { requestContext, markForAutoRelease } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    const folder = this.config.folders.find((folder) => folder.path === args.project);
+    const folder = requestContext.scope.folders.find((folder) => folder.path === args.project);
     if (!folder || !permitted(requestContext.permissions, 'create', { cwd: folder.path }))
       return {
         status: 'rejected',
@@ -819,13 +869,13 @@ export class Bridge {
       await validateExecutionCwd(folder.path);
       let parent, snapshot;
       if (args.fork_from) {
-        parent = await this.session(args.fork_from);
+        parent = await this.session(args.fork_from, requestContext);
         this.check('read', parent, requestContext);
         let runtime = await this.pool.forRead(parent);
         while (runtime && this.handoffs.get(parent.id)?.runtime === runtime) {
           await runtime.autoReleaseTask;
           this.assertOpen();
-          parent = await this.session(args.fork_from);
+          parent = await this.session(args.fork_from, requestContext);
           this.check('read', parent, requestContext);
           runtime = await this.pool.forRead(parent);
         }
@@ -837,7 +887,7 @@ export class Bridge {
             ? await runtime.entries()
             : await loadSavedSession(parent, { config: this.config });
       }
-      child = await prepareSession(this.config, folder.path, {
+      child = await prepareSession({ ...this.config, ...requestContext.scope }, folder.path, {
         name: args.name,
         parent,
         snapshot,
@@ -909,7 +959,7 @@ export class Bridge {
   async #delete(args, { requestContext, resultBudget } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    const target = await this.session(args.session_id).catch(() => null);
+    const target = await this.session(args.session_id, requestContext).catch(() => null);
     if (
       !permitted(
         requestContext.permissions,
@@ -927,7 +977,7 @@ export class Bridge {
     return this.mutationLock(args.session_id, 'delete', requestContext, async () => {
       let trash, release;
       try {
-        const s = await this.session(args.session_id);
+        const s = await this.session(args.session_id, requestContext);
         this.check('delete', s, requestContext);
         trash = await prepareTrash(this.config, s);
         this.check('delete', s, requestContext);
@@ -1143,6 +1193,7 @@ function safeReason(error) {
     'EXTENSION_UI_STARTUP_UNAVAILABLE',
     'EXTENSION_UI_SHUTDOWN_UNAVAILABLE',
     'BRIDGE_CLOSING',
+    'CONFIG_RESTART_REQUIRED',
     'INVALID_PROMPT_INPUT',
     'INVALID_PROMPT_RESULT',
     'SNAPSHOT_UNSUPPORTED',

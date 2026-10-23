@@ -37,7 +37,7 @@ export const descriptions = {
   batch:
     'Wrap 1–10 operations (all tools except batch). Same-session operations execute serially through submission results; different sessions run concurrently. Each item keeps its own permissions. Every mutation item is a new operation, including in repeated batches; no outer replay or deduplication. Item failure does not cancel other items. Results share preallocated UTF-8/JSON/wire budgets: command/stop may return a smaller prefix than max_chars, with accurate completeness flags; auxiliary command.fullOutputPath/delete.project may be omitted. Captured query pages may shrink or explicitly refuse; mutation results are retained.',
   health:
-    'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Takes no domain selector; does not change authorization.',
+    'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Unscoped health also reports names of fixed settings awaiting restart, without blocking business requests or exposing their values. Takes no domain selector; does not change authorization.',
 };
 export const toolNames = [
   'list',

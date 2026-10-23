@@ -5,7 +5,9 @@ import path from 'node:path';
 import { companionProfile, companionIncludes } from '../src/companion-profile.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
-import { readClaim, reserveOwner, claimFile } from '../src/attachments.mjs';
+import { readClaim, reserveOwner, claimFile, processIdentity } from '../src/attachments.mjs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 async function fixture(t) {
@@ -77,6 +79,63 @@ test('explicit owner profile and directory must agree; directory-only host opt-i
   });
 });
 
+test('scope removal preserves resume protection for an existing live writer', async (t) => {
+  const f = await fixture(t),
+    oldFile = process.env.PI_MCP_OWNER_CONFIG,
+    oldDir = process.env.PI_MCP_ATTACH_DIR;
+  process.env.PI_MCP_OWNER_CONFIG = f.file;
+  delete process.env.PI_MCP_ATTACH_DIR;
+  t.after(() => {
+    if (oldFile === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
+    else process.env.PI_MCP_OWNER_CONFIG = oldFile;
+    if (oldDir === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+    else process.env.PI_MCP_ATTACH_DIR = oldDir;
+  });
+  const handlers = {};
+  await attachExtension({
+    on: (name, fn) => (handlers[name] = fn),
+    registerShortcut() {},
+    registerCommand() {},
+  });
+  const ctx = { mode: 'tui', ui: { notify() {} } },
+    resume = (file) =>
+      handlers.session_before_switch({ reason: 'resume', targetSessionFile: file }, ctx),
+    dir = path.join(f.config.stateDir, 'ipc'),
+    outside = path.join(f.dir, 'ordinary.jsonl');
+  assert.equal(await resume(outside), undefined);
+  await assert.rejects(fs.stat(dir), { code: 'ENOENT' });
+
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  t.after(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = once(child, 'exit');
+    child.kill('SIGTERM');
+    await exited;
+  });
+  await once(child, 'spawn');
+  const manager = SessionManager.create(f.dir, f.config.sessionRoots[0]),
+    session = { file: manager.getSessionFile(), header: manager.getHeader() };
+  await fs.writeFile(session.file, JSON.stringify(session.header) + '\n');
+  await reserveOwner(dir, session, 'host', await processIdentity(child.pid));
+  const claim = await fs.readFile(claimFile(dir, session));
+  assert.deepEqual(await resume(session.file), { cancel: true });
+
+  await fs.writeFile(
+    f.file,
+    JSON.stringify({ ...f.config, sessionRoots: [path.join(f.dir, 'replacement-root')] }),
+  );
+  assert.deepEqual(await resume(session.file), { cancel: true });
+  const alias = path.join(f.dir, 'alias.jsonl');
+  await fs.symlink(session.file, alias);
+  assert.deepEqual(await resume(alias), { cancel: true });
+  assert.equal(await resume(outside), undefined);
+  assert.deepEqual(await fs.readFile(claimFile(dir, session)), claim);
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+});
+
 test('scoped companion skips excluded bodies and retires only its completed former session', async (t) => {
   const f = await fixture(t);
   const oldFile = process.env.PI_MCP_OWNER_CONFIG,
@@ -128,10 +187,41 @@ test('scoped companion skips excluded bodies and retires only its completed form
   await fs.writeFile(other.file, JSON.stringify(other.header) + '\n');
   const controller = await reserveOwner(dir, other, 'host');
   const controllerBytes = await fs.readFile(claimFile(dir, other));
+  const nextRoot = path.join(f.dir, 'new-root');
+  await fs.mkdir(nextRoot);
+  await fs.writeFile(f.file, JSON.stringify({ ...f.config, sessionRoots: [nextRoot] }));
+  assert.equal(
+    (await readClaim(dir, session)).phase,
+    'ready',
+    'Scope removal does not retire a live claim',
+  );
   await handlers.session_shutdown({ reason: 'switch' });
-  await handlers.session_start({}, excluded);
+  await handlers.session_start(
+    {},
+    {
+      ...excluded,
+      sessionManager: { ...excluded.sessionManager, getSessionFile: () => session.file },
+    },
+  );
+  assert.equal(
+    (await readClaim(dir, session)).phase,
+    'transitioning',
+    'Same-file reload outside scope preserves ownership',
+  );
+  // A later switch registers against current roots, without reloading the extension.
+  const nextManager = SessionManager.create(f.dir, nextRoot),
+    nextSession = { file: nextManager.getSessionFile(), header: nextManager.getHeader() };
+  const alias = path.join(nextRoot, 'alias.jsonl');
+  await fs.symlink(other.file, alias);
+  assert.deepEqual(
+    await handlers.session_before_switch({ reason: 'resume', targetSessionFile: alias }, ctx),
+    { cancel: true },
+  );
+  await handlers.session_start({}, { ...ctx, sessionManager: nextManager });
+  assert.equal((await readClaim(dir, nextSession)).phase, 'ready');
   assert.equal(await readClaim(dir, session), null);
   assert.deepEqual(await fs.readFile(claimFile(dir, other)), controllerBytes);
   assert.equal((await readClaim(dir, other)).generation, controller.generation);
-  assert.equal((await fs.readdir(dir)).filter((p) => p.endsWith('.sock')).length, 0);
+  assert.equal((await fs.readdir(dir)).filter((p) => p.endsWith('.sock')).length, 1);
+  await handlers.session_shutdown({ reason: 'quit' });
 });

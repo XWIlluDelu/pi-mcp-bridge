@@ -34,6 +34,16 @@ export async function companionProfile(env = process.env) {
   };
 }
 
+// Refresh only directory scope at native session admission. IPC identity and the
+// already-running Pi installation remain fixed for this companion instance.
+export async function currentCompanionScope(profile) {
+  if (!profile.file) return profile;
+  const { config } = await readOwnerConfig(profile.file);
+  if ((config.attachmentDir ?? path.join(config.stateDir, 'ipc')) !== profile.dir)
+    throw new Error('HANDOFF_DIRECTORY_MISMATCH');
+  return { ...profile, roots: config.sessionRoots };
+}
+
 export function companionIncludes(profile, file) {
   return (
     typeof file === 'string' &&
