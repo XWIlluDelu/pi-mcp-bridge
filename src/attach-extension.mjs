@@ -31,6 +31,7 @@ import {
 } from './companion-profile.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { ContextObservation } from './context-observation.mjs';
+import { nativeReadFeatures } from './read-features.mjs';
 import {
   privateDirectory,
   processIdentity,
@@ -193,8 +194,8 @@ export default async function attachExtension(pi) {
     pi.on(event, (value) => {
       active?.liveMessage.update(value);
     });
-  // All context transforms have finished before this phase, including MC even
-  // when it loaded after the companion. Never mutate the observed event.
+  // All native context transforms have finished before this phase, regardless
+  // of extension load order. Never mutate the observed event.
   pi.on('context_with_system', (event, ctx) => active?.observation.capture(event, ctx));
   // These events occur after the relevant persistence; every IPC request also
   // validates, including the first request after a previously absent file appears.
@@ -413,6 +414,17 @@ export default async function attachExtension(pi) {
                 generation: record.generation,
                 activity: activity(),
               };
+            else if (request.op === 'read_features')
+              data = {
+                contract: READ_CONTRACT,
+                sessionFile: file,
+                sessionId: header.id,
+                ...nativeReadFeatures(
+                  pi.getAllTools?.(),
+                  pi.getCommands?.(),
+                  ctx.sessionManager.getLeafId(),
+                ),
+              };
             else if (['read', 'snapshot'].includes(request.op)) {
               const sdk =
                 request.op === 'read' && args.view !== 'observed' ? await nativeSdk(profile) : null;
@@ -438,7 +450,7 @@ export default async function attachExtension(pi) {
                     : prepareContextRead(
                         { header, entries, leafId, live: runtime.liveMessage.snapshot() },
                         args,
-                        sdk,
+                        { ...sdk, readAdapters: request.readAdapters },
                       )),
                 };
               }

@@ -111,7 +111,14 @@ pages; list is not a frozen export.
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-`view:"native"` is the default. Explicit `view:"observed"` reads the
+The default call uses a matching configured session reader based on the target
+session's live or persisted extension evidence, otherwise native projection.
+Only explicit `view:"native"` forces native projection. Selection parameters
+(`preset`, `select`, `leaf_id`) go to the selected reader and do not change the
+source. Adapted results identify `reader.id` and share frozen pagination. See
+[session routing](compatibility.md#session-specific-read-routing).
+
+Explicit `view:"observed"` reads the
 latest captured request-stage context, including MC transformations when
 observed; it has no native selectors or leaf override. Missing observations are
 explicitly unavailable, never recreated by running Pi. Owned observations survive
@@ -120,10 +127,12 @@ normal RPC release in a bounded Bridge-memory cache. See
 retention semantics.
 
 Native reads default to `preset:"latest"`: the last prompt, all assistant text
-and first/last two thinking blocks, without summaries, tools or commands.
-Use `preset:"recent"` for the last three prompts with summaries,
-`select.tools` for calls and paired outputs, or `preset:"full"` for all effective
-context. See [reading](reading.md) for the seven selectors, sanitized content,
+and first/last two thinking blocks, without system instructions, summaries, tools
+or commands. Use `preset:"recent"` for the last three prompts with summaries,
+`select.tools` for calls and paired outputs, `select.system:-1` to include system
+instructions, or `preset:"full"` for all effective context. System omissions are
+counted; custom messages are not hidden by this selector. See
+[reading](reading.md) for the eight selectors, sanitized content,
 byte budgets and live output.
 
 Pages start with the newest selected content and continue backwards. Continue

@@ -2,12 +2,14 @@
 import net from 'node:net';
 import { ownerRequest } from './owner-runtime.mjs';
 import { opaqueId } from './storage.mjs';
-// Pi's extension loader supplies the CLI's own public SDK exports.
+// Pi's extension loader supplies its own public exports, including the actual
+// CLI class in bundled installations. Importing sdkEntry separately would not.
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { observeRpcInputs } from './rpc-input-activity.mjs';
 import fs from 'node:fs/promises';
-import { prepareContextRead } from './context-read.mjs';
+import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { ContextObservation } from './context-observation.mjs';
+import { nativeReadFeatures } from './read-features.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
 export default async function rpcObserver(pi) {
@@ -40,7 +42,7 @@ export default async function rpcObserver(pi) {
     'message_end',
   ])
     pi.on(name, (event) => live.update(event));
-  // Preserve observation ordering across native extension reload.
+  // Preserve observation/completion ordering across native extension reload.
   const key = Symbol.for('pi-mcp-bridge.rpc-observer.lifecycle');
   const lifecycle =
     globalThis[key]?.generation === generation
@@ -72,8 +74,8 @@ export default async function rpcObserver(pi) {
     });
   // Preserve capture ordering across reload within this same owner generation.
   const observation = new ContextObservation(generation, lifecycle);
-  // Pi dispatches every context handler (including MC) before this phase,
-  // irrespective of extension load order. Later full-context hooks can still change it.
+  // Pi dispatches every context handler before this phase, irrespective of
+  // extension load order. Later full-context hooks can still change it.
   pi.on('context_with_system', (event, ctx) => observation.capture(event, ctx));
   // An owned RPC is one file-bound writer. Veto before Pi opens another file;
   // session_shutdown is too late. Native TUI/host owners use their own lifecycle.
@@ -108,7 +110,7 @@ export default async function rpcObserver(pi) {
           const request = JSON.parse(body.slice(0, body.indexOf('\n')));
           if (
             !context ||
-            !['state', 'read'].includes(request.op) ||
+            !['state', 'read', 'read_features'].includes(request.op) ||
             request.generation !== generation ||
             request.file !== context.sessionManager.getSessionFile() ||
             request.sessionId !== context.sessionManager.getSessionId()
@@ -116,27 +118,38 @@ export default async function rpcObserver(pi) {
             throw new Error('RUNTIME_SESSION_CHANGED');
           result = {
             data:
-              request.op === 'state'
+              request.op === 'read_features'
                 ? {
-                    isIdle: context.isIdle(),
-                    hasPendingMessages: context.hasPendingMessages(),
-                    ...inputActivity(context.sessionManager),
-                  }
-                : {
+                    contract: READ_CONTRACT,
                     sessionFile: request.file,
                     sessionId: request.sessionId,
-                    ...(request.body?.view === 'observed'
-                      ? observation.read(request.body, context)
-                      : prepareContextRead(
-                          {
-                            entries: context.sessionManager.getEntries(),
-                            leafId: context.sessionManager.getLeafId(),
-                            live: live.snapshot(),
-                          },
-                          request.body,
-                          sdk,
-                        )),
-                  },
+                    ...nativeReadFeatures(
+                      pi.getAllTools?.(),
+                      pi.getCommands?.(),
+                      context.sessionManager.getLeafId(),
+                    ),
+                  }
+                : request.op === 'state'
+                  ? {
+                      isIdle: context.isIdle(),
+                      hasPendingMessages: context.hasPendingMessages(),
+                      ...inputActivity(context.sessionManager),
+                    }
+                  : {
+                      sessionFile: request.file,
+                      sessionId: request.sessionId,
+                      ...(request.body?.view === 'observed'
+                        ? observation.read(request.body, context)
+                        : prepareContextRead(
+                            {
+                              entries: context.sessionManager.getEntries(),
+                              leafId: context.sessionManager.getLeafId(),
+                              live: live.snapshot(),
+                            },
+                            request.body,
+                            { ...sdk, readAdapters: request.readAdapters },
+                          )),
+                    },
           };
         } catch (error) {
           result = { error: error.message };

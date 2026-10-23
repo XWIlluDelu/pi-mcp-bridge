@@ -24,6 +24,9 @@ import {
 } from './prompt-input.mjs';
 import { ContextReadCache } from './read-cache.mjs';
 import { prepareContextRead } from './context-read.mjs';
+import { CompatibilityModules } from './compatibility.mjs';
+import { CompatibilityServices } from './compatibility-services.mjs';
+import { captureSessionRead } from './session-readers.mjs';
 import { checkObservation, unavailableObservation } from './context-observation.mjs';
 import {
   discover,
@@ -54,6 +57,7 @@ import { prepareTrash } from './trash.mjs';
 import { idleHandoff, cancelHandoff } from './idle-handoff.mjs';
 import { scheduleAutoRelease } from './auto-release.mjs';
 import { optionalResultFields } from './response-budget.mjs';
+import { ownerReadFeatures } from './read-features.mjs';
 function scopeSnapshot(config) {
   const folders = Object.freeze(config.folders.map((folder) => Object.freeze({ ...folder })));
   const sessionRoots = Object.freeze([...config.sessionRoots]);
@@ -66,7 +70,13 @@ export class Bridge {
     this.configFile = configFile;
     const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
     this.ownerSettings = structuredClone(settings);
+    this.compatibilityServices = new CompatibilityServices();
+    this.compatibility = new CompatibilityModules(
+      config.compatibilityModules,
+      this.compatibilityServices,
+    );
     this.pool = new RuntimePool(config, factory, {
+      compatibility: this.compatibilityServices,
       configFile,
       completionControl: { stateDir: config.stateDir, attachmentDir: config.attachmentDir },
     });
@@ -97,9 +107,11 @@ export class Bridge {
       busy: 'BRIDGE_ALREADY_RUNNING',
     });
     try {
+      await this.compatibility.start();
       await this.events.init();
       this.ownerControl = await serveOwnerControl(this);
     } catch (error) {
+      await Promise.allSettled([this.compatibility.stop(), this.events.close()]);
       await this.lock.close();
       this.lock = null;
       throw error;
@@ -531,33 +543,47 @@ export class Bridge {
     });
     let captured,
       retained = false;
-    if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
-      captured = await runtime.read(args);
-    else if (args.view === 'observed') {
-      captured = runtime
-        ? unavailableObservation(id, 'runtime_observer_unavailable')
-        : this.pool.observations.get(s);
+    if (args.view === 'observed') {
+      captured =
+        runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord)
+          ? await runtime.read(args)
+          : runtime
+            ? unavailableObservation(id, 'runtime_observer_unavailable')
+            : this.pool.observations.get(s);
       retained = !runtime;
     } else {
-      if (runtime) {
-        const active = await runtime.entries();
-        if (
-          !active.entries.every(
-            (entry) => typeof entry.id === 'string' && entry.id.length <= 128,
-          ) ||
-          !(
-            active.leafId === null ||
-            (typeof active.leafId === 'string' && active.leafId.length <= 128)
-          )
-        )
-          throw new Error('INVALID_RUNTIME_ENTRIES');
-        s = { ...s, entries: active.entries, leafId: active.leafId, live: active.live };
-      } else s = await loadSavedSession(s, { omitImageData: true, config: this.config });
-      captured = prepareContextRead(
-        s,
-        args,
-        await nativeSdk(this.config, launchProfile(this.config).env),
-      );
+      const nativeRead = () => this.acquireNativeRead(s, runtime, { ...args, view: 'native' });
+      const acquire = async () => {
+        // Only an explicit view selects a source. Modules assess session-local
+        // evidence even without a live owner; reading never starts Pi.
+        if (this.compatibilityServices.sessionReaders.readers.size && args.view !== 'native') {
+          const context = {
+            session: Object.freeze({
+              id,
+              file: s.file,
+              native_id: s.header.id,
+              cwd: s.header.cwd,
+            }),
+            owner: await ownerReadFeatures(runtime),
+            request: args,
+            nativeRead,
+          };
+          const reader = await this.compatibilityServices.sessionReaders.select(context);
+          if (reader) {
+            const result = await captureSessionRead(reader, context, args);
+            // Recheck applicability, including an owner that appeared during
+            // a saved read. Existing live endpoints also recheck their identity.
+            const currentReader = await this.compatibilityServices.sessionReaders.select({
+              ...context,
+              owner: await ownerReadFeatures(runtime ?? (await this.pool.forRead(s))),
+            });
+            if (currentReader?.id !== reader.id) throw new Error('READ_SOURCE_CHANGED');
+            return result;
+          }
+        }
+        return nativeRead();
+      };
+      captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
     }
     const runtimeObservation = runtime && captured.view === 'observed' ? captured : null;
     let currentLeaf;
@@ -595,6 +621,7 @@ export class Bridge {
         session_id: id,
         view: captured.view,
         ...(captured.observation ? { observation: captured.observation } : {}),
+        ...(captured.reader ? { reader: captured.reader, request: args } : {}),
         leaf_id: captured.leaf_id,
         selection: captured.selection,
         omissions: captured.omissions,
@@ -617,6 +644,26 @@ export class Bridge {
       live,
       runtimeEvents: events,
       readPins,
+    });
+  }
+  async acquireNativeRead(session, runtime, args) {
+    if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
+      return runtime.read(args);
+    if (runtime) {
+      const active = await runtime.entries();
+      if (
+        !active.entries.every((entry) => typeof entry.id === 'string' && entry.id.length <= 128) ||
+        !(
+          active.leafId === null ||
+          (typeof active.leafId === 'string' && active.leafId.length <= 128)
+        )
+      )
+        throw new Error('INVALID_RUNTIME_ENTRIES');
+      session = { ...session, entries: active.entries, leafId: active.leafId, live: active.live };
+    } else session = await loadSavedSession(session, { omitImageData: true, config: this.config });
+    return prepareContextRead(session, args, {
+      ...(await nativeSdk(this.config, launchProfile(this.config).env)),
+      readAdapters: this.compatibilityServices.readInputs.snapshot(),
     });
   }
   async #setModel(args, { requestContext, markForAutoRelease } = {}) {
@@ -1193,9 +1240,14 @@ export class Bridge {
       await this.pool.drainAcks?.();
       await this.pool.close();
       await Promise.allSettled([...this.autoReleases]);
-      if (this.lock) {
-        await this.lock.close();
-        this.lock = null;
+      // Modules remain active until writers, ACKs and release captures drain.
+      try {
+        await this.compatibility.stop();
+      } finally {
+        if (this.lock) {
+          await this.lock.close();
+          this.lock = null;
+        }
       }
     })();
     return this.closePromise;

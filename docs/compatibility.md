@@ -1,0 +1,108 @@
+# Optional plugin compatibility modules
+
+Modules share registration, owner configuration, loading and lifecycle. Their
+capabilities and processing paths remain independent.
+
+## Owner configuration
+
+```json
+{
+  "compatibilityModules": [
+    {
+      "module": "/path/to/pi-mcp-bridge/src/compatibility/intercom.mjs",
+      "enabled": true
+    }
+  ]
+}
+```
+
+The list defaults to empty. Each entry has an absolute ESM `module` path,
+optional `enabled` (default `true`) and module-specific `options` object.
+Disabled modules are not imported. Changes take effect on a normal service
+restart; health reports pending changes as `restart_required`.
+
+A module exports `{id, start}`. Its synchronous/asynchronous
+`start({id, services, onStop}, options)` runs once during Bridge startup.
+Register cleanup with `onStop(callback)` immediately after acquiring a resource.
+Bridge starts modules in configuration order under its service lock. Partial
+startup unwinds registered cleanup. Shutdown drains writers, ACKs and release
+captures before running cleanup in reverse order, continuing after an individual
+cleanup failure. Duplicate paths and active module IDs are rejected.
+
+Modules are trusted owner code with the owner's Unix access. They do not change
+Bridge grants or replace native Pi's own extension installation/configuration.
+
+## Input mapping
+
+`services.readInputs.register(id, inputCustomTypes)` returns cleanup for exact
+native custom-message input types. Bridge sends detached descriptors through
+existing read IPC to RPC observers, companions and hosts; only Bridge imports
+module code. Invalid descriptors, duplicate mapping IDs or overlapping input
+types fail registration with `INVALID_READ_ADAPTER`. See
+[input selection](reading.md#optional-input-mappings) for prompt boundaries and
+source metadata.
+
+The supplied `src/compatibility/intercom.mjs` makes `intercom_message` an input
+boundary for native `latest`/`recent` and subsequent response selection. It
+preserves the custom role, source IDs, attachments and business details. It also
+uses `services.daemonEnvironment.register(filter)` to remove `PI_INTERCOM_*`
+identity variables from Herdr's shared-daemon environment. The actual Pi child
+keeps its native launch environment. Both registrations share module enablement
+and cleanup.
+
+## Session-specific read routing
+
+A memory integration registers its own reader under the same lifecycle:
+
+```js
+onStop(
+  services.sessionReaders.register(id, {
+    matches: ({ session, owner }) => matchesSessionExtension(session, owner),
+    read: readSessionContext,
+  }),
+);
+```
+
+`matches` and `read` may be asynchronous. The context contains:
+
+- `session`: Bridge ID, canonical `file`, native `native_id` and `cwd`.
+- `owner`: `available`, current registered `tools`, `commands` and native `leaf_id`.
+  Without registration information, `available` is false, names are empty and
+  `leaf_id` is null. This describes observation availability, not plugin absence.
+- `request`: the parsed initial read arguments, including selection intent.
+- `nativeRead()`: the existing authorized, sanitized native snapshot acquisition.
+
+Bridge obtains tool/command names from the target live owner. Owned RPCs,
+companions and SDK host bindings expose native registration information.
+Command registrations can identify an extension even when its tools are disabled.
+RPC host bindings expose extension command names through public `getCommands()`
+and the leaf through `getEntries()`;
+their tool list is empty because RPC does not expose all tool registrations.
+Custom hosts can supply `readFeatures()` with
+`{available,tools,commands,leaf_id}`. Without live registration information,
+modules may use session-local persisted evidence. Each module defines which
+evidence identifies its extension and how to read its context; global package
+installation alone does not establish activation in a session.
+
+External agents continue to call `read({session_id,max_bytes})`. A matching
+reader overrides default native acquisition for that session, including saved
+sessions. No match uses native reading. Reading never starts Pi.
+Only explicit `view:"native"` forces native projection; `preset`, `select` and
+`leaf_id` do not choose a source. The selected reader handles that selection intent
+through `request` and can reuse `nativeRead()`, which receives the same arguments.
+A reader must apply supported selection intent or reject it, not silently ignore it.
+Explicit `view:"observed"` uses the built-in request-stage capture.
+
+`read(context)` returns an array of native-shaped messages. Bridge sanitizes,
+segments and budgets them as frozen `view:"adapted"` pages with `reader.id` and
+`source.reader_index`; it does not invent native entry IDs for synthetic context.
+The module can retain its own provenance in message `details`. Adapted pages
+have no native selection counts. Continue with the cursor alone; repeated selection
+arguments must match the captured request intent. No new owner probe or adapter
+execution occurs on later pages. Cursor requests still check current read
+authorization and native identity.
+
+Matching more than one reader reports `SESSION_READER_CONFLICT`. Reader errors
+report `SESSION_READER_FAILED`, without silently substituting another context.
+Bridge rechecks native session identity and reader applicability before publishing a
+capture, including live registration information that becomes available during a saved read; a removed/replaced source reports `READ_SOURCE_CHANGED`.

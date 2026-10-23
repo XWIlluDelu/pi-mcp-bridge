@@ -219,7 +219,11 @@ test('compaction preserves checkpoint and kept context; existing summary only', 
       systemMessage: { role: 'system', content: 'checkpoint' },
     },
   ]);
-  const r = await f.bridge.read({ session_id: f.id, preset: 'recent' });
+  const r = await f.bridge.read({
+    session_id: f.id,
+    preset: 'recent',
+    select: { system: -1 },
+  });
   assert.equal(r.items[0].message.role, 'system');
   assert.equal(JSON.stringify(r).includes('summarized-old'), false);
   assert.equal(JSON.stringify(r).includes('kept'), true);

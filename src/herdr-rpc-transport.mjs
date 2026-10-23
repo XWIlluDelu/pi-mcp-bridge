@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 // Same child-shaped byte transport as spawn(). The scope covers the worker and
 // Pi (including detached native tool children); it is not a session owner registry.
 export class HerdrRpcTransport extends EventEmitter {
-  constructor(binary, launch, { signal } = {}) {
+  constructor(binary, launch, { signal, daemonEnvironment = process.env } = {}) {
     super();
     this.stdin = new PassThrough();
     this.stdout = new PassThrough();
@@ -27,7 +27,9 @@ export class HerdrRpcTransport extends EventEmitter {
     this.sockets = new Set();
     this.channels = {};
     this.token = randomBytes(32).toString('hex');
-    this.ready = Promise.resolve().then(() => this.start(binary, launch, signal));
+    this.ready = Promise.resolve().then(() =>
+      this.start(binary, launch, signal, daemonEnvironment),
+    );
   }
   async scopeActive() {
     const { stdout } = await exec(
@@ -47,7 +49,7 @@ export class HerdrRpcTransport extends EventEmitter {
       await delay(25);
     }
   }
-  async start(binary, launch, cancellation) {
+  async start(binary, launch, cancellation, daemonEnvironment) {
     const timeout = AbortSignal.timeout(30000);
     const signal = cancellation ? AbortSignal.any([timeout, cancellation]) : timeout;
     signal.throwIfAborted();
@@ -85,7 +87,7 @@ export class HerdrRpcTransport extends EventEmitter {
       flag: 'wx',
       mode: 0o600,
     });
-    this.control = await HerdrControl.open(binary);
+    this.control = await HerdrControl.open(binary, daemonEnvironment);
     // A scope is required before granting Pi startup. No force-kill timeout is used.
     await exec('systemctl', ['--user', 'show-environment'], { timeout: 8000 });
     signal.throwIfAborted();
