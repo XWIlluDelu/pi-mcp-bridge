@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { openProfile, openSession } from '../src/open.mjs';
 import { opaqueId } from '../src/storage.mjs';
+import { PiRpc } from '../src/rpc.mjs';
 test('open starts a fresh native TUI with normal configuration and automatic safe join, never the target file', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-open-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -20,11 +21,10 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   const id = opaqueId(target + '\0native'),
     file = path.join(dir, 'owner.json'),
     config = {
-      principal: 'open-fixture',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [root],
-      folders: [{ id: 'p', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [],
     };
   await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
@@ -66,9 +66,21 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   });
   assert.equal(observed[2].stdio, 'inherit');
   assert.equal(observed[2].cwd, cwd);
+  await fs.writeFile(file, JSON.stringify({ ...config, piArgs: ['--session-dir', root] }));
+  const directoryProfile = await openProfile(file, id, host);
+  assert.deepEqual(directoryProfile.args.slice(0, 2), ['--session-dir', root]);
+  assert.equal(directoryProfile.args.at(-1), '/bridge-join ' + id);
   for (const flag of [
     '--session',
     '--session=unsafe',
+    '--session-id',
+    '--session-id=unsafe',
+    '--resume',
+    '--no-session',
+    '--export',
+    '--',
+    '-c',
+    '-p',
     '--continue',
     '--fork',
     '--mode',
@@ -78,5 +90,6 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   ]) {
     await fs.writeFile(file, JSON.stringify({ ...config, piArgs: [flag] }));
     await assert.rejects(openProfile(file, id, host), /UNSAFE_OPEN_PI_ARGS/);
+    await assert.rejects(new PiRpc({ piArgs: [flag] }, {}).start(), /UNSAFE_PI_ARGS/);
   }
 });

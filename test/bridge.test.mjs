@@ -31,14 +31,12 @@ async function fixture(t, grants, factory) {
     child = path.join(cwd, 'child');
   await fs.mkdir(child, { recursive: true });
   const config = {
-    principal: 'test-caller',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [
-      { id: 'project', path: cwd },
-      { id: 'child', path: child },
-    ],
+    piRuntime: { agentDir: path.join(dir, 'agent'), inheritEnv: [] },
+    piArgs: ['--session-dir', path.join(dir, 'sessions')],
+    folders: [{ path: cwd }, { path: child }],
     grants: grants?.(cwd, child) ?? [
       { folder: cwd, list: true, read: true, send: true, delete: true, create: true },
     ],
@@ -69,7 +67,7 @@ async function fixture(t, grants, factory) {
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
-  const created = await savedSession(bridge, { folder_id: 'project', request_id: 'create-1' });
+  const created = await savedSession(bridge);
   return { bridge, config, dir, cwd, child, runtime, id: created.session_id, created };
 }
 async function append(f, entries) {
@@ -110,26 +108,28 @@ test('send-only permission cannot disclose metadata or bodies', async (t) => {
   await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
   const receipt = await f.bridge.send({
     session_id: f.id,
-    request_id: 'send-only',
+
     text: 'own-input',
   });
-  assert.equal(receipt.status, 'accepted');
+  assert.ok(['started', 'queued', 'handled'].includes(receipt.status), JSON.stringify(receipt));
   assert.equal(JSON.stringify(receipt).includes('secret'), false);
 });
 test('saved idle_only resumes first; process reused', async (t) => {
   const f = await fixture(t);
-  assert.equal(
-    (
-      await f.bridge.send({
-        session_id: f.id,
-        request_id: 'idle-1',
-        text: 'hello',
-        mode: 'idle_only',
-      })
-    ).status,
-    'accepted',
+  assert.ok(
+    ['started', 'queued', 'handled'].includes(
+      (
+        await f.bridge.send({
+          session_id: f.id,
+
+          text: 'hello',
+          mode: 'idle_only',
+        })
+      ).status,
+    ),
+    'Expected native prompt admission',
   );
-  await f.bridge.send({ session_id: f.id, request_id: 'idle-2', text: 'again' });
+  await f.bridge.send({ session_id: f.id, text: 'again' });
   assert.equal(f.runtime.resumes, 1);
   assert.equal(f.runtime.calls.length, 2);
 });
@@ -137,54 +137,35 @@ test('idle_only skips busy while native and strategy modes retain Pi semantics',
   const f = await fixture(t);
   f.runtime.state = async () => ({ isStreaming: true });
   assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'idle', text: 'x', mode: 'idle_only' }))
-      .status,
+    (await f.bridge.send({ session_id: f.id, text: 'x', mode: 'idle_only' })).status,
     'skipped',
   );
   assert.equal(f.runtime.calls.length, 0);
-  await f.bridge.send({ session_id: f.id, request_id: 'native', text: 'x', mode: 'default' });
-  await f.bridge.send({ session_id: f.id, request_id: 'steer', text: 'x', mode: 'steer' });
-  await f.bridge.send({ session_id: f.id, request_id: 'queue', text: 'x', mode: 'follow_up' });
+  await f.bridge.send({ session_id: f.id, text: 'x', mode: 'default' });
+  await f.bridge.send({ session_id: f.id, text: 'x', mode: 'steer' });
+  await f.bridge.send({ session_id: f.id, text: 'x', mode: 'follow_up' });
   assert.deepEqual(
     f.runtime.calls.map((c) => c.streamingBehavior),
     ['steer', 'steer', 'followUp'],
   );
-  for (const mode of ['native', 'queue', 'unknown'])
-    await assert.rejects(
-      f.bridge.send({ session_id: f.id, request_id: 'invalid-' + mode, text: 'x', mode }),
-      /INVALID_ARGUMENTS/,
-    );
+  await assert.rejects(
+    f.bridge.send({ session_id: f.id, text: 'x', mode: 'unknown' }),
+    /INVALID_ARGUMENTS/,
+  );
   assert.equal(f.runtime.calls.length, 3);
 });
-test('concurrent same request_id sends once; new IDs do not content-dedupe', async (t) => {
+
+test('independent concurrent calls all submit even with identical payloads', async (t) => {
   const f = await fixture(t);
-  const args = { session_id: f.id, request_id: 'same', text: 'hello' };
+  const args = { session_id: f.id, text: 'hello' };
   const r = await Promise.all(Array.from({ length: 10 }, () => f.bridge.send(args)));
-  assert.equal(f.runtime.calls.length, 1);
-  assert.deepEqual(r[0], r[9]);
-  await assert.rejects(f.bridge.send({ ...args, text: 'different' }), /REQUEST_ID_CONFLICT/);
-  assert.deepEqual(await f.bridge.send({ session_id: f.id, request_id: 'same' }), r[0]);
-  await f.bridge.send({ ...args, request_id: 'another' });
-  assert.equal(f.runtime.calls.length, 2);
+  assert.equal(f.runtime.calls.length, 10);
+  assert.ok(r.every((result) => result.status === 'started'));
+
+  await f.bridge.send({ ...args });
+  assert.equal(f.runtime.calls.length, 11);
 });
-test('unknown acceptance is journaled; retries never resend; late ACK repairs receipt', async (t) => {
-  const f = await fixture(t);
-  let late;
-  f.runtime.command = async (c, timeout, onLate) => {
-    f.runtime.calls.push(c);
-    late = onLate;
-    throw new RpcFailure('ACK_TIMEOUT', true);
-  };
-  const args = { session_id: f.id, request_id: 'timeout', text: 'hello' };
-  assert.equal((await f.bridge.send(args)).status, 'unknown');
-  assert.equal((await f.bridge.send(args)).status, 'unknown');
-  assert.equal(f.runtime.calls.length, 1);
-  await late({ ok: true, data: { disposition: 'queued' } });
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'timeout' })).disposition,
-    'queued',
-  );
-});
+
 test('context edits and branch selection; raw remains distinct; read does not write', async (t) => {
   const f = await fixture(t);
   const file = await append(f, [
@@ -209,8 +190,6 @@ test('context edits and branch selection; raw remains distinct; read does not wr
     },
   ]);
   const before = await fs.readFile(file, 'utf8');
-  for (const retired of [{ view: 'raw' }, { view: 'context' }, { max_chars: 256 }])
-    await assert.rejects(f.bridge.read({ session_id: f.id, ...retired }), /INVALID_READ_ARGUMENTS/);
   const read = await f.bridge.read({ session_id: f.id });
   assert.equal(read.items[0].message.content, 'replacement');
   assert.equal(JSON.stringify(read).includes('original-secret'), false);
@@ -239,7 +218,7 @@ test('compaction preserves checkpoint and kept context; existing summary only', 
       systemMessage: { role: 'system', content: 'checkpoint' },
     },
   ]);
-  const r = await f.bridge.read({ session_id: f.id });
+  const r = await f.bridge.read({ session_id: f.id, preset: 'recent' });
   assert.equal(r.items[0].message.role, 'system');
   assert.equal(JSON.stringify(r).includes('summarized-old'), false);
   assert.equal(JSON.stringify(r).includes('kept'), true);
@@ -287,7 +266,7 @@ test('summaries follow the selected leaf and exclude superseded checkpoints reta
     },
   ]);
   const before = await fs.readFile(file, 'utf8');
-  const current = await f.bridge.read({ session_id: f.id });
+  const current = await f.bridge.read({ session_id: f.id, preset: 'recent' });
   const summaryParts = (read) =>
     read.items.filter((x) => x.type === 'summary').flatMap((x) => x.parts);
   assert.deepEqual(
@@ -296,7 +275,7 @@ test('summaries follow the selected leaf and exclude superseded checkpoints reta
   );
   assert.equal(current.leaf_id, 'later');
   assert.equal(summaryParts(current)[0].message.summary, 'new checkpoint');
-  const earlier = await f.bridge.read({ session_id: f.id, leaf_id: 'b' });
+  const earlier = await f.bridge.read({ session_id: f.id, preset: 'recent', leaf_id: 'b' });
   assert.deepEqual(
     summaryParts(earlier).map((x) => x.source.entry_id),
     ['c1'],
@@ -327,9 +306,9 @@ test('summaries omit a context-hidden branch summary but retain its original raw
     },
     { type: 'context_edit', id: 'hide', parentId: 'branch', targetId: 'branch', replacement: null },
   ]);
-  const current = await f.bridge.read({ session_id: f.id });
+  const current = await f.bridge.read({ session_id: f.id, preset: 'recent' });
   assert.ok(!current.items.some((x) => x.type === 'summary'));
-  const earlier = await f.bridge.read({ session_id: f.id, leaf_id: 'branch' });
+  const earlier = await f.bridge.read({ session_id: f.id, preset: 'recent', leaf_id: 'branch' });
   assert.equal(
     earlier.items.find((x) => x.type === 'summary').parts[0].message.summary,
     'branch checkpoint',
@@ -354,8 +333,8 @@ test('selected context leaf metadata matches projected branch, including empty c
 test('delete stops active process, moves to recoverable trash, leaves project alone', async (t) => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.cwd, 'keep.txt'), 'untouched');
-  await f.bridge.send({ session_id: f.id, request_id: 'send', text: 'hello' });
-  const r = await f.bridge.delete({ session_id: f.id, request_id: 'delete' });
+  await f.bridge.send({ session_id: f.id, text: 'hello' });
+  const r = await f.bridge.delete({ session_id: f.id });
   assert.equal(r.status, 'deleted');
   assert.equal(f.runtime.alive, false);
   assert.equal((await f.bridge.list()).sessions.length, 0);
@@ -367,22 +346,20 @@ test('delete stops active process, moves to recoverable trash, leaves project al
     ),
   );
   assert.ok((await fs.stat(metadata.trash_path)).size > 0);
-  assert.deepEqual(await f.bridge.delete({ session_id: f.id, request_id: 'delete' }), r);
+
   assert.equal(metadata.session_id, f.id);
   await fs.rename(metadata.trash_path, metadata.original_path);
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.id);
 });
-test('create idempotence persists across a bridge restart', async (t) => {
+test('create survives a bridge restart without automatically repeating work', async (t) => {
   const f = await fixture(t),
     created = await f.bridge.create({
       project: f.cwd,
       text: 'first',
-      request_id: 'durable-create',
     });
   await f.bridge.close();
   const fresh = await new Bridge(f.config).init();
   try {
-    assert.deepEqual(await fresh.create({ project: f.cwd, request_id: 'durable-create' }), created);
     assert.equal((await fresh.list()).sessions.length, 2);
   } finally {
     await fresh.close();
@@ -402,7 +379,7 @@ test('empty sessionRoots is rejected at startup instead of failing later during 
 
 test('changed native header identity produces a new opaque ID and cannot reuse old runtime', async (t) => {
   const f = await fixture(t);
-  await f.bridge.send({ session_id: f.id, request_id: 'original-send', text: 'fixture' });
+  await f.bridge.send({ session_id: f.id, text: 'fixture' });
   assert.equal(f.runtime.resumes, 1);
   const original = await f.bridge.session(f.id);
   await fs.writeFile(
@@ -412,7 +389,7 @@ test('changed native header identity produces a new opaque ID and cannot reuse o
   await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
   const rejected = await f.bridge.send({
     session_id: f.id,
-    request_id: 'old-send',
+
     text: 'fixture',
   });
   assert.equal(rejected.status, 'rejected');
@@ -421,7 +398,7 @@ test('changed native header identity produces a new opaque ID and cannot reuse o
   assert.notEqual(replacement.session_id, f.id);
   await f.bridge.send({
     session_id: replacement.session_id,
-    request_id: 'new-send',
+
     text: 'fixture',
   });
   assert.equal(f.runtime.resumes, 2);
@@ -437,10 +414,7 @@ test('project symlink cannot borrow lexical parent permissions', async (t) => {
   s.header.cwd = link;
   await fs.writeFile(s.file, JSON.stringify(s.header) + '\n');
   assert.deepEqual((await f.bridge.list()).sessions, []);
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, request_id: 'symlink', text: 'hello' })).status,
-    'rejected',
-  );
+  assert.equal((await f.bridge.send({ session_id: f.id, text: 'hello' })).status, 'rejected');
 });
 
 test('invalid transcript trees retain identity but content reads reject', async (t) => {
@@ -480,51 +454,35 @@ test('overlapping bridge state and session storage is rejected', async (t) => {
   await assert.rejects(new Bridge(f.config).init(), /OVERLAPPING_STORAGE/);
 });
 
-test('shutdown stops admission and drains sends before closing owned runtime', async (t) => {
-  const f = await fixture(t);
-  await f.bridge.send({ session_id: f.id, request_id: 'start', text: 'hello' });
-  let unblock;
-  const gate = new Promise((r) => {
-    unblock = r;
-  });
-  const original = f.bridge.journal.put.bind(f.bridge.journal);
-  let held = true;
-  f.bridge.journal.put = async (...args) => {
-    if (held) {
-      held = false;
-      await gate;
-    }
-    return original(...args);
+test('shutdown rejects new work and drains an admitted send before closing its runtime', async (t) => {
+  const f = await fixture(t),
+    entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  f.runtime.command = async () => {
+    entered.resolve();
+    await release.promise;
+    return { disposition: 'started' };
   };
-  const sending = f.bridge.send({
-    session_id: f.id,
-    request_id: 'shutdown-race',
-    text: 'not dispatched',
+  const sending = f.bridge.send({ session_id: f.id, text: 'admitted' });
+  await entered.promise;
+  let closed = false;
+  const closing = f.bridge.close().then(() => {
+    closed = true;
   });
-  const closing = f.bridge.close();
-  try {
-    await assert.rejects(
-      f.bridge.send({ session_id: f.id, request_id: 'late', text: 'no' }),
-      /BRIDGE_CLOSING/,
-    );
-  } finally {
-    unblock();
-  }
-  const receipt = await sending;
+  await assert.rejects(f.bridge.send({ session_id: f.id, text: 'too late' }), /BRIDGE_CLOSING/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closed, false);
+  release.resolve();
+  assert.deepEqual(await sending, { status: 'started' });
   await closing;
-  assert.equal(receipt.status, 'rejected');
-  assert.deepEqual((await f.bridge.journal.get('shutdown-race')).receipt, receipt);
-  assert.equal(f.runtime.calls.length, 1);
   assert.equal(f.runtime.alive, false);
-  assert.equal(f.runtime.resumes, 1);
 });
-
 test('delete preparation failure leaves an owned runtime alive and creates no restore intent', async (t) => {
   const f = await fixture(t);
-  await f.bridge.send({ session_id: f.id, request_id: 'start', text: 'fixture' });
+  await f.bridge.send({ session_id: f.id, text: 'fixture' });
   await fs.mkdir(path.join(f.config.stateDir, 'trash'), { mode: 0o755 });
   await fs.chmod(path.join(f.config.stateDir, 'trash'), 0o755);
-  const result = await f.bridge.delete({ session_id: f.id, request_id: 'delete' });
+  const result = await f.bridge.delete({ session_id: f.id });
   assert.equal(result.status, 'rejected');
   assert.equal(f.runtime.alive, true);
   assert.deepEqual(await fs.readdir(path.join(f.config.stateDir, 'trash')), []);
@@ -558,7 +516,7 @@ test('delete rename failure cleans intents while post-move sync failure preserve
     });
     let result;
     try {
-      result = await f.bridge.delete({ session_id: f.id, request_id: 'delete' });
+      result = await f.bridge.delete({ session_id: f.id });
     } finally {
       t.mock.restoreAll();
     }
@@ -576,15 +534,13 @@ test('delete rename failure cleans intents while post-move sync failure preserve
       assert.ok(await fs.stat(metadata.trash_path));
       assert.ok(await fs.stat(metadata.metadata_path));
       await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
-      assert.deepEqual(await f.bridge.delete({ session_id: f.id, request_id: 'delete' }), result);
     }
   }
 });
 
 test('name filtering scans list-authorized metadata until its page and one extra match', async (t) => {
   const f = await fixture(t);
-  for (let i = 1; i < 6; i++)
-    await savedSession(f.bridge, { folder_id: 'project', request_id: `query-session-${i}` });
+  for (let i = 1; i < 6; i++) await savedSession(f.bridge);
   const sessions = await f.bridge.sessions(),
     files = new Set(sessions.map((s) => s.file)),
     seen = [];
@@ -634,7 +590,7 @@ test('name filtering scans list-authorized metadata until its page and one extra
 
 test('unfiltered list reads only its page and metadata does not depend on read', async (t) => {
   const f = await fixture(t);
-  await savedSession(f.bridge, { folder_id: 'project', request_id: 'second' });
+  await savedSession(f.bridge);
   const sessions = await f.bridge.sessions(),
     files = new Set(sessions.map((s) => s.file)),
     seen = [];
@@ -672,4 +628,118 @@ test('unfiltered list reads only its page and metadata does not depend on read',
     t.mock.restoreAll();
     syncBuiltinESMExports();
   }
+});
+
+test('live names share the status snapshot without scanning growing saved history', async (t) => {
+  const f = await fixture(t),
+    session = await f.bridge.session(f.id),
+    seen = [];
+  await append(f, [{ type: 'session_info', id: 'saved-name', parentId: null, name: 'disk name' }]);
+  f.config.grants.push({ session_id: f.id, read: false });
+  await f.bridge.pool.resolve(session);
+  let name = 'live name',
+    states = 0;
+  f.runtime.state = async () => {
+    states++;
+    return { sessionName: name, isStreaming: true, pendingMessageCount: 0 };
+  };
+  const original = fsSync.createReadStream;
+  t.mock.method(fsSync, 'createReadStream', (...args) => {
+    if (args[0] === session.file) seen.push(args[0]);
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    for (const current of ['live name', 'renamed', null]) {
+      name = current;
+      await fs.appendFile(
+        session.file,
+        JSON.stringify({
+          type: 'custom',
+          id: String(states),
+          parentId: null,
+          data: 'more history',
+        }) + '\n',
+      );
+      const [row] = (await f.bridge.list()).sessions;
+      assert.equal(row.name, current);
+      assert.equal(row.status.state, 'busy');
+    }
+    assert.equal(states, 3);
+    assert.deepEqual(seen, []);
+    f.runtime.alive = false;
+    assert.equal((await f.bridge.list()).sessions[0].name, 'disk name');
+    assert.equal(seen.length, 1);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test(
+  'name-filter live state lookup is bounded, concurrent and consumed in sorted order',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(t);
+    for (let i = 1; i < 9; i++) await savedSession(f.bridge);
+    const sessions = await f.bridge.sessions(),
+      entered = [],
+      gates = sessions.map(() => Promise.withResolvers()),
+      started = Promise.withResolvers();
+    t.after(() => gates.forEach((g) => g.resolve()));
+    for (const [index, session] of sessions.entries()) {
+      await fs.utimes(session.file, 10000 - index, 10000 - index);
+      f.bridge.pool.instances.set(session.id, {
+        alive: true,
+        state: async () => {
+          entered.push(index);
+          if (entered.length === 4) started.resolve();
+          await gates[index].promise;
+          return { sessionName: 'needle ' + index };
+        },
+        stop: async () => {},
+      });
+    }
+    const listing = f.bridge.list({ name: 'needle', offset: 1, limit: 1 });
+    await started.promise;
+    assert.deepEqual(
+      entered.toSorted((a, b) => a - b),
+      [0, 1, 2, 3],
+    );
+    gates[3].resolve();
+    gates[1].resolve();
+    gates[0].resolve();
+    gates[2].resolve();
+    const result = await listing;
+    assert.deepEqual(
+      result.sessions.map((s) => s.session_id),
+      [sessions[1].id],
+    );
+    assert.equal(result.next_offset, 2);
+    assert.ok(
+      entered.length <= 6,
+      'stop after one extra matching row, with at most three speculative observations',
+    );
+  },
+);
+
+test('an admitted list finishes its observation after admission closes, while new queries are refused', async (t) => {
+  const f = await fixture(t),
+    entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  t.after(() => release.resolve());
+  f.runtime.state = async () => {
+    entered.resolve();
+    await release.promise;
+    return { sessionName: 'CAPTURED_TITLE', isIdle: true };
+  };
+  f.bridge.pool.instances.set(f.id, f.runtime);
+  const listing = f.bridge.list({ session_id: f.id });
+  await entered.promise;
+  await f.bridge.prepareClose();
+  release.resolve();
+  const result = await listing;
+  assert.equal(result.sessions.length, 1);
+  assert.equal(result.sessions[0].name, 'CAPTURED_TITLE');
+  await assert.rejects(f.bridge.list({ session_id: f.id }), /BRIDGE_CLOSING/);
 });

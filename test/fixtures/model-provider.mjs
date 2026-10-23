@@ -43,6 +43,13 @@ export default function (pi) {
       return { content: [{ type: 'text', text: 'tool complete' }], details: {} };
     },
   });
+  pi.on('input', async (event) => {
+    if (event.text !== 'HOLD_PREFLIGHT') return;
+    const gate = process.env.PI_MODEL_GATE;
+    await fs.writeFile(gate + '.preflight-start', 'started');
+    while (!(await exists(gate + '.preflight-release'))) await pause(10);
+    return { action: 'handled' };
+  });
   pi.on('session_start', () => {
     pi.setActiveTools(['model_fixture_tool']);
   });
@@ -76,9 +83,13 @@ export default function (pi) {
   faux.setResponses(
     Array.from({ length: 100 }, () => async (context, options, _state, model) => {
       const content = context.messages.findLast((m) => m.role === 'user')?.content;
-      if (process.env.PI_MODEL_GATE && JSON.stringify(content).includes('HOLD_MODEL'))
+      if (process.env.PI_MODEL_GATE && JSON.stringify(content).includes('HOLD_MODEL')) {
+        await fs.writeFile(process.env.PI_MODEL_GATE + '.provider-start', 'started');
         while (!options?.signal?.aborted && !(await exists(process.env.PI_MODEL_GATE)))
           await pause(10);
+        if (options?.signal?.aborted)
+          await fs.writeFile(process.env.PI_MODEL_GATE + '.provider-aborted', 'aborted');
+      }
       if (context.messages.at(-1)?.role === 'user' && JSON.stringify(content).includes('USE_TOOL'))
         return fauxAssistantMessage([fauxToolCall('model_fixture_tool', {})], {
           stopReason: 'toolUse',

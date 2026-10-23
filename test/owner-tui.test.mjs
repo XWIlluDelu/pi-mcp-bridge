@@ -32,19 +32,14 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   await fs.mkdir(denied);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'fixture-agent',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [
-      { id: 'project', path: cwd },
-      { id: 'child', path: childFolder },
-      { id: 'denied', path: denied },
-    ],
+    folders: [{ path: cwd }, { path: childFolder }, { path: denied }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     attachmentDir: path.join(dir, 'ipc'),
     piArgs: [
-      '--offline',
+      ...isolatedRuntime(dir).piArgs,
       '-e',
       path.join(base, 'test/fixtures/faux-extension.mjs'),
       '--provider',
@@ -56,7 +51,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
   const configFile = path.join(dir, 'owner.json');
   await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const setup = await new Bridge(config).init();
-  const made = await savedSession(setup, { folder_id: 'project', request_id: 'seed' });
+  const made = await savedSession(setup);
   const session = await setup.session(made.session_id);
   await setup.close();
   const agentDir = path.join(dir, 'agent');
@@ -197,11 +192,8 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       'delete',
       'health',
       'list',
-      'models',
       'read',
-      'reload',
       'send',
-      'set_model',
       'stop',
     ]);
     const id = made.session_id;
@@ -209,7 +201,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('send', {
           session_id: id,
-          request_id: 'first',
+
           text: 'PUBLIC_OWNER_SESSION_FIXTURE',
         })
       ).status,
@@ -225,7 +217,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('command', {
           session_id: id,
-          request_id: 'unsupported-tui-bash',
+
           command: 'MUST_NOT_EXECUTE',
         })
       ).reason,
@@ -236,40 +228,31 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await call('command', {
           session_id: id,
-          request_id: 'bash-denied',
+
           command: 'MUST_NOT_EXECUTE',
         })
       ).isError,
       true,
     );
     await edit(0, 4, 0, (c) => sessionRule(c)?.stop === true);
-    assert.equal(
-      (await ok('stop', { session_id: id, request_id: 'unsupported-tui-stop' })).reason,
-      'STOP_UNSUPPORTED',
-    );
+    assert.equal((await ok('stop', { session_id: id })).reason, 'STOP_UNSUPPORTED');
     await edit(0, 4, 1, (c) => sessionRule(c)?.stop === false);
-    assert.equal(
-      (await call('stop', { session_id: id, request_id: 'command-denied' })).isError,
-      true,
-    );
+    assert.equal((await call('stop', { session_id: id })).isError, true);
     await edit(0, 1, 1, (c) => sessionRule(c)?.read === false);
     assert.equal((await ok('list', {})).sessions.find((x) => x.session_id === id).project, cwd);
     assert.equal((await call('read', { session_id: id })).isError, true);
     assert.equal((await ok('list', { name: 'PUBLIC_OWNER_SESSION_FIXTURE' })).sessions.length, 0);
     const sendOnly = await ok('send', {
       session_id: id,
-      request_id: 'send-only',
+
       text: 'PRIVATE_TO_CALLER_FIXTURE',
     });
     assert.equal(sendOnly.status, 'unknown');
-    assert.equal(sendOnly.dispatch, 'submitted');
+    assert.equal(sendOnly.dispatch, undefined);
     assert.ok(!JSON.stringify(sendOnly).includes('PRIVATE_TO_CALLER_FIXTURE'));
     assert.ok(!JSON.stringify(sendOnly).includes(cwd));
     await edit(0, 5, 1, (c) => sessionRule(c)?.delete === false);
-    assert.equal(
-      (await ok('delete', { session_id: id, request_id: 'deny-delete' })).status,
-      'rejected',
-    );
+    assert.equal((await ok('delete', { session_id: id })).status, 'rejected');
     assert.equal(await ownerAlive(owner.owner), true);
     assert.ok(await fs.stat(session.file));
     await edit(0, 2, 1, (c) => sessionRule(c)?.send === false);
@@ -277,7 +260,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('send', {
           session_id: id,
-          request_id: 'deny-send',
+
           text: 'MUST_NOT_ENTER_SESSION',
         })
       ).status,
@@ -294,7 +277,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('send', {
           session_id: id,
-          request_id: 'inherited-deny',
+
           text: 'blocked by project',
         })
       ).status,
@@ -306,7 +289,6 @@ test('human Pi menu changes live session/project permissions enforced by actual 
         await ok('create', {
           project: childFolder,
           text: 'PUBLIC_CHILD_FIRST_PROMPT',
-          request_id: 'new-session-denied',
         })
       ).status,
       'rejected',
@@ -315,14 +297,13 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     const created = await ok('create', {
       project: childFolder,
       text: 'PUBLIC_CHILD_FIRST_PROMPT',
-      request_id: 'child-create',
     });
-    assert.equal(created.status, 'accepted');
+    assert.ok(['started', 'queued', 'handled'].includes(created.status), JSON.stringify(created));
     assert.equal(
       (
         await ok('send', {
           session_id: created.session_id,
-          request_id: 'child-deny',
+
           text: 'blocked inherited send',
         })
       ).status,
@@ -333,7 +314,6 @@ test('human Pi menu changes live session/project permissions enforced by actual 
         await ok('create', {
           project: denied,
           text: 'PUBLIC_DENIED_FIRST_PROMPT',
-          request_id: 'default-deny',
         })
       ).status,
       'rejected',
@@ -345,15 +325,17 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (c) => c.grants.findLast((r) => r.folder === childFolder)?.send === true,
       1,
     );
-    assert.equal(
-      (
-        await ok('send', {
-          session_id: created.session_id,
-          request_id: 'child-allow',
-          text: 'child allowed public fixture',
-        })
-      ).status,
-      'accepted',
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (
+          await ok('send', {
+            session_id: created.session_id,
+
+            text: 'child allowed public fixture',
+          })
+        ).status,
+      ),
+      'Expected native prompt admission',
     );
     await until(
       async () =>
@@ -364,16 +346,13 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('send', {
           session_id: id,
-          request_id: 'parent-still-denied',
+
           text: 'parent denied',
         })
       ).status,
       'rejected',
     );
-    assert.equal(
-      (await ok('delete', { session_id: created.session_id, request_id: 'child-delete' })).status,
-      'deleted',
-    );
+    assert.equal((await ok('delete', { session_id: created.session_id })).status, 'deleted');
     const finalConfig = JSON.parse(await fs.readFile(configFile, 'utf8'));
     assert.deepEqual(finalConfig.piArgs, config.piArgs);
     assert.deepEqual(finalConfig.piRuntime, config.piRuntime);
@@ -384,7 +363,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       (
         await ok('send', {
           session_id: id,
-          request_id: 'closed-ui-denied',
+
           text: 'still denied after UI closes',
         })
       ).status,
@@ -393,17 +372,18 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     const headless = await ok('create', {
       project: childFolder,
       text: 'PUBLIC_CHILD_FIRST_PROMPT',
-      request_id: 'headless-create',
     });
-    assert.equal(
-      (
-        await ok('send', {
-          session_id: headless.session_id,
-          request_id: 'headless-send',
-          text: 'public background fixture',
-        })
-      ).status,
-      'accepted',
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (
+          await ok('send', {
+            session_id: headless.session_id,
+
+            text: 'public background fixture',
+          })
+        ).status,
+      ),
+      'Expected native prompt admission',
     );
     await until(
       async () =>
@@ -412,11 +392,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
         ),
       'headless response after TUI exit',
     );
-    assert.equal(
-      (await ok('delete', { session_id: headless.session_id, request_id: 'headless-delete' }))
-        .status,
-      'deleted',
-    );
+    assert.equal((await ok('delete', { session_id: headless.session_id })).status, 'deleted');
   } catch (error) {
     error.message += '; terminal tail: ' + chunks.join('').slice(-1500);
     throw error;

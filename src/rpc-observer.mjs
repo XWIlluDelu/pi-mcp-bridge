@@ -22,6 +22,16 @@ export default function rpcObserver(pi) {
   pi.on('input', (event) => {
     if (event.source !== 'rpc') preflight.nonRpcInputSeen = true;
   });
+  // An owned RPC is one file-bound writer. Veto before Pi opens another file;
+  // session_shutdown is too late. Native TUI/host owners use their own lifecycle.
+  pi.on('session_before_switch', (event, ctx) => {
+    if (
+      event.reason !== 'resume' ||
+      event.targetSessionFile !== ctx.sessionManager.getSessionFile()
+    )
+      return { cancel: true };
+  });
+  pi.on('session_before_fork', () => ({ cancel: true }));
   pi.on('session_start', async (_event, ctx) => {
     context = ctx;
     if (server) return;

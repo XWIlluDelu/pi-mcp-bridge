@@ -27,7 +27,7 @@ function fixture(fetchImpl) {
   });
   return { input, lines, proxy };
 }
-test('stdio proxy forwards modern mirrored metadata and legacy handshake without runtime or retry', async () => {
+test('stdio proxy forwards modern metadata and SDK initialization without runtime or retry', async () => {
   const received = [];
   const f = fixture(async (url, options) => {
     const body = JSON.parse(options.body);
@@ -81,13 +81,13 @@ test('proxy reports a lost connection once, never resubmits a mutation, and clos
       jsonrpc: '2.0',
       id: 7,
       method: 'tools/call',
-      params: { name: 'send', arguments: { request_id: 'receipt' } },
+      params: { name: 'send', arguments: {} },
     }) + '\n',
   );
   await f.proxy.drain();
   assert.equal(count, 1);
   assert.equal(f.lines[0].error.message, 'BRIDGE_CONNECTION_LOST');
-  assert.match(JSON.stringify(f.lines), /SAME_REQUEST_ID/);
+  assert.match(JSON.stringify(f.lines), /OUTCOME_UNKNOWN/);
   await f.proxy.close();
   const blocked = fixture(
     async (_url, { signal }) =>

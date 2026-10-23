@@ -156,7 +156,6 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       pending: 0,
       disconnected: false,
       server: null,
-      controller: new AbortController(),
     };
     requests.add(record);
     const release = () => {
@@ -164,7 +163,6 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     };
     res.once('close', () => {
       record.disconnected = true;
-      record.controller.abort();
       void record.server?.close().catch(() => {});
       release();
     });
@@ -189,7 +187,8 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
             res,
             504,
             rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
-              recovery: 'QUERY_SAME_REQUEST_ID; timeout does not stop submitted Pi work',
+              recovery:
+                'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
             }),
           );
         else reject(res, 504, 'REQUEST_WAIT_EXPIRED');
@@ -223,7 +222,6 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
         if (mismatch) return jsonResponse(res, 400, mismatch);
         const response = await dispatchModern(bridge, body, {
           execute,
-          signal: record.controller.signal,
         });
         if (!record.disconnected) jsonResponse(res, response.status, response.message);
         return;
@@ -271,8 +269,9 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
         );
         // Stop incomplete uploads/validation; admitted tools remain alive.
         for (const record of requests) if (record.pending === 0) record.res.destroy();
-        await Promise.allSettled([...operations]);
         try {
+          await bridge.prepareClose();
+          await Promise.allSettled([...operations]);
           await bridge.close();
         } finally {
           for (const record of requests) {

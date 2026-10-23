@@ -1,93 +1,84 @@
-// Native cancellation and recoverable withdrawal, never process teardown.
-import { Journal } from './journal.mjs';
-import path from 'node:path';
-import { textCursorOffset, textBoundary, textCursor, fitDecodedText } from './data.mjs';
-import { hash } from './storage.mjs';
+// Native cancellation and request-local withdrawal; never teardown or a result store.
+import { fitDecodedText } from './data.mjs';
+import { fitsResult } from './response-budget.mjs';
 
-const withdrawals = (dir) =>
-  new Journal({ stateDir: path.join(dir, 'stop'), principal: 'withdrawn-inputs' });
-export function withdrawalCapture(dir, session, generation, id) {
-  if (!/^[a-f0-9]{64}$/.test(id ?? '')) throw new Error('INVALID_STOP_REQUEST');
-  const record = {
-    file: session.file,
-    sessionId: session.header.id,
-    generation,
-    text: '',
-    includesEditorDraft: false,
-  };
-  let saving = Promise.resolve();
-  return (value) => {
-    let text,
-      includesEditorDraft = false;
-    if (typeof value?.text === 'string') {
-      text = value.text;
-      includesEditorDraft = value.includesEditorDraft === true;
-    } else {
-      if (
-        !value ||
-        !Array.isArray(value.steering) ||
-        !Array.isArray(value.followUp) ||
-        [...value.steering, ...value.followUp].some((text) => typeof text !== 'string')
-      )
-        throw new Error('INVALID_STOP_RECEIPT');
-      // Exactly the native Escape editor's grouping/order; no inferred chronology.
-      text = [...value.steering, ...value.followUp].join('\n\n');
-    }
-    const next = saving.then(async () => {
-      if (text) record.text += (record.text ? '\n\n' : '') + text;
-      record.includesEditorDraft ||= includesEditorDraft;
-      await withdrawals(dir).put(id, record);
-    });
-    saving = next;
-    return next;
-  };
-}
-export async function recoveredWithdrawal(dir, session, generation, id) {
-  const record = await withdrawals(dir).get(id);
-  if (!record) return null;
-  if (
-    record.file !== session.file ||
-    record.sessionId !== session.header.id ||
-    record.generation !== generation ||
-    typeof record.text !== 'string'
-  )
-    throw new Error('RUNTIME_SESSION_CHANGED');
-  return record;
-}
-export function withdrawalPage(receipt, record, args) {
-  const binding = {
-    session_id: args.session_id,
-    operation: 'stop',
-    request_id: args.request_id,
-  };
-  const revision = hash({
-    generation: record.generation,
-    text: record.text,
-    includesEditorDraft: record.includesEditorDraft,
-  });
-  const offset = textCursorOffset({ ...binding, cursor: args.cursor }, revision);
-  if (offset > record.text.length || !textBoundary(record.text, offset))
-    throw new Error('INVALID_CURSOR');
-  const rest = record.text.slice(offset),
-    units = fitDecodedText(rest, args.max_chars ?? 12000, (text) => ({ withdrawn_text: text }));
-  if (rest && !units) throw new Error('WITHDRAWAL_BUDGET_TOO_SMALL');
-  const end = offset + units;
+export function withdrawalCollector(maxChars = 12000) {
+  let current;
   return {
+    get value() {
+      return current && { ...current };
+    },
+    add(value) {
+      let text,
+        includesEditorDraft = false;
+      if (typeof value?.text === 'string') {
+        if (
+          value.includesEditorDraft !== undefined &&
+          typeof value.includesEditorDraft !== 'boolean'
+        )
+          throw new Error('INVALID_STOP_RECEIPT');
+        text = value.text;
+        includesEditorDraft = value.includesEditorDraft === true;
+      } else {
+        if (
+          !Array.isArray(value?.steering) ||
+          !Array.isArray(value.followUp) ||
+          [...value.steering, ...value.followUp].some((part) => typeof part !== 'string')
+        )
+          throw new Error('INVALID_STOP_RECEIPT');
+        // Native Escape grouping, not an inferred interleaving of the two queues.
+        text = [...value.steering, ...value.followUp].join('\n\n');
+      }
+      const previous = current ?? { text: '', includesEditorDraft: false, complete: true };
+      const addition = (previous.text && text ? '\n\n' : '') + text;
+      const units = previous.complete
+        ? fitDecodedText(addition, Math.max(0, maxChars - previous.text.length), (text) => ({
+            text,
+          }))
+        : 0;
+      current = {
+        text: previous.text + addition.slice(0, units),
+        includesEditorDraft: previous.includesEditorDraft || includesEditorDraft,
+        complete: previous.complete && units === addition.length,
+      };
+      return this.value;
+    },
+  };
+}
+export function inlineWithdrawal(value) {
+  if (
+    typeof value?.text !== 'string' ||
+    typeof value.includesEditorDraft !== 'boolean' ||
+    typeof value.complete !== 'boolean'
+  )
+    throw new Error('INVALID_STOP_RECEIPT');
+  return {
+    text: value.text,
+    includesEditorDraft: value.includesEditorDraft,
+    complete: value.complete,
+  };
+}
+export function withdrawalOutput(receipt, record, args, resultBudget) {
+  const render = (withdrawn_text) => ({
     ...receipt,
     withdrawn_available: true,
-    withdrawn_text: rest.slice(0, units),
+    withdrawn_text,
     includes_editor_draft: record.includesEditorDraft,
-    text_offset: offset,
-    total_text_units: record.text.length,
-    offset_units: 'utf16_code_units',
-    withdrawn_complete: end === record.text.length,
-    next_cursor: end < record.text.length ? textCursor(binding, revision, end) : null,
-  };
+    withdrawn_complete: record.complete && withdrawn_text.length === record.text.length,
+  });
+  const units = fitDecodedText(
+    record.text,
+    args.max_chars ?? 12000,
+    (withdrawn_text) => ({ withdrawn_text }),
+    ({ withdrawn_text }) => fitsResult(render(withdrawn_text), resultBudget),
+  );
+  if (record.text && !units) throw new Error('WITHDRAWAL_BUDGET_TOO_SMALL');
+  return render(record.text.slice(0, units));
 }
 export function stopReceipt(value) {
   if (
     !value ||
-    (value.status !== undefined && value.status !== 'accepted') ||
+    value.status !== 'accepted' ||
     !['native_ack', 'requested'].includes(value.acknowledgement) ||
     value.coverage !== 'agent_and_bash'
   )
@@ -97,19 +88,26 @@ export function stopReceipt(value) {
     acknowledgement: value.acknowledgement,
     coverage: 'agent_and_bash',
     queue_policy: 'withdraw',
-    completion: 'not_tracked',
   };
 }
 export async function requestRpcStop(client, onWithdraw) {
   if (!['clearQueue', 'abort', 'abortBash'].every((name) => typeof client[name] === 'function'))
     throw new Error('STOP_UNSUPPORTED');
-  // Submit in order without an ACK round trip between withdrawal/cancellation.
   const cleared = client.clearQueue();
   const cancellation = Promise.allSettled([client.abort(), client.abortBash()]);
-  await onWithdraw(await cleared); // Preserve text even if cancellation times out.
+  try {
+    await onWithdraw(await cleared);
+  } finally {
+    // Capture failure cannot settle Stop while its dispatched aborts still run.
+    await cancellation;
+  }
   const results = await cancellation,
     failed = results.find((result) => result.status === 'rejected');
   if (failed) throw failed.reason;
-  await onWithdraw(await client.clearQueue()); // Inputs admitted during settling.
-  return stopReceipt({ acknowledgement: 'native_ack', coverage: 'agent_and_bash' });
+  await onWithdraw(await client.clearQueue());
+  return stopReceipt({
+    status: 'accepted',
+    acknowledgement: 'native_ack',
+    coverage: 'agent_and_bash',
+  });
 }

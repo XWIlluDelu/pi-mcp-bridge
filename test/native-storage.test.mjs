@@ -23,7 +23,6 @@ test('native umask directories work below private ancestors without chmod; mutab
     { mode: 0o644 },
   );
   const config = {
-      principal: 'fixture',
       stateDir: dir + '/state',
       sessionRoots: [root],
       folders: [],

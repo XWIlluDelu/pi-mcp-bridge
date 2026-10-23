@@ -10,13 +10,14 @@ import {
   releaseOwner,
   processIdentity,
   readClaim,
+  claimFile,
 } from '../src/attachments.mjs';
 import { RuntimePool } from '../src/rpc.mjs';
 
-test('only a quitting TUI marker plus exact process death lifts a handoff cold-resume fence', async (t) => {
+test('ordinary join reservations block live writers but exact death permits cold resume in any phase', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-cold-resume-'),
     file = path.join(dir, 'session.jsonl'),
-    session = { file, header: { id: 'isolated' } },
+    session = { file, id: 'isolated', header: { id: 'isolated' } },
     ipc = path.join(dir, 'ipc');
   await fs.writeFile(
     file,
@@ -30,31 +31,25 @@ test('only a quitting TUI marker plus exact process death lifts a handoff cold-r
     await fs.rm(dir, { recursive: true, force: true });
   });
   const owner = await processIdentity(child.pid),
-    record = await reserveOwner(ipc, session, 'tui', owner);
-  await updateOwner(ipc, session, record, {
-    noColdReacquire: true,
-    phase: 'transitioning',
-    coldReacquireAfterExit: true,
-  });
-  const pool = new RuntimePool({ attachmentDir: ipc }, async () =>
-    assert.fail('live marked writer must block'),
-  );
-  await assert.rejects(pool.resolve({ ...session, id: 'isolated' }), /LIVE_OWNER_UNREACHABLE/);
-  await assert.rejects(reserveOwner(ipc, session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
+    record = await reserveOwner(ipc, session, 'tui', owner),
+    pool = new RuntimePool({ attachmentDir: ipc }, async () =>
+      assert.fail('live writer must block'),
+    );
+  for (const phase of ['starting', 'ready', 'transitioning']) {
+    await updateOwner(ipc, session, record, { phase });
+    await assert.rejects(pool.resolve(session), /LIVE_OWNER_UNREACHABLE/);
+    await assert.rejects(reserveOwner(ipc, session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
+  }
   child.kill('SIGTERM');
   await exited;
-  for (const changes of [
-    { coldReacquireAfterExit: false },
-    { coldReacquireAfterExit: true, phase: 'starting' },
-  ]) {
-    await updateOwner(ipc, session, record, changes);
-    await assert.rejects(reserveOwner(ipc, session, 'rpc'), /COLD_REACQUIRE_BLOCKED/);
+  for (const phase of ['starting', 'ready', 'transitioning']) {
+    await fs.writeFile(claimFile(ipc, session), JSON.stringify({ ...record, phase }), {
+      mode: 0o600,
+    });
+    const reacquired = await reserveOwner(ipc, session, 'rpc');
+    assert.equal(reacquired.noColdReacquire, undefined);
+    assert.notEqual(reacquired.generation, record.generation);
+    await releaseOwner(ipc, session, reacquired);
+    assert.equal(await readClaim(ipc, session), null);
   }
-  await updateOwner(ipc, session, record, { phase: 'transitioning', coldReacquireAfterExit: true });
-  const reacquired = await reserveOwner(ipc, session, 'rpc');
-  assert.equal(reacquired.noColdReacquire, undefined);
-  assert.equal(reacquired.coldReacquireAfterExit, undefined);
-  assert.notEqual(reacquired.generation, record.generation);
-  await releaseOwner(ipc, session, reacquired);
-  assert.equal(await readClaim(ipc, session), null);
 });

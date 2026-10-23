@@ -125,7 +125,8 @@ export function createStdioProxy({
         if (body.id !== undefined && !controller.signal.aborted)
           await this.write(
             rpcError(body.id, -32000, 'BRIDGE_CONNECTION_LOST', {
-              recovery: 'QUERY_SAME_REQUEST_ID; no automatic replay was attempted',
+              recovery:
+                'OUTCOME_UNKNOWN; no automatic replay was attempted. Inspect list/read before deciding whether to submit again.',
             }),
           );
       } finally {

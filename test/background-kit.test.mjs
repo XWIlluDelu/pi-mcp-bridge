@@ -16,11 +16,10 @@ async function fixture() {
   await fs.mkdir(cwd);
   const config = {
       ...isolatedRuntime(dir),
-      principal: 'offline-service-fixture',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'project', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [{ folder: cwd, create: true }],
     },
     file = path.join(dir, 'owner.json');
@@ -60,6 +59,21 @@ test('bounded detached MCP client survives launcher exit and reloads owner grant
     changed = path.join(f.dir, 'changed'),
     stop = path.join(f.dir, 'stop'),
     stopped = path.join(f.dir, 'stopped');
+  // Creation destinations are page-local: seed one list-visible saved session.
+  f.config.grants[0].list = true;
+  await fs.writeFile(f.file, JSON.stringify(f.config));
+  await fs.mkdir(f.config.sessionRoots[0], { mode: 0o700 });
+  await fs.writeFile(
+    path.join(f.config.sessionRoots[0], 'saved.jsonl'),
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'detached-fixture',
+      timestamp: new Date().toISOString(),
+      cwd: f.config.folders[0].path,
+    }) + '\n',
+    { mode: 0o600 },
+  );
   // writeFile can expose an empty/partial JSON marker before the writer finishes.
   async function wait(file, parse = (value) => value) {
     const end = Date.now() + 10000;
@@ -81,8 +95,8 @@ test('bounded detached MCP client survives launcher exit and reloads owner grant
     `import fs from 'node:fs/promises';import {Client} from ${JSON.stringify(path.join(sdk, 'index.js'))};import {StdioClientTransport} from ${JSON.stringify(path.join(sdk, 'stdio.js'))};
  const client=new Client({name:'offline-detached-fixture',version:'1'});const dir=${JSON.stringify(f.dir)};
  const transport=new StdioClientTransport({command:process.execPath,args:[${JSON.stringify(path.join(base, 'src/server.mjs'))},${JSON.stringify(f.file)}],env:{PATH:process.env.PATH,HOME:dir,PI_OFFLINE:'1'},stderr:'pipe'});
- try{await client.connect(transport);const first=await client.callTool({name:'list',arguments:{}});if(first.structuredContent.projects.length!==1)throw new Error('Fixture grant missing');await fs.writeFile(dir+'/ready',JSON.stringify({pid:process.pid,ppid:process.ppid}));
- const end=Date.now()+8000;while(Date.now()<end){if(await fs.stat(dir+'/stop').then(()=>true,()=>false))break;if(await fs.stat(dir+'/check').then(()=>true,()=>false)){const next=await client.callTool({name:'list',arguments:{}});await fs.writeFile(dir+'/changed',JSON.stringify({folders:next.structuredContent.projects.length}));}await new Promise(r=>setTimeout(r,50));}
+ try{await client.connect(transport);const first=await client.callTool({name:'list',arguments:{}});if(first.structuredContent.creatable_projects.length!==1)throw new Error('Fixture grant missing');await fs.writeFile(dir+'/ready',JSON.stringify({pid:process.pid,ppid:process.ppid}));
+ const end=Date.now()+8000;while(Date.now()<end){if(await fs.stat(dir+'/stop').then(()=>true,()=>false))break;if(await fs.stat(dir+'/check').then(()=>true,()=>false)){const next=await client.callTool({name:'list',arguments:{}});await fs.writeFile(dir+'/changed',JSON.stringify({folders:next.structuredContent.creatable_projects.length}));}await new Promise(r=>setTimeout(r,50));}
  }finally{await client.close();await fs.writeFile(dir+'/stopped','closed');}
  `,
   );
@@ -107,7 +121,6 @@ test('bounded detached MCP client survives launcher exit and reloads owner grant
     assert.equal((await wait(changed, JSON.parse)).folders, 0);
     await fs.writeFile(stop, 'stop');
     await wait(stopped);
-    await assert.rejects(fs.stat(path.join(f.config.stateDir, 'bridge.lock')), { code: 'ENOENT' });
   } finally {
     await fs.writeFile(stop, 'stop');
     if (pid)

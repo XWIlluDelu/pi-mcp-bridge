@@ -5,13 +5,20 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
-import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
-import { readSchema, FULL_SELECTION, RECENT_SELECTION } from '../src/read-schema.mjs';
+import { SessionManager, buildSessionProjection } from '@earendil-works/pi-coding-agent';
+import {
+  readSchema,
+  FULL_SELECTION,
+  RECENT_SELECTION,
+  LATEST_SELECTION,
+} from '../src/read-schema.mjs';
+import { prepareContextRead } from '../src/context-read.mjs';
+import { contextWindow } from './fixtures/context-window.mjs';
 import {
   renderContextRead,
   assertContextReadResponse,
-  rebudgetContextRead,
-} from '../src/context-read.mjs';
+  chronological,
+} from './fixtures/read-pages.mjs';
 
 const msg = (id, parentId, role, content, extra = {}) => ({
   type: 'message',
@@ -32,7 +39,6 @@ const snapshot = (entries, leafId = entries.at(-1)?.id ?? null) => ({
   header: { id: 'native-session' },
   entries,
   leafId,
-  revision: 'intentionally-unused',
 });
 const args = { session_id: 'public-session', max_bytes: 65536 };
 const render = (data, options = {}) => renderContextRead(data, { ...args, ...options });
@@ -59,45 +65,21 @@ function allPages(data, options = {}) {
   } while (cursor);
   return pages;
 }
-function reassemble(pages) {
-  const records = new Map();
-  for (const page of pages)
-    for (const item of page.items) {
-      const parts = records.get(item.record_index) ?? [];
-      parts.push(item);
-      records.set(item.record_index, parts);
-    }
-  return [...records]
-    .sort(([a], [b]) => a - b)
-    .map(([, parts]) => {
-      if (parts[0].type !== 'fragment') {
-        assert.equal(parts.length, 1);
-        return parts[0];
-      }
-      parts.sort((a, b) => a.offset - b.offset);
-      let end = 0,
-        encoded = '';
-      for (const part of parts) {
-        assert.equal(part.offset, end);
-        assert.ok(part.json_fragment.isWellFormed());
-        encoded += part.json_fragment;
-        end += part.json_fragment.length;
-      }
-      assert.equal(end, parts[0].total_units);
-      return JSON.parse(encoded);
-    });
-}
+const reassemble = chronological;
 
-test('public schema is strict, finite and independent of legacy views', () => {
+test('public read schema validates selectors and byte limits', () => {
   assert.ok(readSchema.safeParse({ session_id: 's' }).success);
   for (const value of [4096, 24000, 65536])
     assert.ok(readSchema.safeParse({ session_id: 's', max_bytes: value }).success);
-  for (const select of [zero, FULL_SELECTION, RECENT_SELECTION, { text: 0, thinking: 4 }])
+  for (const select of [
+    zero,
+    FULL_SELECTION,
+    RECENT_SELECTION,
+    LATEST_SELECTION,
+    { text: 0, thinking: 4 },
+  ])
     assert.ok(readSchema.safeParse({ session_id: 's', select }).success);
   for (const invalid of [
-    { view: 'raw' },
-    { limit: 1 },
-    { max_chars: 4096 },
     { select: { other: 2 } },
     { select: { text: -2 } },
     { select: { text: 0.5 } },
@@ -113,6 +95,239 @@ test('public schema is strict, finite and independent of legacy views', () => {
       false,
       JSON.stringify(invalid),
     );
+});
+
+test('omitted preset is latest, distinct from explicit recent and full, including pagination', () => {
+  const data = snapshot(contextWindow()),
+    result = render(data);
+  assert.equal(readSchema.parse({ session_id: 's' }).preset, undefined);
+  assert.deepEqual(result.selection, {
+    summary: 0,
+    recent_prompts: 1,
+    earliest_prompts: 0,
+    text: -1,
+    thinking: 2,
+    tools: 0,
+    commands: 0,
+  });
+  assert.deepEqual(
+    result.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    ['u4'],
+  );
+  assert.equal(result.items.filter((r) => r.type === 'text').length, 8);
+  assert.deepEqual(
+    result.items.filter((r) => r.type === 'thinking').map((r) => r.block.thinking),
+    [0, 1, 6, 7].map((n) => `reason-4-${n}`),
+  );
+  assert.ok(
+    !result.items.some(
+      (r) => r.type.startsWith('tool_') || ['summary', 'command'].includes(r.type),
+    ),
+  );
+  assert.deepEqual(result.omissions.selection, {
+    summary: 1,
+    prompts: 4,
+    text: 32,
+    thinking: 36,
+    tools: 40,
+    commands: 1,
+  });
+  const implicit = allPages(data, { max_bytes: 4096 });
+  assert.ok(implicit.length > 1);
+  assert.deepEqual(
+    reassemble(implicit),
+    reassemble(allPages(data, { max_bytes: 4096, preset: 'latest' })),
+  );
+  assert.deepEqual(reassemble(implicit), result.items);
+
+  const recent = render(data, { preset: 'recent' });
+  assert.deepEqual(recent.selection, {
+    summary: 1,
+    recent_prompts: 3,
+    earliest_prompts: 0,
+    text: -1,
+    thinking: 3,
+    tools: 0,
+    commands: 0,
+  });
+  assert.deepEqual(
+    recent.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    ['u2', 'u3', 'u4'],
+  );
+  assert.equal(
+    recent.items.find((r) => r.type === 'summary').parts[0].message.summary,
+    'WINDOW_SUMMARY',
+  );
+  assert.equal(recent.items.filter((r) => r.type === 'text').length, 24);
+  for (const p of [2, 3, 4])
+    assert.deepEqual(
+      recent.items
+        .filter((r) => r.type === 'thinking' && r.prompt_id === 'u' + p)
+        .map((r) => r.block.thinking),
+      [0, 1, 2, 5, 6, 7].map((n) => `reason-${p}-${n}`),
+    );
+  assert.ok(!recent.items.some((r) => r.type.startsWith('tool_') || r.type === 'command'));
+
+  const fullPages = allPages(data, { max_bytes: 4096, preset: 'full' }),
+    full = reassemble(fullPages);
+  assert.deepEqual(fullPages[0].selection, FULL_SELECTION);
+  assert.ok(fullPages.every((p) => Object.values(p.omissions.selection).every((n) => n === 0)));
+  assert.deepEqual(
+    full.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    ['u0', 'u1', 'u2', 'u3', 'u4'],
+  );
+  for (const type of ['text', 'thinking', 'tool_call', 'tool_result'])
+    assert.equal(full.filter((r) => r.type === type).length, 40, type);
+  assert.equal(full.find((r) => r.type === 'summary').parts[0].message.summary, 'WINDOW_SUMMARY');
+  assert.equal(full.find((r) => r.type === 'command').message.output, 'shell output');
+  assert.equal(
+    full.find((r) => r.source.entry_id === 'r0-0').message.content[0].text,
+    'output-0-0',
+  );
+});
+
+test('recent selector overrides add earliest prompts and whole first/last tool units with output', () => {
+  const data = snapshot(contextWindow()),
+    sampled = render(data, {
+      preset: 'recent',
+      select: { earliest_prompts: 1, text: 1, thinking: 1, tools: 1 },
+    });
+  assert.deepEqual(sampled.selection, {
+    ...RECENT_SELECTION,
+    earliest_prompts: 1,
+    text: 1,
+    thinking: 1,
+    tools: 1,
+  });
+  assert.deepEqual(
+    sampled.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    ['u0', 'u2', 'u3', 'u4'],
+  );
+  const calls = sampled.items.filter((r) => r.type === 'tool_call');
+  assert.deepEqual(
+    calls.map((r) => r.call_id),
+    [0, 2, 3, 4].flatMap((p) => [`call-${p}-0`, `call-${p}-7`]),
+  );
+  for (const call of calls) {
+    const result = sampled.items.find(
+      (r) => r.type === 'tool_result' && r.tool_id === call.tool_id,
+    );
+    assert.equal(call.pairing, 'paired');
+    assert.equal(result.pairing, 'paired');
+    assert.equal(result.prompt_id, call.prompt_id);
+    assert.deepEqual(call.block.arguments, {
+      path: '/synthetic/' + call.call_id.replace('call-', 'file-'),
+    });
+    assert.equal(result.message.content[0].text, call.call_id.replace('call-', 'output-'));
+  }
+  assert.equal(sampled.omissions.selection.tools, 32);
+  assert.equal(sampled.items.filter((r) => r.type === 'text').length, 8);
+  assert.equal(sampled.items.filter((r) => r.type === 'thinking').length, 8);
+  const latestTools = render(data, { select: { tools: -1, earliest_prompts: 1 } });
+  assert.deepEqual(latestTools.selection, { ...LATEST_SELECTION, tools: -1, earliest_prompts: 1 });
+  assert.deepEqual(
+    latestTools.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    ['u0', 'u4'],
+  );
+  assert.equal(latestTools.items.filter((r) => r.type === 'tool_call').length, 16);
+  assert.equal(latestTools.items.filter((r) => r.type === 'tool_result').length, 16);
+  assert.ok(!latestTools.items.some((r) => r.type === 'summary'));
+  const allTools = render(data, { preset: 'recent', select: { tools: -1 } });
+  assert.deepEqual(allTools.selection, { ...RECENT_SELECTION, tools: -1 });
+  assert.equal(allTools.items.filter((r) => r.type === 'tool_call').length, 24);
+  assert.equal(allTools.items.filter((r) => r.type === 'tool_result').length, 24);
+  assert.equal(allTools.omissions.selection.tools, 16);
+  assert.equal(
+    allTools.items.find((r) => r.source.entry_id === 'r2-3').message.content[0].text,
+    'output-2-3',
+  );
+  const fullOverride = reassemble(
+    allPages(data, { preset: 'full', select: { recent_prompts: 1 } }),
+  );
+  assert.equal(
+    fullOverride.filter((r) => r.type === 'prompt').length,
+    5,
+    'full retains earliest_prompts:-1 unless overridden',
+  );
+});
+
+test('tools selection omits system declarations, not instructions or custom notices', () => {
+  const definitions = Array.from({ length: 30 }, (_, i) => ({
+    name: 'declared_' + i,
+    description: ('DECLARATION_' + i + ' ').repeat(300),
+    parameters: { type: 'object', properties: { path: { type: 'string' } } },
+  }));
+  const data = snapshot([
+    msg('system', null, 'system', 'GLOBAL_CONTEXT', {
+      sections: { rules: 'KEEP_RULE', removed: null },
+      toolsAdded: [definitions[0]],
+    }),
+    msg('u', 'system', 'user', 'USER_WORK mentions toolsAdded'),
+    msg('a', 'u', 'assistant', [text('ASSISTANT_WORK'), call('used')]),
+    msg('r', 'a', 'toolResult', [text('RESULT_WORK')], { toolCallId: 'used' }),
+    {
+      type: 'custom_message',
+      id: 'notice',
+      parentId: 'r',
+      timestamp: '2026-01-01T00:00:00Z',
+      customType: 'notification',
+      content: 'CUSTOM_NOTICE',
+      display: true,
+      details: { toolsAdded: 'BUSINESS_DATA' },
+    },
+    msg('update', 'notice', 'system', [text('SYSTEM_NOTICE')], {
+      sections: { rules: null },
+      toolsRemoved: [{ name: 'retired_tool' }],
+    }),
+    msg('declarations', 'update', 'system', '', { toolsAdded: definitions }),
+  ]);
+  const before = structuredClone(data);
+  for (const options of [{}, { preset: 'recent' }, { preset: 'full', select: { tools: 0 } }]) {
+    const page = render(data, { max_bytes: 4096, ...options });
+    assert.equal(page.next_cursor, null, 'default pages must not fill with tool definitions');
+    assert.deepEqual(
+      page.items.map((item) => item.type),
+      ['system', 'prompt', 'text', 'custom', 'system'],
+    );
+    assert.equal(page.items[0].message.content, 'GLOBAL_CONTEXT');
+    assert.deepEqual(page.items[0].message.sections, { rules: 'KEEP_RULE', removed: null });
+    assert.equal(page.items[1].message.content, 'USER_WORK mentions toolsAdded');
+    assert.equal(page.items[2].block.text, 'ASSISTANT_WORK');
+    assert.equal(page.items[3].message.content, 'CUSTOM_NOTICE');
+    assert.deepEqual(page.items[3].message.details, { toolsAdded: 'BUSINESS_DATA' });
+    assert.deepEqual(page.items[4].message.content, [text('SYSTEM_NOTICE')]);
+    assert.deepEqual(page.items[4].message.sections, { rules: null });
+    for (const item of page.items.filter((item) => item.type === 'system')) {
+      assert.equal(item.message.toolsAdded, undefined);
+      assert.equal(item.message.toolsRemoved, undefined);
+    }
+    assert.equal(page.omissions.selection.tools, 1, 'declarations are not logical tool units');
+  }
+  for (const options of [{ preset: 'full' }, { select: { tools: 1 } }]) {
+    const units = chronological(allPages(data, options));
+    assert.deepEqual(
+      [
+        ...new Set(
+          units.flatMap((item) => item.message?.toolsAdded?.map((tool) => tool.name) ?? []),
+        ),
+      ],
+      definitions.map((tool) => tool.name),
+    );
+    assert.deepEqual(
+      units.flatMap((item) => item.message?.toolsRemoved ?? []),
+      [{ name: 'retired_tool' }],
+    );
+    assert.equal(units.filter((item) => item.type.startsWith('tool_')).length, 2);
+    for (const definition of definitions) {
+      const parts = units
+        .filter((item) => item.source.entry_id === 'declarations')
+        .flatMap((item) => item.message?.toolsAdded ?? [])
+        .filter((tool) => tool.name === definition.name);
+      assert.equal(parts.map((tool) => tool.description).join(''), definition.description);
+      assert.deepEqual(parts[0].parameters, definition.parameters);
+    }
+  }
+  assert.deepEqual(data, before, 'selection does not mutate native snapshots');
 });
 
 test('full context preserves chronological blocks, native system/custom/images and excludes raw state', () => {
@@ -156,7 +371,7 @@ test('full context preserves chronological blocks, native system/custom/images a
     msg('user2', 'state', 'user', 'same prompt'),
     msg('future', 'user2', 'futureRole', [{ type: 'futureBlock', payload: 'native' }]),
   ];
-  const result = render(snapshot(entries));
+  const result = render(snapshot(entries), { preset: 'full' });
   assert.deepEqual(result.selection, FULL_SELECTION);
   assert.deepEqual(
     result.items.map((r) => r.type),
@@ -173,10 +388,17 @@ test('full context preserves chronological blocks, native system/custom/images a
     ],
   );
   assert.deepEqual(result.items[0].message, entries[0].message);
-  assert.deepEqual(result.items[1].message, entries[1].message);
-  assert.deepEqual(result.items[5].message, entries[3].message);
-  assert.equal(result.items[6].message.content[0].data, 'CUSTOM_IMAGE');
-  assert.equal(result.items[2].block.thinkingSignature, 'opaque');
+  assert.equal(result.items[1].message.content[0].text, 'same prompt');
+  assert.deepEqual(result.items[1].message.content[1], {
+    type: 'image',
+    mime_type: 'image/png',
+    data_omitted: true,
+  });
+  assert.equal(result.items[5].message.content[0].text, 'tool output');
+  assert.equal(result.items[5].message.content[1].data_omitted, true);
+  assert.equal(result.items[6].message.content[0].data_omitted, true);
+  assert.equal(result.items[2].block.thinkingSignature, undefined);
+  assert.equal(result.items[2].metadata.usage, undefined);
   assert.equal(result.items[2].metadata.stopReason, 'toolUse');
   assert.equal(result.items[4].tool_id, result.items[5].tool_id);
   assert.equal(result.items[5].prompt_id, 'user');
@@ -190,7 +412,7 @@ test('full context preserves chronological blocks, native system/custom/images a
     tools: 0,
     commands: 0,
   });
-  assertContextReadResponse(result, args);
+  assertContextReadResponse(result, { ...args, preset: 'full' });
 });
 
 test('native context-hidden user boundaries prevent reassignment to earlier visible inputs', () => {
@@ -236,7 +458,7 @@ test('synthetic context prefix survives compaction that retains only an assistan
       tokensBefore: 100,
     },
   ];
-  const result = render(snapshot(entries));
+  const result = render(snapshot(entries), { preset: 'recent' });
   assert.deepEqual(
     result.items.map((r) => r.type),
     ['summary', 'prompt', 'text'],
@@ -254,7 +476,7 @@ test('tool pairing precedes prompt selection and keeps a steering result in sour
     msg('result', 'b', 'toolResult', [text('result for A')], { toolCallId: 'c' }),
     msg('answer-b', 'result', 'assistant', [text('answer B')]),
   ];
-  const result = render(snapshot(entries));
+  const result = render(snapshot(entries), { preset: 'recent', select: { tools: -1 } });
   assert.deepEqual(
     result.items.map((r) => r.source.entry_id),
     ['a', 'call', 'b', 'result', 'answer-b'],
@@ -285,11 +507,11 @@ test('tool units retain unresolved calls, orphan results and repeated call IDs w
     msg('r2', 'c2', 'toolResult', [text('two')], { toolCallId: 'same' }),
     msg('orphan', 'r2', 'toolResult', [text('three')], { toolCallId: 'missing' }),
   ];
-  const result = render(snapshot(entries));
+  const result = render(snapshot(entries), { select: { tools: -1 } });
   const calls = result.items.filter((r) => r.type === 'tool_call'),
     results = result.items.filter((r) => r.type === 'tool_result');
-  assert.equal(results[0].tool_id, calls[0].id);
-  assert.equal(results[1].tool_id, calls[1].id);
+  assert.equal(results[0].tool_id, calls[0].tool_id);
+  assert.equal(results[1].tool_id, calls[1].tool_id);
   assert.equal(calls[2].pairing, 'unresolved');
   assert.equal(results[2].pairing, 'orphan_result');
   const sampled = render(snapshot(entries), { select: { ...zero, recent_prompts: 1, tools: 1 } });
@@ -351,7 +573,7 @@ test('commands select independently, are recent-only, and expose !! exclusion wi
       cancelled: true,
     }),
   ];
-  const all = render(snapshot(entries));
+  const all = render(snapshot(entries), { preset: 'full' });
   assert.equal(all.items.find((r) => r.source.entry_id === 'cmd2').in_model_context, false);
   const recent = render(snapshot(entries), { select: { ...zero, commands: 2 } });
   assert.deepEqual(
@@ -362,7 +584,73 @@ test('commands select independently, are recent-only, and expose !! exclusion wi
   assert.equal(recent.omissions.selection.prompts, 1);
 });
 
-test('one logical summary contains only active provenance-preserving summaries and keeps system checkpoints', () => {
+for (const state of [
+  { exitCode: 23, cancelled: false, truncated: false },
+  { exitCode: undefined, cancelled: true, truncated: false },
+  { exitCode: 0, cancelled: false, truncated: true },
+])
+  test('paged command output keeps nearby native execution state ' + JSON.stringify(state), () => {
+    const output = 'partial report 😀 \\"quoted\\"\n'.repeat(2500),
+      command = 'generate-partial-report',
+      fullOutputPath = '/tmp/native-report.txt',
+      data = snapshot([
+        msg('cmd', null, 'bashExecution', undefined, {
+          command,
+          output,
+          fullOutputPath,
+          ...state,
+          excludeFromContext: true,
+        }),
+      ]);
+    const pages = allPages(data, { select: { commands: 1 }, max_bytes: 4096 });
+    assert.ok(pages.length > 1);
+    const chunks = reassemble(pages).filter((u) => typeof u.message?.output === 'string');
+    assert.ok(pages[0].items.some((u) => u.message?.output));
+    for (const unit of chunks) {
+      assert.equal(unit.type, 'command');
+      assert.equal(unit.in_model_context, false);
+      assert.equal(unit.message.command, command);
+      assert.equal(unit.message.fullOutputPath, fullOutputPath);
+      for (const key of ['exitCode', 'cancelled', 'truncated'])
+        assert.equal(unit.message[key], state[key]);
+      assert.ok(!/[\\uD800-\\uDBFF]$/.test(unit.message.output));
+    }
+    assert.equal(chunks.map((u) => u.message.output).join(''), output);
+    assert.deepEqual(
+      chunks.map((u) => u.part),
+      Array.from({ length: chunks.length }, (_, i) => i + 1),
+    );
+  });
+
+test('large command/path metadata stays once without hiding output or repeating across pages', () => {
+  const command = 'long-command-'.repeat(1000),
+    fullOutputPath = '/' + 'path-'.repeat(2000),
+    output = 'native output 😀\n'.repeat(1000),
+    data = snapshot([
+      msg('cmd', null, 'bashExecution', undefined, {
+        command,
+        output,
+        fullOutputPath,
+        exitCode: 23,
+        cancelled: false,
+        truncated: true,
+      }),
+    ]);
+  const prepared = prepareContextRead(data, { ...args, select: { commands: 1 } });
+  for (const key of ['command', 'fullOutputPath'])
+    assert.equal(prepared.units.filter((u) => u.message?.[key]).length, 1);
+  for (const budget of [4096, 65536]) {
+    const pages = allPages(data, { select: { commands: 1 }, max_bytes: budget });
+    const chunks = reassemble(pages).filter((u) => typeof u.message?.output === 'string');
+    assert.equal(chunks.map((u) => u.message.output).join(''), output);
+    assert.ok(chunks.every((u) => u.message.exitCode === 23 && u.message.truncated));
+    if (budget === 4096)
+      assert.ok(pages.some((p) => p.items.some((u) => u.omitted_fields?.includes('command'))));
+    else assert.ok(pages.some((p) => p.items.some((u) => u.message?.command === command)));
+  }
+});
+
+test('active summaries keep their native positions and system checkpoints', () => {
   const entries = [
     msg('u', null, 'user', 'old'),
     {
@@ -398,19 +686,20 @@ test('one logical summary contains only active provenance-preserving summaries a
     },
   ];
   const data = snapshot(entries),
-    result = render(data);
+    result = render(data, { preset: 'recent' });
   const summary = result.items.filter((r) => r.type === 'summary');
-  assert.equal(summary.length, 1);
+  assert.equal(summary.length, 2);
   assert.deepEqual(
-    summary[0].parts.map((p) => p.message.summary),
+    summary.flatMap((r) => r.parts.map((p) => p.message.summary)),
     ['LATEST', 'BRANCH'],
   );
   assert.deepEqual(
-    summary[0].parts.map((p) => p.source.entry_id),
+    summary.flatMap((r) => r.parts.map((p) => p.source.entry_id)),
     ['new-cmp', 'branch'],
   );
   assert.equal(result.items[0].type, 'system');
-  assert.deepEqual(result.items[0].message, entries.at(-1).systemMessage);
+  const { toolsRemoved, ...instructions } = entries.at(-1).systemMessage;
+  assert.deepEqual(result.items[0].message, instructions);
   assert.ok(!JSON.stringify(result).includes('SUPERSEDED'));
   const none = render(data, { select: zero });
   assert.deepEqual(
@@ -419,330 +708,339 @@ test('one logical summary contains only active provenance-preserving summaries a
   );
   assert.equal(none.omissions.selection.summary, 1);
   const projection = buildSessionProjection(entries, data.leafId);
-  assert.deepEqual(result.items[0].message, projection.messages[0]);
+  assert.deepEqual(render(data, { preset: 'full' }).items[0].message, projection.messages[0]);
 });
 
-test('default page is newest, pages are chronological and continuation moves backwards', () => {
-  const entries = [];
-  let parent = null;
-  for (let i = 0; i < 30; i++) {
-    const id = 'm' + i;
-    entries.push(
-      msg(id, parent, i % 2 ? 'assistant' : 'user', i % 2 ? [text('answer'.repeat(80))] : 'prompt'),
-    );
-    parent = id;
-  }
-  const data = snapshot(entries),
-    complete = render(data),
-    pages = allPages(data, { max_bytes: 4096 });
-  assert.ok(pages.length > 1);
-  assert.equal(pages[0].items.at(-1).source.entry_id, 'm29');
-  for (const page of pages) {
-    assert.deepEqual(
-      page.items.map((r) => r.record_index),
-      page.items.map((r) => r.record_index).sort((a, b) => a - b),
-    );
-    assert.deepEqual(page.omissions.selection, {
-      summary: 0,
-      prompts: 0,
-      text: 0,
-      thinking: 0,
-      tools: 0,
-      commands: 0,
-    });
-  }
-  assert.ok(pages[0].omissions.capacity.records_before > 0);
-  assert.ok(pages.at(-1).omissions.capacity.records_after > 0);
-  assert.deepEqual(reassemble(pages), complete.items);
-});
-
-test('UTF8 whole-result budgets split giant native records losslessly without surrogate breaks', () => {
-  const value = '😀中文 " \n\\ '.repeat(1800);
-  const entries = [
-    msg('u', null, 'user', 'input'),
+test('whole readable paragraphs page without loss, duplication or a JSON reconstruction protocol', () => {
+  const value = Array.from(
+    { length: 100 },
+    (_, i) => 'Paragraph-' + i + ' 漢😀"\\ '.repeat(20) + '\n\n',
+  ).join('');
+  const data = snapshot([
+    msg('u', null, 'user', 'task'),
     msg('a', 'u', 'assistant', [text(value)]),
-    msg('system', 'a', 'system', '', {
-      sections: { huge: value },
-      toolsAdded: [{ name: 'x', description: value }],
+  ]);
+  const pages = allPages(data, { max_bytes: 4096 });
+  assert.ok(pages.length > 1);
+  for (const page of pages) assertContextReadResponse(page, { max_bytes: 4096 });
+  const items = chronological(pages);
+  assert.equal(
+    items
+      .filter((unit) => unit.type === 'text')
+      .map((unit) => unit.block.text)
+      .join(''),
+    value,
+  );
+  assert.equal(items.filter((unit) => unit.type === 'prompt').length, 1);
+  assert.ok(
+    items.filter((unit) => unit.type === 'text').every((unit) => unit.block.text.endsWith('\n\n')),
+  );
+});
+
+test('long single-line text pages completely through Unicode-safe source parts', () => {
+  const original = 'word 😀\\ boundary '.repeat(5000),
+    data = snapshot([msg('u', null, 'user', 'task'), msg('a', 'u', 'assistant', [text(original)])]);
+  const pages = allPages(data, { max_bytes: 4096, preset: 'full' }),
+    units = chronological(pages).filter((unit) => unit.type === 'text');
+  assert.equal(units.map((unit) => unit.block.text).join(''), original);
+  assert.ok(units.every((unit) => unit.block.text.isWellFormed()));
+  assert.ok(units.every((unit, index) => unit.part === index + 1 && unit.source.entry_id === 'a'));
+  assert.ok(pages.length > 1);
+});
+
+test('images and native signatures are removed while tool business signature fields remain', () => {
+  const entries = [
+    msg('u', null, 'user', [
+      text('IMPORTANT TASK'),
+      { type: 'image', mimeType: 'image/png', data: 'A'.repeat(50000) },
+    ]),
+    msg(
+      'a',
+      'u',
+      'assistant',
+      [
+        { type: 'text', text: 'answer', textSignature: 'NATIVE_SECRET' },
+        {
+          type: 'thinking',
+          thinking: 'reason',
+          thinkingSignature: 'NATIVE_SECRET',
+          redacted: false,
+        },
+        {
+          type: 'toolCall',
+          id: 'c',
+          name: 'verify',
+          arguments: { signature: 'BUSINESS', nested: { textSignature: 'BUSINESS' } },
+        },
+      ],
+      {
+        responseId: 'NATIVE_SECRET',
+        usage: { cost: 200 },
+        api: 'internal',
+        model: 'native',
+        stopReason: 'toolUse',
+      },
+    ),
+    msg('r', 'a', 'toolResult', [text('verified')], {
+      toolCallId: 'c',
+      details: { signature: 'BUSINESS' },
     }),
   ];
-  const data = snapshot(entries),
-    pages = allPages(data, { max_bytes: 4096 });
-  assert.ok(pages.some((p) => p.items.some((i) => i.type === 'fragment')));
-  assert.ok(pages[0].items[0].offset > 0, 'newest giant record starts from its suffix');
-  const reconstructed = reassemble(pages);
-  assert.equal(reconstructed.find((r) => r.type === 'text').block.text, value);
-  assert.deepEqual(reconstructed.find((r) => r.type === 'system').message, entries[2].message);
-  assert.ok(
-    pages.every((p) => p.omissions.selection.text === 0),
-    'capacity is not selection omission',
+  const page = render(snapshot(entries), { select: { tools: -1 }, max_bytes: 4096 });
+  assert.ok(JSON.stringify(page).includes('IMPORTANT TASK'));
+  assert.ok(!JSON.stringify(page).includes('NATIVE_SECRET'));
+  assert.ok(!JSON.stringify(page).includes('AAAAAAA'));
+  assert.equal(
+    page.items.find((unit) => unit.type === 'tool_call').block.arguments.signature,
+    'BUSINESS',
+  );
+  assert.equal(
+    page.items.find((unit) => unit.type === 'tool_result').message.details.signature,
+    'BUSINESS',
   );
 });
 
-test('continuation freezes leaf across append, metadata, new compaction and context edits', () => {
-  const entries = [
-    msg('u', null, 'user', 'work'),
-    msg('a', 'u', 'assistant', [text('OLD😀'.repeat(2500))]),
-  ];
-  const old = snapshot(entries),
-    first = render(old, { max_bytes: 4096 });
-  assert.ok(first.next_cursor);
-  const appended = [
-    ...entries,
-    { type: 'custom', id: 'meta', parentId: 'a', customType: 'state', data: 1 },
-    msg('new-user', 'meta', 'user', 'new input'),
-    {
-      type: 'context_edit',
-      id: 'edit',
-      parentId: 'new-user',
-      targetId: 'a',
-      replacement: { content: 'REPLACED' },
-    },
-    {
-      type: 'compaction',
-      id: 'compact',
-      parentId: 'edit',
-      summary: 'NEW SUMMARY',
-      firstKeptEntryId: 'compact',
-      tokensBefore: 99,
-    },
-  ];
-  const changed = snapshot(appended);
-  changed.revision = 'new-file-revision';
-  const next = render(changed, { max_bytes: 4096, cursor: first.next_cursor });
-  assert.equal(next.leaf_id, 'a');
-  assert.equal(next.snapshot, first.snapshot);
-  const expected = render(old, { max_bytes: 4096, cursor: first.next_cursor });
-  assert.deepEqual(next, expected);
-  const fresh = render(changed);
-  assert.equal(fresh.leaf_id, 'compact');
-  assert.equal(fresh.items[0].parts[0].message.summary, 'NEW SUMMARY');
-  assert.deepEqual(render(changed, { leaf_id: 'a' }), render(old, { leaf_id: 'a' }));
+test('live stays transient and readable, with explicit capacity/unavailable fallbacks', () => {
+  const data = snapshot([msg('u', null, 'user', 'task')]);
+  data.live = {
+    available: true,
+    source: 'events',
+    message: { role: 'assistant', content: [text('live answer'), thought('live thought')] },
+  };
+  const page = render(data, { max_bytes: 4096 });
+  assert.equal(page.live.transient, true);
+  assert.equal(page.live.complete, false);
+  assert.equal(page.live.items[0].block.text, 'live answer');
+  assert.ok(!JSON.stringify(page.items).includes('live answer'));
+  data.live.message.content = [text('X'.repeat(20000) + '😀LATEST')];
+  const large = render(data, { max_bytes: 4096 });
+  assert.equal(large.live.omitted_by_capacity, true);
+  assert.ok(large.live.items.at(-1).block.text.endsWith('😀LATEST'));
+  assert.ok(large.live.items.at(-1).block.text.isWellFormed());
+  const wider = render(data, { max_bytes: 65536 });
+  assert.ok(wider.live.items.at(-1).block.text.length > large.live.items.at(-1).block.text.length);
+  assert.ok(!JSON.stringify(large).includes('json_fragment'));
+  data.live = {
+    available: true,
+    source: 'events',
+    message: { role: 'assistant', content: 'invalid native content' },
+  };
+  const unavailable = render(data);
+  assert.equal(unavailable.live.available, false);
+  assert.equal(unavailable.live.reason, 'invalid_live_message');
 });
 
-test('cursors reject missing/rewritten snapshots, changed selectors, identity and malformed offsets', () => {
+test('explicit native root leaf never falls back to an abandoned tail', () => {
+  const page = render(snapshot([msg('u', null, 'user', 'OLD_BRANCH')], null));
+  assert.equal(page.leaf_id, null);
+  assert.deepEqual(page.items, []);
+  assert.ok(!JSON.stringify(page).includes('OLD_BRANCH'));
+});
+
+test('large known system sections page by paragraphs despite empty content; declarations remain readable', () => {
+  const value = Array.from(
+    { length: 100 },
+    (_, i) => 'RULE_' + i + ' ' + 'x'.repeat(800) + '\n\n',
+  ).join('');
   const data = snapshot([
-    msg('u', null, 'user', 'p'),
-    msg('a', 'u', 'assistant', [text('data'.repeat(5000))]),
+    msg('system', null, 'system', '', {
+      sections: { rules: value },
+      toolsAdded: [{ name: 'verify', parameters: { signature: 'BUSINESS' } }],
+    }),
   ]);
-  const page = render(data, { max_bytes: 4096 }),
-    cursor = page.next_cursor;
-  assert.ok(cursor);
-  const stale = (d, options = {}) =>
-    assert.throws(() => render(d, { max_bytes: 4096, cursor, ...options }), /STALE_CURSOR/);
-  stale(snapshot(data.entries.slice(0, 1)));
-  stale({ ...data, header: { id: 'different' } });
-  stale(data, { session_id: 'different' });
-  stale(data, { leaf_id: 'u' });
-  stale(data, { preset: 'recent' });
-  stale(data, { select: { text: 0 } });
-  const rewritten = structuredClone(data);
-  rewritten.entries[1].message.content[0].text += 'changed';
-  stale(rewritten);
-  assert.throws(() => render(data, { cursor: 'not+base64' }), /INVALID_CURSOR/);
-  const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString());
-  for (const patch of [
-    { offset: 0 },
-    { index: -1 },
-    { offset: 1.5 },
-    { index: 99999 },
-    { offset: 999999 },
+  const pages = allPages(data, { max_bytes: 4096, preset: 'full' }),
+    units = chronological(pages);
+  assert.equal(
+    units
+      .filter((unit) => unit.message.sections)
+      .map((unit) => unit.message.sections.rules)
+      .join(''),
+    value,
+  );
+  assert.equal(
+    units.find((unit) => unit.message.toolsAdded).message.toolsAdded[0].parameters.signature,
+    'BUSINESS',
+  );
+  assert.ok(units.every((unit) => !unit.message.sections_omitted));
+});
+
+test('custom records follow their prompt window while context prefixes remain global', () => {
+  const data = snapshot([
+    msg('prefix', null, 'custom', 'GLOBAL'),
+    msg('u1', 'prefix', 'user', 'OLD'),
+    msg('c1', 'u1', 'custom', 'OLD_CUSTOM'),
+    msg('u2', 'c1', 'user', 'NEW'),
+    msg('c2', 'u2', 'custom', 'NEW_CUSTOM'),
+  ]);
+  const latest = JSON.stringify(render(data, { preset: 'latest' })),
+    full = JSON.stringify(render(data, { preset: 'full' }));
+  assert.ok(latest.includes('GLOBAL'));
+  assert.ok(latest.includes('NEW_CUSTOM'));
+  assert.ok(!latest.includes('OLD_CUSTOM'));
+  assert.ok(full.includes('OLD_CUSTOM'));
+});
+
+test('split multi-block messages retain each native content index and complete text', () => {
+  const originals = ['FIRST 😀 '.repeat(900), 'SECOND 😀 '.repeat(900)],
+    data = snapshot([msg('u', null, 'user', originals.map(text))]);
+  const units = chronological(allPages(data, { preset: 'full', max_bytes: 4096 })).filter(
+    (unit) => unit.type === 'prompt',
+  );
+  for (const [index, original] of originals.entries()) {
+    const parts = units.filter((unit) => unit.source.content_index === index);
+    assert.ok(parts.length > 1);
+    assert.equal(parts.map((unit) => unit.message.content[0].text).join(''), original);
+  }
+});
+
+test('large tool metadata is stored once, cannot suppress body text and fits small pages with complete source links', () => {
+  for (const [bodyLength, detailsLength] of [
+    [524288, 30000],
+    [524288, 32000],
+    [10000, 65000],
   ]) {
-    const bad = Buffer.from(JSON.stringify({ ...parsed, ...patch })).toString('base64url');
-    assert.throws(() => render(data, { cursor: bad }), /INVALID_CURSOR/);
+    const body = 'T'.repeat(bodyLength),
+      details = 'D'.repeat(detailsLength);
+    const data = snapshot([
+      msg('u', null, 'user', 'inspect'),
+      msg('a', 'u', 'assistant', [call('outer')]),
+      msg(
+        'r',
+        'a',
+        'toolResult',
+        [text(body.slice(0, bodyLength / 2)), text(body.slice(bodyLength / 2))],
+        { toolCallId: 'outer', toolName: 'read', isError: false, details },
+      ),
+    ]);
+    const prepared = prepareContextRead(data, { ...args, preset: 'full' });
+    assert.ok(
+      Buffer.byteLength(JSON.stringify(prepared)) < 2 * Buffer.byteLength(JSON.stringify(data)),
+    );
+    assert.equal(prepared.units.filter((u) => u.message?.details === details).length, 1);
+    const pages = allPages(data, { preset: 'full', max_bytes: 4096 });
+    const resultUnits = chronological(pages).filter((u) => u.type === 'tool_result');
+    const blocks = resultUnits.flatMap((u) => u.message?.content ?? []);
+    assert.equal(blocks.map((b) => b.text ?? '').join(''), body);
+    assert.deepEqual(new Set(resultUnits.map((u) => u.source.content_index)), new Set([0, 1]));
+    assert.ok(
+      pages.some((p) =>
+        p.items.some((u) => u.type === 'message_metadata' && u.omitted_fields?.includes('details')),
+      ),
+    );
+    assert.ok(resultUnits.every((u) => u.source.entry_id === 'r' && u.call_id === 'outer'));
   }
 });
 
-test('explicit null leaf is an empty projection and non-current branches use native ancestry', () => {
-  const entries = [
-    msg('u', null, 'user', 'root'),
-    msg('a', 'u', 'assistant', [text('branch A')]),
-    msg('b', 'u', 'assistant', [text('branch B')]),
-  ];
-  assert.deepEqual(render(snapshot(entries), { leaf_id: null }).items, []);
-  assert.equal(render(snapshot(entries), { leaf_id: 'a' }).items.at(-1).block.text, 'branch A');
-  assert.throws(() => render(snapshot(entries), { leaf_id: 'missing' }), /ENTRY_NOT_FOUND/);
-  assert.deepEqual(render(snapshot([])).items, []);
-});
-
-test('captured rebudget works after serialization, including complete and already fragmented records', () => {
+test('saved nested calls follow their parent selection and page as whole child records, not invented results', () => {
+  const calls = Array.from({ length: 256 }, (_, i) => ({
+    id: 'nested-' + i,
+    name: 'inner',
+    ...(i === 1 ? { argumentsBytes: 40000 } : { arguments: { index: i } }),
+    status: i === 0 ? 'unfinished' : i === 1 ? 'error' : 'success',
+    ...(i === 1 ? { error: 'NESTED_REAL_FAILURE' } : {}),
+    durationMs: 1,
+  }));
+  const nestedCalls = { calls, complete: false };
   const data = snapshot([
-    msg('u', null, 'user', 'prompt'),
-    msg('a', 'u', 'assistant', [text('😀escaped"\n'.repeat(600))]),
+    msg('u', null, 'user', 'inspect'),
+    msg('a', 'u', 'assistant', [call('outer')]),
+    msg('r', 'a', 'toolResult', [text('OUTER_SUCCEEDED')], {
+      toolCallId: 'outer',
+      toolName: 'read',
+      isError: false,
+      nestedCalls,
+    }),
   ]);
-  const complete = render(data);
-  for (const original of [complete, render(data, { max_bytes: 4096 })]) {
-    const captured = JSON.parse(JSON.stringify(original));
-    const reduced = rebudgetContextRead(captured, args, 1800);
-    assert.ok(reduced);
-    assert.ok(Buffer.byteLength(JSON.stringify(reduced), 'utf8') <= 1800);
-    assert.equal(reduced.snapshot, original.snapshot);
-    assert.equal(reduced.leaf_id, original.leaf_id);
-    assertContextReadResponse(reduced, args);
-    const next = render(data, { cursor: reduced.next_cursor, max_bytes: 4096 });
-    const last = next.items.at(-1),
-      first = reduced.items[0];
-    assert.equal(last.record_index, first.record_index);
-    assert.equal(last.offset + last.json_fragment.length, first.offset);
-  }
-  assert.equal(rebudgetContextRead(complete, args, 1), null);
-  assert.equal(rebudgetContextRead(complete, args, 65536), complete);
-});
-
-test('owner response validator rejects ignored contracts, altered provenance/bindings and budget overflow', () => {
-  const data = snapshot([
-    msg('u', null, 'user', 'p'),
-    msg('a', 'u', 'assistant', [text('X'.repeat(10000))]),
-  ]);
-  const result = render(data, { max_bytes: 4096 }),
-    request = { ...args, max_bytes: 4096 };
-  assertContextReadResponse(result, request);
-  const reject = (change) => {
-    const altered = structuredClone(result);
-    change(altered);
-    assert.throws(() => assertContextReadResponse(altered, request), /OWNER_READ_REFRESH_REQUIRED/);
-  };
-  reject((r) => (r.format = 'context'));
-  reject((r) => (r.session_id = 'wrong'));
-  reject((r) => (r.selection.text = 0));
-  reject((r) => (r.items[0].record_index = 999));
-  reject((r) => (r.items[0].source = {}));
-  reject((r) => (r.items[0].json_fragment = 'X'.repeat(5000)));
-  assert.throws(
-    () => assertContextReadResponse({ items: [] }, request),
-    /OWNER_READ_REFRESH_REQUIRED/,
-  );
-});
-
-test('live preview stays outside frozen history, obeys selectors, budgets and native availability', () => {
-  const entries = [
-    msg('u', null, 'user', 'work'),
-    msg('a', 'u', 'assistant', [text('saved'.repeat(1500))]),
-  ];
-  const data = snapshot(entries);
-  data.live = {
-    available: true,
-    source: 'rpc_message_events',
-    observed_at: '2026-01-01T00:00:01Z',
-    transient: true,
-    truncated: false,
-    message: { role: 'assistant', content: [thought('live thought'), text('live answer')] },
-  };
-  const small = render(data, { max_bytes: 4096 });
-  assert.equal(small.live.format, 'message');
-  assert.equal(small.live.message.content[1].text, 'live answer');
-  assert.equal(small.live.prompt_id, 'u');
-  assert.equal(small.live.transient, true);
-  assert.ok(!JSON.stringify(small.items).includes('live answer'));
-  const changed = structuredClone(data);
-  changed.live.message.content[1].text = 'new live answer';
-  assert.equal(render(changed, { max_bytes: 4096 }).snapshot, small.snapshot);
-  const next = render(changed, { max_bytes: 4096, cursor: small.next_cursor });
-  assert.equal(next.live, null);
-  assert.equal(render(changed, { leaf_id: 'a' }).live, null);
-  const filtered = render(data, { select: { ...zero, recent_prompts: 1, text: 0, thinking: -1 } });
+  const pages = allPages(data, { preset: 'full', max_bytes: 4096 });
+  const nested = chronological(pages).filter((u) => u.type === 'nested_call');
   assert.deepEqual(
-    filtered.live.message.content.map((b) => b.type),
-    ['thinking'],
+    nested.map((u) => u.nested_call),
+    calls,
   );
-  assert.equal(filtered.live.selection_omissions.text, 1);
-  assert.equal(render(data, { select: zero }).live.omitted_by_selection, true);
-
-  changed.live.message.content = [text('😀中文"\\n'.repeat(2000))];
-  changed.live.truncated = true;
-  const giant = render(changed, { max_bytes: 4096 });
-  assert.equal(giant.live.format, 'json_fragment');
-  assert.equal(giant.live.complete, false);
-  assert.equal(giant.live.upstream_complete, false);
-  assert.ok(giant.live.json_fragment.isWellFormed());
-  assert.ok(giant.live.omitted_units > 0);
-  assert.ok(Buffer.byteLength(JSON.stringify(giant.live), 'utf8') <= 1024);
-  assert.ok(Buffer.byteLength(JSON.stringify(giant), 'utf8') <= 4096);
-  const reduced = rebudgetContextRead(JSON.parse(JSON.stringify(giant)), args, 1700);
-  assert.ok(reduced);
-  assert.equal(reduced.live.omitted_by_capacity, true);
-  assert.ok(Buffer.byteLength(JSON.stringify(reduced), 'utf8') <= 1700);
-  assertContextReadResponse(reduced, args);
-
-  assert.equal(render(snapshot(entries)).live.available, false);
-  const idle = { ...data, live: { available: true, source: 'rpc_message_events', message: null } };
-  assert.equal(render(idle).live.message, null);
-  const unsupported = {
-    ...data,
-    live: { available: false, source: 'host_snapshot', reason: 'not_supported' },
+  assert.ok(pages[0].next_cursor);
+  assert.equal(pages.at(-1).next_cursor, null);
+  assert.ok(
+    nested.every(
+      (u) =>
+        u.nested_calls_complete === false && u.source.entry_id === 'r' && u.call_id === 'outer',
+    ),
+  );
+  assert.equal(nested[1].nested_call.arguments, undefined);
+  assert.equal(nested[1].nested_call.argumentsBytes, 40000);
+  assert.ok(!JSON.stringify(render(data, { select: zero })).includes('NESTED_REAL_FAILURE'));
+  const small = structuredClone(data);
+  small.entries.at(-1).message.nestedCalls = { calls: [calls[1]], complete: true };
+  assert.deepEqual(
+    render(small, { preset: 'full' }).items.find((u) => u.type === 'tool_result').message
+      .nestedCalls,
+    { calls: [calls[1]], complete: true },
+  );
+  const large = structuredClone(data);
+  large.entries.at(-1).message.nestedCalls = {
+    calls: [{ ...calls[1], arguments: { large: 'X'.repeat(50000) } }],
+    complete: true,
   };
-  assert.equal(render(unsupported).live.reason, 'not_supported');
+  const reduced = chronological(allPages(large, { preset: 'full', max_bytes: 4096 })).find(
+    (u) => u.type === 'nested_call',
+  );
+  assert.equal(reduced.nested_call.error, 'NESTED_REAL_FAILURE');
+  assert.equal(reduced.nested_call.status, 'error');
+  assert.equal(reduced.nested_calls_complete, true);
+  assert.ok(reduced.omitted_fields.includes('arguments'));
 });
 
-test('captured rebudget can reduce a live-only empty historical projection', () => {
-  const data = snapshot([]);
-  data.live = {
-    available: true,
-    source: 'rpc_message_events',
-    message: { role: 'assistant', content: [text('live'.repeat(2000))] },
-  };
-  const result = render(data),
-    reduced = rebudgetContextRead(JSON.parse(JSON.stringify(result)), args, 1400);
-  assert.ok(reduced);
-  assert.deepEqual(reduced.items, []);
-  assert.equal(reduced.live.omitted_by_capacity, true);
-  assertContextReadResponse(reduced, args);
+test('a large native assistant error is shared once per text block while every text part retains its error state', () => {
+  const body = 'PARTIAL_BODY '.repeat(4000),
+    errorMessage = 'NATIVE_PROVIDER_ERROR '.repeat(1500);
+  const data = snapshot([
+    msg('u', null, 'user', 'inspect'),
+    msg('a', 'u', 'assistant', [text(body)], { stopReason: 'error', errorMessage }),
+  ]);
+  const prepared = prepareContextRead(data, { ...args, preset: 'full' });
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(prepared)) < 2 * Buffer.byteLength(JSON.stringify(data)),
+  );
+  assert.equal(prepared.units.filter((u) => u.metadata?.errorMessage === errorMessage).length, 1);
+  const pages = allPages(data, { preset: 'full', max_bytes: 4096 });
+  const parts = chronological(pages).filter((u) => u.type === 'text');
+  assert.equal(parts.map((u) => u.block.text).join(''), body);
+  assert.ok(parts.every((u) => u.metadata.stopReason === 'error'));
+  assert.ok(pages.some((p) => p.items.some((u) => u.omitted_fields?.includes('errorMessage'))));
 });
 
-test('Bridge independently authorizes known-ID reads and rechecks each continuation and completed capture', async (t) => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-context-permission-'));
-  const cwd = path.join(dir, 'project'),
-    root = path.join(dir, 'sessions');
-  await fs.mkdir(cwd);
-  await fs.mkdir(root, { mode: 0o700 });
-  const entries = [
-    msg('u', null, 'user', 'private input'),
-    msg('a', 'u', 'assistant', [text('private response'.repeat(1000))]),
-  ];
-  const file = path.join(root, 'synthetic.jsonl');
-  await fs.writeFile(
-    file,
-    [
-      { type: 'session', version: 3, id: 'native-session', cwd, timestamp: '2026-01-01T00:00:00Z' },
-      ...entries,
-    ]
-      .map(JSON.stringify)
-      .join('\n') + '\n',
-  );
-  const config = {
-    principal: 'context-test',
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    attachmentDir: path.join(dir, 'ipc'),
-    sessionRoots: [root],
-    folders: [{ id: 'project', path: cwd }],
-    grants: [{ folder: cwd, list: false, read: true }],
-  };
-  const bridge = await new Bridge(config, async () => {
-    throw new Error('READ_MUST_NOT_SPAWN');
-  }).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-  const [session] = await bridge.sessions();
-  assert.deepEqual((await bridge.list()).sessions, [], 'list authorization is independent');
-  const first = await bridge.read({ session_id: session.id, max_bytes: 4096 });
-  assert.equal(first.format, 'context_timeline');
-  assert.ok(first.next_cursor);
-  assert.equal(bridge.pool.instances.size, 0);
-  config.grants.push({ folder: cwd, read: false });
-  await assert.rejects(
-    bridge.read({ session_id: session.id, cursor: first.next_cursor, max_bytes: 4096 }),
-    /NOT_FOUND_OR_DENIED/,
-  );
-  config.grants.push({ folder: cwd, read: true });
-  bridge.pool.forRead = async () => {
-    config.grants.push({ folder: cwd, read: false });
-    return null;
-  };
-  await assert.rejects(
-    bridge.read({ session_id: session.id, max_bytes: 4096 }),
-    /NOT_FOUND_OR_DENIED/,
-  );
+test('native branch/compaction summaries stay ordered around long intermediate context and appear on the newest small page', () => {
+  for (const compact of [false, true]) {
+    const manager = SessionManager.inMemory('/synthetic');
+    const user = manager.appendMessage({ role: 'user', content: 'INITIAL_PROMPT', timestamp: 0 });
+    if (compact) manager.appendCompaction('FIRST_SUMMARY', user, 100);
+    else manager.branchWithSummary(user, 'FIRST_SUMMARY');
+    const middle = manager.appendMessage({
+      role: 'assistant',
+      content: [text('MIDDLE_CONTEXT '.repeat(2600))],
+    });
+    manager.branchWithSummary(middle, 'LATEST_SUMMARY');
+    manager.appendMessage({ role: 'user', content: 'LATEST_PROMPT', timestamp: 0 });
+    const data = snapshot(manager.getEntries(), manager.getLeafId());
+    const native = buildSessionProjection(data.entries, data.leafId)
+      .entries.filter((e) => e.messages.length)
+      .map((e) => e.sourceEntry.id);
+    for (const summary of [1, -1]) {
+      const pages = allPages(data, { preset: 'recent', select: { summary }, max_bytes: 4096 });
+      assert.ok(JSON.stringify(pages[0]).includes('LATEST_SUMMARY'));
+      assert.ok(JSON.stringify(pages[0]).includes('LATEST_PROMPT'));
+      const units = chronological(pages);
+      assert.deepEqual([...new Set(units.map((u) => u.source.entry_id))], native);
+      assert.deepEqual(
+        units
+          .filter((u) => u.type === 'summary')
+          .flatMap((u) => u.parts.map((p) => p.message.summary)),
+        ['FIRST_SUMMARY', 'LATEST_SUMMARY'],
+      );
+    }
+    assert.ok(
+      !JSON.stringify(
+        allPages(data, { preset: 'recent', select: { summary: 0 }, max_bytes: 4096 }),
+      ).includes('LATEST_SUMMARY'),
+    );
+  }
 });

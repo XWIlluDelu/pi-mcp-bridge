@@ -13,11 +13,10 @@ const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'PRIVATE_PATH-')),
 await fs.mkdir(cwd);
 const config = {
   ...isolatedRuntime(dir),
-  principal: 'fixture',
   defaults: denyAllPermissions(),
   stateDir: path.join(dir, 'state'),
   sessionRoots: [path.join(dir, 'sessions')],
-  folders: [{ id: 'project', path: cwd }],
+  folders: [{ path: cwd }],
   grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
 };
 config.piArgs.push(
@@ -55,7 +54,7 @@ async function call(name, args, id) {
   return body.result.structuredContent;
 }
 try {
-  const args = { project: cwd, text: 'PRIVATE_BODY', request_id: 'PRIVATE_MUTATION' },
+  const args = { project: cwd, text: 'PRIVATE_BODY' },
     created = await call('create', args, 'PRIVATE_RPC_ID');
   await call('create', args, 2);
   const saved = await bridge.session(created.session_id);
@@ -84,7 +83,7 @@ try {
   await assert.rejects(
     diagnostics.measure(
       'tool',
-      { op: 'send', mutation_ref: diagnosticRef('PRIVATE_MUTATION_TIMEOUT') },
+      { op: 'send', mcp_id_ref: diagnosticRef('PRIVATE_RPC_TIMEOUT') },
       () =>
         rpc.dispatch({ type: 'prompt', message: 'PRIVATE_BODY' }, 5, () =>
           diagnostics.emit('fixture.late_callback'),

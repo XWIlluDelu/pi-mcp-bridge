@@ -3,11 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { on, once } from 'node:events';
 import { fileURLToPath } from 'node:url';
-import { registryTransaction, processIdentity } from '../src/attachments.mjs';
+import { registryTransaction } from '../src/attachments.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-registry-'));
@@ -45,7 +44,7 @@ async function writer(dir) {
   return worker;
 }
 test(
-  'registry excludes a live writer and serializes recovery after its death',
+  'registry mutex excludes live contenders and is released by the kernel after process death',
   { timeout: 15000 },
   async (t) => {
     const dir = await fixture(t),
@@ -89,111 +88,34 @@ test(
   },
 );
 
-test(
-  'recovery does not unlink a live replacement of the observed dead inode',
-  { timeout: 5000 },
-  async (t) => {
-    const dir = await fixture(t),
-      lock = path.join(dir, 'registry.lock'),
-      owner = await processIdentity();
-    await fs.writeFile(lock, JSON.stringify({ ...owner, start: '0' }), { mode: 0o600 });
-    const lstat = fs.lstat;
-    let replaced = false;
-    t.mock.method(fs, 'lstat', async (file, ...args) => {
-      if (file === lock && !replaced) {
-        replaced = true;
-        // The writer may release and another writer acquire while a
-        // reaper is checking the first identity. Its open fd pins the old inode.
-        await fs.unlink(lock);
-        await fs.writeFile(lock, JSON.stringify(owner), { flag: 'wx', mode: 0o600 });
-      }
-      return lstat(file, ...args);
-    });
-    await assert.rejects(
-      registryTransaction(dir, () => assert.fail('stole replacement')),
-      /ATTACHMENT_REGISTRY_BUSY/,
-    );
-    assert.equal(replaced, true);
-    assert.deepEqual(JSON.parse(await fs.readFile(lock, 'utf8')), owner);
-  },
-);
-
-test('directory spelling aliases share the same recovery gate', { timeout: 5000 }, async (t) => {
+test('canonical directory spellings use one mutex; action failures release it without lockfiles', async (t) => {
   const dir = await fixture(t),
-    lock = path.join(dir, 'registry.lock'),
-    owner = await processIdentity();
-  await fs.writeFile(lock, JSON.stringify({ ...owner, start: '0' }), { mode: 0o600 });
-  let reached,
-    release,
-    observed,
-    checking = false,
-    binds = 0;
-  const atCheck = new Promise((resolve) => {
-      reached = resolve;
-    }),
-    continueCheck = new Promise((resolve) => {
-      release = resolve;
-    });
-  const secondBind = new Promise((resolve) => {
-    observed = resolve;
+    entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  let secondEntered = false;
+  const first = registryTransaction(dir, async () => {
+    entered.resolve();
+    await release.promise;
+    return 1;
   });
-  const lstat = fs.lstat,
-    listen = net.Server.prototype.listen;
-  t.mock.method(fs, 'lstat', async (file, ...args) => {
-    if (file === lock && !checking) {
-      checking = true;
-      reached();
-      await continueCheck;
-    }
-    return lstat(file, ...args);
+  await entered.promise;
+  const second = registryTransaction(dir + '/.', () => {
+    secondEntered = true;
+    return 2;
   });
-  t.mock.method(net.Server.prototype, 'listen', function (...args) {
-    if (++binds === 2) {
-      this.once('listening', () => observed('listening'));
-      this.once('error', (error) => observed(error.code));
-    }
-    return listen.apply(this, args);
-  });
-  const first = registryTransaction(dir, () => 1);
-  let second;
-  try {
-    await atCheck;
-    second = registryTransaction(dir + '/.', () => 2);
-    assert.equal(await secondBind, 'EADDRINUSE');
-  } finally {
-    release();
-    await Promise.allSettled([first, second]);
-  }
-  assert.equal(await first, 1);
-  assert.equal(await second, 2);
-});
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(secondEntered, false);
+  assert.deepEqual(await fs.readdir(dir), [], 'A short transaction creates no lock/recovery files');
+  release.resolve();
+  assert.deepEqual(await Promise.all([first, second]), [1, 2]);
 
-test('publication exposes a complete identity and an action failure releases the registry', async (t) => {
-  const dir = await fixture(t),
-    lock = path.join(dir, 'registry.lock'),
-    link = fs.link;
-  const { state, ...owner } = await processIdentity();
-  let published = false;
-  t.mock.method(fs, 'link', async (from, to) => {
-    if (to === lock) {
-      const { state, ...staged } = JSON.parse(await fs.readFile(from, 'utf8'));
-      assert.deepEqual(staged, owner);
-      await assert.rejects(fs.stat(lock), { code: 'ENOENT' });
-      published = true;
-    }
-    return link(from, to);
-  });
   const failure = new Error('action failed');
   await assert.rejects(
-    registryTransaction(dir, async () => {
-      const { state, ...stored } = JSON.parse(await fs.readFile(lock, 'utf8'));
-      assert.deepEqual(stored, owner);
-      assert.deepEqual(await fs.readdir(dir), ['registry.lock']);
+    registryTransaction(dir, () => {
       throw failure;
     }),
     (error) => error === failure,
   );
-  assert.equal(published, true);
-  assert.deepEqual(await fs.readdir(dir), []);
   assert.equal(await registryTransaction(dir, () => 42), 42);
+  assert.deepEqual(await fs.readdir(dir), []);
 });

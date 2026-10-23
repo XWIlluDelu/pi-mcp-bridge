@@ -41,10 +41,8 @@ test('native control operations and refusal codes remain identifiable without lo
   const refusals = {
     stop: 'STOP_IN_PROGRESS',
     bash: 'BASH_UNSUPPORTED',
-    models: 'MODELS_UNSUPPORTED',
-    set_model: 'THINKING_LEVEL_UNSUPPORTED',
+    send: 'THINKING_LEVEL_UNSUPPORTED',
     compact: 'COMPACT_BUSY',
-    reload: 'RELOAD_IDLE_UNCONFIRMED',
   };
   for (const op of toolNames) {
     log.emit('tool.start', { op });
@@ -76,7 +74,7 @@ test('diagnostics isolate concurrent contexts and exclude unapproved fields and 
     log = createDiagnostics({ enabled: true, write: (line) => rows.push(JSON.parse(line)) });
   await Promise.all(
     ['a', 'b'].map(async (id) =>
-      log.measure('tool', { op: 'read', mutation_ref: diagnosticRef(id) }, async () => {
+      log.measure('tool', { op: 'read', mcp_id_ref: diagnosticRef(id) }, async () => {
         await new Promise((resolve) => setTimeout(resolve, id === 'a' ? 5 : 1));
         log.emit('fixture', {
           body: 'SECRET_BODY',
@@ -89,10 +87,11 @@ test('diagnostics isolate concurrent contexts and exclude unapproved fields and 
   );
   const starts = rows.filter((r) => r.event === 'tool.start');
   assert.equal(new Set(starts.map((r) => r.trace_id)).size, 2);
+  assert.equal(new Set(starts.map((r) => r.mcp_id_ref)).size, 2);
   for (const start of starts)
     assert.equal(
-      rows.find((r) => r.event === 'tool.end' && r.trace_id === start.trace_id).mutation_ref,
-      start.mutation_ref,
+      rows.find((r) => r.event === 'tool.end' && r.trace_id === start.trace_id).mcp_id_ref,
+      start.mcp_id_ref,
     );
   assert.equal(JSON.stringify(rows).includes('SECRET'), false);
   assert.ok(rows.filter((r) => r.event === 'fixture').every((r) => r.code === 'OTHER_ERROR'));
@@ -121,7 +120,7 @@ test('disabled or failed diagnostic sinks cannot change operation outcomes', asy
   );
 });
 
-test('enabled HTTP, RPC, replay and timeout diagnostics remain private and correlated', async () => {
+test('enabled HTTP, RPC and timeout diagnostics remain private and correlated', async () => {
   const { stdout, stderr } = await promisify(execFile)(
     process.execPath,
     [fileURLToPath(new URL('./fixtures/diagnostics.mjs', import.meta.url))],
@@ -132,13 +131,13 @@ test('enabled HTTP, RPC, replay and timeout diagnostics remain private and corre
     },
   );
   assert.deepEqual(JSON.parse(stdout), { ok: true });
-  assert.equal(/PRIVATE_(TOKEN|BODY|PATH|RPC_ID|MUTATION)/.test(stderr), false);
+  assert.equal(/PRIVATE_(TOKEN|BODY|PATH|RPC)/.test(stderr), false);
   const rows = stderr.trim().split('\n').map(JSON.parse);
   const started = rows.find((r) => r.event === 'tool.start' && r.op === 'read');
   assert.ok(started);
   const related = rows.filter((r) => r.trace_id === started.trace_id);
   for (const event of [
-    'permission.reload.end',
+    'permission.snapshot.end',
     'permission.check',
     'read.source',
     'rpc.command.end',
@@ -157,15 +156,16 @@ test('enabled HTTP, RPC, replay and timeout diagnostics remain private and corre
   assert.ok(rows.some((r) => r.event === 'http.rejected' && r.http_status === 401));
   assert.ok(rows.some((r) => r.event === 'runtime.spawned'));
   assert.ok(rows.some((r) => r.event === 'runtime.exited'));
-  const replay = rows.find((r) => r.event === 'receipt.replay' && r.status === 'accepted'),
-    saved = rows.find((r) => r.event === 'receipt.saved' && r.status === 'accepted');
-  assert.equal(replay.mutation_ref, saved.mutation_ref);
-  assert.notEqual(replay.trace_id, saved.trace_id);
+  assert.equal(
+    rows.some((r) => r.event === 'receipt.replay' || r.event === 'receipt.saved'),
+    false,
+  );
   const timeout = rows.find((r) => r.event === 'rpc.command.end' && r.code === 'ACK_TIMEOUT');
   assert.equal(timeout.uncertain, true);
   const late = rows.find((r) => r.event === 'rpc.late_ack');
   assert.equal(late.trace_id, timeout.trace_id);
-  assert.equal(late.mutation_ref, timeout.mutation_ref);
+  assert.equal(timeout.mcp_id_ref, diagnosticRef('PRIVATE_RPC_TIMEOUT'));
+  assert.equal(late.mcp_id_ref, timeout.mcp_id_ref);
   assert.equal(rows.find((r) => r.event === 'fixture.late_callback').trace_id, timeout.trace_id);
   assert.ok(rows.filter((r) => r.duration_ms !== undefined).every((r) => r.duration_ms >= 0));
 });

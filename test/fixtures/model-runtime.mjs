@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../../src/bridge.mjs';
 import { isolatedRuntime } from './isolated-runtime.mjs';
-import { savedSession } from './saved-session.mjs';
+import { savedSession, savedEntries } from './saved-session.mjs';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 export async function until(fn) {
   for (let i = 0; i < 1000; i++) {
@@ -13,6 +13,12 @@ export async function until(fn) {
   throw Error('MODEL_TEST_TIMEOUT');
 }
 export const choice = (id) => ({ provider: 'model-fixture', id });
+export { savedEntries } from './saved-session.mjs';
+export async function completedEntries(bridge, id) {
+  const runtime = bridge.pool.get(id);
+  if (runtime) await idle(runtime);
+  return savedEntries(bridge, id);
+}
 export async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-model-test-'),
     cwd = path.join(dir, 'project'),
@@ -23,6 +29,7 @@ export async function fixture(t) {
     try {
       await fs.writeFile(gate, 'go');
       await fs.writeFile(gate + '.exit', 'go');
+      await fs.writeFile(gate + '.preflight-release', 'go');
       await bridge?.close();
     } finally {
       if (old === undefined) delete process.env.PI_MODEL_GATE;
@@ -33,11 +40,10 @@ export async function fixture(t) {
   await fs.mkdir(cwd);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'model-test',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'p', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true, stop: true }],
   };
   // Let Pi register the fixture's native tool; the synthetic provider calls only it.
@@ -77,10 +83,11 @@ export async function idle(runtime) {
   await until(async () => {
     const s = await runtime.state();
     return (
+      !runtime.hasUnsettledWork() &&
       !s.isStreaming &&
       !s.isCompacting &&
       s.pendingMessageCount === 0 &&
-      runtime.settlement.sequence >= runtime.handoffSettlement
+      runtime.settlement.sequence >= runtime.requiredSettlementSequence
     );
   });
 }

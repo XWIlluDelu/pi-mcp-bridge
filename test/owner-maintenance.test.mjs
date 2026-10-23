@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, until, idle } from './fixtures/model-runtime.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
-import { readClaim, ownerAlive } from '../src/attachments.mjs';
+import { readClaim, claimFile, ownerAlive } from '../src/attachments.mjs';
 
 test(
   'explicit owner interruption recovers held native startup without changing the saved session',
@@ -29,10 +29,10 @@ test(
     // The fixture reloads grants only; its launch profile is the same in-memory object.
     const accepted = await f.bridge.send({
       session_id: f.id,
-      request_id: 'held',
+
       text: '/held-extension-input',
     });
-    assert.equal(accepted.disposition, 'handled');
+    assert.equal(accepted.status, 'handled');
     await until(() =>
       fs.stat(marker).then(
         () => true,
@@ -61,27 +61,134 @@ test(
     assert.equal(await ownerAlive(previous.owner), false);
     assert.equal((await readClaim(f.bridge.pool.attachmentDir, session)).noColdReacquire, true);
     assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'held-fence', text: 'NOT_SENT' }))
-        .reason,
+      (await f.bridge.send({ session_id: f.id, text: 'NOT_SENT' })).reason,
       'COLD_REACQUIRE_BLOCKED',
     );
     await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, request_id: 'resumed', text: 'AFTER_MAINTENANCE' }))
-        .status,
-      'accepted',
+    assert.ok(
+      ['started', 'queued', 'handled'].includes(
+        (await f.bridge.send({ session_id: f.id, text: 'AFTER_MAINTENANCE' })).status,
+      ),
+      'Expected native prompt admission',
     );
     const next = f.bridge.pool.get(f.id);
-    await idle(next);
+    await until(async () => (await next.idleSnapshot()).status === 'idle');
     assert.equal(next.session.file, session.file);
     assert.equal(next.session.header.id, session.header.id);
     assert.notEqual(next.generation, runtime.generation);
-    await next.assertReleasable();
     const body = JSON.stringify(await f.bridge.read({ session_id: f.id }));
     assert.ok(body.includes('AFTER_MAINTENANCE'));
     assert.ok(!body.includes('UNFINISHED_EXTENSION_INPUT'));
   },
 );
+
+test('missing history does not strand a known owned writer', { timeout: 15000 }, async (t) => {
+  for (const interrupt of [false, true]) {
+    await t.test(interrupt ? 'explicit interruption' : 'normal EOF', async (t) => {
+      const f = await fixture(t),
+        session = await f.bridge.session(f.id),
+        runtime = await f.bridge.pool.resolve(session),
+        record = structuredClone(runtime.ownerRecord),
+        removed = path.join(f.dir, 'removed-session.jsonl'),
+        history = await fs.readFile(session.file),
+        signals = [];
+      const kill = runtime.child.kill.bind(runtime.child);
+      t.mock.method(runtime.child, 'kill', (signal) => {
+        signals.push(signal);
+        return kill(signal);
+      });
+      await fs.rename(session.file, removed);
+      const result = await ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt });
+      assert.equal(result.status, 'released');
+      assert.equal(result.no_cold_reacquire, true);
+      assert.equal(await ownerAlive(record.owner), false);
+      assert.deepEqual(signals, interrupt ? ['SIGTERM'] : []);
+      if (!interrupt) {
+        assert.equal(runtime.child.exitCode, 0);
+        assert.equal(runtime.child.signalCode, null);
+      }
+      assert.equal(f.bridge.pool.get(f.id), null);
+      const released = await readClaim(f.bridge.pool.attachmentDir, session);
+      assert.equal(released.generation, record.generation);
+      assert.equal(released.phase, 'released');
+      assert.equal(released.owner, null);
+      await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
+      assert.deepEqual(await fs.readFile(removed), history);
+    });
+  }
+});
+
+test(
+  'missing-history release rejects a changed claim and a replacement history',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t),
+      session = await f.bridge.session(f.id),
+      runtime = await f.bridge.pool.resolve(session),
+      file = claimFile(f.bridge.pool.attachmentDir, session),
+      original = await fs.readFile(file, 'utf8'),
+      record = JSON.parse(original),
+      history = await fs.readFile(session.file),
+      signals = [];
+    const kill = runtime.child.kill.bind(runtime.child);
+    t.mock.method(runtime.child, 'kill', (signal) => {
+      signals.push(signal);
+      return kill(signal);
+    });
+    await fs.unlink(session.file);
+    try {
+      for (const changed of [
+        { ...record, generation: 'another-generation' },
+        { ...record, owner: { ...record.owner, start: 'another-process-start' } },
+      ]) {
+        const bytes = JSON.stringify(changed);
+        await fs.writeFile(file, bytes);
+        for (const interrupt of [false, true]) {
+          await assert.rejects(
+            ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
+            /RUNTIME_SESSION_CHANGED/,
+          );
+          assert.equal(await fs.readFile(file, 'utf8'), bytes);
+          assert.equal(runtime.child.stdin.writableEnded, false);
+        }
+      }
+      await fs.writeFile(file, original);
+      const lines = history.toString().split('\n'),
+        replacement = JSON.parse(lines[0]);
+      replacement.id = 'replacement-native-session';
+      lines[0] = JSON.stringify(replacement);
+      const bytes = lines.join('\n');
+      await fs.writeFile(session.file, bytes);
+      for (const interrupt of [false, true]) {
+        await assert.rejects(
+          ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
+          /NOT_FOUND_OR_DENIED/,
+        );
+      }
+      assert.equal(await fs.readFile(session.file, 'utf8'), bytes);
+      assert.equal(await ownerAlive(record.owner), true);
+      assert.equal(runtime.child.stdin.writableEnded, false);
+      assert.deepEqual(signals, []);
+    } finally {
+      await fs.writeFile(file, original);
+      await fs.writeFile(session.file, history);
+    }
+  },
+);
+
+test('missing history without an owned writer cannot release an arbitrary claim', async (t) => {
+  const f = await fixture(t),
+    session = await f.bridge.session(f.id);
+  await fs.unlink(session.file);
+  for (const interrupt of [false, true]) {
+    await assert.rejects(
+      ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
+      /NOT_FOUND_OR_DENIED/,
+    );
+  }
+  assert.equal(f.bridge.pool.instances.size, 0);
+  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
+});
 
 test(
   'release fences new mutations, drains admitted stop and uses normal EOF',
@@ -110,14 +217,12 @@ test(
     try {
       for (const [op, body] of [
         ['send', { text: 'NOT_SENT' }],
-        ['set_model', { thinking_level: 'high' }],
         ['command', { command: 'echo NOT_RUN' }],
         ['stop', {}],
-        ['reload', {}],
       ]) {
         const result = await f.bridge[op]({
           session_id: f.id,
-          request_id: 'blocked-' + op,
+
           ...body,
         }).catch((error) => ({ reason: error.code ?? error.message }));
         assert.ok(
@@ -153,14 +258,14 @@ test(
       first = Promise.withResolvers();
     let captured = false,
       exiting = false;
-    runtime.trackRecovery(async () => {
+    runtime.trackAck(async () => {
       await gate.promise;
-      await runtime.checkedState();
+      await runtime.state();
       captured = true;
     });
-    const drain = runtime.drainRecovery.bind(runtime),
+    const drain = runtime.drainAcks.bind(runtime),
       exit = runtime.gracefulExit.bind(runtime);
-    runtime.drainRecovery = () => {
+    runtime.drainAcks = () => {
       first.resolve('drain');
       return drain();
     };

@@ -5,9 +5,7 @@ import { opaqueId } from '../../src/storage.mjs';
 
 // Seed persisted history without starting Pi or exercising create-and-send.
 // Tests of create itself must call Bridge.create with an initial prompt.
-export async function savedSession(bridge, { folder_id, request_id } = {}) {
-  const folder =
-    bridge.config.folders.find((folder) => folder.id === folder_id) ?? bridge.config.folders[0];
+export async function savedSession(bridge, { project = bridge.config.folders[0]?.path } = {}) {
   const id = randomUUID(),
     timestamp = new Date().toISOString();
   const file = path.join(
@@ -17,8 +15,13 @@ export async function savedSession(bridge, { folder_id, request_id } = {}) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(
     file,
-    JSON.stringify({ type: 'session', version: 3, id, timestamp, cwd: folder.path }) + '\n',
+    JSON.stringify({ type: 'session', version: 3, id, timestamp, cwd: project }) + '\n',
     { flag: 'wx', mode: 0o600 },
   );
-  return { request_id, status: 'created', session_id: opaqueId(`${file}\0${id}`) };
+  return { status: 'created', session_id: opaqueId(`${file}\0${id}`) };
+}
+
+export async function savedEntries(bridge, id) {
+  const session = await bridge.session(id);
+  return (await fs.readFile(session.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
 }
