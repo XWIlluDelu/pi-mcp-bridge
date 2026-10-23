@@ -97,6 +97,7 @@ test('seven permissions inherit independently and typo denials fail closed', () 
 
 test('list permission owns metadata; hidden known IDs can still be read and sent', async (t) => {
   const f = await fixture(t, { list: false });
+  assert.deepEqual((await f.bridge.list()).creatable_projects, []);
   const seed = await savedSession(f.bridge),
     id = seed.session_id,
     session = await f.bridge.session(id);
@@ -122,15 +123,15 @@ test('list permission owns metadata; hidden known IDs can still be read and sent
   await assert.rejects(f.bridge.read({ session_id: id }), /NOT_FOUND_OR_DENIED/);
 });
 
-test('creatable_projects is the configured, create-authorized intersection of the final filtered page', async (t) => {
+test('creation targets use project list/create rights independently of session pages', async (t) => {
   const f = await fixture(t, { create: true, read: false, send: false }),
     other = path.join(path.dirname(f.project), 'other'),
     unused = path.join(path.dirname(f.project), 'unused'),
     legacy = path.join(f.project, 'not-configured');
   assert.deepEqual(
     (await f.bridge.list()).creatable_projects,
-    [],
-    'Default create permission must not enumerate configured folders on an empty page',
+    [f.project],
+    'An authorized empty project must be discoverable before its first session',
   );
   for (const directory of [other, unused, legacy]) await fs.mkdir(directory);
   f.config.folders.push({ path: other }, { path: unused }, { path: legacy });
@@ -162,23 +163,20 @@ test('creatable_projects is the configured, create-authorized intersection of th
   );
   assert.deepEqual(
     all.creatable_projects,
-    [f.project],
-    'Deduplicate; omit hidden, unused, denied and unconfigured projects',
+    [f.project, unused],
+    'Session-specific denial does not hide the configured project; denied and unconfigured targets stay absent',
   );
-  for (const [args, expected] of [
-    [{ limit: 1 }, [f.project]],
-    [{ offset: 1, limit: 1 }, [f.project]],
-    [{ offset: 2, limit: 1 }, []],
-    [{ offset: 3, limit: 1 }, []],
-    [{ offset: 4, limit: 1 }, []],
-    [{ project: other }, []],
-    [{ name: 'alpha' }, [f.project]],
-    [{ name: 'missing' }, []],
-    [{ session_id: rows[4] }, []],
+  for (const args of [
+    { limit: 1 },
+    { offset: 3, limit: 1 },
+    { offset: 100 },
+    { project: other },
+    { name: 'missing' },
+    { session_id: rows[4] },
   ])
-    assert.deepEqual((await f.bridge.list(args)).creatable_projects, expected);
-  f.config.grants.push({ folder: other, create: true });
-  assert.deepEqual((await f.bridge.list({ name: 'Beta' })).creatable_projects, [other]);
+    assert.deepEqual((await f.bridge.list(args)).creatable_projects, [f.project, unused]);
+  f.config.grants.push({ folder: other, create: true }, { folder: unused, list: false });
+  assert.deepEqual((await f.bridge.list({ name: 'Beta' })).creatable_projects, [f.project, other]);
   await assert.rejects(f.bridge.read({ session_id: rows[0] }), /NOT_FOUND_OR_DENIED/);
   // A directory absent from this page can still be a valid configured create target.
   const created = await f.bridge.create({

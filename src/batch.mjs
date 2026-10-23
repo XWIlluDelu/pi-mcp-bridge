@@ -72,10 +72,6 @@ function fitQuery(op, result, args, budget) {
         [key]: rows.slice(0, count),
         next_offset: (args.offset ?? 0) + count,
       };
-      if (op === 'list')
-        page.creatable_projects = result.creatable_projects.filter((project) =>
-          page.sessions.some((row) => row.project === project),
-        );
       if (fitsResult(page, budget)) return page;
     }
   }

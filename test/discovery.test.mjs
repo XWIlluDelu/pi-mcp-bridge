@@ -54,7 +54,9 @@ test('warm known-ID lookup and listing avoid discovery but revalidate identity a
   assert.equal(scans, 0);
   const header = { ...f.session.header, cwd: '/unavailable' };
   await fs.writeFile(f.session.file, JSON.stringify(header) + '\n');
-  assert.equal((await f.bridge.session(f.session.id)).cwd, null);
+  const moved = await f.bridge.session(f.session.id);
+  assert.equal(moved.cwd, null);
+  assert.equal(moved.projectCwd, '/unavailable');
   assert.deepEqual((await f.bridge.list({ session_id: f.session.id })).sessions, []);
   assert.equal(scans, 0);
   await fs.writeFile(f.session.file, JSON.stringify({ ...header, id: 'replacement' }) + '\n');
@@ -138,22 +140,26 @@ test('identity discovery ignores unrelated transcript bodies, content parse foll
   assert.equal(other.status, 'rejected');
   assert.equal((await f.bridge.delete({ session_id: f.session.id })).status, 'deleted');
 });
-test('missing cwd retains explicit read/delete grants, no folder inheritance and no new runtime', async (t) => {
+test('missing cwd retains project history and deletion rights without permitting a new writer', async (t) => {
   const f = await fixture(t);
+  await fs.appendFile(
+    f.session.file,
+    JSON.stringify({
+      type: 'message',
+      id: 'saved-input',
+      parentId: null,
+      message: { role: 'user', content: 'preserved workspace history' },
+    }) + '\n',
+  );
+  const previous = await f.bridge.read({ session_id: f.session.id });
+  assert.match(JSON.stringify(previous.items), /preserved workspace history/);
   await fs.rename(f.cwd, f.cwd + '-moved');
   const identity = await readSessionIdentity(f.session.file);
   assert.equal(identity.cwd, null);
+  assert.equal(identity.projectCwd, f.cwd);
   assert.equal(identity.header.cwd, f.cwd);
-  assert.deepEqual((await f.bridge.list()).sessions, []);
-  await assert.rejects(f.bridge.read({ session_id: f.session.id }), /NOT_FOUND_OR_DENIED/);
-  f.config.grants.push({
-    session_id: f.session.id,
-    list: true,
-    read: true,
-    send: true,
-    delete: true,
-  });
-  assert.deepEqual((await f.bridge.read({ session_id: f.session.id })).items, []);
+  assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
+  assert.deepEqual((await f.bridge.read({ session_id: f.session.id })).items, previous.items);
   assert.equal(
     (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
@@ -164,11 +170,12 @@ test('missing cwd retains explicit read/delete grants, no folder inheritance and
     'EXECUTION_CWD_UNAVAILABLE',
   );
   assert.equal((await fs.readdir(f.config.sessionRoots[0])).length, 1);
-  assert.equal((await f.bridge.delete({ session_id: f.session.id })).status, 'deleted');
+  const deleted = await f.bridge.delete({ session_id: f.session.id });
+  assert.equal(deleted.status, 'deleted');
+  assert.equal(deleted.project, f.cwd);
 });
-test('existing owned runtime remains controllable after cwd disappears', async (t) => {
+test('existing owned runtime retains project-authorized control after cwd disappears', async (t) => {
   const f = await fixture(t);
-  f.config.grants.push({ session_id: f.session.id, send: true });
   await f.bridge.send({ session_id: f.session.id, text: 'fixture' });
   await fs.rename(f.cwd, f.cwd + '-moved');
   assert.ok(
@@ -179,12 +186,16 @@ test('existing owned runtime remains controllable after cwd disappears', async (
   );
   assert.equal(f.starts(), 1);
 });
-test('create freshly rejects a directory replaced by file or symlink', async (t) => {
+test('file or symlink replacement preserves project identity and refuses cold execution', async (t) => {
   const f = await fixture(t);
   await fs.rename(f.cwd, f.cwd + '-moved');
   await fs.writeFile(f.cwd, 'fixture');
   assert.equal(
     (await f.bridge.create({ project: f.cwd, text: 'first' })).reason,
+    'EXECUTION_CWD_UNAVAILABLE',
+  );
+  assert.equal(
+    (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
   );
   await fs.unlink(f.cwd);
@@ -193,7 +204,15 @@ test('create freshly rejects a directory replaced by file or symlink', async (t)
     (await f.bridge.create({ project: f.cwd, text: 'first' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
   );
+  assert.equal(
+    (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
+    'EXECUTION_CWD_UNAVAILABLE',
+  );
+  assert.equal(f.starts(), 0);
   assert.equal((await fs.readdir(f.config.sessionRoots[0])).length, 1);
+  f.config.grants = [{ folder: f.cwd + '-moved', list: true, read: true }];
+  assert.deepEqual((await f.bridge.list()).sessions, []);
+  await assert.rejects(f.bridge.read({ session_id: f.session.id }), /NOT_FOUND_OR_DENIED/);
 });
 test('identity discovery reads a small header prefix and still supports bounded longer headers', async (t) => {
   const f = await fixture(t),
@@ -248,11 +267,15 @@ test('stream parser preserves LF framing and validates header independently', as
   );
   await assert.rejects(readSessionIdentity(f.session.file), /INVALID_SESSION_HEADER/);
   assert.deepEqual(await discover(f.config), []);
+  await fs.writeFile(
+    f.session.file,
+    JSON.stringify({ ...f.session.header, cwd: f.cwd + '\0suffix' }) + '\n',
+  );
+  await assert.rejects(readSessionIdentity(f.session.file), /INVALID_SESSION_HEADER/);
 });
 
-test('bridge restart with missing configured cwd preserves explicit saved-history access', async (t) => {
+test('bridge restart with missing configured cwd preserves project-authorized saved history', async (t) => {
   const f = await fixture(t);
-  f.config.grants = [{ session_id: f.session.id, list: true, read: true, delete: true }];
   await f.bridge.close();
   await fs.rename(f.cwd, f.cwd + '-moved');
   const restarted = await new Bridge(f.config).init();

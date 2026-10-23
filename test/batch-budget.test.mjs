@@ -180,7 +180,7 @@ test('ten real deletes keep restore tokens when escaped native project paths can
   }
 });
 
-test('captured list pages keep page-local projects and offsets; an unpageable title cannot displace deletion', async (t) => {
+test('captured list pages keep creation targets and offsets; an unpageable title cannot displace deletion', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-batch-list-budget-'),
     project = path.join(dir, 'project');
   await fs.mkdir(project, { mode: 0o700 });
@@ -188,7 +188,7 @@ test('captured list pages keep page-local projects and offsets; an unpageable ti
     {
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ path: project }],
+      folders: [{ path: project }, { path: path.join(dir, 'empty-project') }],
       defaults: { ...denyAllPermissions(), list: true, create: true, delete: true },
     },
     () => assert.fail('No fallback writer'),
@@ -220,7 +220,7 @@ test('captured list pages keep page-local projects and offsets; an unpageable ti
       assert.ok(result.sessions.length > 0 && result.sessions.length < 10);
       assert.deepEqual(result.sessions, captured.sessions.slice(0, result.sessions.length));
       assert.equal(result.next_offset, result.sessions.length);
-      assert.deepEqual(result.creatable_projects, [project]);
+      assert.deepEqual(result.creatable_projects, [project, path.join(dir, 'empty-project')]);
     }
     const target = saved[0];
     await fs.appendFile(

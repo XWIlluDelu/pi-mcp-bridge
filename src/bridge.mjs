@@ -31,7 +31,7 @@ import {
   validateExecutionCwd,
   assertSingleSessionFile,
 } from './data.mjs';
-import { hash, atomicJson, assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
+import { atomicJson, assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
 import { stopReceipt, inlineWithdrawal, withdrawalOutput } from './stop-execution.mjs';
 import { bashOutput, inlineBashResult } from './bash-execution.mjs';
@@ -219,6 +219,8 @@ export class Bridge {
     if (!s) throw new Error('NOT_FOUND_OR_DENIED');
     return s;
   }
+  // Request policy is immutable. Check at admission and after refreshing a
+  // target identity, not repeatedly across awaits with the same target/policy.
   check(action, s, requestContext) {
     const allowed = permitted(requestContext.permissions, action, s);
     diagnostics.emit('permission.check', { op: action, allowed });
@@ -319,11 +321,7 @@ export class Bridge {
               busy: 'COMPACT_BUSY',
               unconfirmed: 'COMPACT_IDLE_UNCONFIRMED',
             });
-          const authorized = async () => {
-            checkInput();
-            this.check('send', session, requestContext);
-            if (body.interrupt) this.check('stop', session, requestContext);
-          };
+          const authorized = checkInput;
           await authorized();
           const late = () => {}; // Keep native late-ACK identity validation.
           const result = runtime.attached
@@ -449,11 +447,15 @@ export class Bridge {
     return {
       sessions: selected,
       next_offset: hasMore ? offset + limit : null,
-      creatable_projects: [...new Set(selected.map((row) => row.project))].filter(
-        (project) =>
-          requestContext.scope.folders.some((folder) => folder.path === project) &&
-          permitted(requestContext.permissions, 'create', { cwd: project }),
-      ),
+      // Project discovery is independent of existing sessions and their page.
+      // Session-specific list grants do not disclose other creation targets.
+      creatable_projects: requestContext.scope.folders
+        .filter(({ path }) =>
+          ['list', 'create'].every((action) =>
+            permitted(requestContext.permissions, action, { cwd: path }),
+          ),
+        )
+        .map(({ path }) => path),
     };
   }
   async health(args = {}, { requestContext } = {}) {
@@ -468,7 +470,7 @@ export class Bridge {
       }));
       return permissionsHealth(
         { ...requestContext.permissions, folders: requestContext.scope.folders },
-        { session_id, cwd: target.cwd },
+        { session_id, cwd: target.projectCwd ?? target.cwd },
       );
     }
     return {
@@ -623,7 +625,7 @@ export class Bridge {
         if (
           current.file !== target.file ||
           current.header.id !== target.header.id ||
-          current.cwd !== target.cwd
+          current.header.cwd !== target.header.cwd
         )
           throw new Error('RUNTIME_SESSION_CHANGED');
         this.check('send', current, requestContext);
@@ -685,10 +687,7 @@ export class Bridge {
             runtime = await this.pool.resolve(s);
             markForAutoRelease(runtime);
           }
-          const authorized = async () => {
-            beforeDispatch();
-            this.check('send', s, requestContext);
-          };
+          const authorized = beforeDispatch;
           await authorized();
           if (runtime.attached)
             return attachedPromptResult(
@@ -768,7 +767,6 @@ export class Bridge {
               await this.pool.instances.get(session.id)?.autoReleaseTask;
             const beforeDispatch = async () => {
               checkInput();
-              this.check('command', session, requestContext);
               if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
             };
             await beforeDispatch();
@@ -794,7 +792,6 @@ export class Bridge {
           }
         });
       })();
-      this.check('command', session, requestContext);
       return output
         ? bashOutput(receipt, output, args, resultBudget)
         : { ...receipt, output_available: false };
@@ -820,7 +817,6 @@ export class Bridge {
             return { status: 'skipped', reason: 'not_running' };
           const runtime = await this.pool.forRead(session);
           this.assertOpen();
-          this.check('stop', session, requestContext);
           if (!runtime) return { status: 'skipped', reason: 'not_running' };
           if (typeof runtime.stopExecution !== 'function') throw new Error('STOP_UNSUPPORTED');
           generation = runtime.generation ?? runtime.record?.generation ?? null;
@@ -839,7 +835,6 @@ export class Bridge {
       },
       `stop:${session.id}`,
     );
-    this.check('stop', session, requestContext);
     if (receipt.status === 'skipped')
       withdrawn = { text: '', includesEditorDraft: false, complete: true };
     return withdrawn
@@ -894,14 +889,10 @@ export class Bridge {
       });
       // Keep the chosen child identity in partial failure responses.
 
-      this.check('create', { cwd: folder.path }, requestContext);
-      if (parent) this.check('read', parent, requestContext);
       this.assertOpen();
       return await this.locked(child.id, () =>
         this.withInput(child.id, this.registerInput(child.id), async (checkInput) => {
           const beforeDispatch = async () => {
-            this.check('create', { cwd: folder.path }, requestContext);
-            if (parent) this.check('read', parent, requestContext);
             checkInput();
             if (this.handoffs.has(child.id)) throw new Error('HANDOFF_PENDING');
           };
@@ -975,9 +966,7 @@ export class Bridge {
         const s = await this.session(args.session_id, requestContext);
         this.check('delete', s, requestContext);
         trash = await prepareTrash(this.config, s);
-        this.check('delete', s, requestContext);
         release = await this.pool.stopForDelete(s); // Hold ownership through the move.
-        this.check('delete', s, requestContext);
         await trash.move();
         return optionalResultFields(
           {
@@ -985,7 +974,7 @@ export class Bridge {
             recoverable: true,
             restore_token: trash.token,
           },
-          { project: s.cwd },
+          { project: s.projectCwd ?? s.cwd },
           resultBudget,
         );
       } catch (e) {
@@ -994,7 +983,7 @@ export class Bridge {
             status: trash?.moved ? 'unknown' : 'rejected',
             reason: safeReason(e),
           },
-          { project: target?.cwd ?? null },
+          { project: target?.projectCwd ?? target?.cwd ?? null },
           resultBudget,
         );
       } finally {
