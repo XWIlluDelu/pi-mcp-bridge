@@ -1,48 +1,25 @@
 # Public tool API
 
-All inputs are strict objects; misspelled or obsolete fields are rejected.
-The MCP tool definitions are generated from `src/tool-schemas.mjs`.
-All examples below are **tool arguments**, not JSON-RPC envelopes.
+Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
 
 ## Sessions and mutations
 
-A session ID is an opaque Bridge ID derived from the canonical native file path
-and native session identity. It is not a filename or an entry ID. The same
-identity remains stable across restart; moving/replacing the native identity
-can change it. List permission controls discovery, not use of a known ID.
+A `session_id` is an opaque Bridge ID derived from the canonical native file path and native session identity. It survives restart but can change when that identity moves or is replaced. List permission controls discovery; a known ID remains usable with the permission for the requested operation.
 
-Every mutation call is a new operation. There is no caller-supplied mutation ID,
-public result handle, lookup or replay API. Identical calls are not deduplicated.
-The Bridge drains admitted work and native late-ACK checks before shutdown.
-It keeps no business-operation journal or command/withdrawal result files.
-Known native output travels within the original call, including bounded partial
-output received before an uncertain final ACK.
+Every mutation call is a new operation, including identical calls. There is no mutation-ID deduplication or result lookup. If a result is lost or unknown, inspect `list` for session activity and `read` for native history before deciding whether to submit again. Retain a returned child `session_id` even if create's initial send failed.
 
-Common outcomes:
+| Status     | Meaning                                                                        |
+| ---------- | ------------------------------------------------------------------------------ |
+| `started`  | Pi started a send/create prompt; model execution may still be running.         |
+| `queued`   | Pi queued a send/create prompt.                                                |
+| `handled`  | Native input handling completed, such as an extension command.                 |
+| `accepted` | A command, stop or compact operation returned its native result.               |
+| `rejected` | Definite refusal, explained by `reason`.                                       |
+| `skipped`  | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
+| `unknown`  | Dispatch or outcome is uncertain.                                              |
+| `deleted`  | The session moved to recoverable Bridge trash.                                 |
 
-| Status     | Meaning                                                                         |
-| ---------- | ------------------------------------------------------------------------------- |
-| `started`  | Native Pi started the send/create prompt. Not model completion.                 |
-| `queued`   | Native Pi queued the send/create prompt.                                        |
-| `handled`  | Native Pi handled the input, for example through an extension command.          |
-| `accepted` | A control operation (command, stop or compact) returned its native result.      |
-| `rejected` | Definite refusal; reason identifies the cause.                                  |
-| `skipped`  | Deliberately not submitted, e.g. idle-only found busy or stop found no runtime. |
-| `unknown`  | Dispatch or outcome is uncertain. Inspect list/read; never infer refusal.       |
-| `deleted`  | Session file moved to recoverable Bridge trash.                                 |
-
-Tool-level errors use `isError:true` and JSON text
-`{"error":{"code":"…"}}`. Operation results may instead contain a rejected or unknown status.
-Batch records each item's result or error without collapsing other items.
-
-If a response is lost or unknown, the operation may already have happened.
-Automatically resubmitting can duplicate work.
-Use `list` to inspect session/owner activity and discover a partially created
-session; use `read` to inspect saved inputs, assistant output and native command
-history (include commands with the appropriate read selection). These are
-observations, not per-prompt completion tracking. Decide whether another
-operation is appropriate from that evidence. When create returns a child
-`session_id`, retain it even if its initial send failed or is unknown.
+Tool errors return `isError:true` with `{error:{code:…}}` in text and structured content. An operation may instead return `rejected` or `unknown`. Batch retains each item's result or error independently.
 
 ### List
 
@@ -50,60 +27,25 @@ operation is appropriate from that evidence. When create returns a child
 { "project": "analysis", "name": "review", "active_after": "2026-10-01T00:00:00Z", "limit": 30 }
 ```
 
-Optional filters: case-insensitive project-directory/name substrings,
-`active_after`/`active_before` inclusive RFC3339 timestamps, and exact
-`session_id`. They combine with AND. `offset` defaults to 0;
-`limit` defaults to 30 and is bounded 1–100.
+Filters combine with AND: case-insensitive project-directory/name substrings, inclusive RFC3339 activity bounds and exact `session_id`. Offset defaults to 0; limit is 1–100, default 30. Results sort by newest native file mtime, then session ID. `next_offset` is null at the end; concurrent activity can reorder later pages.
 
-Results sort newest activity first, then session ID. Activity is native file
-mtime, not a claim about last model completion. Rows contain `session_id`,
-`project`, `name` (nullable), `parent_session_id` (nullable),
-`last_activity` and `status`. Parent IDs require the parent's current list
-permission; a child grant does not disclose a hidden parent. Metadata belongs
-to list permission and is available independently of read permission.
+Each row contains `session_id`, `project`, nullable `name` and `parent_session_id`, `last_activity` and `status`. A parent ID is disclosed only with its own list permission. Listing requires no read permission and never starts Pi.
 
-Status is a sampled observation:
+Status describes the sampled runtime:
 
-- `saved`: no cooperating live runtime found.
-- `busy`: native activity, admission/preparation or pending work observed.
-- `idle`: a source explicitly reports idle and no busy evidence conflicts.
-- `unknown`: connected but insufficient idle evidence.
-- `unavailable`: ownership/state could not be safely observed.
+| State         | Meaning                                                   |
+| ------------- | --------------------------------------------------------- |
+| `saved`       | No cooperating live runtime found.                        |
+| `busy`        | Activity, input preparation or pending work observed.     |
+| `idle`        | Explicit idle evidence with no conflicting busy evidence. |
+| `unknown`     | Connected, but insufficient evidence to establish idle.   |
+| `unavailable` | Ownership/state could not be safely observed.             |
 
-Use `list({session_id})` to observe a known session without adding another
-status endpoint. In particular, native RPC `get_state` has no complete `isIdle`:
-not streaming with an empty queue can still be `unknown` during preparation.
-These are coarse agent/input observations, not per-request completion states;
-control results and subsequent read output remain the result evidence.
+Status includes observation time, pending-message count where available, and live `model:{provider,id}` / `thinking_level` values or null. Saved and unavailable sessions have null settings. These observations describe session activity, not completion of a particular prompt.
 
-Companion/host idle observations are used when supplied; a streaming or pending
-signal takes precedence. Observed shell activity and unfinished control capture
-also count as busy; an agent-only idle flag does not override them.
-Warm known-ID lookups revalidate the target file without
-rescanning every session. Unchanged title metadata is cached; runtime status
-and permissions are checked on each request.
+Connected runtimes also expose `capabilities:{send,command,stop}`. Values are true, false or null for supported, unsupported or unconfirmed operation paths. Capabilities are independent of grants and current admission state; see the [owner capability table](runtime.md#runtime-capabilities).
 
-Status includes `model: {provider,id} | null` and `thinking_level` (a native level or null). These come only from a trusted live owner state observation, including when activity is `unknown`. Unobserved native selections return null; `saved` and `unavailable` always return null for both. Saved history and defaults are not used to guess a live selection. This metadata requires only list permission, and full native model/provider objects never enter the response.
-
-Status also includes observation time, pending-message count where available and
-`capabilities: {send, command, stop}` for connected runtimes, even when activity
-is `unknown`. These describe operation-path support: prompt submission, native
-shell execution, and stopping execution with queued-input withdrawal.
-Each value is `true` (supported), `false` (known unsupported), or `null` (unconfirmed).
-The object is absent for `saved` and `unavailable` sessions.
-
-Bridge-owned RPC supports all three; ordinary TUI/RPC companions support only
-send. Hosts support send through their required submit callback. Host adapters
-report command with a bash callback and either cancel or stop for lifecycle
-cancellation; remote stop independently requires a stop callback. Current hosts
-must declare these boolean capabilities; a missing or malformed declaration requires a component update.
-Capabilities are independent of permissions and busy/idle state: they neither
-grant access nor guarantee acceptance or success. Send mode still controls
-busy-input admission. Listing never starts Pi.
-`next_offset` is null at the end. Concurrent activity may reorder subsequent
-pages; list is not a frozen export.
-
-`creatable_projects` lists configured creation destinations with both project-level `list` and `create` permission in the request snapshot, in configuration order. It includes projects without sessions and is independent of session filters, pagination and session-specific grants. Unconfigured directories are never inferred from session rows. Project discovery does not add a permission dependency to `create`: callers may still create in a known configured project with `create:true, list:false`.
+`creatable_projects` lists configured destinations with project-level `list` and `create` permission, in configuration order. It includes empty projects and is independent of session filters, pagination and session-specific grants. A known configured destination remains usable with create permission even if it is hidden from this catalog.
 
 ### Read
 
@@ -111,52 +53,23 @@ pages; list is not a frozen export.
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-The default call uses a matching configured session reader based on the target
-session's live or persisted extension evidence, otherwise native projection.
-Only explicit `view:"native"` forces native projection. Selection parameters
-(`preset`, `select`, `leaf_id`) go to the selected reader and do not change the
-source. Adapted results identify `reader.id` and share frozen pagination. See
-[session routing](compatibility.md#session-specific-read-routing).
+Read uses a matching configured session reader, otherwise native projection. Explicit `view:"native"` selects native projection; `preset`, `select` and `leaf_id` customize the selected reader. Adapted results identify `reader.id`. `view:"observed"` reads captured request-stage context and accepts only `session_id`, `view`, `cursor` and `max_bytes`. Missing observations are unavailable; reading never starts Pi.
 
-Explicit `view:"observed"` reads the
-latest captured request-stage context, including MC transformations when
-observed; it has no native selectors or leaf override. Missing observations are
-explicitly unavailable, never recreated by running Pi. Owned observations survive
-normal RPC release in a bounded Bridge-memory cache. See
-[observed context](reading.md#observed-request-context) for stage, freshness and
-retention semantics.
+Native `preset:"latest"` selects the last prompt, assistant text and sampled thinking. `recent` adds summaries and the last three prompts; `full` selects all effective context. Selectors add or sample system instructions, tools and commands. See [reading](reading.md) for routing, selectors, content and budgets.
 
-Native reads default to `preset:"latest"`: the last prompt, all assistant text
-and first/last two thinking blocks, without system instructions, summaries, tools
-or commands. Use `preset:"recent"` for the last three prompts with summaries,
-`select.tools` for calls and paired outputs, `select.system:-1` to include system
-instructions, or `preset:"full"` for all effective context. System omissions are
-counted; custom messages are not hidden by this selector. See
-[reading](reading.md) for the eight selectors, sanitized content,
-byte budgets and live output.
+Pages start with the newest selected content. Continue backwards with `cursor` alone, optionally changing `max_bytes`. Session, view, selection and leaf stay frozen; conflicting overrides, eviction or restart return `STALE_CURSOR`. Every continuation reauthorizes read.
 
-Pages start with the newest selected content and continue backwards. Continue
-with `cursor` alone (and optionally a different `max_bytes`); the view, session,
-selection and leaf stay frozen. Conflicting overrides return `STALE_CURSOR`.
-Snapshots have no inactivity timeout; cache eviction or Bridge restart also
-returns `STALE_CURSOR`, requiring a fresh read.
-Every continuation is a new request and reauthorizes read. Each call uses its
-[receive-time permission snapshot](configuration.md#request-permission-snapshots)
-through execution and response delivery.
+### Models
 
-### Models, set_model and compact
-
-See [model discovery and native controls](model-control.md) for `models`,
-standalone `set_model`, prompt model/thinking settings and `compact`, including
-permissions, lifecycle and timeout behavior.
+`models({offset?,limit?})` returns `{models,next_offset}` from the owner's native configured catalog, without network refresh or loading sessions/extensions. Offset defaults to 0; limit is 1–100, default 30. Authorization requires effective `send`, `command` or `create` on a configured project, or `send`/`command` on an in-scope session. See [catalog details](model-control.md#session-independent-model-catalog).
 
 ### Set model
 
-`set_model({session_id, model?, thinking_level?})` requires at least one setting
-and the target's `send` permission. It changes the current native selection,
-including while busy, without sending a prompt. Success contains only
-`{model:{provider,id},thinking_level}`, with actual native adjustments.
-Unsupported owners return a tool error. See [selection and owner support](model-control.md#standalone-selection-set_model).
+`set_model({session_id,model?,thinking_level?})` requires at least one setting and `send` permission. It changes the current selection, including while busy, and returns actual `{model:{provider,id},thinking_level}`. See [selection timing and owner support](model-control.md#standalone-selection-set_model).
+
+### Compact
+
+`compact({session_id,instructions?,interrupt?,timeout_ms?})` performs native compaction. It requires `send` and proven idle by default; explicit `interrupt:true` also requires `stop` and may abort the agent even if compaction fails. Success returns bounded completion metadata; summary text requires `read`. See [compaction support and results](model-control.md#manual-compaction-compact).
 
 ### Send
 
@@ -164,113 +77,49 @@ Unsupported owners return a tool error. See [selection and owner support](model-
 { "session_id": "ps_…", "text": "Review the change", "mode": "default" }
 ```
 
-`text` is 1–100000 UTF-16 code units. The modes are:
+Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 
-- `default`: ordinary native Enter semantics, steer while busy.
-- `idle_only`: skip if busy/pending; it may cold-start a saved session first.
-- `steer`: native steering queue.
-- `follow_up`: native follow-up queue.
+- `default`: ordinary native Enter semantics, steering while busy.
+- `idle_only`: skip if busy/pending; a saved session may first cold-start.
+- `steer`: use the native steering queue.
+- `follow_up`: use the native follow-up queue.
 
-`timeout_ms` (50–30000, default 5000) bounds admission acknowledgement, not
-model execution. Queued input is an accepted submission, not a completed task.
-After the run and queues finish, a proven-idle Bridge-owned RPC normally exits
-and the session becomes saved. The next send can resume it; external owners
-keep their own lifecycle. See [automatic release and its limits](runtime.md#runtime-capabilities).
-At least one of `text` or `images` is required. Each call submits new input.
-The result has exactly one `status`: `started`, `queued`, `handled`, `skipped`,
-`rejected` or `unknown`. `reason` appears only when needed. There is no separate
-`disposition`, operation wrapper or completion field. Only explicit model/thinking
-settings can add `model_selection:{model:{provider,id},thinking_level}`, and
-only after those values have been verified. A failed or timed-out setting does
-not guess an actual value. A current native API that cannot establish admission
-disposition returns `unknown`, not a fabricated accepted status.
-Optional `model:{provider,id}` and/or `thinking_level` apply native session
-settings just before submission on a proven-idle Bridge-owned RPC. Busy/queued/shared-owner cases
-refuse the combination without enqueueing; see [model timing](model-control.md#prompt-model-and-thinking-settings).
-A plain companion reports unknown acceptance when the public extension API
-cannot prove admission; it does not invent a native ACK.
-Successful send/create admission that required cancelling an unsupported dialog
-includes `reason:"EXTENSION_UI_CANCEL_SENT"`; this warning is not a completion
-claim. Lifecycle failures retain their specific reason. See the
-[lifecycle UI limits](runtime.md#shutdown-and-in-flight-acks).
-A throwing extension command can still receive a native `handled` admission ACK.
-Owned RPC errors and notifications are observable through
-[`read.runtime_events`](reading.md#live-output-and-runtime-extension-events).
+`timeout_ms` is 50–30000, default 5000, and bounds acknowledgement rather than model execution. The result contains `status` (`started`, `queued`, `handled`, `skipped`, `rejected` or `unknown`) and a `reason` when needed. An owner unable to prove admission reports `unknown`; a handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
+
+Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
+
+Admission that cancelled an unsupported native dialog carries `reason:"EXTENSION_UI_CANCEL_SENT"`. [Runtime lifecycle](runtime.md#shutdown-and-in-flight-acks) describes dialog handling and automatic release.
 
 ### Image input (send and create)
-
-Both tools accept `images` in native Pi `ImageContent` format:
 
 ```json
 {
   "session_id": "ps_…",
-
   "text": "Describe this picture",
   "images": [{ "type": "image", "mimeType": "image/png", "data": "<actual base64 image bytes>" }]
 }
 ```
 
-For `create`, replace `session_id` with the configured absolute `project`.
-You may omit `text` for image-only input. The Bridge adds the neutral text
-`[Image attachment]` so native queues can remove the consumed entry by its
-nonempty text; the picture still arrives as a native image block. Omitting **both** payload fields is rejected, including when model/thinking
-settings are supplied. Identical image submissions are independent operations.
+For create, replace `session_id` with the configured absolute `project`. Image-only input is supported; Bridge adds `[Image attachment]` as neutral queue text.
 
-- Accepted MIME types: `image/png`, `image/jpeg`, `image/gif`, `image/webp`.
-- One or more images, **no fixed count cap**; at most **5 MiB decoded bytes total**
-  per send/create. Total bytes and serialized envelope size bound validation work; native model/
-  provider-specific image limits still apply.
-- `data` must be canonical base64, without whitespace or a `data:` prefix.
-  URLs, local paths and client attachment IDs are not fetched or opened.
-- The **8 MiB serialized request limit** still applies to HTTP, stdio and IPC.
-  A batch shares that envelope limit; it is not multiplied by its item count.
-- The Bridge validates base64, size and format signatures before dispatch.
-  Pi retains its normal decoding, resizing and extension input behavior.
-  Extensions may consume or transform images or select a different model before
-  the request. Bridge does not reject input based on the pre-hook model; the final
-  Pi/provider path handles image support using its native rules.
-- Images enter native user-message image blocks, not descriptions, OCR text or
-  base64 embedded in a text prompt. Native history and forked context retain
-  those blocks; read pagination remains bounded even for large image records.
-- Owners without advertised image support return `IMAGE_INPUT_UNSUPPORTED`
-  before sending, even when text accompanies the image. Custom hosts must
-  declare and implement image support; installed components must also be loaded
-  by the running owner. See [image-capable owners](runtime.md#image-capable-owners).
-  Bridge forwards the image blocks unchanged rather than falling back to text-only
-  delivery. Native extensions and provider conversion may then transform them.
+- MIME types: PNG, JPEG, GIF and WebP. `data` must be canonical base64 without whitespace or a `data:` prefix; URLs, paths and attachment IDs are not fetched.
+- There is no fixed image-count cap. Total decoded size is at most 5 MiB per send/create, within the shared 8 MiB serialized request limit. Native provider limits also apply.
+- Bridge validates bytes and format signatures, then forwards native image blocks. Pi extensions and provider conversion retain their normal decoding, resizing and transformation behavior; image support is determined after native input processing.
+- Owners must advertise image support or the whole submission returns `IMAGE_INPUT_UNSUPPORTED`. See [image-capable owners](runtime.md#image-capable-owners).
 
-A native ACK confirms admission, not successful visual interpretation. Model
-responses and any native image-processing diagnostics are read from the session.
-Pi's native stop/queue-withdrawal APIs recover queued **text**, not image bytes;
-a stop result must not be treated as an attachment backup.
+Native history and forks retain image blocks. Acknowledgement confirms admission, not visual interpretation. Stop returns queued text, not image bytes; withdrawn text is not an attachment backup.
 
 ### Native command
 
 ```json
-{
-  "session_id": "ps_…",
-
-  "command": "git status --short",
-  "max_chars": 12000
-}
+{ "session_id": "ps_…", "command": "git status --short", "max_chars": 12000 }
 ```
 
-The tool name is `command`, not `bash`. Pass the command **without** the leading
-`!`. It uses Pi's native bash path, history, user-bash hooks and cancellation.
-It never sends a disguised model prompt or starts a separate Bridge shell.
+Requires `command` permission. Pass the command without `!`; it uses Pi's native bash path, history, hooks and cancellation. Unsupported owners return `BASH_UNSUPPORTED`.
 
-A supported owner returns output, exit status, cancellation/truncation flags and
-a result generation. An unsupported owner returns `BASH_UNSUPPORTED`.
-The timeout is an ACK wait, not a kill deadline; an independently authorized
-stop can interrupt a long command.
+The result includes captured output, exit status, cancellation/truncation flags and generation. `timeout_ms` bounds acknowledgement, not shell lifetime; a separate authorized stop can interrupt a long command.
 
-`command` is required. `max_chars` is 256–32768 (default 12000) and bounds
-the output JSON field in UTF-16 units; the separate MCP wire cap still applies.
-Only one bounded output prefix is returned. `output_complete:false` means
-the Bridge cut off the captured output; native `truncated:true` independently
-describes truncation by Pi. There is no continuation or result lookup.
-Use authorized `read` with command selection to inspect native history;
-do not execute a command again merely to retrieve more output.
+`max_chars` is 256–32768, default 12000, measured in UTF-16 units. `output_complete:false` means Bridge shortened the returned prefix; native `truncated:true` describes Pi's own truncation. There is no continuation. Use read with command selection for native history instead of rerunning a command to retrieve output.
 
 ### Stop
 
@@ -278,64 +127,28 @@ do not execute a command again merely to retrieve more output.
 { "session_id": "ps_…", "max_chars": 12000 }
 ```
 
-Requires only stop permission. It requests native agent/bash cancellation,
-withdraws queued inputs in native order and returns joined
-`withdrawn_text`. Any already-available capture survives an uncertain ACK.
-The result reports whether an editor draft was part of the native capture.
-`max_chars` has the same bounds as command and limits the returned prefix.
-`withdrawn_complete:false` means the returned text is incomplete; there is no
-continuation or lookup. Unsent withdrawn text may not be present in history.
+Requires only `stop`. It cancels native agent/bash activity, withdraws queued input in native order and returns `withdrawn_text`, including whether the capture contained an editor draft. Captured text can accompany an uncertain final acknowledgement. `max_chars` uses command's bounds; `withdrawn_complete:false` marks an incomplete prefix. Withdrawn unsent text may not exist in history, and there is no result continuation.
 
-Stop never cold-starts a session. Once its recovery finishes, a Bridge-owned
-prompt runtime may exit through normal automatic release; external owners stay open.
-Pending Bridge inputs not yet dispatched, including batch items waiting for a
-lane or permission snapshot, are invalidated rather than reviving after stop.
-An explicit stop→send in one batch restarts in order; an external Stop still
-withdraws pending inputs, and later batch stops never restore them. Already-dispatched requests awaiting an asynchronous `input` or
-`user_bash` hook can resume and execute after Stop's native ACKs: Pi's queue
-withdrawal and current-operation cancellation do not cancel those hook
-continuations. Every new stop call acts on the current execution and queues,
-including later work. Do not repeat stop merely to retrieve prior withdrawn text.
+Stop never cold-starts Pi. It invalidates pending Bridge inputs, including batch items waiting for a lane or permission snapshot. An explicit stop→send sequence within one batch runs in order; a separate stop still withdraws pending input. Already-dispatched asynchronous native `input` or `user_bash` hooks may resume after Stop's acknowledgement. See [shutdown and in-flight work](runtime.md#shutdown-and-in-flight-acks).
+
+A completed owned runtime may release normally; external owners stay open. Each stop acts on current work, so repeating it to retrieve old withdrawn text can interrupt a later run.
 
 ### Create and send
 
 ```json
 {
   "project": "/home/example/project",
-
   "text": "Continue the review",
   "name": "Follow-up",
   "fork_from": "ps_PARENT"
 }
 ```
 
-`project` must exactly match a configured canonical project path. The child uses
-that project's native Pi session location and effective agent environment, not
-`sessionRoots[0]`. Native CLI/environment/settings overrides retain their normal
-precedence; see [storage configuration](configuration.md#storage-and-project-paths).
-If the native destination is outside the configured roots, creation rejects with
-`NATIVE_SESSION_OUTSIDE_ROOTS` before publishing a session or sending the prompt.
-`name` is optional, 1–200 code units. `fork_from` is optional and identifies
-the parent's **current committed native branch tail**, not an arbitrary
-position or an unfinished assistant preview. Pi's native fork preserves current
-bookmarks, including updates or clears made outside that ancestry, and reconnects
-retained entries after removing old label records.
+`project` must exactly match a configured canonical path. The child uses the project's [native session destination](configuration.md#storage-and-project-paths); a destination outside configured roots returns `NATIVE_SESSION_OUTSIDE_ROOTS` before publication or input. `name` is optional, 1–200 code units. Text or images are required, with the same image and model/thinking rules as send.
 
-Only target create permission is needed for the first prompt; later sends
-need send permission. A fork additionally requires source read. The source
-writer is not switched or restarted by the fork. If automatic release is already
-closing it, the fork waits for that exit before acquiring the source. A live
-parent's native snapshot is authoritative; unsupported snapshot capability is
-an explicit failure, never a disk fallback.
+Target `create` permission authorizes the first prompt; later sends need `send`. Optional `fork_from` additionally requires source `read` and copies the parent's current committed native branch, preserving native bookmarks. A live parent's native snapshot is authoritative; unsupported snapshot capability fails. The fork leaves its owner in place and waits if that owner is already releasing. See [read/fork boundaries](runtime.md#read-and-fork-boundaries).
 
-A result contains `created`, the child `session_id` when chosen, and nested
-`send` status/details. If startup/submission fails after creation, the child ID
-remains available in the result. The initial prompt holds the new session's admission lane
-so a concurrently submitted prompt cannot overtake it.
-
-Text or images are required. Another create call creates another child.
-If the first result is unavailable, inspect `list` and authorized `read`
-before deciding whether to create again.
+The result contains `created`, the chosen child `session_id` when available, and nested `send` status/details. A failure after creation retains the child ID. The initial prompt holds the child's admission lane so later input cannot overtake it. Another create call creates another child.
 
 ### Delete
 
@@ -343,37 +156,9 @@ before deciding whether to create again.
 { "session_id": "ps_…" }
 ```
 
-Requires only delete permission, independently of list/read/send/stop. Delete
-authorizes interruption of the target writer, regardless of who launched it.
-It does not require idle, a responsive state endpoint, or release support.
-An authorized delete fences new input and overrides a waiting automatic release,
-local release or handoff, including a native shutdown hook already waiting after EOF.
-The operation takes exclusive deletion authority over the session: a transfer
-completed before that point is included, and another writer cannot take over
-while termination and the trash move are in progress.
-An unopened handoff reservation is revoked without terminating its requester.
-If native switching has already begun, the same delete call waits for that one
-switch to register its actual writer or confirm cancellation, then continues;
-other acquisitions remain blocked throughout. Pi has no atomic switch-cancel
-API, so a switch that never completes can leave deletion waiting.
-After verifying the native session and exact owner generation/PID/start/boot,
-Bridge sends SIGTERM and, if necessary, SIGKILL, then confirms exit before moving
-the session to private trash. It never sends a model prompt to request exit and
-does not remove project files. If the file move fails, an existing owner-local
-cold-resume pause remains in effect; the pause is cleared only after the file moves.
+Requires only `delete`. It authorizes interruption of the target writer, including during release or handoff, and moves the native session to private trash while preserving project files. Delete fences new writers until termination and the move finish. A shared host that cannot close only this session returns `DELETE_SHARED_OWNER`; Bridge does not kill its other sessions. See [deletion lifecycle](runtime.md#explicit-deletion) for switching, process termination and partial failures.
 
-A shared SDK host is closed through its session-local release callback. If that
-cannot close the target and the same process owns another session, Bridge reports
-`DELETE_SHARED_OWNER` instead of killing those other sessions. A dedicated host
-without release support uses the same verified process termination as ordinary
-Pi. Bridge-created Herdr scopes also reap their tool descendants; external parent
-processes and shared daemons are never signal targets.
-
-The result returns a `restore_token` and project authorization scope. Its
-restore manifest under `stateDir/trash` records original/trash paths. A repeated call is a new deletion attempt, not a lookup of the prior result.
-There is no remote restore tool: an owner must inspect the manifest, confirm
-writers are closed and restore deliberately. Unknown partial moves remain
-inspectable; never guess by creating another session or deleting the manifest.
+Success returns a `restore_token` and project authorization scope. The manifest under `stateDir/trash` records original/trash paths. Restore is an owner operation: inspect the manifest and confirm writers are closed before restoring. Each new delete call is another attempt, not a lookup of the previous result.
 
 ### Batch
 
@@ -387,38 +172,13 @@ inspectable; never guess by creating another session or deleting the manifest.
 }
 ```
 
-Wraps 1–10 operations of any other public tool, including list and health.
-The outer request adds no permission. Each item keeps its ordinary payload and
-grant checks. All items use the same permission snapshot captured when the
-authoritative Bridge receives the outer request, including items waiting in a
-lane. Every mutation item executes independently; repeating a batch can repeat
-all its mutations.
+Wraps 1–10 operations of any other tool as `{op,args}`. Each item keeps its own permission checks, using the outer request's permission snapshot. Within a batch, same-session operations run in order through their ordinary return boundary, not model completion. Different sessions run concurrently; forks use the parent lane and independent creates can run concurrently in the same project. Results retain input order and item failures do not block later items. Invalid outer shape/count or size rejects before scheduling.
 
-Within one batch, operations for a session execute in input order **through
-their ordinary return boundary**, not until model completion. Different
-sessions run concurrently. A fork uses its parent lane; independent creates run concurrently even in the same destination project. Each child has its own identity/publication and admission lock. Results stay in original item order.
-Malformed/denied/failed items do not block valid later items. Invalid outer
-shape/count or an oversized batch rejects before scheduling.
+Items share a 196608-byte structured budget and the [MCP envelope budget](transports.md#bounds-and-errors). Mutation statuses, child IDs, restore tokens and verified settings are retained. Command/stop may return less than `max_chars`, with accurate completeness flags; auxiliary `command.fullOutputPath` and `delete.project` may be omitted.
 
-Before execution, batch divides its 196608-byte structured ceiling and actual
-duplicated text/structured MCP wire budget among the items, including item wrappers,
-UTF-8 and JSON escaping. Mutation status, child session IDs, restore tokens and
-actual model settings are retained; batch never drops whole mutation results to fit.
+Captured query pages may shrink while retaining their original snapshot and continuation. A query that cannot fit returns `BATCH_QUERY_BUDGET_TOO_SMALL` for that item. Batch does not reread after later mutations or rerun operations to fit the response. Repeating a batch repeats its mutations.
 
-Command and stop render their captured output within the assigned budget.
-`max_chars` remains an upper bound: batch may return a smaller prefix, with
-`output_complete` / `withdrawn_complete` reflecting exactly what was returned.
-Auxiliary `command.fullOutputPath` and `delete.project` may be omitted when they
-do not fit; standalone calls retain their ordinary fields.
-
-Captured reads are resized without reacquiring history after a later mutation,
-keeping their original snapshot and usable continuation cursors. Captured list
-and model pages may be shortened with an adjusted `next_offset`; the independent
-creation-target catalog is retained. A query that
-cannot fit even a smaller page returns `BATCH_QUERY_BUDGET_TOO_SMALL` for that
-item, without displacing any mutation result or executing an operation again.
-A separate stop request can interrupt a running command; a stop behind it in
-the same batch waits for that command's ordinary return/timeout.
+To interrupt a running command, send stop separately: a stop behind it in the same batch waits for the command's return or timeout.
 
 ### Health
 
@@ -426,17 +186,11 @@ the same batch waits for that command's ordinary return/timeout.
 { "session_id": "ps_KNOWN_OPTIONAL" }
 ```
 
-Reports only noteworthy permission combinations and their relevant source rules,
-deduplicating inherited issues. Healthy configurations return
-`{"domain":"permissions","status":"ok"}` without normal permission tables.
-`{}` diagnoses defaults and configured projects; an optional known `session_id`
-limits diagnosis to that session, labeling source tiers without exposing native
-metadata. `domain` is a result label, not an accepted input parameter.
-Unscoped `health({})` also includes `restart_required:["setting",…]` when fixed
-settings differ from the active service configuration. Only names are returned,
-not configuration values; permission status and business admission are unchanged.
-Unscoped health additionally includes `events:{status:"unavailable",reason:"…"}`
-when subscription storage cannot be safely loaded. Permission-domain status and
-core operations remain independent; event methods report their own unavailability.
-No callback URL, secret or stored record is returned.
-See [configuration](configuration.md).
+Reports noteworthy permission combinations and source rules, deduplicating inherited issues. Healthy configurations return `{"domain":"permissions","status":"ok"}`. `{}` diagnoses defaults and configured projects; a known `session_id` limits diagnosis without exposing native metadata.
+
+Unscoped health may additionally report:
+
+- `restart_required:["setting",…]`: names of fixed settings changed since startup.
+- `events:{status:"unavailable",reason:"…"}`: subscription storage could not be safely loaded.
+
+These reports do not change grants or block core operations. See [configuration](configuration.md) and [event storage](events.md#authorization-storage-and-delivery) for remediation.

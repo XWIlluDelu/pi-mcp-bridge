@@ -2,66 +2,74 @@
 
 ## Development policy
 
-Support only the current Bridge and matching companion/host components; update
-them together. Native history projection and raw fork snapshots remain current
-functionality. [Development instructions](../AGENTS.md) define cleanup policy,
-safety constraints and the separate authorization required for production operations.
+Support the current Bridge and matching companion/host components; update them
+at a safe native lifecycle boundary. Native history projection and raw fork
+snapshots remain supported. [AGENTS.md](../AGENTS.md) defines development and
+production-operation constraints.
 
 ## Components
 
-- **Protocol:** `protocol.mjs` owns the public tool registry and MCP dispatcher. `server.mjs` supplies the MCP SDK adapter; `protocol-stdio.mjs` performs bounded LF framing. `http-server.mjs` owns loopback, token, Host and origin checks and bounded HTTP waits. `stdio-proxy.mjs` forwards to one service; it does not run Pi or retry mutations.
-- **Policy and admission:** `protocol.mjs` starts a request's policy read before executor waits; `bridge.mjs` captures immutable permission snapshots and composes per-operation checks, session locks and stop/handoff fences. Explicit internal request contexts carry the same snapshot through batch lanes and asynchronous work; direct Bridge/batch calls capture one at entry. `permissions.mjs` resolves independent rights; `owner-config.mjs` validates and atomically edits them. Public schemas live in `tool-schemas.mjs`. `errors.mjs` defines the content-free error codes shared by public results, owner IPC and diagnostics; unknown exception messages are suppressed.
-- **History:** `data.mjs` validates native files and retains the recorded project identity independently of the currently usable execution cwd. Project authorization survives workspace cleanup, while cold starts still validate the canonical directory. `context-read.mjs` projects the effective native branch, applies selectors, then budgets chronological result pages. Registered native input descriptors validated by `read-adapters.mjs` classify selected custom message types as inputs before selection; plugin-specific logic lives in optional compatibility modules, not the core reader. Known-ID lookups cache file locations but revalidate native identity and cwd on every access. `session-metadata.mjs` caches at most 256 short titles, keyed by inode, size and modification/change times; it never retains transcript bodies.
-- **Plugin integration:** `compatibility.mjs` owns the single optional module registration/configuration/loading/start/stop lifecycle. `compatibility-services.mjs` exposes independent input-mapping, session-reader and shared-daemon-environment ports. `session-readers.mjs` selects a reader from session-local live or persisted extension evidence and captures adapted messages through common pagination; `read-features.mjs` obtains native tool/command registrations without running tools or context hooks. `compatibility/intercom.mjs` uses the input-mapping and daemon-environment ports. Modules start under the service lock and stop after runtime drain; [module management](compatibility.md) defines the contract. Native Pi and observed capture remain built-in.
-- **Runtime:** `rpc.mjs` owns child lifecycle, prompt admission, native ACK recovery and the pool. `attachments.mjs` coordinates exact process identity and private IPC. `attach-extension.mjs` is a cooperative native extension; `host-adapter.mjs` supports hosts with an explicit controller contract.
-- **Native controls:** `models.mjs` allowlists catalog/runtime metadata and validates model/thinking selection. After effective project/session execution authorization, `model-catalog.mjs` launches `native-model-catalog.mjs` with the existing owner launch profile and trusted Bridge cwd for a network-disabled native `ModelRuntime` snapshot, without session/resource/extension construction. `pi-installation.mjs` selects one external Pi package for CLI and SDK consumers. `model-catalog-storage.mjs` uses that installation's native read-only credential store and a read-only existing-cache adapter; see [model discovery](model-control.md#session-independent-model-catalog). `compact.mjs` keeps read-protected summaries out of control results.
-- **Durability:** `create-session.mjs` publishes a complete native prefix before starting the child; `trash.mjs` performs recoverable moves. Command/stop return bounded native output inline. Optional host `onResult`/`onWithdraw` callbacks deliver known partial output on the original connection, never through files or later queries. Bridge drains pending mutations and received late-ACK identity checks before shutdown.
-- **Local owner control:** `owner-runtime.mjs`, `idle-handoff.mjs`, `join-extension.mjs` and `open.mjs` negotiate before a live session is opened. Owner control is private local IPC, not a remotely authorized prompt command.
-- **Observation:** `context-observation.mjs` passively captures cleaned request-stage context in owned RPCs/companions and retains the latest per session in bounded Bridge memory through normal owned exit. Its observed view shares sanitization and frozen pagination with native reads, without MC storage coupling. `live-message.mjs` retains bounded native partial text/thinking. The companion reports native idle/pending evidence; owned RPC settlement separately fences automatic release. `diagnostics.mjs` emits opt-in, privacy-filtered operational events.
-
-MCP, Bridge and attached owners use the same context-timeline read contract and send modes. Forking uses a separate native snapshot that preserves entries omitted by the public projection. An incompatible read contract returns `OWNER_READ_REFRESH_REQUIRED`: update the companion/host with the Bridge; no older Bridge wire is decoded.
+| Area                           | Modules and responsibility                                                                                                                                                                                                                                             |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Protocol                       | `protocol.mjs` and `tool-schemas.mjs` define tools and dispatch. `server.mjs`, `protocol-stdio.mjs` and `http-server.mjs` provide MCP transports; `stdio-proxy.mjs` forwards to one service.                                                                           |
+| Authorization and admission    | `bridge.mjs` composes request snapshots, permissions, session lanes and lifecycle fences. `permissions.mjs` resolves rights; `owner-config.mjs` validates and edits policy.                                                                                            |
+| Native data and reading        | `data.mjs` validates session identity and storage. `context-read.mjs` projects, selects and sanitizes; `read-cache.mjs` freezes pages. `session-metadata.mjs` caches bounded titles.                                                                                   |
+| Plugin integration             | `compatibility.mjs` owns module lifecycle. `compatibility-services.mjs` exposes independent input-mapping, session-reader and daemon-environment capabilities; `session-readers.mjs` routes session-local context.                                                     |
+| Runtime ownership              | `rpc.mjs` owns child lifecycle and ACK tracking. `attachments.mjs` coordinates claims and IPC; `attach-extension.mjs` and `host-adapter.mjs` connect cooperating owners. `herdr-rpc-transport.mjs` supplies optional process placement.                                |
+| Native controls                | `pi-installation.mjs` selects one external CLI/SDK installation. `model-catalog.mjs`, `set-model.mjs`, `compact.mjs` and `stop-execution.mjs` implement native controls.                                                                                               |
+| Creation, deletion and handoff | `create-session.mjs` publishes native sessions; `trash.mjs` performs recoverable moves. `owner-runtime.mjs`, `idle-handoff.mjs`, `join-extension.mjs` and `open.mjs` coordinate local entry and release.                                                               |
+| Observation and events         | `context-observation.mjs` retains request-stage context; `live-message.mjs` and `runtime-events.mjs` bound transient observations. `events.mjs` and `event-webhook.mjs` deliver completion notifications. `diagnostics.mjs` emits privacy-filtered operational events. |
 
 ## API distinctions
 
-- `list({session_id})` observes task state, current model identity and thinking level from a live owner; absent/unavailable runtime metadata is null. Its `creatable_projects` independently discovers configured projects with project-level list/create permission, including projects without sessions. `models({offset,limit})` returns only `models/next_offset` from the separate native agent-configuration catalog under effective project/session execution authorization. It is independent of any session/project selection and excludes extension/session-only model registrations.
-- `set_model` changes current session selection through native busy-capable setters, without a prompt or default-setting write. Owned RPC, updated companions and supplied host bindings share the strict input and actual-value output; custom hosts may add a setter callback. A setter cold-start uses existing ownership and safe idle release.
-- `send/create` can apply model and/or thinking settings immediately before submitting a prompt on a proven-idle Bridge-owned RPC. Queued messages have no per-message settings binding.
-- `stop` cancels execution and withdraws queued text. `compact` changes context. Their permissions, side effects and returned results remain distinct.
+[API](api.md) defines operations, [configuration](configuration.md) defines
+permission snapshots, [runtime](runtime.md) defines ownership and host contracts,
+and [reading](reading.md) defines projection and pagination. Optional integration
+APIs are in [module management](compatibility.md).
 
 ## Invariants
 
-1. **One writer.** A known live or uncertain cooperating writer blocks a second writer. Lost IPC is not proof of process death. PID reuse is checked against boot and process-start identity, not an age timeout.
-2. **Snapshot authorization.** Capture policy at the authoritative business-request receive boundary, before queues. Authorize before transcript inspection or control, using that immutable policy through execution and returned read/command/stop content. Later edits affect new calls, including repeated mutations and read cursor pages, not an in-flight request. One batch and each fork's combined permissions share one snapshot. Listing metadata has its own grant; references to hidden parents do not bypass it. Identity and Stop/handoff/lifecycle checks remain live.
-3. **Report uncertainty.** Preserve uncertainty about native dispatch and results. A missing response is never proof of refusal, and unknown work is never replayed automatically.
-4. **Drain received ACKs.** Drain received late-ACK identity checks and capture tasks before final runtime close. Do not wait indefinitely for ACKs that have not arrived.
-5. **Native order is authoritative.** Native projection order and source provenance determine timeline ownership; timestamps and extractive excerpts are not substitutes for the native tree.
-6. **Stable cursors.** Historical cursors pin leaf, selection and projection identity. Fresh live previews are separate and cannot silently change a historical continuation.
-7. **Wire budget.** Budget both the structured selection and the actual escaped/duplicated wire envelope. Batch resizing uses captured observations, not a later reread.
-8. **Release ordering.** Host release closes admission, cancels work when needed, drains admitted operations and captures, then closes the writer. A pending native bash must not deadlock waiting for a release callback that is itself behind the drain.
+1. **One writer.** A live or uncertain owner blocks another writer. Only exact
+   process exit or completed native replacement ends its ephemeral claim.
+2. **Request authorization.** One receive-time policy snapshot governs an
+   operation, including batch items and fork checks. Identity, Stop and lifecycle
+   fences remain live throughout execution.
+3. **Native outcomes.** Missing ACKs leave outcomes unknown; work is never replayed
+   automatically. Shutdown drains received ACK checks and captures.
+4. **Ordered release.** Close admission, cancel when authorized, drain admitted
+   work and captures, then close the writer and release its claim.
+5. **Native provenance.** Projection order determines prompt ownership and tool
+   pairing. Fork uses raw native records rather than the public read projection.
+6. **Frozen, bounded reads.** Cursors retain selected history and identity while
+   each page rechecks authorization. Budgets include structured results and the
+   duplicated wire envelope; batch never rereads after a later mutation.
 
 ## Verification
 
-`npm test` runs Node's semantic suites against temporary native stores, synthetic providers and explicit agent/environment isolation; no credentials or paid endpoint are needed. Network-disabled native fixtures verify Pi admission, queues, persisted history, shell/stop, TUI menus, ordinary extensions and native entry independently of model quality. Coverage:
+Run `npm test` and `npm run format:check`. Tests use temporary native stores,
+isolated agent environments and synthetic providers without credentials or paid
+endpoints. CI runs both commands on Node 22 and 26 for `main` pushes and pull
+requests.
 
-- **Authorization:** three-tier rights, unknown-key refusal, receive-time snapshots before delayed executors, concurrent policy isolation, stable authorization through cold startup/locks/disk reads, batch/fork policy consistency, new-call/read-continuation authorization, hidden-parent references and Stop fencing during policy I/O.
-- **Plugin integration:** independent capabilities under one lifecycle, disabled modules never imported, configuration/options isolation, per-session memory-reader routing with a real native extension, frozen adapted pages, partial-start rollback, reverse cleanup despite failures, startup lock release, shutdown ordering, Intercom mapping and daemon-only environment isolation.
-- **Reading:** context grouping, hidden/orphan prompt boundaries, system sections, compaction/branch summaries, checkpoint edits, tool pairing, readable Unicode units, frozen bounded history, cursor-only selection inheritance, bounded live observation, warm lookup without rescans, title-cache invalidation, companion idle evidence.
-- **Requests and recovery:** independent repeated submissions, ACK timeouts, late identity validation, persistence failures, shutdown drain without replay, shutdown races.
-- **Native controls:** image bytes (including more than 32 images within byte limits), session-free offline catalog discovery, effective project/session catalog authorization, model metadata redaction across catalog/list/owner IPC, provider-call boundaries, partial selection, default-idle compaction, cancellation, exact-identity automatic release and later cold resume.
-- **Batch:** per-session lanes, independent progress, invalid-item isolation, captured-read rebudgeting, envelope byte limits.
-- **Ownership:** Unix owner claims, kernel-released registry mutex and exact long-lived owner claims, filesystem aliases, unreachable hosts, release cancellation/drain, idle EOF handoff, cold resume only after an appropriate exact-death condition.
-- **Transports:** per-request MCP and current SDK clients over stdio/HTTP, shared proxies, authentication/header errors, frame limits, disconnects, bounded response waits.
+Pi is an external test dependency. Tests use PATH or an explicit installation:
 
-CI runs the suite and formatting on Node 22 and 26 for pushes and pull requests to `main`, without provider credentials. `npm run format:check` covers maintained source, tests, docs and the CI workflow. `npm audit` checks dependencies, not behavioral correctness.
+```sh
+BRIDGE_TEST_PI_CLI=/absolute/path/to/pi npm test
+```
 
-Bridge's lockfile contains no Pi packages. CI prepares a separate external test Pi; local tests select PATH or `BRIDGE_TEST_PI_CLI=/absolute/path/to/pi npm test`. Fixtures use that installation's CLI and APIs. Default-launch tests also verify PATH selection and native process identity, with temporary HOME/agent directories that leave user credentials and sessions untouched.
+The optional real Herdr check needs a working user-systemd bus:
 
-For the real Herdr transport check, run `BRIDGE_TEST_HERDR=/absolute/path/to/herdr node --test test/herdr-runtime.test.mjs` with a working user-systemd bus. It uses an isolated named daemon and synthetic environment data to check launch, owner reuse, hot placement changes, stream draining, disconnect/EOF cleanup, explicit deletion of stubborn tool descendants and environment transfer without credential values in argv. The test deletes its daemon session afterward; normal `npm test` skips this opt-in case when Herdr is not selected.
+```sh
+BRIDGE_TEST_HERDR=/absolute/path/to/herdr node --test test/herdr-runtime.test.mjs
+```
+
+It creates and removes an isolated named daemon. Normal test runs skip this
+opt-in check. `npm audit` checks dependency advisories separately.
 
 ## Operational boundaries
 
-- **Registry scope:** one machine, with a shared canonical IPC directory and compatible Linux PID/network namespaces. Unregistered RPC pipes cannot be discovered or taken over.
-- **HTTP auth:** the loopback backend authenticates with an owner-local token and is not an OAuth authorization server; a remote tunnel supplies the public authentication boundary.
-- **TUI death:** a dying TUI's in-flight model computation is not preserved.
-
-See [runtime](runtime.md) for cooperative entry and restart paths, and [transports](transports.md) for client behavior after unknown outcomes.
+The cooperative registry requires one machine, a shared canonical IPC directory
+and compatible Linux PID/network namespaces. Unregistered writers need host
+coordination before reopening; see [runtime](runtime.md). The HTTP backend uses
+an owner-local token, with public authentication supplied by a tunnel; see
+[transports](transports.md).

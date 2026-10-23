@@ -344,16 +344,13 @@ test('project-authorized subscriptions survive workspace cleanup but not permiss
   assert.equal(f.bridge.events.records.size, 0);
 });
 
-test('expired subscription metadata is retired before active-format validation', async (t) => {
+test('expired subscription records are pruned before loading active subscriptions', async (t) => {
   const f = await fixture(t);
   await f.call('events/subscribe', request(f.session.id));
   const active = [...f.bridge.events.records.values()][0],
     expired = {
       ...active,
-      expiresAt: Date.now() - 1,
-      obsoleteMetadata: true,
-      url: 'retired endpoint',
-      secret: 'retired signing format',
+      expiresAt: f.bridge.events.now() - 1,
     },
     raw = JSON.stringify([expired, active]),
     file = f.dir + '/state/event-subscriptions.json';
@@ -363,7 +360,6 @@ test('expired subscription metadata is retired before active-format validation',
   assert.equal(f.bridge.events.records.size, 1);
   await f.settle();
   assert.equal(f.sent.at(-1).decoded.name, 'session.settled');
-  assert.equal(await fs.readFile(file, 'utf8'), raw);
 });
 
 for (const invalid of ['active record', 'file privacy'])

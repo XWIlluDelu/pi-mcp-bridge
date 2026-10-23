@@ -1,7 +1,9 @@
 # Optional plugin compatibility modules
 
-Modules share registration, owner configuration, loading and lifecycle. Their
-capabilities and processing paths remain independent.
+Trusted owner modules share configuration and lifecycle while registering
+independent input-mapping, session-reader and daemon-environment capabilities.
+They run with the owner's Unix access and do not change Bridge grants or install
+native Pi extensions.
 
 ## Owner configuration
 
@@ -16,39 +18,37 @@ capabilities and processing paths remain independent.
 }
 ```
 
-The list defaults to empty. Each entry has an absolute ESM `module` path,
-optional `enabled` (default `true`) and module-specific `options` object.
-Disabled modules are not imported. Changes take effect on a normal service
-restart; health reports pending changes as `restart_required`.
+The list defaults to empty. Entries accept an absolute ESM `module` path,
+`enabled` (default true) and module-specific `options` object. Disabled modules
+are not imported. Changes require service restart and appear in
+[`health.restart_required`](configuration.md#request-permission-snapshots).
+Duplicate paths and active module IDs reject.
 
-A module exports `{id, start}`. Its synchronous/asynchronous
-`start({id, services, onStop}, options)` runs once during Bridge startup.
-Register cleanup with `onStop(callback)` immediately after acquiring a resource.
-Bridge starts modules in configuration order under its service lock. Partial
-startup unwinds registered cleanup. Shutdown drains writers, ACKs and release
-captures before running cleanup in reverse order, continuing after an individual
-cleanup failure. Duplicate paths and active module IDs are rejected.
-
-Modules are trusted owner code with the owner's Unix access. They do not change
-Bridge grants or replace native Pi's own extension installation/configuration.
+A module exports `{id,start}`. Bridge calls
+`start({id,services,onStop}, options)` once, in configuration order under its
+service lock; start may be asynchronous. Register `onStop(cleanup)` immediately
+after acquiring resources. Failed startup unwinds registered cleanup. Shutdown
+drains writers, ACKs and release captures before cleanup runs in reverse order,
+continuing after individual failures.
 
 ## Input mapping
 
-`services.readInputs.register(id, inputCustomTypes)` returns cleanup for exact
-native custom-message input types. Bridge sends detached descriptors through
-existing read IPC; owner processes do not import module code.
+`services.readInputs.register(id,inputCustomTypes)` returns cleanup for exact
+native custom-message types. Bridge validates and sends detached descriptors
+through owner IPC; only Bridge imports module code. Invalid descriptors,
+duplicate IDs or overlapping types report `INVALID_READ_ADAPTER`.
+[Reading](reading.md#optional-input-mappings) defines input boundaries and
+source metadata.
 
-The supplied `src/compatibility/intercom.mjs` makes `intercom_message` an input
-boundary for native `latest`/`recent` and subsequent response selection. It
-preserves the custom role, source IDs, attachments and business details. It also
-uses `services.daemonEnvironment.register(filter)` to remove `PI_INTERCOM_*`
-identity variables from Herdr's shared-daemon environment. The actual Pi child
-keeps its native launch environment. Both registrations share module enablement
-and cleanup.
+The supplied Intercom module maps `intercom_message`. It also uses
+`services.daemonEnvironment.register(filter)` to remove `PI_INTERCOM_*` identity
+variables from Herdr's shared-daemon environment. Each filter mutates a detached
+environment copy and registration returns cleanup. The actual Pi child retains
+its launch environment. Both registrations follow module enablement/lifecycle.
 
 ## Session-specific read routing
 
-A memory integration registers its own reader under the same lifecycle:
+A memory integration can register:
 
 ```js
 onStop(
@@ -59,52 +59,37 @@ onStop(
 );
 ```
 
-`matches` and `read` may be asynchronous. The context contains:
+`matches` and `read` may be asynchronous. Both receive:
 
-- `session`: Bridge ID, canonical `file`, native `native_id` and `cwd`.
-- `owner`: `available`, current registered `tools`, `commands` and native `leaf_id`.
-  Without registration information, `available` is false, names are empty and
-  `leaf_id` is null. This describes observation availability, not plugin absence.
-- `request`: the parsed initial read arguments, including selection intent.
-- `nativeRead()`: the existing authorized, sanitized native snapshot acquisition.
+| Field          | Meaning                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `session`      | Bridge `id`, canonical `file`, native `native_id` and recorded `cwd`.                                                                                              |
+| `owner`        | Registration `available`, `tools`, `commands` and native `leaf_id`. Without information: false, empty names and null leaf; this does not establish plugin absence. |
+| `request`      | Parsed initial read arguments, including selection intent.                                                                                                         |
+| `nativeRead()` | Authorized, sanitized native acquisition using the same arguments.                                                                                                 |
 
-Bridge obtains tool/command names from the target live owner, not from globally
-installed packages. Owned RPCs, companions and SDK host bindings expose native
-registration information. RPC host bindings use public `getCommands()` for extension
-command names and `getEntries()` for the leaf; they do not infer all registered tools
-from the model's active tool list. Custom hosts can supply `readFeatures()`
-with `{available,tools,commands,leaf_id}`. Module code decides which registrations
-identify its extension; reading context remains the module's own implementation.
-Tools disabled for model use do not imply that a memory extension is unloaded,
-so command registrations are also available. Without live registration information,
-the module may use session-local persisted evidence of its extension's activation.
-Bridge still invokes matching and does not infer activation from global installation
-or require a live owner. The module determines what evidence is valid for its extension.
+Owned RPCs, companions and SDK hosts expose native registrations. RPC hosts
+expose extension commands via `getCommands()` and leaf via `getEntries()`; tools
+are empty because RPC does not expose all registrations. Custom hosts can supply
+`readFeatures()` with the owner fields above. Commands can identify an extension
+whose tools are disabled. Without live information, matching may use session-local
+persisted evidence. Each module defines valid evidence and context acquisition;
+global installation alone does not establish session activation.
 
-External agents continue to call `read({session_id,max_bytes})`. A matching
-reader overrides default native acquisition for that session, including saved
-sessions. No match uses native reading. Reading never starts Pi.
-Only explicit `view:"native"` forces native projection; `preset`, `select` and
-`leaf_id` do not choose a source. The selected reader handles that selection intent
-through `request` and can reuse `nativeRead()`, which receives the same arguments.
-A reader must apply supported selection intent or reject it, not silently ignore it.
-Explicit `view:"observed"` retains its native capture semantics.
-Callers need not identify a plugin to choose the default source.
+A match overrides the default read source, including for saved sessions. No match
+uses native projection. Explicit `view:"native"` forces native acquisition and
+`view:"observed"` uses the built-in capture. `preset`, `select` and `leaf_id` stay
+with the selected reader: it must apply supported intent or reject it. Reading
+never starts Pi.
 
-`read(context)` returns an array of native-shaped messages. Bridge sanitizes,
-segments and budgets them as frozen `view:"adapted"` pages with `reader.id` and
-`source.reader_index`; it does not invent native entry IDs for synthetic context.
-The module can retain its own provenance in message `details`. Adapted pages
-have no native selection counts. Continue with the cursor alone; repeated selection
-arguments must match the captured request intent. No new owner probe or adapter
-execution occurs on later pages. Cursor requests still check current read
-authorization and native identity.
+`read(context)` returns native-shaped messages. Bridge sanitizes and pages them
+as `view:"adapted"` with `reader.id`, synthetic `source.reader_index` and null native
+selection counts. Modules may put provenance in message `details`.
+[Read continuations](reading.md#request) freeze the capture and selection intent
+without another owner probe or reader call, while rechecking authorization/identity.
 
-Matching more than one reader reports `SESSION_READER_CONFLICT`. Reader errors
-report `SESSION_READER_FAILED`, without silently substituting another context.
-Bridge rechecks native session identity and reader applicability before publishing a
-capture, including live registration information that becomes available during a saved read; a removed/replaced source reports `READ_SOURCE_CHANGED`.
-
-Native history projection and `context_with_system`/observed capture remain
-plugin-independent. The routing path is verified with an isolated memory
-extension; its fixture format does not define Magic Context content selection.
+Multiple matches report `SESSION_READER_CONFLICT`; reader exceptions report
+`SESSION_READER_FAILED` without substituting native content. Before publication,
+Bridge rechecks native identity and applicability, including an owner that
+appeared during a saved read. A changed applicable reader reports
+`READ_SOURCE_CHANGED`.

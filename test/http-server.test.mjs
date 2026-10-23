@@ -439,6 +439,7 @@ for (const first of ['send', 'read'])
       await lost;
       release.resolve();
       await completed.promise; // Disconnect is not service shutdown.
+      await Promise.all([...f.bridge.pendingMutations]);
       assert.ok((await f.bridge.sessions()).length >= 2);
       if (first === 'send') {
         assert.ok(f.runtime.calls.length >= 1);
@@ -465,7 +466,7 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
         { op: 'send', args: { session_id: f.id, text: 'fixture' } },
         {
           op: 'create',
-          args: { project: f.config.folders[0].path, text: 'fixture' },
+          args: { project: f.config.folders[0].path, fork_from: f.id, text: 'fixture' },
         },
       ],
     }),
@@ -479,13 +480,12 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
   await close;
   const results = (await response).body.result.structuredContent.results;
   assert.equal(results[0].result.status, 'started');
-  assert.equal(results[1].result.created, false);
-  assert.equal(results[1].result.send.reason, 'BRIDGE_CLOSING');
+  assert.equal(results[1].error.code, 'BRIDGE_CLOSING');
   assert.equal((await f.bridge.sessions()).length, 1);
   assert.equal(f.runtime.alive, false);
 });
 
-test('two standard stdio proxies share one HTTP runtime and closing either preserves service and receipts', async (t) => {
+test('two standard stdio proxies share one HTTP runtime and closing either preserves the service', async (t) => {
   const f = await fixture(t),
     tokenFile = path.join(f.dir, 'proxy-token'),
     file = path.join(f.dir, 'proxy-owner.json');
