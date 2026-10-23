@@ -426,4 +426,8 @@ metadata. `domain` is a result label, not an accepted input parameter.
 Unscoped `health({})` also includes `restart_required:["setting",…]` when fixed
 settings differ from the active service configuration. Only names are returned,
 not configuration values; permission status and business admission are unchanged.
+Unscoped health additionally includes `events:{status:"unavailable",reason:"…"}`
+when subscription storage cannot be safely loaded. Permission-domain status and
+core operations remain independent; event methods report their own unavailability.
+No callback URL, secret or stored record is returned.
 See [configuration](configuration.md).

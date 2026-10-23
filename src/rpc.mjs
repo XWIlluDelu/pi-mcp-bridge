@@ -61,8 +61,8 @@ export function launchProfile(config, hostEnv = process.env) {
 }
 export class PiRpc {
   constructor(config, session, { completionControl } = {}) {
-    this.completionControl = completionControl;
     this.config = config;
+    this.completionControl = completionControl;
     this.session = session;
     this.pending = new Map();
     this.activeBashes = 0;

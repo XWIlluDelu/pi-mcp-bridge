@@ -48,8 +48,17 @@ function reject(res, status, code) {
   });
   res.end(JSON.stringify({ error: code }));
 }
+function logRpcResponse(message, httpStatus) {
+  diagnostics.emit('http.rpc_response', {
+    http_status: httpStatus,
+    rpc_status: message.error ? 'error' : message.result !== undefined ? 'result' : undefined,
+    rpc_code: message.error?.code,
+    callback_reason: message.error?.data?.reason,
+  });
+}
 function jsonResponse(res, status, message) {
   if (res.destroyed || res.writableEnded) return;
+  logRpcResponse(message, status);
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(message));
 }
@@ -168,6 +177,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     try {
       const body = await parseBody(req);
       if (record.disconnected) return;
+      diagnostics.emit('http.request', { method: body.method });
       if (
         body.jsonrpc !== '2.0' ||
         typeof body.method !== 'string' ||
@@ -231,7 +241,11 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
         enableJsonResponse: true,
       });
       const send = transport.send.bind(transport);
-      transport.send = (message) => send(boundMessage(message));
+      transport.send = (message) => {
+        const bounded = boundMessage(message);
+        logRpcResponse(bounded); // The SDK owns HTTP status; http.closed records it.
+        return send(bounded);
+      };
       await record.server.connect(transport);
       if (record.disconnected) {
         await record.server.close();

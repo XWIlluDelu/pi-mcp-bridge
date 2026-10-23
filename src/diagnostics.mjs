@@ -4,6 +4,28 @@ import { createHash, randomUUID } from 'node:crypto';
 import { knownErrorCode } from './errors.mjs';
 
 const enums = {
+  method: [
+    'initialize',
+    'notifications/initialized',
+    'ping',
+    'server/discover',
+    'tools/list',
+    'tools/call',
+    'events/list',
+    'events/subscribe',
+    'events/unsubscribe',
+  ],
+  rpc_status: ['result', 'error'],
+  callback_reason: [
+    'connection_refused',
+    'timeout',
+    'tls_error',
+    'http_4xx',
+    'http_5xx',
+    'challenge_failed',
+    'blocked_address',
+    'response_too_large',
+  ],
   catalog_stage: [
     'modules',
     'storage',
@@ -89,6 +111,14 @@ export function createDiagnostics({ enabled = false, write = () => {} } = {}) {
     };
     for (const [key, value] of Object.entries(fields)) {
       if (enums[key]?.includes(value) || (refs.has(key) && /^[a-f0-9]{24}$/.test(value)))
+        record[key] = value;
+      else if (
+        key === 'callback_hostname' &&
+        typeof value === 'string' &&
+        /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?[.]?$/.test(value)
+      )
+        record[key] = value;
+      else if (key === 'rpc_code' && Number.isInteger(value) && value >= -32768 && value <= -32000)
         record[key] = value;
       else if (['duration_ms', 'http_status', 'index'].includes(key) && Number.isFinite(value))
         record[key] = value;

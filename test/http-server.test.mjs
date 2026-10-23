@@ -485,7 +485,7 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
   assert.equal(f.runtime.alive, false);
 });
 
-test('two standard stdio proxies share one HTTP runtime and closing either preserves service and receipts', async (t) => {
+test('two standard stdio proxies share one HTTP runtime and closing either preserves the service', async (t) => {
   const f = await fixture(t),
     tokenFile = path.join(f.dir, 'proxy-token'),
     file = path.join(f.dir, 'proxy-owner.json');
