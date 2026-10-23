@@ -10,6 +10,7 @@ import { executeBatch } from '../src/batch.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
+import { diagnostics } from '../src/diagnostics.mjs';
 
 async function fixture(t, overrides = {}) {
   const dir = await fs.mkdtemp('/tmp/pi-catalog-'),
@@ -290,9 +291,13 @@ test('models uses receive-time snapshots, isolates concurrent policies and reaut
   assert.equal(batch.results[1].error.code, 'INVALID_OPERATION');
 });
 
-test('models validates pagination and refuses environment overrides; native errors stay private', async (t) => {
+test('models validates pagination and keeps useful failure stages without disclosing native errors', async (t) => {
   const f = await fixture(t),
-    { bridge } = f;
+    { bridge } = f,
+    failures = [];
+  t.mock.method(diagnostics, 'emit', (event, fields) => {
+    if (event === 'model_catalog.failure') failures.push(fields);
+  });
   const schema = toolDefinitions().find((tool) => tool.name === 'models').inputSchema;
   assert.deepEqual(schema.required ?? [], []);
   assert.deepEqual(Object.keys(schema.properties).sort(), ['limit', 'offset']);
@@ -312,6 +317,7 @@ test('models validates pagination and refuses environment overrides; native erro
     const failed = await callBridgeTool(bridge, 'models', {});
     assert.equal(JSON.parse(failed.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
     assert.ok(!JSON.stringify(failed).includes('PRIVATE_CACHE_ERROR'));
+    assert.deepEqual(failures.at(-1), { catalog_stage: 'storage', catalog_reason: 'invalid_json' });
   }
   await fs.rm(cacheFile);
   const authFile = path.join(f.config.piRuntime.agentDir, 'auth.json');
@@ -319,11 +325,20 @@ test('models validates pagination and refuses environment overrides; native erro
   const authFailure = await callBridgeTool(bridge, 'models', {});
   assert.equal(JSON.parse(authFailure.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
   assert.ok(!JSON.stringify(authFailure).includes('PRIVATE_AUTH_ERROR'));
+  assert.deepEqual(failures.at(-1), {
+    catalog_stage: 'configuration',
+    catalog_reason: 'invalid_configuration',
+  });
   await fs.rm(authFile);
   await fs.writeFile(path.join(f.config.piRuntime.agentDir, 'models.json'), '{ PRIVATE_RAW_ERROR');
   const failure = await callBridgeTool(bridge, 'models', {});
   assert.equal(JSON.parse(failure.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
   assert.ok(!JSON.stringify(failure).includes('PRIVATE_RAW_ERROR'));
+  assert.deepEqual(failures.at(-1), {
+    catalog_stage: 'configuration',
+    catalog_reason: 'invalid_configuration',
+  });
+  assert.ok(!JSON.stringify(failures).includes('PRIVATE_'));
 });
 
 test('batch shrinks the captured native catalog page with a correct offset while preserving deletion', async (t) => {

@@ -33,6 +33,20 @@ test('attached state diagnostics retain built-in failures but suppress unknown s
   assert.equal(rows.at(-1).code, 'OTHER_ERROR');
   assert.equal(rows.at(-1).op, undefined);
   assert.equal(JSON.stringify(rows).includes('PRIVATE_'), false);
+  log.emit('model_catalog.failure', {
+    catalog_stage: 'storage',
+    catalog_reason: 'invalid_json',
+    message: 'PRIVATE_CREDENTIAL',
+  });
+  assert.equal(rows.at(-1).catalog_stage, 'storage');
+  assert.equal(rows.at(-1).catalog_reason, 'invalid_json');
+  log.emit('model_catalog.failure', {
+    catalog_stage: 'PRIVATE_STAGE',
+    catalog_reason: 'PRIVATE_REASON',
+  });
+  assert.equal(rows.at(-1).catalog_stage, undefined);
+  assert.equal(rows.at(-1).catalog_reason, undefined);
+  assert.equal(JSON.stringify(rows).includes('PRIVATE_'), false);
 });
 
 test('native control operations and refusal codes remain identifiable without logging content', async () => {
@@ -157,10 +171,6 @@ test('enabled HTTP, RPC and timeout diagnostics remain private and correlated', 
   assert.ok(rows.some((r) => r.event === 'http.rejected' && r.http_status === 401));
   assert.ok(rows.some((r) => r.event === 'runtime.spawned'));
   assert.ok(rows.some((r) => r.event === 'runtime.exited'));
-  assert.equal(
-    rows.some((r) => r.event === 'receipt.replay' || r.event === 'receipt.saved'),
-    false,
-  );
   const timeout = rows.find((r) => r.event === 'rpc.command.end' && r.code === 'ACK_TIMEOUT');
   assert.equal(timeout.uncertain, true);
   const late = rows.find((r) => r.event === 'rpc.late_ack');

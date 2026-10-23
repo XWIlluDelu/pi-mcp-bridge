@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { launchProfile } from './rpc.mjs';
 import { resolvePiInstallation } from './pi-installation.mjs';
+import { diagnostics } from './diagnostics.mjs';
 
 const execute = promisify(execFile);
 const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.url));
@@ -12,6 +13,7 @@ const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.u
 export async function loadModelCatalog(config, { offset, limit }) {
   const { env } = launchProfile(config);
   const installation = await resolvePiInstallation(config, env);
+  let stage = 'subprocess';
   try {
     const { stdout } = await execute(
       process.execPath,
@@ -22,9 +24,29 @@ export async function loadModelCatalog(config, { offset, limit }) {
         maxBuffer: 512 * 1024,
       },
     );
+    stage = 'response';
     return JSON.parse(stdout);
-  } catch {
-    // Neither native errors nor subprocess stdout/stderr may disclose credentials.
+  } catch (error) {
+    let failure;
+    if (stage === 'subprocess') {
+      try {
+        failure = JSON.parse(error.stderr);
+      } catch {}
+    }
+    // The diagnostic sink accepts only known stage/reason values, never raw
+    // subprocess text. Remote callers keep a content-free public error.
+    diagnostics.emit('model_catalog.failure', {
+      catalog_stage: failure?.stage ?? stage,
+      catalog_reason:
+        failure?.reason ??
+        (stage === 'response'
+          ? 'invalid_response'
+          : error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+            ? 'output_limit'
+            : error.killed
+              ? 'timeout'
+              : 'process_failed'),
+    });
     throw new Error('MODEL_CATALOG_UNAVAILABLE');
   }
 }

@@ -4,6 +4,40 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PiRpc, RpcFailure, RuntimePool, launchProfile } from '../src/rpc.mjs';
 
+test('compact RPC rejection exposes only exact safe native reasons', async () => {
+  const known = [
+    'Nothing to compact (session too small)',
+    'Already compacted',
+    'Compaction cancelled',
+  ];
+  for (const [command, message, expected] of [
+    ...known.map((message) => ['compact', message, message]),
+    ['compact', 'Provider failed: secret-key /private/session user text', undefined],
+    ['compact', known[0] + '\n/private/session', undefined],
+    ['compact', { message: known[0], secret: 'private' }, undefined],
+    ['bash', known[0], undefined],
+  ]) {
+    const rpc = new PiRpc({}, {});
+    const failure = new Promise((resolve) =>
+      rpc.pending.set('request', {
+        commandType: command,
+        generation: rpc.generation,
+        reject: resolve,
+      }),
+    );
+    rpc.receiveResponse(
+      { type: 'response', id: 'request', command, success: false, error: message },
+      rpc.generation,
+    );
+    const error = await failure;
+    assert.equal(error.code, 'PI_REJECTED');
+    assert.equal(error.message, 'PI_REJECTED');
+    assert.equal(error.uncertain, false);
+    assert.equal(error.native_reason, expected);
+    assert.ok(!JSON.stringify(error).includes('private'));
+  }
+});
+
 test('launcher uses native defaults and only explicit owner overrides', () => {
   const host = {
     PATH: '/bin',

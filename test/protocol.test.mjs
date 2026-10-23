@@ -139,6 +139,27 @@ test('public mutation payloads are validated before dispatch', async () => {
   assert.equal(unknown.message.result.isError, true);
   assert.equal(called, 1);
 });
+test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
+  const bridge = {
+    read: async () => {
+      throw new Error('OWNER_READ_REFRESH_REQUIRED');
+    },
+  };
+  const response = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'read',
+      arguments: { session_id: 'ps_' + 'a'.repeat(32) },
+    }),
+  );
+  const result = response.message.result;
+  assert.equal(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+  assert.equal(result.structuredContent.error.code, 'OWNER_READ_REFRESH_REQUIRED');
+  assert.match(result.structuredContent.error.recovery, /idle boundary/);
+  assert.match(result.structuredContent.error.recovery, /Changing read arguments will not/);
+});
+
 test('modern HTTP validates mirrored headers including encoded Unicode and duplicates', () => {
   const body = message('tools/call', { name: '命令', arguments: {} });
   const values = {
