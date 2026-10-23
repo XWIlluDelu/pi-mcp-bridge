@@ -1,5 +1,5 @@
 // Explicit synthetic provider for isolated integration tests. No credentials or network.
-import { fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { fauxProvider, fauxAssistantMessage } from './pi.mjs';
 export default function (pi) {
   globalThis.fetch = async () => {
     throw new Error('Synthetic fixture blocks network');

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
-import { fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSessionRuntime,
   createAgentSessionServices,
@@ -12,7 +12,7 @@ import {
   SessionManager,
   SettingsManager,
   RpcClient,
-} from '@earendil-works/pi-coding-agent';
+} from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 import { readClaim } from '../src/attachments.mjs';

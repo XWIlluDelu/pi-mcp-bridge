@@ -1,13 +1,15 @@
 // Public Pi context observation for a Bridge-owned child. Never owns a claim.
 import net from 'node:net';
+import { loadPiSdk } from './pi-installation.mjs';
 import fs from 'node:fs/promises';
 import { prepareContextRead } from './context-read.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
-export default function rpcObserver(pi) {
+export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
   if (!value) return;
-  const { socket, generation } = JSON.parse(value);
+  const { socket, generation, sdkEntry } = JSON.parse(value);
+  const sdk = await loadPiSdk({ sdkEntry });
   let server, context;
   const connections = new Set();
   const live = new LiveMessageObserver('rpc_message_events');
@@ -90,6 +92,7 @@ export default function rpcObserver(pi) {
                         live: live.snapshot(),
                       },
                       request.body,
+                      sdk,
                     ),
                   },
           };

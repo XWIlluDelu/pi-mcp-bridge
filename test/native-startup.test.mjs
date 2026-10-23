@@ -1,3 +1,4 @@
+import { aiEntry, sdkEntry } from './fixtures/pi.mjs';
 import { nativePiCli, nativeInstallation } from './fixtures/isolated-runtime.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,8 +8,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
-import { RpcClient, SessionManager } from '@earendil-works/pi-coding-agent';
-import { fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { RpcClient, SessionManager } from './fixtures/pi.mjs';
+import { fauxAssistantMessage } from './fixtures/pi.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function fixture(t, model = {}) {
@@ -51,7 +52,7 @@ test(
     );
     await fs.writeFile(
       path.join(pkg, 'index.mjs'),
-      `import {fauxProvider} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-ai'))};export default pi=>{
+      `import {fauxProvider} from ${JSON.stringify(aiEntry)};export default pi=>{
     const faux=fauxProvider({provider:'native-fixture',models:[{id:'native-model',name:'Synthetic native default',reasoning:true},{id:'saved-model',name:'Synthetic saved selection',reasoning:true}]});
     pi.registerProvider(faux.provider);pi.on('session_start',()=>pi.appendEntry('native-package',{tools:pi.getActiveTools(),env:process.env.NATIVE_FIXTURE_VALUE,cli:process.argv[1],home:process.env.HOME,pid:process.pid}));
   };`,
@@ -162,7 +163,7 @@ test(
     const script = `
     import {RuntimePool} from ${JSON.stringify(pathToFileURL(path.join(base, 'src/rpc.mjs')).href)};
     import {readClaim} from ${JSON.stringify(pathToFileURL(path.join(base, 'src/attachments.mjs')).href)};
-    import {RpcClient} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-coding-agent'))};
+    import {RpcClient} from ${JSON.stringify(sdkEntry)};
     const target={id:'profile-fixture',file:${JSON.stringify(f.file)},cwd:${JSON.stringify(f.cwd)},header:{id:${JSON.stringify(f.id)}}},dir=${JSON.stringify(ipc)};
     const pool=new RuntimePool({stateDir:${JSON.stringify(path.join(f.dir, 'state'))},attachmentDir:dir});
     let rpc;

@@ -1,12 +1,13 @@
 // Resolve a fresh identity in the same cwd/environment as the owned Pi. No
 // extensions, credentials or model runtime are loaded by this preparation step.
 import path from 'node:path';
-import { SessionManager, SettingsManager, parseArgs } from '@earendil-works/pi-coding-agent';
+import { loadPiSdk } from './pi-installation.mjs';
 import { inside } from './permissions.mjs';
 import { assertNativeDirectory } from './storage.mjs';
 
 try {
-  const { roots, args, parentSession } = JSON.parse(process.argv[2]);
+  const { roots, args, parentSession, sdkEntry } = JSON.parse(process.argv[2]);
+  const { SessionManager, SettingsManager, parseArgs } = await loadPiSdk({ sdkEntry });
   const cwd = process.cwd();
   const parsed = parseArgs(args);
   const settings = SettingsManager.create(cwd);

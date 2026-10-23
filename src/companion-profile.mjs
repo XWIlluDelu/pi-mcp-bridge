@@ -26,7 +26,12 @@ export async function companionProfile(env = process.env) {
   const dir = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
   if (env.PI_MCP_ATTACH_DIR && env.PI_MCP_ATTACH_DIR !== dir)
     throw new Error('HANDOFF_DIRECTORY_MISMATCH');
-  return { file, dir, roots: config.sessionRoots };
+  return {
+    file,
+    dir,
+    roots: config.sessionRoots,
+    ...(config.piExecutable ? { piExecutable: config.piExecutable } : {}),
+  };
 }
 
 export function companionIncludes(profile, file) {

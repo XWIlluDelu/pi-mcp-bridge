@@ -306,15 +306,8 @@ test('models validates pagination and refuses environment overrides; native erro
   }
   assert.equal(await f.calls(), '');
   const cacheFile = path.join(f.config.piRuntime.agentDir, 'models-store.json');
-  for (const invalid of [
-    '{ PRIVATE_CACHE_ERROR',
-    '[]',
-    '{"openrouter":{"models":{}}}',
-    '{"openrouter":{"models":[],"unknownLayout":true}}',
-    '{"openrouter":{"models":[{"id":"missing-fields"}]}}',
-    '{"openrouter":{"models":[{"id":"m","provider":"wrong","api":"api"}]}}',
-    '{"openrouter":{"models":[{"id":"m","provider":"openrouter","api":"api","type":"unknown"}]}}',
-  ]) {
+  // Native Pi interprets cache records; Bridge only parses the file container.
+  for (const invalid of ['{ PRIVATE_CACHE_ERROR']) {
     await fs.writeFile(cacheFile, invalid);
     const failed = await callBridgeTool(bridge, 'models', {});
     assert.equal(JSON.parse(failed.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');

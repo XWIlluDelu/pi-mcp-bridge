@@ -1,9 +1,10 @@
+import { aiEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { RpcClient } from '@earendil-works/pi-coding-agent';
+import { RpcClient } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
@@ -69,7 +70,7 @@ for (const mode of ['tui', 'rpc'])
       await fs.writeFile(
         probe,
         `import fs from 'node:fs/promises';
-import {fauxProvider} from ${JSON.stringify(import.meta.resolve('@earendil-works/pi-ai'))};
+import {fauxProvider} from ${JSON.stringify(aiEntry)};
 export default pi=>{
  pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']}]}).provider);
  pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile)},JSON.stringify({

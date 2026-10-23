@@ -1,4 +1,4 @@
-import { fauxProvider, fauxAssistantMessage, fauxToolCall } from '@earendil-works/pi-ai';
+import { fauxProvider, fauxAssistantMessage, fauxToolCall } from './pi.mjs';
 import fs from 'node:fs/promises';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const exists = (file) =>

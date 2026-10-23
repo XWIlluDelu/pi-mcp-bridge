@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { launchProfile } from './rpc.mjs';
+import { resolvePiInstallation } from './pi-installation.mjs';
 
 const execute = promisify(execFile);
 const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.url));
@@ -10,10 +11,11 @@ const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.u
 // without temporarily mutating Bridge process.env or sharing provider registries.
 export async function loadModelCatalog(config, { offset, limit }) {
   const { env } = launchProfile(config);
+  const installation = await resolvePiInstallation(config, env);
   try {
     const { stdout } = await execute(
       process.execPath,
-      [helper, JSON.stringify({ offset, limit })],
+      [helper, JSON.stringify({ offset, limit, installation })],
       {
         env,
         timeout: 15000,

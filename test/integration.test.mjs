@@ -1,3 +1,4 @@
+import { aiEntry } from './fixtures/pi.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -11,14 +12,14 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSession,
   createExtensionRuntime,
   ModelRuntime,
   SessionManager,
   SettingsManager,
-} from '@earendil-works/pi-coding-agent';
+} from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 
@@ -327,7 +328,7 @@ test('real RPC preparation barrier preserves unknown receipts and fences admissi
   await fs.writeFile(
     extension,
     `import fs from 'node:fs/promises';
-import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(path.join(base, 'node_modules/@earendil-works/pi-ai/dist/index.js'))};
+import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(aiEntry)};
 export default function(pi){
  globalThis.fetch=async()=>{throw new Error('OFFLINE_FIXTURE');};
  const faux=fauxProvider({provider:'admission-fixture',models:[{id:'slow',name:'Offline admission fixture'}],tokensPerSecond:10,tokenSize:{min:1,max:1}});

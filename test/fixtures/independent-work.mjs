@@ -1,7 +1,7 @@
 // A real extension starts native work outside the Bridge's session lane.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fauxProvider, fauxAssistantMessage } from '@earendil-works/pi-ai';
+import { fauxProvider, fauxAssistantMessage } from './pi.mjs';
 export default function independentWork(pi) {
   const dir = path.dirname(process.cwd());
   const mark = (name) => fs.writeFile(path.join(dir, name), 'yes');

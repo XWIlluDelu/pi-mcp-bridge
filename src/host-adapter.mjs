@@ -2,6 +2,7 @@
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import fs from 'node:fs/promises';
 import net from 'node:net';
+import { nativeSdk } from './pi-installation.mjs';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
@@ -50,7 +51,7 @@ function receipt(value) {
     return { status: 'rejected', reason: value.reason };
   fail('INVALID_HOST_RECEIPT');
 }
-export async function reserveHostSession({ attachmentDir, session, owner }) {
+export async function reserveHostSession({ attachmentDir, session, owner, piExecutable }) {
   const target = structuredClone(session);
   owner ??= await processIdentity();
   if (!owner || !(await ownerAlive(owner))) fail('PROCESS_IDENTITY_UNAVAILABLE');
@@ -196,6 +197,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
         },
       };
     else if (['read', 'snapshot'].includes(request.op)) {
+      const sdk = request.op === 'read' ? await nativeSdk({ piExecutable }) : null;
       const observed = await callbacks.snapshot();
       const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
       await assertIdentity(snapshot);
@@ -242,6 +244,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
               live: snapshot.live ?? { available: false, source: 'host_snapshot' },
             },
             args,
+            sdk,
           ),
         };
       }

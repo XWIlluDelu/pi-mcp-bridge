@@ -10,7 +10,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { discover, loadSession } from '../src/data.mjs';
 import { reserveOwner, releaseOwner, updateOwner, processIdentity } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
-import { SessionManager } from '@earendil-works/pi-coding-agent';
+import { SessionManager } from './fixtures/pi.mjs';
 import { readClaim, AttachedRuntime } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
 
