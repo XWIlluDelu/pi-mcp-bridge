@@ -102,7 +102,7 @@ busy-input admission. Listing never starts Pi.
 `next_offset` is null at the end. Concurrent activity may reorder subsequent
 pages; list is not a frozen export.
 
-`creatable_projects` contains only the distinct projects represented by sessions actually returned on this page that are both configured create destinations and permitted for `create` in the same request snapshot. Filters, pagination and list permission determine the page first; an empty page returns `[]`, even when create is allowed by default. It does not enumerate every configured or authorized directory, and a session in an unconfigured subdirectory does not make that directory a create target. This is a page-local hint, not a restriction on `create`: callers may still create in any known configured, authorized project.
+`creatable_projects` lists configured creation destinations with both project-level `list` and `create` permission in the request snapshot, in configuration order. It includes projects without sessions and is independent of session filters, pagination and session-specific grants. Unconfigured directories are never inferred from session rows. Project discovery does not add a permission dependency to `create`: callers may still create in a known configured project with `create:true, list:false`.
 
 ### Read
 
@@ -381,7 +381,8 @@ do not fit; standalone calls retain their ordinary fields.
 
 Captured reads are resized without reacquiring history after a later mutation,
 keeping their original snapshot and usable continuation cursors. Captured list
-and model pages may be shortened with an adjusted `next_offset`. A query that
+and model pages may be shortened with an adjusted `next_offset`; the independent
+creation-target catalog is retained. A query that
 cannot fit even a smaller page returns `BATCH_QUERY_BUDGET_TOO_SMALL` for that
 item, without displacing any mutation result or executing an operation again.
 A separate stop request can interrupt a running command; a stop behind it in

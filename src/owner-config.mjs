@@ -196,8 +196,9 @@ export async function editPermission(file, revision, target, action, value) {
       : { folder: target.folder };
   if (target.default) validatePermissionValues({ [action]: value });
   else validateGrants([{ ...scope, [action]: value }]);
-  if (scope.folder && (await fs.realpath(scope.folder)) !== scope.folder)
-    throw new Error('INVALID_PROJECT_FOLDER');
+  // Project grants address the recorded identity, not the current filesystem.
+  // Editing policy must remain possible after cleanup or symlink replacement.
+  if (scope.folder) scope.folder = path.resolve(scope.folder);
   await readOwnerConfig(file); // Validate the canonical private namespace first.
   const lock = await kernelLock('permissions:' + file, { busy: 'OWNER_CONFIG_BUSY' });
   let temporary;

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { nativeSdk } from './pi-installation.mjs';
 import path from 'node:path';
-import { hash, opaqueId, assertNativeDirectory } from './storage.mjs';
+import { opaqueId, assertNativeDirectory } from './storage.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
 export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
@@ -40,7 +40,7 @@ function validateHeader(header) {
     header.id.length > 128 ||
     (header.cwd !== undefined &&
       header.cwd !== '' &&
-      (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd)))
+      (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd) || header.cwd.includes('\0')))
   )
     throw new Error('INVALID_SESSION');
   if (![1, 2, 3].includes(header.version ?? 1)) throw new Error('UNSUPPORTED_SESSION_VERSION');
@@ -86,16 +86,19 @@ export async function readSessionIdentity(file) {
   } finally {
     await fd.close();
   }
+  // A saved session belongs to its recorded project even after workspace
+  // cleanup. Current symlinks cannot retarget that authorization identity.
+  const projectCwd = header.cwd ? path.resolve(header.cwd) : null;
   let cwd = null;
-  if (header.cwd) {
+  if (projectCwd) {
     try {
-      const resolved = await fs.realpath(header.cwd);
-      if ((await fs.stat(resolved)).isDirectory()) cwd = resolved;
+      const resolved = await fs.realpath(projectCwd);
+      if (resolved === projectCwd && (await fs.stat(resolved)).isDirectory()) cwd = resolved;
     } catch {
-      /* Explicit session grants remain usable without a project directory. */
+      /* Only a new writer requires a currently usable canonical directory. */
     }
   }
-  return { header, file, id: opaqueId(`${file}\0${header.id}`), cwd };
+  return { header, file, id: opaqueId(`${file}\0${header.id}`), projectCwd, cwd };
 }
 export async function validateExecutionCwd(cwd) {
   try {

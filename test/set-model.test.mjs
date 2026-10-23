@@ -65,6 +65,24 @@ test('standalone selection updates a busy native RPC without aborting its captur
   assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
 });
 
+test('native model selection keeps project authorization when its workspace disappears during dispatch', async (t) => {
+  const f = await fixture(t),
+    { bridge, id } = f,
+    runtime = await bridge.pool.resolve(await bridge.session(id)),
+    select = runtime.selectModel.bind(runtime);
+  t.mock.method(runtime, 'selectModel', async (...args) => {
+    await fs.rename(f.cwd, f.cwd + '-moved');
+    return select(...args);
+  });
+  assert.deepEqual(await bridge.set_model({ session_id: id, model: choice('vision') }), {
+    model: choice('vision'),
+    thinking_level: 'off',
+  });
+  const identity = await bridge.session(id);
+  assert.equal(identity.projectCwd, f.cwd);
+  assert.equal(identity.cwd, null);
+});
+
 test('a timed-out native setter remains fenced until its exact ACK and never applies later steps', async (t) => {
   const f = await fixture(t),
     { bridge, id } = f;

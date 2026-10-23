@@ -62,7 +62,14 @@ export async function prepareSession(config, project, { name, parent, snapshot }
       timestamp,
       name,
     });
-  return { id: opaqueId(`${file}\0${id}`), header, file, cwd: project, entries };
+  return {
+    id: opaqueId(`${file}\0${id}`),
+    header,
+    file,
+    projectCwd: path.resolve(header.cwd),
+    cwd: project,
+    entries,
+  };
 }
 
 export async function persistSession(session) {
