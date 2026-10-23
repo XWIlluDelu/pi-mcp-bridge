@@ -14,7 +14,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile } from './data.mjs';
-import { atomicJson, opaqueId } from './storage.mjs';
+import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
 export class AttachmentFailure extends Error {
   constructor(code, uncertain = false, options) {
     super(code, options);
@@ -63,16 +63,14 @@ export async function privateDirectory(dir) {
   // Validate identically for bridge and extension, before either can treat a missing claim as safe.
   if (Buffer.byteLength(path.join(dir, '2147483647-12345678.sock')) > 100)
     throw new AttachmentFailure('ATTACHMENT_SOCKET_PATH_TOO_LONG');
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-  const stat = await fs.lstat(dir);
-  if (
-    !stat.isDirectory() ||
-    stat.isSymbolicLink() ||
-    stat.uid !== process.getuid() ||
-    stat.mode & 0o077 ||
-    (await fs.realpath(dir)) !== path.resolve(dir)
-  )
-    throw new AttachmentFailure('INVALID_ATTACHMENT_DIRECTORY');
+  const canonical = path.resolve(dir);
+  try {
+    await assertPrivateDirectory(canonical, { code: 'INVALID_ATTACHMENT_DIRECTORY' });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await fs.mkdir(canonical, { recursive: true, mode: 0o700 });
+    await assertPrivateDirectory(canonical, { code: 'INVALID_ATTACHMENT_DIRECTORY' });
+  }
 }
 export function claimFile(dir, session) {
   return path.join(dir, `${opaqueId(`${session.file}\0${session.header.id}`)}.owner.json`);

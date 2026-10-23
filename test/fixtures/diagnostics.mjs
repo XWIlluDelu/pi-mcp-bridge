@@ -29,7 +29,7 @@ config.piArgs.push(
   'deterministic',
 );
 const configFile = path.join(dir, 'config.json');
-await fs.writeFile(configFile, JSON.stringify(config));
+await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
 const bridge = await new Bridge(config, undefined, { configFile }).init(),
   token = 'PRIVATE_TOKEN_' + 'x'.repeat(32);
 const service = createHttpService(bridge, { token }),

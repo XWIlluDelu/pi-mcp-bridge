@@ -67,7 +67,7 @@ export async function fixture(t) {
     }),
   );
   const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
+  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   bridge = await new Bridge(config, undefined, { configFile }).init();
   const made = await savedSession(bridge),
     id = made.session_id;

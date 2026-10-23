@@ -84,7 +84,7 @@ async function fixture(t) {
     },
   };
   const configFile = path.join(dir, 'config.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
+  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const calls = [],
     runtime = {
       alive: true,

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import { createReadStream, constants } from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { hash, opaqueId } from './storage.mjs';
+import { hash, opaqueId, assertNativeDirectory } from './storage.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
 export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
@@ -13,6 +13,7 @@ export async function assertSingleSessionFile(file, { allowMissing = false } = {
     (await fs.realpath(path.dirname(file))) !== path.dirname(file)
   )
     throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  const { protectedPath } = await assertNativeDirectory(path.dirname(file));
   let stat;
   try {
     stat = await fs.lstat(file);
@@ -27,6 +28,8 @@ export async function assertSingleSessionFile(file, { allowMissing = false } = {
     (await fs.realpath(file)) !== file
   )
     throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  if (stat.uid !== process.getuid() || (!protectedPath && stat.mode & 0o022))
+    throw new Error('UNSAFE_NATIVE_SESSION_STORAGE');
   return stat;
 }
 function validateHeader(header) {

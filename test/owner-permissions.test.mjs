@@ -32,7 +32,7 @@ async function fixture(t) {
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     piRuntime: { inheritEnv: ['PATH'], tools: ['read'] },
   };
-  await fs.writeFile(file, JSON.stringify(config));
+  await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   return { dir, cwd, child, file, config };
 }
