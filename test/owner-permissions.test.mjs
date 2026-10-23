@@ -13,6 +13,8 @@ import {
   validateGrants,
 } from '../src/owner-config.mjs';
 import ownerPermissions from '../src/owner-permissions-extension.mjs';
+import { SessionManager } from './fixtures/pi.mjs';
+import { opaqueId } from '../src/storage.mjs';
 import { Bridge } from '../src/bridge.mjs';
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-perm-')),
@@ -170,6 +172,107 @@ test('permission menu registers only a human TUI shortcut and aborts on lifecycl
     else process.env.PI_MCP_OWNER_CONFIG = prior;
   }
 });
+function permissionMenu(t, file, context) {
+  const prior = process.env.PI_MCP_OWNER_CONFIG;
+  process.env.PI_MCP_OWNER_CONFIG = file;
+  t.after(() => {
+    if (prior === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
+    else process.env.PI_MCP_OWNER_CONFIG = prior;
+  });
+  let shortcut, choices;
+  const selections = [],
+    notices = [];
+  ownerPermissions({
+    on() {},
+    registerShortcut: (_key, value) => {
+      shortcut = value.handler;
+    },
+    registerCommand: () => assert.fail('Permission edits remain owner-local'),
+    registerTool: () => assert.fail('Permission edits remain owner-local'),
+  });
+  const ctx = {
+    mode: 'tui',
+    hasUI: true,
+    ...context,
+    ui: {
+      notify: (message, level) => notices.push({ message, level }),
+      select: async (title, options) => {
+        selections.push({ title, options });
+        const value = choices.shift();
+        const selected = typeof value === 'number' ? options[value] : value;
+        assert.ok(options.includes(selected), `Unavailable menu choice: ${selected}`);
+        return selected;
+      },
+    },
+  };
+  return {
+    selections,
+    notices,
+    async run(...values) {
+      choices = values;
+      await shortcut(ctx);
+      assert.deepEqual(choices, [], notices.map(({ message }) => message).join('\n'));
+    },
+  };
+}
+
+for (const replacement of ['missing', 'symlink'])
+  test(`owner can revoke recorded project permissions after the workspace becomes ${replacement}`, async (t) => {
+    const f = await fixture(t);
+    await fs.rm(f.cwd, { recursive: true });
+    const outside = path.join(f.dir, 'outside');
+    if (replacement === 'symlink') {
+      await fs.mkdir(outside);
+      await fs.symlink(outside, f.cwd);
+    }
+    const before = await readOwnerConfig(f.file);
+    const after = await editPermission(f.file, before.revision, { folder: f.cwd }, 'read', false);
+    assert.equal(permitted(after.config, 'read', { projectCwd: f.cwd, cwd: null }), false);
+    assert.equal(permitted(after.config, 'read', { cwd: outside }), false);
+    assert.equal(after.config.grants[0].folder, f.cwd);
+    assert.deepEqual(after.config.folders, before.config.folders);
+  });
+
+test('owner menu edits defaults and project rules without requiring a workspace or creation target', async (t) => {
+  const f = await fixture(t);
+  await fs.writeFile(f.file, JSON.stringify({ ...f.config, folders: [] }));
+  await fs.rm(f.cwd, { recursive: true });
+  const menu = permissionMenu(t, f.file, { cwd: f.cwd });
+  await menu.run('Defaults', 1, 'Allow', 'Done');
+  assert.equal((await readOwnerConfig(f.file)).config.defaults.read, true);
+  await menu.run('This project', 2, 'Block', 'Done');
+  assert.equal(permitted((await readOwnerConfig(f.file)).config, 'send', { cwd: f.cwd }), false);
+  await menu.run('Another configured project', f.cwd, 2, 'Allow', 'Done');
+  const after = await readOwnerConfig(f.file);
+  assert.equal(permitted(after.config, 'send', { cwd: f.cwd }), true);
+  assert.deepEqual(after.config.folders, []);
+  assert.ok(menu.notices.every((notice) => notice.level === 'info'));
+});
+
+test('owner session menu uses the reserved native identity and recorded project before first persistence', async (t) => {
+  const f = await fixture(t);
+  await fs.mkdir(f.config.sessionRoots[0]);
+  const manager = SessionManager.create(f.cwd, f.config.sessionRoots[0]);
+  const file = manager.getSessionFile();
+  const id = opaqueId(`${file}\0${manager.getSessionId()}`);
+  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+  await fs.rm(f.cwd, { recursive: true });
+  const menu = permissionMenu(t, f.file, { cwd: f.dir, sessionManager: manager });
+  await menu.run('This session', 1, 'Block', 'Done');
+  const readRows = menu.selections.find(({ title }) => title === 'This session').options;
+  assert.ok(readRows[1].startsWith('Read: Allowed'));
+  assert.ok(readRows[1].includes(f.cwd));
+  const after = await readOwnerConfig(f.file);
+  assert.equal(permitted(after.config, 'read', { id, projectCwd: f.cwd }), false);
+  assert.equal(permitted(after.config, 'read', { id: 'another', projectCwd: f.cwd }), true);
+  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+  // Granting a reserved identity must not permit aliases to substitute another file.
+  await fs.symlink(f.file, file);
+  await menu.run('This session');
+  assert.equal((await readOwnerConfig(f.file)).revision, after.revision);
+  assert.equal(menu.notices.at(-1).level, 'error');
+});
+
 test('running bridge reloads valid permissions independently of pending fixed settings', async (t) => {
   const f = await fixture(t);
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();

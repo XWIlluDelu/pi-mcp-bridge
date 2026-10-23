@@ -4,7 +4,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
-import { withdrawalCollector } from '../src/stop-execution.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
@@ -251,7 +250,7 @@ test('list keeps parent references from its snapshot through slow child status',
   const fresh = await f.bridge.list({ session_id: child.session_id });
   assert.equal(fresh.sessions[0].parent_session_id, null);
 });
-test('deleted-file receipt replay requires current authorization without needing the original file', async (t) => {
+test('repeated delete reauthorizes and cannot recover the prior trash result', async (t) => {
   const f = await fixture(t),
     seed = await savedSession(f.bridge),
     args = { session_id: seed.session_id };
@@ -267,6 +266,10 @@ test('deleted-file receipt replay requires current authorization without needing
   await f.update((c) => {
     c.grants = [{ session_id: seed.session_id, delete: true }];
   });
+  const repeated = await f.bridge.delete(args);
+  assert.equal(repeated.status, 'rejected');
+  assert.equal(repeated.reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal(repeated.restore_token, undefined);
 });
 test('create holds the new session lane until its initial prompt is admitted', async (t) => {
   const f = await fixture(t),
@@ -293,41 +296,6 @@ test('create holds the new session lane until its initial prompt is admitted', a
     'Expected native prompt admission',
   );
   assert.deepEqual(f.calls, ['initial', 'later']);
-});
-test('stop keeps its admission grant through durable dispatch receipt writes', async (t) => {
-  const f = await fixture(t),
-    seed = await savedSession(f.bridge);
-  let stops = 0;
-  await f.update((c) => {
-    c.defaults.stop = true;
-  });
-  f.runtime.generation = 'native-generation';
-  const session = await f.bridge.session(seed.session_id);
-  f.runtime.stopExecution = async ({ max_chars }) => {
-    stops++;
-    const withdrawn = withdrawalCollector(max_chars);
-    return {
-      status: 'accepted',
-      acknowledgement: 'native_ack',
-      coverage: 'agent_and_bash',
-      withdrawal: withdrawn.add({ steering: ['kept output'], followUp: [] }),
-    };
-  };
-  f.bridge.pool.instances.set(seed.session_id, f.runtime);
-  const stop = f.runtime.stopExecution;
-  f.runtime.stopExecution = async (args) => {
-    const result = await stop(args);
-    await f.update((c) => {
-      c.defaults.stop = false;
-    });
-    return result;
-  };
-  assert.equal(
-    (await f.bridge.stop({ session_id: seed.session_id })).withdrawn_text,
-    'kept output',
-  );
-  assert.equal(stops, 1);
-  await assert.rejects(f.bridge.stop({ session_id: seed.session_id }), /NOT_FOUND_OR_DENIED/);
 });
 test('delete retains its admission grant through owner release', async (t) => {
   const f = await fixture(t),

@@ -1,6 +1,6 @@
 // Human TUI shortcut only: deliberately no slash command or model/MCP tool.
-import fs from 'node:fs/promises';
 import path from 'node:path';
+import { assertSingleSessionFile } from './data.mjs';
 import { inside } from './permissions.mjs';
 import { opaqueId } from './storage.mjs';
 import { readOwnerConfig, editPermission, permissionDetails } from './owner-config.mjs';
@@ -44,7 +44,6 @@ export default function ownerPermissions(pi) {
       };
       try {
         let snapshot = await readOwnerConfig(file);
-        const cwd = await fs.realpath(ctx.cwd);
         const choice = await ctx.ui.select(
           'MCP permissions',
           ['This session', 'This project', 'Another configured project', 'Defaults'],
@@ -66,26 +65,29 @@ export default function ownerPermissions(pi) {
             ctx.ui.notify('This session is outside the bridge session storage.', 'warning');
             return;
           }
-          const stat = await fs.lstat(sessionFile);
-          if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('SESSION_NOT_SAVED');
-          target = { session_id: opaqueId(`${sessionFile}\0${id}`), cwd };
+          const header = ctx.sessionManager.getHeader();
+          await assertSingleSessionFile(sessionFile, { allowMissing: true });
+          target = {
+            session_id: opaqueId(`${sessionFile}\0${id}`),
+            cwd: header?.cwd ? path.resolve(header.cwd) : null,
+          };
           title = 'This session';
         } else {
-          let folder = cwd;
+          let folder = path.resolve(ctx.cwd);
           if (choice === 'Another configured project') {
-            folder = await ctx.ui.select(
-              'Choose project',
-              snapshot.config.folders.map((f) => f.path),
-              options,
-            );
+            const projects = [
+              ...new Set([
+                ...snapshot.config.folders.map((f) => path.resolve(f.path)),
+                ...(snapshot.config.grants ?? [])
+                  .filter((rule) => rule.folder)
+                  .map((rule) => path.resolve(rule.folder)),
+              ]),
+            ];
+            folder = await ctx.ui.select('Choose project', projects, options);
             current();
             if (!folder) return;
           }
-          if (!snapshot.config.folders.some((f) => f.path === folder)) {
-            ctx.ui.notify('Choose a project from the configured folder list.', 'warning');
-            return;
-          }
-          target = { folder: await fs.realpath(folder) };
+          target = { folder };
           title = `Project: ${target.folder}`;
         }
         const actions = Object.keys(labels).filter(
@@ -129,7 +131,8 @@ export default function ownerPermissions(pi) {
             {
               OWNER_CONFIG_CHANGED: 'Configuration changed elsewhere. Reopen the menu.',
               OWNER_CONFIG_BUSY: 'Another permission edit is in progress. Try again.',
-              SESSION_NOT_SAVED: 'Save this session before changing its permissions.',
+              SESSION_FILE_ALIAS_NOT_ALLOWED: "This session's storage cannot be safely identified.",
+              UNSAFE_NATIVE_SESSION_STORAGE: "This session's storage cannot be safely identified.",
             }[error.message] ?? 'Could not update permissions. Check the owner configuration.';
           ctx.ui.notify(message, 'error');
         }

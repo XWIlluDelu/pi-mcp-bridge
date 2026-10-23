@@ -27,8 +27,8 @@ Only the fields below are accepted. Unknown fields and incomplete baseline permi
 - Existing `stateDir` and `attachmentDir` must belong to the service user and have no group/other permissions. Native session storage has a separate integrity rule, not a 0700 rule: Pi's ordinary 0755 directories and 0644 files are supported. An owned private ancestor protects descendants; otherwise the entire canonical directory chain and the actual file must not be writable by other users. Sticky temporary-directory ancestors are allowed. Unsafe storage is rejected without chmod.
 - `sessionRoots` bounds discovery and access; its order does not select the destination for `create`. New sessions use the target project's native Pi location: `piArgs --session-dir`, then inherited `PI_CODING_AGENT_SESSION_DIR`, then merged project/global `sessionDir`, otherwise Pi's per-project default under the effective agent directory. `piRuntime.agentDir` and `inheritEnv` apply to this selection just as they do to runtime launch.
 - The native destination must be inside an existing configured session root. Otherwise `create` rejects with `NATIVE_SESSION_OUTSIDE_ROOTS`, without publishing a session or sending a prompt; it never falls back to the first root or expands the roots. Destination directories must satisfy the native canonical-path integrity checks; unsafe existing directories are rejected, not chmodded. Existing sessions are not moved.
-- Project cwd comes from the native session header and is validated independently of the storage path. Configure roots and project grants together; neither implies the other.
-- Saved history can remain readable when its cwd is unavailable, provided the remaining permission policy authorizes the read. Creating a session or cold-starting a writer requires a real, canonical project directory. Existing cooperating owners remain controllable if their original cwd disappears.
+- A saved session's project identity is the normalized absolute cwd recorded in its native header, independent of storage location and current filesystem availability. Project grants follow this recorded identity, not a later symlink target. Configure roots and project grants together; neither implies the other.
+- Workspace cleanup does not revoke project-level history or control authorization. Creating a session or cold-starting a writer still requires the recorded project directory to exist at its canonical path; a file or symlink replacement cannot redirect execution elsewhere. Existing cooperating owners remain controllable under their current grants if their original cwd disappears.
 
 ### Native environment
 
@@ -102,7 +102,7 @@ Consequences:
 
 The authoritative Bridge starts one policy read when it receives a complete, schema-valid business request, before executor or session queues. The resulting independent, immutable snapshot includes `defaults`, `grants`, `folders` and `sessionRoots`. It governs that request's directory scope, permission checks, execution and returned data, including waits, cold startup, native ACKs and inline output delivery. Later permission and scope edits affect new requests only; they neither revoke nor add access to an in-flight request. The stdio proxy only forwards requests; client/proxy timestamps and the later native execution time do not select the policy.
 
-All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, page-local `creatable_projects`, authorized model catalogs and health diagnostics also use the request snapshot.
+All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, independently authorized `creatable_projects`, model catalogs and health diagnostics also use the request snapshot.
 
 Every new call captures a new policy, including every new mutation and each read cursor page. A read cursor is not an authorization token. Late ACKs finish native identity checks without replaying work or acquiring rights from another request; permission snapshots are process-local, not persisted credentials.
 
@@ -120,9 +120,11 @@ Warnings cover known-ID-only access, work without progress reading, work without
 
 ### Native human menu
 
-Load `src/owner-permissions-extension.mjs` into Pi with `PI_MCP_OWNER_CONFIG=/absolute/path/owner.json`, then press **Ctrl+Alt+P** in a native TUI. Choose this session, this project, another configured project or the defaults. Each field offers Allow, Block or Inherit and shows its effective source. Session menus omit `create`.
+Load `src/owner-permissions-extension.mjs` into Pi with `PI_MCP_OWNER_CONFIG=/absolute/path/owner.json`, then press **Ctrl+Alt+P** in a native TUI. Choose this session, this project (the native working-directory path), another configured project or the defaults. Other projects come from configured creation targets and project-grant rules; neither listing nor editing a grant adds a creation target. Each field offers Allow, Block or Inherit and shows its effective source. Session menus omit `create` and use the native header's project identity to display inheritance.
 
-The menu is a human shortcut, not a model tool or slash command. It writes only the chosen field, preserves other settings, rejects concurrent edits and closes on native session lifecycle changes. A saved session outside the configured roots cannot be edited through this session's menu.
+Permission edits address normalized recorded paths, without requiring the workspace to exist or following a replacement symlink. Default edits do not depend on the current workspace. A persistent native session can receive its own grant before its first message is written, using its reserved canonical file path and native ID; in-memory sessions, out-of-root paths and file aliases are not eligible. Editing permissions never starts Pi or writes session history. Create and cold execution still validate the current canonical cwd separately.
+
+The menu is a human shortcut, not a model tool or slash command. It writes only the chosen field, preserves other settings, rejects concurrent edits and closes on native session lifecycle changes.
 
 ## Startup and deployment
 
