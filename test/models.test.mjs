@@ -204,7 +204,7 @@ test(
 );
 
 test(
-  'unavailable models and image-incompatible choices retain partial create identity',
+  'unavailable models retain partial create identity and settings require a prompt',
   { timeout: 20000 },
   async (t) => {
     const f = await fixture(t),
@@ -226,14 +226,6 @@ test(
     );
 
     assert.equal((await bridge.sessions()).length, 2);
-    const rejected = await bridge.send({
-      session_id: id,
-
-      images: [pngImage()],
-      model: choice('alpha'),
-    });
-    assert.equal(rejected.reason, 'MODEL_IMAGE_INPUT_UNSUPPORTED');
-    assert.equal(rejected.model_selection, undefined);
     await assert.rejects(
       bridge.send({ session_id: id, model: choice('vision') }),
       /INVALID_ARGUMENTS/,

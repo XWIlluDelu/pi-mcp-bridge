@@ -385,7 +385,6 @@ export class AttachedRuntime {
               'THINKING_LEVEL_UNSUPPORTED',
               'THINKING_SUPPORT_UNKNOWN',
               'IMAGE_INPUT_UNSUPPORTED',
-              'MODEL_IMAGE_INPUT_UNSUPPORTED',
               'INVALID_PROMPT_INPUT',
               'INVALID_ATTACHED_SEND',
             ].includes(response.error)
