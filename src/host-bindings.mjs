@@ -2,12 +2,7 @@
 // session, spawn a process, read stdio, or access private admission hooks.
 import { requireInterruptCompaction } from './compact.mjs';
 import { nativeBashResult } from './bash-execution.mjs';
-import {
-  SEND_MODES,
-  assertImageModel,
-  hasPromptSettings,
-  promptOptions as options,
-} from './prompt-input.mjs';
+import { SEND_MODES, hasPromptSettings, promptOptions as options } from './prompt-input.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
@@ -111,7 +106,6 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
-      assertImageModel(images, session.model);
       beforeDispatch?.();
       if (
         mode === 'idle_only' &&
@@ -273,7 +267,6 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
-      if (images) assertImageModel(images, (await client.getState()).model);
       if (mode === 'idle_only') {
         const observed = await state();
         if (observed.isStreaming || observed.isCompacting || observed.pendingMessageCount > 0)

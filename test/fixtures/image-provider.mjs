@@ -11,7 +11,25 @@ export function imageReply(context) {
   // Digest only the test image bytes: do not echo large base64 into model output.
   return fauxAssistantMessage('IMAGE_CONTEXT:' + JSON.stringify(images.map(imageEvidence)));
 }
+export function imageInputExtension(pi) {
+  pi.on('input', (event) => {
+    if (event.text.startsWith('HANDLE_IMAGE_TEST')) {
+      const evidence = event.images?.map(imageEvidence);
+      if (!evidence?.length || !event.text.includes(evidence[0].sha256))
+        throw new Error('INPUT_IMAGE_CHANGED');
+      pi.appendEntry('image-input-fixture', evidence);
+      return { action: 'handled' };
+    }
+    if (event.text === 'TRANSFORM_IMAGE_TEST')
+      return { action: 'transform', text: 'IMAGE_TRANSFORMED', images: [] };
+  });
+  pi.on('before_agent_start', async (event, ctx) => {
+    if (event.messageType === 'user' && event.prompt === 'SELECT_IMAGE_TEST')
+      await pi.setModel(ctx.modelRegistry.find(ctx.model.provider, 'vision'));
+  });
+}
 export default function (pi) {
+  imageInputExtension(pi);
   globalThis.fetch = async () => {
     throw new Error('Image fixture blocks network');
   };
