@@ -57,6 +57,7 @@ export async function serveOwnerControl(bridge) {
           const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
           const methods = {
             release: 'releaseForLocal',
+            settled: 'settledForLocal',
             input_activity: 'inputActivityForLocal',
             reset: 'resetColdResume',
             handoff: 'handoffForLocal',

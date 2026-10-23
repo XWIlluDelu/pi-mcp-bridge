@@ -28,7 +28,7 @@ Only the fields below are accepted. Unknown fields and incomplete baseline permi
 - `sessionRoots` bounds discovery and access; its order does not select the destination for `create`. New sessions use the target project's native Pi location: `piArgs --session-dir`, then inherited `PI_CODING_AGENT_SESSION_DIR`, then merged project/global `sessionDir`, otherwise Pi's per-project default under the effective agent directory. `piRuntime.agentDir` and `inheritEnv` apply to this selection just as they do to runtime launch.
 - The native destination must be inside an existing configured session root. Otherwise `create` rejects with `NATIVE_SESSION_OUTSIDE_ROOTS`, without publishing a session or sending a prompt; it never falls back to the first root or expands the roots. Destination directories must satisfy the native canonical-path integrity checks; unsafe existing directories are rejected, not chmodded. Existing sessions are not moved.
 - A saved session's project identity is the normalized absolute cwd recorded in its native header, independent of storage location and current filesystem availability. Project grants follow this recorded identity, not a later symlink target. Configure roots and project grants together; neither implies the other.
-- Workspace cleanup does not revoke project-level history or control authorization. Creating a session or cold-starting a writer still requires the recorded project directory to exist at its canonical path; a file or symlink replacement cannot redirect execution elsewhere. Existing cooperating owners remain controllable under their current grants if their original cwd disappears.
+- Workspace cleanup does not revoke project-level history, control or notification authorization. Creating a session or cold-starting a writer still requires the recorded project directory to exist at its canonical path; a file or symlink replacement cannot redirect execution elsewhere. Existing cooperating owners remain controllable under their current grants if their original cwd disappears.
 
 ### Native environment
 
@@ -117,6 +117,12 @@ An installed companion rereads directory scope before native session registratio
 `health({})` reports noteworthy permission combinations and, when present, the fixed settings awaiting restart. A healthy configuration with no pending restart returns `{"domain":"permissions","status":"ok"}`. Issues include their relevant allowed/blocked conditions and source rules; the same inherited issue is reported once, without normal permission tables or repeated project configuration. Add a known `session_id` to diagnose only that session; source labels show the tier without disclosing its project or name. `health` never changes permissions.
 
 Warnings cover known-ID-only access, work without progress reading, work without stop, restricted access to newly created sessions, and the difference between direct shell permission and model tools. These are valid configurations, not validation errors or implicit permission dependencies.
+
+Unscoped health also reports `events:{status:"unavailable",reason:"…"}` when the
+private subscription store cannot be safely loaded. This is separate from the
+permission-domain status: core operations remain available, while event methods
+report their own unavailability. See [event storage](events.md#authorization-storage-and-delivery)
+for owner repair and restart.
 
 ### Native human menu
 

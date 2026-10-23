@@ -48,7 +48,28 @@ export default async function rpcObserver(pi) {
       : (globalThis[key] = {
           generation,
           captureSequence: 0,
+          completionSequence: 0,
         });
+  // Capture the native boundary before the first await. Only local IPC is
+  // acknowledged here; HTTPS delivery never blocks Pi or keeps its writer alive.
+  if (ownerControl)
+    pi.on('agent_settled', async (event, ctx) => {
+      const file = ctx.sessionManager.getSessionFile(),
+        id = ctx.sessionManager.getSessionId();
+      await ownerRequest(
+        ownerControl,
+        {
+          op: 'settled',
+          session_id: opaqueId(file + '\0' + id),
+          generation,
+          sequence: ++lifecycle.completionSequence,
+          leafId: ctx.sessionManager.getLeafId(),
+          aborted: event.aborted,
+          timestamp: new Date().toISOString(),
+        },
+        { signal: AbortSignal.timeout(2000) },
+      );
+    });
   // Preserve capture ordering across reload within this same owner generation.
   const observation = new ContextObservation(generation, lifecycle);
   // Pi dispatches every context handler (including MC) before this phase,
