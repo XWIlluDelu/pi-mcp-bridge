@@ -5,7 +5,7 @@ import {
   fixture,
   until,
   choice,
-  completedEntries,
+  releasedEntries,
   savedEntries,
 } from './fixtures/model-runtime.mjs';
 import { Bridge } from '../src/bridge.mjs';
@@ -44,7 +44,7 @@ for (const op of ['send', 'create']) {
         const effective = receipt.model_selection;
         assert.deepEqual(effective.model, choice('vision'));
         if (kind !== 'model') assert.equal(effective.thinking_level, 'high');
-        const entries = await completedEntries(bridge, id),
+        const entries = await releasedEntries(bridge, id),
           reply = replies(entries)[0];
         assert.equal(reply.id, 'vision');
         assert.equal(
@@ -54,6 +54,7 @@ for (const op of ['send', 'create']) {
         assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
         assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
         assert.deepEqual(await savedEntries(bridge, id), entries);
+        assert.equal(bridge.pool.instances.size, 0);
       },
     );
   }
@@ -76,7 +77,7 @@ for (const op of ['send', 'create']) {
       assert.equal(receipt.status, 'rejected');
       assert.equal(receipt.reason, 'THINKING_LEVEL_UNSUPPORTED');
       assert.equal(receipt.model_selection, undefined);
-      const entries = await completedEntries(bridge, id);
+      const entries = await releasedEntries(bridge, id);
       assert.equal(entries.filter((e) => e.message?.role === 'user').length, 0);
       assert.ok(
         !entries.some((e) => e.type === 'thinking_level_change' && e.thinkingLevel === 'high'),
@@ -109,7 +110,7 @@ for (const op of ['send', 'create']) {
       await fs.writeFile(f.gate, 'go');
       await until(() => !bridge.pool.get(id)?.modelMutation);
       assert.equal(sendReceipt(result).model_selection, undefined);
-      const entries = await completedEntries(bridge, id);
+      const entries = await releasedEntries(bridge, id);
       assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'vision');
       assert.equal(entries.filter((e) => e.message?.role === 'user').length, 0);
       assert.ok(
@@ -166,7 +167,7 @@ for (const op of ['send', 'create']) {
       await until(() => !bridge.pool.get(id)?.modelMutation);
       assert.equal(sendReceipt(result).model_selection, undefined);
       assert.equal(
-        (await completedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,
+        (await releasedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,
         0,
       );
     },
@@ -188,7 +189,7 @@ test(
       const result = await bridge.send({ session_id: id, text });
       assert.ok(['started', 'queued', 'handled'].includes(result.status), JSON.stringify(result));
       assert.equal(result.model_selection, undefined);
-      const reply = replies(await completedEntries(bridge, id)).at(-1);
+      const reply = replies(await releasedEntries(bridge, id)).at(-1);
       assert.equal(reply.id, 'vision');
       assert.equal(reply.reasoning, 'high');
     }
@@ -238,7 +239,7 @@ test(
       'queued',
     );
     await fs.writeFile(f.gate, 'go');
-    const values = replies(await completedEntries(bridge, id));
+    const values = replies(await releasedEntries(bridge, id));
     assert.equal(values.length, 2);
     assert.ok(values.every((v) => v.id === 'vision' && v.reasoning === 'high'));
   },
@@ -261,7 +262,7 @@ test(
     });
     assert.ok(['started', 'queued', 'handled'].includes(result.status), JSON.stringify(result));
     assert.equal(result.model_selection.thinking_level, 'off');
-    assert.equal(replies(await completedEntries(bridge, id))[0].reasoning, null);
+    assert.equal(replies(await releasedEntries(bridge, id))[0].reasoning, null);
     assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
   },
 );
@@ -322,7 +323,7 @@ test(
     assert.equal(unknown.model_selection.thinking_level, 'high');
     await until(() => rpc.settlement.sequence > 0);
     receive(...held);
-    const entries = await completedEntries(bridge, id);
+    const entries = await releasedEntries(bridge, id);
     assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
     assert.equal(replies(entries)[0].reasoning, 'high');
 

@@ -296,6 +296,7 @@ export class PiRpc {
         observed_at: new Date().toISOString(),
         aborted: event.aborted,
       };
+      this.onIdleCandidate?.();
       return; // Settlement alone never clears an unresolved prompt ACK fence.
     }
     if (event.type !== 'response') return;
@@ -348,6 +349,17 @@ export class PiRpc {
       this.modelMutation = null;
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation)
       this.promptAdmission = null;
+    const notifyIdle = () => {
+      if (
+        ![
+          'get_state',
+          'get_entries',
+          'get_available_models',
+          'get_available_thinking_levels',
+        ].includes(req.commandType)
+      )
+        this.onIdleCandidate?.();
+    };
     const ui = uiSnapshot(req.uiFacts);
     const result = event.success
       ? { ok: true, data: ui.ui ? { ...event.data, ...ui } : event.data }
@@ -360,10 +372,12 @@ export class PiRpc {
         status: result.ok ? 'ok' : 'error',
       });
       if (req.onLate) this.trackAck(() => req.onLate(result));
+      notifyIdle();
       return;
     }
     if (result.ok) req.resolve(result.data);
     else req.reject(Object.assign(new RpcFailure(result.code), ui));
+    notifyIdle();
   }
   trackAck(work) {
     let task;
@@ -531,6 +545,7 @@ export class PiRpc {
       return await read();
     } finally {
       this.activeReads--;
+      this.onIdleCandidate?.();
     }
   }
   entries() {
@@ -674,6 +689,7 @@ export class PiRpc {
       }
     } finally {
       this.activeBashes--;
+      this.onIdleCandidate?.();
     }
   }
   async stopExecution({ timeout_ms = 5000, max_chars } = {}) {
@@ -870,6 +886,7 @@ export class RuntimePool {
       this.runtimeEvents.set(runtime.session.id, runtime.runtimeEvents);
       if (this.runtimeEvents.size > 16)
         this.runtimeEvents.delete(this.runtimeEvents.keys().next().value);
+      runtime.onIdleCandidate = () => this.onIdleCandidate?.(runtime);
     }
     return runtime;
   }

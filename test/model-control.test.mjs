@@ -6,7 +6,7 @@ import {
   until,
   choice,
   savedEntries,
-  completedEntries,
+  releasedEntries,
 } from './fixtures/model-runtime.mjs';
 import { Bridge } from '../src/bridge.mjs';
 test('selection keeps its admission grant through native model discovery', async (t) => {
@@ -29,7 +29,7 @@ test('selection keeps its admission grant through native model discovery', async
     thinking_level: 'high',
   });
   assert.ok(['started', 'queued', 'handled'].includes(selected.status), JSON.stringify(selected));
-  const entries = await completedEntries(bridge, id);
+  const entries = await releasedEntries(bridge, id);
   assert.ok(entries.some((e) => e.type === 'model_change' && e.modelId === 'vision'));
   assert.ok(entries.some((e) => e.type === 'thinking_level_change' && e.thinkingLevel === 'high'));
   assert.equal(
@@ -80,7 +80,7 @@ for (const operation of ['send', 'create'])
       );
       await fs.writeFile(f.configFile, JSON.stringify(f.config));
       assert.equal((result.send ?? result).model_selection, undefined);
-      const entries = await completedEntries(bridge, target);
+      const entries = await releasedEntries(bridge, target);
       assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'vision');
 
       assert.equal(
@@ -118,7 +118,7 @@ test('cold selection retains its admission snapshot', { timeout: 15000 }, async 
     (await bridge.send({ session_id: id, text: 'DENIED' })).reason,
     'NOT_FOUND_OR_DENIED',
   );
-  const entries = await completedEntries(bridge, id);
+  const entries = await releasedEntries(bridge, id);
   assert.ok(entries.some((e) => e.type === 'model_change' && e.modelId === 'vision'));
   assert.ok(entries.some((e) => e.message?.role === 'user'));
 });

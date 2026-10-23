@@ -147,6 +147,9 @@ See [native controls](model-control.md) for prompt model/thinking settings and m
 
 `timeout_ms` (50–30000, default 5000) bounds admission acknowledgement, not
 model execution. Queued input is an accepted submission, not a completed task.
+After the run and queues finish, a proven-idle Bridge-owned RPC normally exits
+and the session becomes saved. The next send can resume it; external owners
+keep their own lifecycle. See [automatic release and its limits](runtime.md#runtime-capabilities).
 At least one of `text` or `images` is required. Each call submits new input.
 The result has exactly one `status`: `started`, `queued`, `handled`, `skipped`,
 `rejected` or `unknown`. `reason` appears only when needed. There is no separate
@@ -255,7 +258,8 @@ The result reports whether an editor draft was part of the native capture.
 `withdrawn_complete:false` means the returned text is incomplete; there is no
 continuation or lookup. Unsent withdrawn text may not be present in history.
 
-Stop never cold-starts a session or closes its owner.
+Stop never cold-starts a session. Once its recovery finishes, a Bridge-owned
+prompt runtime may exit through normal automatic release; external owners stay open.
 Pending Bridge inputs not yet dispatched, including batch items waiting for a
 lane or permission snapshot, are invalidated rather than reviving after stop.
 An explicit stop→send in one batch restarts in order; an external Stop still
@@ -291,8 +295,9 @@ retained entries after removing old label records.
 
 Only target create permission is needed for the first prompt; later sends
 need send permission. A fork additionally requires source read. The source
-writer is not switched or restarted by the fork. A live parent's native snapshot
-is authoritative; unsupported snapshot capability is
+writer is not switched or restarted by the fork. If automatic release is already
+closing it, the fork waits for that exit before acquiring the source. A live
+parent's native snapshot is authoritative; unsupported snapshot capability is
 an explicit failure, never a disk fallback.
 
 A result contains `created`, the child `session_id` when chosen, and nested

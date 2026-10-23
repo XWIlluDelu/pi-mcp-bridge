@@ -28,6 +28,8 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
   validate(request);
   bridge.assertOpen();
   const { session_id, requester, handoff_id } = request;
+  if (bridge.handoffs.get(session_id)?.kind === 'auto_release')
+    await bridge.pool.instances.get(session_id)?.autoReleaseTask;
   if (bridge.handoffs.has(session_id)) throw new Error('HANDOFF_PENDING');
   const controller = new AbortController();
   signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;

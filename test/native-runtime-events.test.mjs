@@ -91,6 +91,7 @@ test(
       false,
     );
 
+    await rpc.autoReleaseTask;
     const current = await f.bridge.pool.resolve(session);
     await current.command({ type: 'prompt', message: '/audit-deferred' });
     const holding = f.bridge.send({ session_id: session.id, text: 'HELD' });
@@ -121,7 +122,7 @@ test(
 );
 
 test(
-  'native handled input notices survive owner-local EOF release, without reopening or persisting notices',
+  'native handled input notices survive automatic EOF release, without reopening or persisting notices',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t);
@@ -131,10 +132,7 @@ test(
       text: 'NOTIFY_ONLY',
     });
     assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
-    await until(
-      async () => (await f.bridge.pool.get(made.session_id).idleSnapshot()).status === 'idle',
-    );
-    await f.bridge.releaseForLocal({ session_id: made.session_id });
+    await until(() => !f.bridge.pool.instances.has(made.session_id) && !f.bridge.autoReleases.size);
     const args = { session_id: made.session_id, max_bytes: 4096 },
       read = await f.bridge.read(args);
     assertContextReadResponse(read, args);

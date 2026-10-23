@@ -1,22 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { fixture, until, idle, savedEntries } from './fixtures/model-runtime.mjs';
+import { fixture, until, savedEntries } from './fixtures/model-runtime.mjs';
 const exists = (file) =>
   fs.stat(file).then(
     () => true,
     () => false,
   );
-const completed = (f) => idle(f.bridge.pool.get(f.id));
+const released = (f) => until(() => !f.bridge.pool.instances.has(f.id));
 async function populate(f) {
   const sent = await f.bridge.send({ session_id: f.id, text: 'KEEP_HISTORY '.repeat(200) });
   assert.equal(sent.status, 'started');
-  await completed(f);
-  await f.bridge.pool.stop(f.id);
+  await released(f);
 }
 
 test(
-  'cold compact needs send, hides its native summary at completion',
+  'cold compact needs send, hides its native summary and releases when complete',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t);
@@ -32,7 +31,7 @@ test(
     assert.equal(result.interrupt_requested, false);
     assert.ok(!JSON.stringify(result).includes('RETAIN_THE_MARKER'));
     assert.ok(!('summary' in result));
-    await completed(f);
+    await released(f);
     const entries = await savedEntries(f.bridge, f.id);
     assert.equal(entries.filter((e) => e.type === 'compaction').length, 1);
     assert.ok(entries.find((e) => e.type === 'compaction').summary.includes('RETAIN_THE_MARKER'));
@@ -56,7 +55,7 @@ test(
     const result = await f.bridge.compact({ session_id: f.id, interrupt: true });
     assert.equal(result.status, 'accepted', JSON.stringify(result));
     assert.equal(result.interrupt_requested, true);
-    await completed(f);
+    await released(f);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
       1,
@@ -73,7 +72,7 @@ test(
 );
 
 test(
-  'timed-out cold compact holds its fence through the late ACK, then settles without replay',
+  'timed-out cold compact holds its fence through the late ACK, then releases without replay',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t);
@@ -97,7 +96,7 @@ test(
     );
     assert.equal(runtime.exited, false);
     await fs.writeFile(f.gate, 'go');
-    await completed(f);
+    await released(f);
     assert.equal(runtime.compactionMutation, null);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
@@ -119,7 +118,7 @@ test(
     const result = await compacting;
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'PI_REJECTED');
-    await completed(f);
+    await released(f);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
       0,
@@ -128,7 +127,7 @@ test(
 );
 
 test(
-  'native extension cancellation refuses a cold compact without generating a summary',
+  'native extension cancellation refuses a cold compact and releases its idle writer',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t);
@@ -136,7 +135,7 @@ test(
     const result = await f.bridge.compact({ session_id: f.id, instructions: 'CANCEL_COMPACT' });
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'PI_REJECTED');
-    await completed(f);
+    await released(f);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
       0,

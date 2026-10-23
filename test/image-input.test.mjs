@@ -122,7 +122,7 @@ test(
       return r.structuredContent;
     };
     const completed = async (id) => {
-      await until(async () => (await bridge.pool.get(id).idleSnapshot()).status === 'idle');
+      await until(() => !bridge.pool.get(id) && !bridge.autoReleases.size);
       return savedEntries(bridge, id);
     };
     const image = pngImage(),
@@ -214,7 +214,6 @@ test(
       .flatMap((item) => item.message?.content ?? [])
       .find((block) => block.type === 'image');
     assert.deepEqual(descriptor, { type: 'image', mime_type: image.mimeType, data_omitted: true });
-    const owners = bridge.pool.instances.size;
     const invalid = await client.callTool({
       name: 'send',
       arguments: {
@@ -224,7 +223,7 @@ test(
       },
     });
     assert.equal(invalid.isError, true);
-    assert.equal(bridge.pool.instances.size, owners);
+    assert.equal(bridge.pool.instances.size, 0);
     const denied = await call('send', {
       session_id: made.session_id,
 
@@ -273,7 +272,7 @@ test(
     });
     assert.equal(oversized.status, 413);
     await oversized.arrayBuffer();
-    assert.equal(bridge.pool.instances.size, owners);
+    assert.equal(bridge.pool.instances.size, 0);
     assert.equal((await fs.stat((await bridge.session(made.session_id)).file)).size, before.size);
   },
 );

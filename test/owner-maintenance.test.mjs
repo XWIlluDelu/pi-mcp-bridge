@@ -72,10 +72,12 @@ test(
       'Expected native prompt admission',
     );
     const next = f.bridge.pool.get(f.id);
-    await until(async () => (await next.idleSnapshot()).status === 'idle');
+    await until(() => next.exited && !f.bridge.autoReleases.size);
     assert.equal(next.session.file, session.file);
     assert.equal(next.session.header.id, session.header.id);
     assert.notEqual(next.generation, runtime.generation);
+    assert.equal(next.child.exitCode, 0);
+    assert.equal(next.child.signalCode, null);
     const body = JSON.stringify(await f.bridge.read({ session_id: f.id }));
     assert.ok(body.includes('AFTER_MAINTENANCE'));
     assert.ok(!body.includes('UNFINISHED_EXTENSION_INPUT'));

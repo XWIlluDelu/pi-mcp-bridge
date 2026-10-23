@@ -14,9 +14,8 @@ export async function until(fn) {
 }
 export const choice = (id) => ({ provider: 'model-fixture', id });
 export { savedEntries } from './saved-session.mjs';
-export async function completedEntries(bridge, id) {
-  const runtime = bridge.pool.get(id);
-  if (runtime) await idle(runtime);
+export async function releasedEntries(bridge, id) {
+  await until(() => !bridge.pool.get(id) && !bridge.autoReleases.size);
   return savedEntries(bridge, id);
 }
 export async function fixture(t) {
@@ -83,7 +82,6 @@ export async function idle(runtime) {
   await until(async () => {
     const s = await runtime.state();
     return (
-      !runtime.hasUnsettledWork() &&
       !s.isStreaming &&
       !s.isCompacting &&
       s.pendingMessageCount === 0 &&
