@@ -1,5 +1,6 @@
 // Owner-side configuration edits only. Not exposed as an MCP operation.
 import fs from 'node:fs/promises';
+import { validateCompatibilityModules } from './compatibility.mjs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
@@ -67,6 +68,7 @@ export function validateOwnerConfig(config) {
     'piExecutable',
     'piArgs',
     'piRuntime',
+    'compatibilityModules',
     'herdr',
   ]);
   if (Object.keys(config).some((key) => !fields.has(key))) throw new Error('INVALID_OWNER_CONFIG');
@@ -87,6 +89,7 @@ export function validateOwnerConfig(config) {
   if (ACTIONS.some((action) => !Object.hasOwn(config.defaults, action)))
     throw new Error('INVALID_OWNER_CONFIG');
   validateGrants(config.grants);
+  validateCompatibilityModules(config.compatibilityModules);
   if (
     (config.herdr !== undefined && typeof config.herdr !== 'boolean') ||
     (config.attachmentDir !== undefined && !absolute(config.attachmentDir)) ||

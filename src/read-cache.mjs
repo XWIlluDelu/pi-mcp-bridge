@@ -41,22 +41,28 @@ export class ContextReadCache {
   }
   get(args, identity) {
     const { position, entry } = this.lookup(args.cursor),
-      snapshot = entry.snapshot;
+      snapshot = entry.snapshot,
+      selection =
+        snapshot.view === 'adapted' ? contextSelection(snapshot.request) : snapshot.selection,
+      leaf =
+        snapshot.view === 'adapted' && snapshot.request.leaf_id !== undefined
+          ? snapshot.request.leaf_id
+          : snapshot.leaf_id;
     if (
       JSON.stringify(identity) !== JSON.stringify(entry.identity) ||
       (args.session_id !== undefined && args.session_id !== snapshot.session_id) ||
       (args.view !== undefined && args.view !== (snapshot.view ?? 'native')) ||
       (snapshot.view === 'observed' &&
         [args.preset, args.select, args.leaf_id].some((v) => v !== undefined)) ||
-      (args.leaf_id !== undefined && args.leaf_id !== snapshot.leaf_id)
+      (args.leaf_id !== undefined && args.leaf_id !== leaf)
     )
       throw new Error('STALE_CURSOR');
     if (args.preset !== undefined) {
-      if (JSON.stringify(contextSelection(args)) !== JSON.stringify(snapshot.selection))
+      if (JSON.stringify(contextSelection(args)) !== JSON.stringify(selection))
         throw new Error('STALE_CURSOR');
     } else if (
       Object.entries(args.select ?? {}).some(
-        ([key, value]) => value !== undefined && value !== snapshot.selection[key],
+        ([key, value]) => value !== undefined && value !== selection[key],
       )
     )
       throw new Error('STALE_CURSOR');

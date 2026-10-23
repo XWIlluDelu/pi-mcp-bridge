@@ -3,13 +3,21 @@ import { z } from 'zod';
 const count = z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER);
 export const contextSelectSchema = z
   .object({
+    system: z
+      .union([z.literal(-1), z.literal(0)])
+      .describe(
+        'Native system instructions/sections: 0 omits, -1 includes. Defaults to 0 except full.',
+      )
+      .optional(),
     summary: z.union([z.literal(-1), z.literal(0), z.literal(1)]).optional(),
     recent_prompts: count.optional(),
     earliest_prompts: count.optional(),
     text: count.optional(),
     thinking: count.optional(),
     tools: count
-      .describe('Logical tool units per prompt; 0 also omits system tool declarations.')
+      .describe(
+        'Logical tool units per prompt; 0 also omits tool declarations when system is included.',
+      )
       .optional(),
     commands: count.optional(),
   })
@@ -37,6 +45,7 @@ export const readSchema = z
   );
 
 export const FULL_SELECTION = Object.freeze({
+  system: -1,
   summary: -1,
   recent_prompts: -1,
   earliest_prompts: -1,
@@ -46,6 +55,7 @@ export const FULL_SELECTION = Object.freeze({
   commands: -1,
 });
 export const RECENT_SELECTION = Object.freeze({
+  system: 0,
   summary: 1,
   recent_prompts: 3,
   earliest_prompts: 0,
@@ -55,6 +65,7 @@ export const RECENT_SELECTION = Object.freeze({
   commands: 0,
 });
 export const LATEST_SELECTION = Object.freeze({
+  system: 0,
   summary: 0,
   recent_prompts: 1,
   earliest_prompts: 0,
