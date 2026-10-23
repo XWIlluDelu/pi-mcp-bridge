@@ -1,9 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import path from 'node:path';
+import { savedSession } from './fixtures/saved-session.mjs';
+import { processIdentity, readClaim, reserveOwner } from '../src/attachments.mjs';
+import { randomUUID } from 'node:crypto';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { fixture, releasedEntries } from './fixtures/model-runtime.mjs';
+import { fixture, releasedEntries, until } from './fixtures/model-runtime.mjs';
 
 const gate = () => Promise.withResolvers();
 const writePolicy = (f, config) => fs.writeFile(f.configFile, JSON.stringify(config));
@@ -58,6 +62,25 @@ test('receive-time snapshots precede delayed executors and isolate concurrent de
     allowed.grants,
     'Request admission must not mutate shared config',
   );
+});
+
+test('pending registry moves preserve reads and live-owner reuse but cannot admit a writer in the old namespace', async (t) => {
+  const f = await fixture(t);
+  const session = await f.bridge.session(f.id);
+  const nextRegistry = path.join(f.dir, 'next-ipc');
+  const owned = await f.bridge.pool.resolve(session);
+  await writePolicy(f, { ...f.config, attachmentDir: nextRegistry });
+  assert.strictEqual(await f.bridge.pool.resolve(session), owned);
+  await f.bridge.pool.stop(f.id);
+  await reserveOwner(nextRegistry, session, 'tui');
+  assert.equal((await f.bridge.read({ session_id: f.id })).session_id, f.id);
+  assert.deepEqual((await f.bridge.health()).restart_required, ['attachmentDir']);
+  assert.equal(
+    (await f.bridge.send({ session_id: f.id, text: 'MUST_NOT_SPAWN' })).reason,
+    'CONFIG_RESTART_REQUIRED',
+  );
+  assert.equal(f.bridge.pool.instances.size, 0);
+  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
 });
 
 test('policy failure before a delayed executor is handled immediately and never falls back to old config', async (t) => {
@@ -141,7 +164,7 @@ for (const operation of ['send', 'command'])
     },
   );
 
-test('one direct batch snapshot covers late lane items, list project filters and health', async (t) => {
+test('one batch snapshot retains permissions and directory scope across late lane items', async (t) => {
   const f = await fixture(t),
     entered = gate(),
     release = gate(),
@@ -168,7 +191,12 @@ test('one direct batch snapshot covers late lane items, list project filters and
     ],
   });
   await entered.promise;
-  await writePolicy(f, { ...f.config, grants: [] });
+  await writePolicy(f, {
+    ...f.config,
+    grants: [],
+    folders: [],
+    sessionRoots: [path.join(f.dir, 'new-empty-root')],
+  });
   release.resolve();
   const result = await batch;
   assert.equal(captures, 1);
@@ -180,7 +208,151 @@ test('one direct batch snapshot covers late lane items, list project filters and
   const fresh = await f.bridge.list({ session_id: f.id });
   assert.deepEqual(fresh.sessions, []);
   assert.deepEqual(fresh.creatable_projects, []);
-  await releasedEntries(f.bridge, f.id);
+  await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
+});
+
+test('scope edits affect new requests, cached IDs and cursor pages without evicting owner identities', async (t) => {
+  const f = await fixture(t),
+    session = await f.bridge.session(f.id),
+    root = path.join(f.dir, 'added-root'),
+    project = path.join(f.dir, 'added-project');
+  await fs.mkdir(project);
+  await fs.appendFile(
+    session.file,
+    Array.from({ length: 4 }, (_, i) =>
+      JSON.stringify({
+        type: 'message',
+        id: `m${i}`,
+        parentId: i ? `m${i - 1}` : null,
+        timestamp: '2026-01-01T00:00:00Z',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'scope-page '.repeat(200) }],
+          timestamp: 0,
+        },
+      }),
+    ).join('\n') + '\n',
+  );
+  const page = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 4096 });
+  assert.ok(page.next_cursor);
+  const expanded = {
+    ...f.config,
+    sessionRoots: [...f.config.sessionRoots, root],
+    folders: [...f.config.folders, { path: project }],
+    grants: [...f.config.grants, { folder: project, list: true, read: true, create: true }],
+  };
+  await writePolicy(f, expanded);
+  const context = await f.bridge.captureRequestContext();
+  assert.ok(Object.isFrozen(context.scope.sessionRoots));
+  assert.ok(Object.isFrozen(context.scope.folders[0]));
+  await assert.rejects(fs.stat(root), { code: 'ENOENT' });
+  const added = await savedSession({
+    config: { sessionRoots: [root], folders: [{ path: project }] },
+  });
+  assert.equal((await f.bridge.list()).sessions.length, 2);
+  await writePolicy(f, { ...expanded, sessionRoots: [root], folders: [] });
+  await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(f.bridge.read({ cursor: page.next_cursor }), /NOT_FOUND_OR_DENIED/);
+  assert.equal(
+    (await f.bridge.send({ session_id: f.id, text: 'OUT_OF_SCOPE' })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
+  const listed = await f.bridge.list();
+  assert.deepEqual(
+    listed.sessions.map((s) => s.session_id),
+    [added.session_id],
+  );
+  assert.deepEqual(listed.creatable_projects, []);
+  // Removing a creation target is not a new cwd restriction on existing history.
+  assert.equal(
+    (await f.bridge.read({ session_id: added.session_id })).session_id,
+    added.session_id,
+  );
+  assert.equal(
+    (await f.bridge.create({ project, text: 'NO_TARGET' })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
+  assert.equal(
+    (await f.bridge.read({ cursor: page.next_cursor }, { requestContext: context })).session_id,
+    f.id,
+  );
+  f.bridge.pool.instances.set(f.id, { session, alive: false });
+  assert.equal(
+    (await f.bridge.session(f.id)).file,
+    session.file,
+    'Owner cleanup retains its owned identity',
+  );
+  f.bridge.pool.instances.delete(f.id);
+  assert.deepEqual(f.bridge.config.sessionRoots, f.config.sessionRoots);
+});
+
+test('owner handoff cancellation keeps its reservation identity after scope removal and cache replacement', async (t) => {
+  const f = await fixture(t),
+    session = await f.bridge.session(f.id),
+    request = { session_id: f.id, requester: await processIdentity(), handoff_id: randomUUID() };
+  const reserved = await f.bridge.handoffForLocal(request);
+  assert.equal(reserved.status, 'reserved');
+  await writePolicy(f, {
+    ...f.config,
+    sessionRoots: [path.join(f.dir, 'replacement-root')],
+    folders: [],
+  });
+  assert.deepEqual((await f.bridge.list()).sessions, []);
+  assert.equal(f.bridge.sessionFiles.has(f.id), false);
+  assert.equal(
+    (await readClaim(f.bridge.pool.attachmentDir, session)).handoffId,
+    request.handoff_id,
+  );
+  assert.equal((await f.bridge.cancelHandoff(request)).status, 'cancelled');
+  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
+});
+
+test('create uses its captured new project and native destination roots after a scope removal', async (t) => {
+  const f = await fixture(t),
+    project = path.join(f.dir, 'new-project'),
+    entered = gate(),
+    release = gate(),
+    captured = gate(),
+    capture = f.bridge.captureRequestContext.bind(f.bridge);
+  await fs.mkdir(project);
+  t.after(() => release.resolve());
+  t.mock.method(f.bridge, 'captureRequestContext', async () => {
+    const context = await capture();
+    captured.resolve(context);
+    return context;
+  });
+  const policy = {
+    ...f.config,
+    folders: [{ path: project }],
+    grants: [{ folder: project, create: true }],
+  };
+  await writePolicy(f, policy);
+  const pending = callBridgeTool(
+    f.bridge,
+    'create',
+    { project, text: 'CAPTURED_CREATE' },
+    {
+      execute: async (run) => {
+        entered.resolve();
+        await release.promise;
+        return run();
+      },
+    },
+  );
+  await entered.promise;
+  const context = await captured.promise;
+  await writePolicy(f, { ...policy, sessionRoots: [path.join(f.dir, 'different-root')] });
+  release.resolve();
+  const made = (await pending).structuredContent;
+  assert.equal(made.created, true);
+  assert.equal(made.status, 'started');
+  assert.ok(
+    (await f.bridge.session(made.session_id, context)).file.startsWith(f.config.sessionRoots[0]),
+  );
+  const fresh = await f.bridge.create({ project, text: 'OUTSIDE_NEW_ROOT' });
+  assert.equal(fresh.reason, 'NATIVE_SESSION_OUTSIDE_ROOTS');
+  assert.equal(fresh.created, undefined);
+  await until(() => !f.bridge.pool.get(made.session_id) && !f.bridge.autoReleases.size);
 });
 
 for (const initialRead of [true, false])

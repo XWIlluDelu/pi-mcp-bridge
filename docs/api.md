@@ -397,4 +397,7 @@ deduplicating inherited issues. Healthy configurations return
 `{}` diagnoses defaults and configured projects; an optional known `session_id`
 limits diagnosis to that session, labeling source tiers without exposing native
 metadata. `domain` is a result label, not an accepted input parameter.
+Unscoped `health({})` also includes `restart_required:["setting",…]` when fixed
+settings differ from the active service configuration. Only names are returned,
+not configuration values; permission status and business admission are unchanged.
 See [configuration](configuration.md).
