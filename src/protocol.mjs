@@ -34,7 +34,7 @@ export const descriptions = {
   create:
     'Create a session in project (absolute project directory) and send initial text and/or images. Images and optional model:{provider,id} and/or thinking_level use the same rules as send, including the first prompt. Optional name and fork_from copy the parent’s committed tail without switching its owner. Requires target create permission and source read when forking. Text or images are required. A partial result retains the created session ID and send status. Each call creates a new session; after an unknown result inspect list/read, do not automatically resubmit.',
   delete:
-    'Recoverably move an authorized session to Bridge trash, stopping its owned live runtime. Project files are retained. Each call is a new deletion attempt; there is no result lookup.',
+    'Recoverably move an authorized session to Bridge trash, closing its target writer even during release or handoff. Project files are retained. Each call is a new deletion attempt; there is no result lookup.',
   batch:
     'Wrap 1–10 operations (all tools except batch). Each item is {op,args}; for example: {"operations":[{"op":"list","args":{}}]}. Same-session operations execute serially through submission results; different sessions run concurrently. Each item keeps its own permissions. Every mutation item is a new operation, including in repeated batches; no outer replay or deduplication. Item failure does not cancel other items. Results share preallocated UTF-8/JSON/wire budgets: command/stop may return a smaller prefix than max_chars, with accurate completeness flags; auxiliary command.fullOutputPath/delete.project may be omitted. Captured query pages may shrink or explicitly refuse; mutation results are retained.',
   health:

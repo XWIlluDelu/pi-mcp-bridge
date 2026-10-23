@@ -24,6 +24,7 @@ import {
   ownerAlive,
   privateDirectory,
   registryTransaction,
+  assertNoOtherLiveOwner,
   waitOwnerExit,
 } from '../src/attachments.mjs';
 import attachExtension from '../src/attach-extension.mjs';
@@ -129,7 +130,7 @@ async function tui(t, f, { expectFailure = false } = {}) {
   });
   let record;
   t.after(async () => {
-    // Test-owned TUI cleanup only; production attached deletion never sends OS signals.
+    // Clean up any TUI left alive by a test that did not delete it.
     if (record && (await ownerAlive(record.owner))) process.kill(record.owner.pid, 'SIGTERM');
     child.stdin.destroy();
     if (child.exitCode === null) child.kill('SIGTERM');
@@ -181,7 +182,7 @@ test('overlong attachment path prevents bridge startup and official TUI exits on
   assert.equal(f.bridge.pool.instances.size, 0);
 });
 
-test('attached shutdown acknowledgment is insufficient until exact owner process exits', async (t) => {
+test('delete cannot terminate its own shared process; disconnect leaves it alive', async (t) => {
   const f = await fixture(t);
   const record = await reserveOwner(f.config.attachmentDir, f.session, 'tui');
   const server = net.createServer((socket) =>
@@ -208,7 +209,7 @@ test('attached shutdown acknowledgment is insufficient until exact owner process
     runtime.selectModel(undefined, { thinkingLevel: 'high' }),
     (e) => e.message === 'MODEL_SELECTION_UNSUPPORTED' && e.uncertain === false,
   );
-  await assert.rejects(runtime.stopForDelete(), /OWNER_STILL_ALIVE/);
+  await assert.rejects(runtime.stopForDelete(), /DELETE_SHARED_OWNER/);
   assert.equal(await ownerAlive(record.owner), true);
   assert.ok(await fs.stat(f.session.file));
   await runtime.stop();
@@ -232,9 +233,23 @@ test('conclusively dead registered owner permits claimed RPC fallback without a 
   assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
 });
 
-test('deletion holds a cooperative claim until the caller finishes the filesystem move', async (t) => {
+test('deletion excludes new writers until the caller finishes the filesystem move', async (t) => {
   const f = await fixture(t);
   const release = await f.bridge.pool.stopForDelete(f.session);
+  const neighbor = await f.bridge.session((await savedSession(f.bridge)).session_id);
+  const neighborOwner = await reserveOwner(f.config.attachmentDir, neighbor, 'rpc');
+  await releaseOwner(f.config.attachmentDir, neighbor, neighborOwner);
+  // Companion pre-open checks must not bypass deletion for a same-process switch.
+  await assert.rejects(
+    registryTransaction(f.config.attachmentDir, () =>
+      assertNoOtherLiveOwner(
+        f.config.attachmentDir,
+        { file: f.session.file },
+        { allowSameProcess: true },
+      ),
+    ),
+    /LIVE_OWNER_UNREACHABLE/,
+  );
   await assert.rejects(
     reserveOwner(f.config.attachmentDir, f.session, 'tui'),
     /LIVE_OWNER_UNREACHABLE/,
@@ -261,7 +276,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     sessionId: unrelated.header.id,
     kind: 'rpc',
     generation: 'unrelated-generation',
-    owner: { ...(await processIdentity()), start: 'different-process-start' },
+    owner: null,
     phase: 'ready',
     unexpected: true,
   };
@@ -399,11 +414,18 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
       reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
       /LIVE_OWNER_UNREACHABLE/,
     );
-    await handlers.session_start({ reason: 'reload' }, ctx);
-    assert.notEqual(
-      (await readClaim(f.config.attachmentDir, f.session)).generation,
-      record.generation,
+    const previous = await readClaim(f.config.attachmentDir, f.session);
+    delete previous.readContract;
+    await fs.writeFile(
+      claimFile(f.config.attachmentDir, f.session),
+      JSON.stringify({ ...previous, unsupportedControlMetadata: true }),
     );
+    await handlers.session_start({ reason: 'reload' }, ctx);
+    const refreshed = await readClaim(f.config.attachmentDir, f.session);
+    assert.notEqual(refreshed.generation, record.generation);
+    assert.equal(typeof refreshed.readContract, 'string');
+    assert.equal(refreshed.unsupportedControlMetadata, undefined);
+    assert.equal(shutdown, false);
     assert.deepEqual(JSON.parse(await fs.readFile(unrelatedFile, 'utf8')), unrelatedRecord);
   } finally {
     await handlers.session_shutdown({ reason: 'quit' }, ctx);
@@ -626,6 +648,11 @@ test('delayed shutdown flush cannot call a replaced or invalidated Pi context', 
     }
     return originalEnd.apply(this, args);
   });
+  const manager = {
+    getSessionFile: () => f.session.file,
+    getHeader: () => f.session.header,
+    getSessionId: () => f.session.header.id,
+  };
   const context = () => {
     const state = { valid: true };
     const check = () => {
@@ -633,16 +660,9 @@ test('delayed shutdown flush cannot call a replaced or invalidated Pi context', 
     };
     const ctx = {
       mode: 'tui',
-      sessionManager: {
-        getSessionFile: () => {
-          check();
-          return f.session.file;
-        },
-        getHeader: () => f.session.header,
-        getSessionId: () => {
-          check();
-          return f.session.header.id;
-        },
+      get sessionManager() {
+        check();
+        return manager;
       },
       shutdown: () => {
         check();
@@ -742,7 +762,7 @@ test('registry failure during shutdown still closes old socket and retains block
   }
 });
 
-test('socket startup failure retains live ownership and blocks both send fallback and deletion', async (t) => {
+test('socket startup failure retains ownership; send cannot fall back and delete cannot kill its own host', async (t) => {
   const f = await fixture(t),
     previous = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
@@ -788,7 +808,7 @@ test('socket startup failure retains live ownership and blocks both send fallbac
     assert.equal(sent.reason, 'LIVE_OWNER_UNREACHABLE');
     const removed = await f.bridge.delete({ session_id: f.id });
     assert.equal(removed.status, 'rejected');
-    assert.equal(removed.reason, 'LIVE_OWNER_UNREACHABLE');
+    assert.equal(removed.reason, 'DELETE_SHARED_OWNER');
     assert.ok(await fs.stat(f.session.file));
     assert.equal(f.bridge.pool.instances.size, 0);
   } finally {
@@ -869,8 +889,9 @@ test('official TUI session replacement registers a fresh identity and socket los
   const removed = await f.bridge.delete({
     session_id: replacement.id,
   });
-  assert.equal(removed.status, 'rejected');
-  assert.ok(await fs.stat(replacement.file));
+  assert.equal(removed.status, 'deleted', JSON.stringify(removed));
+  assert.equal(await ownerAlive(claim.owner), false);
+  await assert.rejects(fs.stat(replacement.file), { code: 'ENOENT' });
 });
 
 test('standard MCP client attaches to an existing offline TUI through the single-operation tools alongside batch', async (t) => {

@@ -186,11 +186,6 @@ test(
       snapshot = await attached.snapshot();
     assert.equal(snapshot.sessionId, saved.header.id);
     assert.deepEqual(snapshot.entries, entries);
-    const deleted = await ok('delete', {
-      session_id: saved.id,
-    });
-    assert.equal(deleted.reason, 'HOST_RELEASE_UNSUPPORTED');
-    assert.equal(await ownerAlive(owner.owner), true);
     await assert.rejects(attached.request('shutdown'), /HOST_RELEASE_UNSUPPORTED/);
     await remote.close();
     assert.equal(await ownerAlive(owner.owner), true);
@@ -237,5 +232,17 @@ test(
     } finally {
       await fs.rename(replacement.socket + '.paused', replacement.socket);
     }
+    const deleted = await ok('delete', { session_id: saved.id });
+    assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+    assert.equal(deleted.recoverable, true);
+    assert.equal(await ownerAlive(owner.owner), false);
+    await assert.rejects(fs.stat(saved.file), { code: 'ENOENT' });
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
+        'utf8',
+      ),
+    );
+    assert.match(await fs.readFile(manifest.trash_path, 'utf8'), /REMOTE_ORDINARY_RPC/);
   },
 );

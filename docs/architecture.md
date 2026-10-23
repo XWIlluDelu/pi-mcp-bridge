@@ -54,7 +54,7 @@ CI runs the suite and formatting on Node 22 and 26 for pushes and pull requests 
 
 Bridge's lockfile contains no Pi packages. CI prepares a separate external test Pi; local tests select PATH or `BRIDGE_TEST_PI_CLI=/absolute/path/to/pi npm test`. Fixtures use that installation's CLI and APIs. Default-launch tests also verify PATH selection and native process identity, with temporary HOME/agent directories that leave user credentials and sessions untouched.
 
-For the real Herdr transport check, run `BRIDGE_TEST_HERDR=/absolute/path/to/herdr node --test test/herdr-runtime.test.mjs` with a working user-systemd bus. It uses an isolated named daemon and synthetic environment data to check launch, owner reuse, hot placement changes, stream draining, disconnect/EOF cleanup and environment transfer without credential values in argv. The test deletes its daemon session afterward; normal `npm test` skips this opt-in case when Herdr is not selected.
+For the real Herdr transport check, run `BRIDGE_TEST_HERDR=/absolute/path/to/herdr node --test test/herdr-runtime.test.mjs` with a working user-systemd bus. It uses an isolated named daemon and synthetic environment data to check launch, owner reuse, hot placement changes, stream draining, disconnect/EOF cleanup, explicit deletion of stubborn tool descendants and environment transfer without credential values in argv. The test deletes its daemon session afterward; normal `npm test` skips this opt-in case when Herdr is not selected.
 
 ## Operational boundaries
 

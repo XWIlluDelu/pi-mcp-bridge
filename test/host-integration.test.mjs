@@ -176,11 +176,6 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     ).length,
     1,
   );
-  const denied = await f.bridge.delete({ session_id: saved.id });
-  assert.equal(denied.status, 'rejected');
-  assert.ok(await fs.stat(saved.file));
-  assert.equal((await client.getState()).sessionId, saved.header.id);
-  assert.equal(f.spawned(), 0);
   // Losing the controller endpoint cannot turn a surviving child into a cold
   // session. Keep its exact owner claim and refuse bridge-managed fallback.
   await controller.close();
@@ -196,6 +191,10 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   assert.equal(submissions, 2);
   assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, pid);
   assert.equal((await client.getState()).sessionId, saved.header.id);
+  const deleted = await f.bridge.delete({ session_id: saved.id });
+  assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+  await assert.rejects(fs.stat(saved.file), { code: 'ENOENT' });
+  assert.equal(f.spawned(), 0);
 });
 
 test('two official SDK sessions in one host PID release independently without shutting down their neighbor', async (t) => {

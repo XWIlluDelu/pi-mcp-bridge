@@ -195,14 +195,14 @@ test('scoped companion skips excluded bodies and retires only its completed form
     'ready',
     'Scope removal does not retire a live claim',
   );
-  await handlers.session_shutdown({ reason: 'switch' });
-  await handlers.session_start(
-    {},
-    {
-      ...excluded,
-      sessionManager: { ...excluded.sessionManager, getSessionFile: () => session.file },
-    },
-  );
+  await handlers.session_shutdown({ reason: 'reload' });
+  t.mock.method(manager, 'getHeader', () => {
+    throw Error('excluded header read');
+  });
+  t.mock.method(manager, 'getEntries', () => {
+    throw Error('excluded body read');
+  });
+  await handlers.session_start({ reason: 'reload' }, ctx);
   assert.equal(
     (await readClaim(dir, session)).phase,
     'transitioning',
@@ -217,7 +217,11 @@ test('scoped companion skips excluded bodies and retires only its completed form
     await handlers.session_before_switch({ reason: 'resume', targetSessionFile: alias }, ctx),
     { cancel: true },
   );
-  await handlers.session_start({}, { ...ctx, sessionManager: nextManager });
+  await handlers.session_shutdown({ reason: 'new' });
+  await handlers.session_start(
+    { reason: 'new', previousSessionFile: session.file },
+    { ...ctx, sessionManager: nextManager },
+  );
   assert.equal((await readClaim(dir, nextSession)).phase, 'ready');
   assert.equal(await readClaim(dir, session), null);
   assert.deepEqual(await fs.readFile(claimFile(dir, other)), controllerBytes);
