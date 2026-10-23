@@ -12,7 +12,8 @@ import {
   hasPromptSettings,
   remotePromptRejection,
 } from './prompt-input.mjs';
-import { modelState } from './models.mjs';
+import { modelState, sameModel } from './models.mjs';
+import { modelSettingsSchema, modelSettings } from './set-model.mjs';
 import { limitBashResult } from './bash-execution.mjs';
 import { stopReceipt, withdrawalCollector } from './stop-execution.mjs';
 import {
@@ -61,6 +62,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
     stopping = false,
     stopSequence = 0,
     bashing = false,
+    settingModel = false,
     compacting = false,
     releasePromise,
     closePromise;
@@ -177,7 +179,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
           ? { sessionName: observed.sessionName }
           : {}),
         isIdle:
-          bashing || stopping || compacting
+          bashing || stopping || settingModel || compacting
             ? false
             : typeof observed.isIdle === 'boolean'
               ? observed.isIdle
@@ -243,6 +245,32 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
           ),
         };
       }
+    } else if (request.op === 'set_model') {
+      if (typeof callbacks.setModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
+      const input = modelSettingsSchema.safeParse(args);
+      if (!input.success) fail('INVALID_ARGUMENTS');
+      if (settingModel) fail('MODEL_SELECTION_PENDING');
+      const beforeModelDispatch = () => {
+        if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
+      };
+      beforeModelDispatch();
+      settingModel = true;
+      try {
+        const value = modelSettings(
+          await callbacks.setModel({
+            ...input.data,
+            sessionFile: target.file,
+            sessionId: target.header.id,
+            beforeDispatch: beforeModelDispatch,
+          }),
+        );
+        const actual = await state();
+        if (!sameModel(value.model, actual.model) || value.thinking_level !== actual.thinkingLevel)
+          fail('MODEL_SELECTION_CHANGED');
+        data = value;
+      } finally {
+        settingModel = false;
+      }
     } else if (request.op === 'compact') {
       if (typeof callbacks.compact !== 'function') fail('COMPACT_UNSUPPORTED');
       const input = compactInputSchema.safeParse(args);
@@ -264,6 +292,7 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
       }
     } else if (request.op === 'send') {
       if (compacting) fail('COMPACTION_PENDING');
+      if (settingModel) fail('MODEL_SELECTION_PENDING');
       beforeDispatch();
       const input = attachedPromptInput(args);
       if (hasPromptSettings(input)) fail('MODEL_SELECTION_UNSUPPORTED');
@@ -355,12 +384,13 @@ export async function reserveHostSession({ attachmentDir, session, owner }) {
             'cancel',
             'stop',
             'bash',
+            'setModel',
             'compact',
           ].includes(key),
       ) ||
       (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
-      ['release', 'cancel', 'stop', 'bash', 'compact'].some(
+      ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
       )
     )

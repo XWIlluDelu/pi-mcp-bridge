@@ -1,11 +1,47 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
+import { modelInfo } from '../src/models.mjs';
+import { publicSchemas } from '../src/tool-schemas.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
 import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { fixture, choice, savedEntries, releasedEntries } from './fixtures/model-runtime.mjs';
+
+test('model metadata allowlist preserves unknown, native unsupported and thinking levels without configuration', () => {
+  const secret = {
+    provider: 'p',
+    id: 'm',
+    name: 'Name',
+    input: ['text'],
+    reasoning: false,
+    contextWindow: 16000,
+    maxTokens: 2048,
+    headers: { Authorization: 'SECRET' },
+    apiKey: 'SECRET',
+    baseUrl: 'SECRET',
+    cost: { input: 0 },
+    compat: { secret: 'SECRET' },
+  };
+  const info = modelInfo(secret);
+  assert.deepEqual(info.thinking_levels, ['off']);
+  assert.deepEqual(info.input, ['text']);
+  assert.ok(!JSON.stringify(info).includes('SECRET'));
+  const unknown = modelInfo({ provider: 'p', id: 'unknown' });
+  assert.equal(unknown.input, null);
+  assert.equal(unknown.thinking_levels, null);
+  assert.equal(unknown.context_window, null);
+  assert.equal(
+    publicSchemas.send.safeParse({
+      session_id: 's',
+
+      text: 'x',
+      model: { provider: 'p', id: 'm', apiKey: 'secret' },
+    }).success,
+    false,
+  );
+});
 
 test(
   'HTTP create selects the session model and preserves native defaults',
@@ -58,6 +94,9 @@ test(
       (await savedEntries(bridge, made.session_id)).filter((e) => e.type === 'model_change').length,
       snapshot.filter((e) => e.type === 'model_change').length,
     );
+    const page = await call('models', {});
+    assert.deepEqual(Object.keys(page).sort(), ['models', 'next_offset']);
+    assert.deepEqual(page.models, [], 'Extension-only registrations are not agent configuration');
     assert.equal(bridge.pool.instances.size, 0);
     const sent = await call('send', {
       session_id: made.session_id,

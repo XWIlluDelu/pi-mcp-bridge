@@ -1,18 +1,100 @@
-# Model settings and native controls
+# Model discovery and native controls
 
-Prompt settings and compaction act on sessions:
+Model discovery is independent of sessions. Standalone selection, prompt settings and compaction act on sessions:
 
-| Operation                | Behavior                                | Owner                                       | Permission                                 |
-| ------------------------ | --------------------------------------- | ------------------------------------------- | ------------------------------------------ |
-| `send`/`create` settings | Apply model/thinking, then submit input | Proven-idle Bridge-owned RPC                | `send` / `create`                          |
-| `compact`                | Native context compaction               | Owned RPC idle; attached explicit interrupt | `send`; `interrupt:true` also needs `stop` |
+| Operation                | Behavior                                       | Owner                                                    | Permission                                 |
+| ------------------------ | ---------------------------------------------- | -------------------------------------------------------- | ------------------------------------------ |
+| `models`                 | Native configured model catalog                | No session owner involved                                | Effective execution authorization          |
+| `set_model`              | Change current selection, including while busy | Native setters on owned RPC, companion or supported host | `send`                                     |
+| `send`/`create` settings | Apply model/thinking, then submit input        | Proven-idle Bridge-owned RPC                             | `send` / `create`                          |
+| `compact`                | Native context compaction                      | Owned RPC idle; attached explicit interrupt              | `send`; `interrupt:true` also needs `stop` |
+
+## Session-independent model catalog
+
+```json
+{ "offset": 0, "limit": 30 }
+```
+
+`models` accepts only pagination. The request's permission snapshot must allow effective `send`, `command` or `create` on a configured project, or `send`/`command` on an existing in-scope native session. Configured folders are creation targets, not a restriction on native session projects. When no configured project qualifies, the Bridge can discover canonical session identity metadata and apply the ordinary default/project/session override priority; it does not parse transcripts or contact owners. No list/read right is required. The catalog remains independent of session selection and grants no session operation.
+
+A short-lived helper uses native `ModelRuntime.create({allowModelNetwork:false})` with the owner's existing launch-profile agent directory and inherited environment. It inherits the trusted Bridge process cwd, not a project/session cwd. It reads the native catalog from that agent's model/provider/auth configuration and locally cached catalog data, without network refresh or model calls. It does not create, find, read, observe or start a session, or load resource/extension factories. The caller cannot choose an agent directory, project or environment.
+
+**Pinned native read-only storage.** The dependency is fixed at SDK 1.3.0. `model-catalog-storage.mjs` resolves that package's root entry and loads the fixed same-package `./core/auth-storage.js` module for its exported native `ReadOnlyAuthStorage` implementation; the root does not re-export this class. A version mismatch fails safely. Native code alone parses auth. A small injected `ModelsStore` adapter reads the existing `models-store.json` cache using the 1.3.0 provider-entry layout. Missing files mean empty data; corrupt/unknown layouts fail safely. Both stores reject mutations: discovery never initializes auth/cache files, locks them, changes permissions or writes credentials. This narrow module/layout dependency must be revalidated when upgrading the pinned SDK.
+
+This catalog works even when there are no sessions. It excludes models registered only by extensions or a session at runtime; it is not a live owner's complete catalog. Native loading failures return `MODEL_CATALOG_UNAVAILABLE`, without underlying error text.
+
+The response contains only `models` and `next_offset` (null at the end). Offset defaults to 0; limit is 1–100, default 30. Models are sorted by provider/ID; pagination does not freeze the catalog across calls. Each item contains only `provider`, `id`, `name`, `input`, native `thinking_levels`, `context_window`, `max_output_tokens` and `input_limits`. Missing metadata is null. Credentials, endpoints, headers, provider configuration and raw provider errors are omitted.
+
+To inspect a session's current settings, use `list({session_id})`: `status.model` is `{provider,id}` or null, and `status.thinking_level` is a native level or null. These are live owner observations under list permission, not catalog data or guesses from saved history. See [list status](api.md#list).
+
+## Standalone selection: `set_model`
+
+```json
+{
+  "session_id": "ps_…",
+  "model": { "provider": "provider-id", "id": "model-id" },
+  "thinking_level": "high"
+}
+```
+
+Input is only `session_id` plus `model` and/or `thinking_level`; at least one
+setting is required. It needs the target's existing `send` permission, using
+the receive-time permission snapshot. New calls reauthorize; identity and
+ownership checks remain live throughout an admitted call.
+
+Success returns only the actual selection:
+
+```json
+{
+  "model": { "provider": "provider-id", "id": "model-id" },
+  "thinking_level": "high"
+}
+```
+
+Pi applies model-switch thinking preferences and clamps an explicit thinking
+level to the target's native capabilities. Both returned fields reflect the
+result, including automatic adjustment. The tool changes session state without
+a prompt, abort, queue withdrawal or global-default persistence. Thinking-only
+calls apply to the execution-time current model; they do not resolve or restore
+an earlier model observation.
+
+Busy sessions are supported. A provider request already issued keeps its
+captured selection; later provider calls, including calls later in the same
+run or from queued input, use the then-current selection. Bridge serializes
+its own same-session mutations, not independent native owner actions.
+Unresolved prompt preflight and concurrent Stop do not block standalone selection.
+An unresolved native setter rejects overlapping settings and prompt admission
+until it finishes. A later step can fail after the model has changed; there
+is no rollback.
+
+Bridge-owned RPC uses native `set_model` / `set_thinking_level`. Updated ordinary
+TUI/RPC companions use public extension setters. Supplied SDK/RPC host bindings
+use their public native setters; custom hosts may supply the optional
+[`setModel` callback](runtime.md#host-model-setter).
+Current owners without a setter callback return `MODEL_SELECTION_UNSUPPORTED`; they
+are not restarted to add the feature.
+
+For a saved session with no live owner, the existing mutation path validates
+the saved session and cwd and cold-resumes a native Bridge-owned RPC. A runtime
+started for this setter becomes eligible for the existing safe idle release,
+including after failure. Existing external owners remain open. Native launch
+overrides still apply on each cold start. Read-only `list` and `models` never
+start a session runtime.
+
+There is no tool timeout parameter. The existing native/IPC acknowledgement
+budget is 5 seconds per request. Lost or late confirmation is a tool error
+with `uncertain:true`; already-dispatched settings may have taken effect.
+Late ACK handling validates identity and clears the native fence, without
+applying another setting or sending input. Inspect `list.status` and authorized
+`read` before deciding whether another call is appropriate. HTTP/stdio never
+automatically replay it.
 
 ### Pi 1.3.0 empty-context resume limitation
 
 Pi 1.3.0 restores saved model/thinking only when the current branch already
 produces context messages. A published session whose first input was handled
 without a run, or refused before dispatch, can have no such messages. In that
-case native selection entries may have been written, but after normal
+case a successful `set_model` writes native selection entries, but after normal
 release the next cold resume still chooses native defaults instead of restoring
 them. A session with context messages follows the normal restoration path.
 
@@ -33,7 +115,7 @@ changing only Bridge's SDK dependency is insufficient.
 }
 ```
 
-Both `send` and `create` accept `model` and/or `thinking_level`, including create's first prompt. Settings require text or images. They share the prompt's session lane. These settings require proven-idle submission.
+Both `send` and `create` accept `model` and/or `thinking_level`, including create's first prompt. Settings require text or images. They share the prompt's session lane. Unlike standalone `set_model`, these convenience parameters retain their proven-idle submission rules.
 
 - Model only: Pi selects the model and preserves or adjusts thinking natively. The result reports the verified effective model and thinking level.
 - Thinking only: validate against the current native model and change its level.

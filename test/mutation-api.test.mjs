@@ -172,7 +172,7 @@ test('batch retains child IDs, restore tokens and maximum-size actual model sele
   f.config.piArgs = ['--session-dir', f.config.sessionRoots[0]];
   const operations = Array.from({ length: 4 }, () => [
     { op: 'create', args: { project: f.project, text: 'initial', model, thinking_level: 'high' } },
-    { op: 'send', args: { session_id: f.id, text: 'next', model, thinking_level: 'high' } },
+    { op: 'set_model', args: { session_id: f.id, model, thinking_level: 'high' } },
   ]).flat();
   operations.push(
     { op: 'delete', args: { session_id: removed.session_id } },
@@ -194,7 +194,7 @@ test('batch retains child IDs, restore tokens and maximum-size actual model sele
     assert.equal(created.created, true);
     assert.match(created.session_id, /^ps_[0-9a-f]{32}$/);
     assert.deepEqual(created.send.model_selection, { model, thinking_level: 'high' });
-    assert.deepEqual(selected.model_selection, { model, thinking_level: 'high' });
+    assert.deepEqual(selected, { model, thinking_level: 'high' });
   }
   assert.equal(
     new Set(
@@ -205,5 +205,5 @@ test('batch retains child IDs, restore tokens and maximum-size actual model sele
   assert.equal(batch.results[8].result.status, 'deleted');
   assert.match(batch.results[8].result.restore_token, /^[0-9a-f-]{36}$/);
   assert.deepEqual(batch.results[9].result.model_selection, { model, thinking_level: 'high' });
-  assert.equal(f.calls.prompt, 9);
+  assert.equal(f.calls.prompt, 5);
 });

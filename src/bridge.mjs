@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { compactReceipt } from './compact.mjs';
+import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
+import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
 import { readSchema, contextSelection } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
@@ -180,6 +182,34 @@ export class Bridge {
     const allowed = permitted(requestContext.permissions, action, s);
     diagnostics.emit('permission.check', { op: action, allowed });
     if (!allowed) throw new Error('NOT_FOUND_OR_DENIED');
+  }
+  async models(args = {}, { requestContext } = {}) {
+    if (!modelsSchema.safeParse(args).success) throw new Error('INVALID_MODELS_ARGUMENTS');
+    requestContext = await (requestContext ?? this.captureRequestContext());
+    this.assertOpen();
+    const policy = requestContext.permissions;
+    let allowed = this.config.folders.some((folder) =>
+      ['send', 'command', 'create'].some((action) =>
+        permitted(policy, action, { cwd: folder.path }),
+      ),
+    );
+    const mayExecuteSession = ['send', 'command'].some(
+      (action) =>
+        policy.defaults[action] === true || policy.grants.some((rule) => rule[action] === true),
+    );
+    if (!allowed && mayExecuteSession) {
+      // folders configures creation targets, not the universe of native history.
+      // Discover identity metadata once; no transcript or owner is acquired.
+      allowed = (await this.sessions()).some((session) =>
+        ['send', 'command'].some((action) => permitted(policy, action, session)),
+      );
+    }
+    diagnostics.emit('permission.check', { op: 'models', allowed });
+    if (!allowed) throw new Error('NOT_FOUND_OR_DENIED');
+    return loadModelCatalog(this.config, args);
+  }
+  set_model(args, options) {
+    return this.#mutation('set_model', args, options, this.#setModel);
   }
   send(args, options) {
     return this.#mutation('send', args, options, this.#send);
@@ -480,6 +510,44 @@ export class Bridge {
       live,
       runtimeEvents: events,
       readPins,
+    });
+  }
+  async #setModel(args, { requestContext, markForAutoRelease } = {}) {
+    requestContext = await (requestContext ?? this.captureRequestContext());
+    const target = await this.session(args.session_id);
+    this.check('send', target, requestContext);
+    return this.locked(target.id, async () => {
+      let runtime;
+      const authorized = async () => {
+        this.assertOpen();
+        if (this.handoffs.has(target.id) && this.handoffs.get(target.id).kind !== 'auto_release')
+          throw new Error('HANDOFF_PENDING');
+        const current = await this.session(target.id);
+        if (
+          current.file !== target.file ||
+          current.header.id !== target.header.id ||
+          current.cwd !== target.cwd
+        )
+          throw new Error('RUNTIME_SESSION_CHANGED');
+        this.check('send', current, requestContext);
+      };
+      await authorized();
+      runtime = await this.pool.forRead(target);
+      if (!runtime) {
+        await validateExecutionCwd(target.cwd);
+        await loadSavedSession(target);
+        await authorized();
+        runtime = await this.pool.resolve(target);
+        markForAutoRelease(runtime);
+      }
+      await authorized();
+      const actual = await runtime.selectModel(args.model, {
+        thinkingLevel: args.thinking_level,
+        nativeThinking: true,
+        beforeDispatch: authorized,
+      });
+      await authorized();
+      return modelSettings(actual);
     });
   }
   async #send(args, { requestContext, markForAutoRelease, pendingInput } = {}) {

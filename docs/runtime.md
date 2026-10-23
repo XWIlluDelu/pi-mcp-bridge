@@ -44,6 +44,7 @@ outside the cooperative registry.
 | Read context            | Yes                                           | Yes                                                   | Native snapshot                           |
 | Live text/thinking      | Native delta events                           | Public extension events                               | When the host supplies live observation   |
 | Send text/images        | Native ACK                                    | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
+| Standalone `set_model`  | Native setters; busy supported                | Public extension setters; busy supported              | Native setters; busy supported            |
 | Prompt + model/thinking | Proven-idle only                              | Unsupported                                           | Unsupported                               |
 | Native command / stop   | Yes, including queued-input withdrawal        | Unsupported                                           | Yes                                       |
 | Manual compact          | Idle by default; explicit interrupt supported | Explicit interrupt; native callbacks                  | Explicit interrupt via native methods     |
@@ -55,7 +56,8 @@ records are skipped as in Pi; `read.history` reports skipped lines and an
 unterminated tail. Read never repairs or migrates the file on disk.
 Authorized writer open remains responsible for native persistence. Missing or empty native cwd remains readable under session/default permissions; it grants no project scope and cannot cold-start execution.
 
-Authorized send, command or compact can cold-start an RPC; stop never does. `list.status` observes a live owner's current model/thinking, or null when the native selection is unobserved. Current custom hosts declare boolean capabilities from the callbacks they implement.
+Authorized send, command, compact or `set_model` can
+cold-start an RPC; stop never does. Public `models` reads a separate native agent-configuration catalog without involving an owner or session. `list.status` observes a live owner's current model/thinking, or null when the native selection is unobserved. Current custom hosts declare boolean capabilities from the callbacks they implement.
 
 After public prompt or control work, a Bridge-owned RPC normally exits by EOF once matching
 prompt ACKs, native settlement, drained queues and the observer prove idle.
@@ -63,15 +65,15 @@ Stop/recovery, in-flight reads and native command output capture finish first. T
 cold-resume fence: history stays on disk, and a later send resolves ownership
 again and may cold-start the same session. Native launch overrides still apply
 on every cold start. A send arriving during EOF waits for that exact exit.
-Read/list do not reopen a saved session.
+Read/list do not reopen a saved session; model catalog queries never acquire or inspect session owners.
 Companion TUI/RPC instances and supplied hosts retain their own lifecycle.
 On native shutdown/switch, the companion fences admissions and drains its
-admitted manual compaction before allowing a fresh
+admitted model setters and manual compaction before allowing a fresh
 session_start to retire the old claim. Socket loss does not settle those calls.
 
 Missing ACKs and observed independent extension preflight without completion correlation keep the owner alive. Automatic release promises to drain observable top-level calls, runs, queues, received ACK checks and native capture, not arbitrary detached extension jobs. A handled slash or ordinary input does not by itself hold the generation forever; nested asynchronous commands may outlive that top-level return and be interrupted by EOF. Extensions needing a longer lifetime must finish it within the observable lifecycle or use an externally managed owner. No quiet-time heuristic can establish detached-job completion.
 
-A cold `command` is also eligible for safe release after bash completion; timeout retains the native pending ACK and late completion reevaluates release. Compaction also enables safe release on completion or refusal; a timed-out compaction keeps its native fence until settlement.
+A cold `command` is also eligible for safe release after bash completion; timeout retains the native pending ACK and late completion reevaluates release. A runtime cold-started for `set_model` uses the same safe idle release. Compaction also enables safe release on completion or refusal; a timed-out compaction keeps its native fence until settlement. Catalog queries do not acquire a session owner.
 
 The ordinary companion returns `PI_ACCEPTANCE_UNOBSERVABLE` after
 `sendUserMessage()`; a successful transport write is not an admission ACK.
@@ -94,11 +96,44 @@ does not silently convert a busy input into a queued one.
 
 ## Model settings and compaction
 
-Owners expose their current model/thinking through
+`models` reads the native agent-configuration catalog at the Bridge, not through
+owner IPC or host callbacks. Owners expose their current model/thinking through
 `state`, observed by `list.status`. Prompt model/thinking selection requires an
 owned RPC; attached compaction uses native callbacks with explicit interrupt
 support. See [native controls](model-control.md) for queue/model timing, default
 idle-only compaction and permissions.
+
+### Host model setter
+
+`createSdkHostBinding(session)` uses public `session.setModel()` and
+`session.setThinkingLevel()`; `createRpcHostBinding(client)` uses the existing
+demultiplexed client's `setModel()` and `setThinkingLevel()`. Neither opens a
+session or takes over the owner's pipes.
+
+A custom `reserveHostSession(...).ready(callbacks)` may add:
+
+```text
+setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})
+  -> Promise<{model:{provider,id}, thinking_level}>
+```
+
+`model` and `thinking_level` are optional individually. The host must await its
+native setters and report the actual result while keeping the expected session
+identity. `beforeDispatch()` checks that the adapter remains open; a concurrent
+Stop does not block selection because the setter submits no input.
+The adapter independently checks the returned selection against `state()`,
+which must expose the current `model` and `thinkingLevel`. It drains an admitted
+setter during close/release and fences overlapping settings and send while the
+callback is unfinished. Missing callbacks return
+`MODEL_SELECTION_UNSUPPORTED`; no catalog callback or new permission is needed.
+
+The RPC host binding observes the public controller's Promise, not its private
+response demultiplexer. If that controller times out before Pi finishes a setter,
+its ordinary Error cannot reliably distinguish a native rejection from a lost
+ACK; Bridge reports uncertainty and never retries it. The exact matching-late-ACK
+fence belongs to Bridge-owned RPC, whose demultiplexer it controls. Shared hosts
+remain responsible for their own admissions and for closing the actual writer
+before confirming release.
 
 ## Image-capable owners
 

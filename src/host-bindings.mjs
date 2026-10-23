@@ -9,6 +9,7 @@ import {
   promptOptions as options,
 } from './prompt-input.mjs';
 import { modelState } from './models.mjs';
+import { createModelSetter } from './set-model.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
 const unknown = () => ({
   status: 'unknown',
@@ -94,6 +95,17 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
             assertIdentity(before, await state());
             return result;
           }
+        : undefined,
+    setModel:
+      typeof session.modelRuntime?.getAvailableSnapshot === 'function' &&
+      typeof session.setModel === 'function' &&
+      typeof session.setThinkingLevel === 'function'
+        ? createModelSetter({
+            state,
+            models: () => session.modelRuntime.getAvailableSnapshot(),
+            setModel: (model) => tracked.track(session.setModel(model)),
+            setThinkingLevel: (level) => session.setThinkingLevel(level),
+          })
         : undefined,
     submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
@@ -247,6 +259,16 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
             return result;
           }
         : undefined,
+    setModel: ['getAvailableModels', 'setModel', 'setThinkingLevel'].every(
+      (name) => typeof client[name] === 'function',
+    )
+      ? createModelSetter({
+          state,
+          models: () => client.getAvailableModels(),
+          setModel: (model) => tracked.track(client.setModel(model.provider, model.id)),
+          setThinkingLevel: (level) => tracked.track(client.setThinkingLevel(level)),
+        })
+      : undefined,
     submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');

@@ -39,7 +39,20 @@ test('modern requests are self-contained; discovery and tool list carry required
   const listed = (await dispatchModern(stub, message('tools/list'))).message.result;
   assert.deepEqual(
     listed.tools.map((t) => t.name),
-    ['list', 'read', 'compact', 'send', 'command', 'stop', 'create', 'delete', 'batch', 'health'],
+    [
+      'list',
+      'read',
+      'models',
+      'set_model',
+      'compact',
+      'send',
+      'command',
+      'stop',
+      'create',
+      'delete',
+      'batch',
+      'health',
+    ],
   );
   assert.deepEqual(discovery.message.result._meta[META + 'serverInfo'], {
     name: 'pi-session-bridge',
