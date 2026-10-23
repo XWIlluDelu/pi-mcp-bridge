@@ -1060,20 +1060,6 @@ export class Bridge {
       );
     });
   }
-  inputActivityForLocal(request) {
-    this.assertOpen();
-    const runtime =
-      this.pool.instances.get(request.session_id) ??
-      this.pool.starting.get(request.session_id)?.runtime;
-    if (
-      !(runtime instanceof PiRpc) ||
-      !runtime.alive ||
-      request.generation !== runtime.ownerRecord?.generation
-    )
-      throw new Error('INVALID_OWNER_COMMAND');
-    runtime.observeInputActivity(request);
-    return {};
-  }
   settledForLocal(request) {
     this.assertOpen();
     const runtime = this.pool.instances.get(request.session_id);
@@ -1103,6 +1089,20 @@ export class Bridge {
   }
   cancelHandoff(request) {
     return cancelHandoff(this, request);
+  }
+  inputActivityForLocal(request) {
+    this.assertOpen();
+    const runtime =
+      this.pool.instances.get(request.session_id) ??
+      this.pool.starting.get(request.session_id)?.runtime;
+    if (
+      !(runtime instanceof PiRpc) ||
+      !runtime.alive ||
+      request.generation !== runtime.ownerRecord?.generation
+    )
+      throw new Error('INVALID_OWNER_COMMAND');
+    runtime.observeInputActivity(request);
+    return {};
   }
   async releaseForLocal({ session_id, interrupt = false }) {
     this.assertOpen();
