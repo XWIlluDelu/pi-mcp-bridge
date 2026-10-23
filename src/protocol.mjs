@@ -18,6 +18,10 @@ import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
 export const descriptions = {
+  models:
+    'List available chat models from the owner’s native agent configuration and Bridge launch environment, without network refresh or loading sessions/extensions. Input is only offset (default 0) and limit (default 30, 1–100); output is only models and next_offset. Requires effective send/command/create on a configured project, or send/command on a known in-scope session; normal override priority applies. Items contain provider, id, name, input, thinking_levels, context_window, max_output_tokens and input_limits; null means unknown. Excludes extension/session-only dynamic models. Use list.status for current session model/thinking; set_model to change a selection, or send/create for prompt settings.',
+  set_model:
+    'Set the session’s current model and/or thinking_level through native Pi setters, without sending a prompt. Requires send permission; input is only session_id and at least one of model:{provider,id} or thinking_level. Busy sessions are supported: an already-issued provider request keeps its captured selection, later provider calls use the current choice. Returns only actual model:{provider,id} and thinking_level, including native thinking adjustment. Uses the live owner or cold-resumes a saved session; newly started owned RPCs release when safely idle. Current companions and SDK/RPC host bindings support this; an omitted optional host callback returns MODEL_SELECTION_UNSUPPORTED. Keep Bridge and owner components updated together. Global defaults are unchanged.',
   compact:
     'Manually compact through native Pi. Defaults to idle-only with send permission; refuses busy or unproven idle. Only explicit interrupt:true permits native abort-before-compaction and additionally requires stop permission. An interrupting call may abort the agent even if summarization later fails. It does not emulate stop-all or withdraw queues. Owned RPC supports idle compact; companions and supplied SDK/RPC bindings support explicit interrupt and reject unconfirmed idle without aborting. Returns bounded completion metadata, never summary text; use read for the native summary. Timeout means unknown; inspect list/read before deciding whether to submit again. Each call is a new operation. Native stop can cancel compaction where supported; no arbitrary slash command execution.',
   list: 'List authorized Pi sessions with project, name, recent activity and coarse runtime status, including current model identity and thinking_level when observed from a live owner (otherwise null). Never starts a runtime. creatable_projects contains only configured create-permitted projects represented on the returned page, deduplicated. It does not limit create targets. Filters combine; newest activity first. list permission is independent of read.',
@@ -38,6 +42,8 @@ export const descriptions = {
 export const toolNames = [
   'list',
   'read',
+  'models',
+  'set_model',
   'compact',
   'send',
   'command',

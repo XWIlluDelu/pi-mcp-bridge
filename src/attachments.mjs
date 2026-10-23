@@ -10,6 +10,7 @@ import { hasPromptSettings } from './prompt-input.mjs';
 import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
+import { modelSettings } from './set-model.mjs';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -269,7 +270,7 @@ export class AttachedRuntime {
     );
   }
   async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
-    const mutating = ['send', 'stop', 'bash', 'compact'].includes(op);
+    const mutating = ['set_model', 'send', 'stop', 'bash', 'compact'].includes(op);
     const serialized =
       JSON.stringify({
         op,
@@ -365,6 +366,15 @@ export class AttachedRuntime {
             return finish(new AttachmentFailure(response.error));
           if (op === 'compact' && response.error === 'HOST_COMPACT_UNCERTAIN')
             return finish(new AttachmentFailure(response.error, true));
+          if (op === 'set_model' && response.error === 'MODEL_SELECTION_UNSUPPORTED')
+            return finish(new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED'));
+          if (
+            op === 'set_model' &&
+            ['MODEL_SELECTION_PENDING', 'MODEL_UNAVAILABLE', 'INVALID_ARGUMENTS'].includes(
+              response.error,
+            )
+          )
+            return finish(new AttachmentFailure(response.error));
           if (
             op === 'send' &&
             [
@@ -467,6 +477,23 @@ export class AttachedRuntime {
     )
       throw new AttachmentFailure('INVALID_HOST_SNAPSHOT');
     return result;
+  }
+  async selectModel(model, { thinkingLevel, beforeDispatch } = {}) {
+    const value = await this.request(
+      'set_model',
+      {
+        ...(model ? { model } : {}),
+        ...(thinkingLevel !== undefined ? { thinking_level: thinkingLevel } : {}),
+      },
+      5000,
+      beforeDispatch,
+    );
+    try {
+      return modelSettings(value);
+    } catch (error) {
+      error.uncertain = true;
+      throw error;
+    }
   }
   send(args) {
     if (hasPromptSettings(args)) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');

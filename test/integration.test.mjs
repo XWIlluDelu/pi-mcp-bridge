@@ -204,8 +204,10 @@ test('standard MCP stdio client initializes and exercises the single-operation t
       'delete',
       'health',
       'list',
+      'models',
       'read',
       'send',
+      'set_model',
       'stop',
     ]);
     const call = async (name, args) => {

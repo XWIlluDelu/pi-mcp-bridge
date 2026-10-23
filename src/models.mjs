@@ -25,6 +25,12 @@ export function modelSetting(model, level) {
     thinking_level: thinkingLevelSchema.safeParse(level).success ? level : null,
   };
 }
+export const modelsSchema = z
+  .object({
+    offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+  })
+  .strict();
 // Native state is reduced before owner IPC as well as before public list output.
 export function modelState(state) {
   const model = modelSelectionSchema.safeParse({
@@ -39,3 +45,44 @@ export function modelState(state) {
 }
 
 export const sameModel = (a, b) => !!a && !!b && a.provider === b.provider && a.id === b.id;
+const numberOrNull = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
+const textOrNull = (value) => (typeof value === 'string' && value.length <= 256 ? value : null);
+
+// Allowlist only. Full native Model objects can carry endpoint headers and
+// arbitrary provider configuration; never pass them to MCP or owner IPC.
+export function modelInfo(model) {
+  if (!modelSelectionSchema.safeParse({ provider: model?.provider, id: model?.id }).success)
+    throw new Error('INVALID_MODEL_METADATA');
+  const input =
+    Array.isArray(model.input) && model.input.every((x) => ['text', 'image'].includes(x))
+      ? [...new Set(model.input)]
+      : null;
+  const reasoning = typeof model.reasoning === 'boolean' ? model.reasoning : null;
+  return {
+    provider: model.provider,
+    id: model.id,
+    name: textOrNull(model.name),
+    input,
+    context_window: numberOrNull(model.contextWindow),
+    max_output_tokens: numberOrNull(model.maxTokens),
+    // This is the same native helper used by AgentSession, not a Bridge guess.
+    thinking_levels: reasoning === null ? null : getSupportedThinkingLevels(model),
+    input_limits: {
+      max_request_bytes: numberOrNull(model.inputLimits?.maxRequestBytes),
+      images_per_message: numberOrNull(model.inputLimits?.images?.maxPerMessage),
+      images_per_request: numberOrNull(model.inputLimits?.images?.maxPerRequest),
+    },
+  };
+}
+export function catalogPage(models, args = {}) {
+  if (!Array.isArray(models)) throw new Error('INVALID_MODEL_METADATA');
+  const ordered = models
+    .map(modelInfo)
+    .sort((a, b) => a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id));
+  const offset = args.offset ?? 0,
+    limit = args.limit ?? 30;
+  return {
+    models: ordered.slice(offset, offset + limit),
+    next_offset: offset + limit < ordered.length ? offset + limit : null,
+  };
+}

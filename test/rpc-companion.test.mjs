@@ -129,8 +129,10 @@ test(
       'delete',
       'health',
       'list',
+      'models',
       'read',
       'send',
+      'set_model',
       'stop',
     ]);
     assert.equal(

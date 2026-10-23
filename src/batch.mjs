@@ -64,17 +64,19 @@ function planBatch(operations) {
 
 function fitQuery(op, result, args, budget) {
   if (fitsResult(result, budget)) return result;
-  if (op === 'list') {
-    const rows = result.sessions;
+  if (op === 'models' || op === 'list') {
+    const key = op === 'models' ? 'models' : 'sessions',
+      rows = result[key];
     for (let count = rows.length - 1; count > 0; count--) {
       const page = {
         ...result,
-        sessions: rows.slice(0, count),
+        [key]: rows.slice(0, count),
         next_offset: (args.offset ?? 0) + count,
       };
-      page.creatable_projects = result.creatable_projects.filter((project) =>
-        page.sessions.some((row) => row.project === project),
-      );
+      if (op === 'list')
+        page.creatable_projects = result.creatable_projects.filter((project) =>
+          page.sessions.some((row) => row.project === project),
+        );
       if (fitsResult(page, budget)) return page;
     }
   }
@@ -127,7 +129,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
               retainedInputs: op === 'stop' ? inputs : undefined,
             }),
           );
-          if (['read', 'list', 'health'].includes(op))
+          if (['read', 'models', 'list', 'health'].includes(op))
             result = fitQuery(op, result, args, resultBudget);
           results[index] = { index, op, result };
         } catch (error) {

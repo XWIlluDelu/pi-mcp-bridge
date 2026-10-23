@@ -94,6 +94,7 @@ const enums = {
   ui_method: ['confirm', 'select', 'input', 'editor'],
   op: [
     'state',
+    'models',
     'set_model',
     'set_thinking_level',
     'get_available_models',
