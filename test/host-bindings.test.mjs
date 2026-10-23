@@ -22,6 +22,52 @@ function sdk(prompt) {
 }
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
+test('SDK read features expose current tool and command names without executing them', async () => {
+  const value = sdk(() => assert.fail('Read features must not prompt'));
+  value.getAllTools = () => [
+    { name: 'memory_tool', description: 'PRIVATE_DESCRIPTION', parameters: { secret: true } },
+  ];
+  value.extensionRunner = {
+    getRegisteredCommands: () => [
+      {
+        name: 'memory-command',
+        handler: () => assert.fail('Read features must not execute a command'),
+      },
+    ],
+  };
+  assert.deepEqual(await createSdkHostBinding(value).readFeatures(), {
+    available: true,
+    tools: ['memory_tool'],
+    commands: ['memory-command'],
+    leaf_id: 'entry',
+  });
+});
+
+test('RPC read features use registered extension commands and reject identity changes', async () => {
+  const value = { ...idle };
+  const client = {
+    getState: async () => value,
+    getCommands: async () => [
+      { name: 'memory-command', source: 'extension', description: 'PRIVATE_DESCRIPTION' },
+      { name: 'prompt-only', source: 'prompt' },
+      { name: 'skill-only', source: 'skill' },
+    ],
+    getEntries: async () => ({ entries: [], leafId: 'entry' }),
+  };
+  const binding = createRpcHostBinding(client);
+  assert.deepEqual(await binding.readFeatures(), {
+    available: true,
+    tools: [],
+    commands: ['memory-command'],
+    leaf_id: 'entry',
+  });
+  client.getEntries = async () => {
+    value.sessionId = 'different';
+    return { entries: [], leafId: null };
+  };
+  await assert.rejects(binding.readFeatures(), /RUNTIME_SESSION_CHANGED/);
+});
+
 test('SDK/RPC bindings expose only model identity and a valid native thinking level in state', async () => {
   const value = {
     ...idle,

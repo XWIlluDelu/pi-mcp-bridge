@@ -15,6 +15,7 @@ import { modelSettings } from './set-model.mjs';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
+import { assertReadFeatures } from './read-features.mjs';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
@@ -383,7 +384,8 @@ async function terminateOwnerForDelete(config, session, record) {
   await releaseOwner(config.attachmentDir, session, record);
 }
 export class AttachedRuntime {
-  constructor(config, session, record) {
+  constructor(config, session, record, { compatibility } = {}) {
+    this.compatibility = compatibility;
     this.config = config;
     this.session = session;
     this.record = record;
@@ -401,6 +403,9 @@ export class AttachedRuntime {
       JSON.stringify({
         op,
         body,
+        ...(op === 'read' && body.view !== 'observed'
+          ? { readAdapters: this.compatibility?.readInputs.snapshot() ?? [] }
+          : {}),
         generation: this.record.generation,
         file: this.record.file,
         sessionId: this.record.sessionId,
@@ -579,6 +584,16 @@ export class AttachedRuntime {
     )
       throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
     return state;
+  }
+  async readFeatures() {
+    if (this.record.readContract !== READ_CONTRACT)
+      throw new AttachmentFailure('OWNER_READ_REFRESH_REQUIRED');
+    const result = await this.request('read_features');
+    if (result?.contract !== READ_CONTRACT)
+      throw new AttachmentFailure('OWNER_READ_REFRESH_REQUIRED');
+    if (result.sessionFile !== this.session.file || result.sessionId !== this.session.header.id)
+      throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+    return assertReadFeatures(result);
   }
   async read(args) {
     if (this.record.readContract !== READ_CONTRACT)

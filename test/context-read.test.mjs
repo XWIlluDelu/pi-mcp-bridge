@@ -356,6 +356,38 @@ test('system instructions are opt-in outside full; tools and custom notices keep
   assert.deepEqual(data, before, 'selection does not mutate native snapshots');
 });
 
+test('generic custom reading preserves repeated business fields and native content across pages', () => {
+  const body = 'Native custom body 漢😀\n\n'.repeat(800);
+  const repeated = body.slice(-200);
+  const details = {
+    bodyText: repeated,
+    message: {
+      content: { text: repeated, attachments: [{ type: 'file', name: 'note', content: 'DATA' }] },
+    },
+    signature: 'BUSINESS_FIELD',
+  };
+  const data = snapshot([
+    msg('u', null, 'user', 'Review the update'),
+    msg('notice', 'u', 'custom', body, { customType: 'fixture-message', details, display: true }),
+  ]);
+  const before = structuredClone(data);
+  for (const max_bytes of [4096, 65536]) {
+    const pages = allPages(data, { max_bytes });
+    if (max_bytes === 4096) assert.ok(pages.length > 1);
+    const units = chronological(pages);
+    assert.equal(
+      units
+        .filter((u) => u.source.entry_id === 'notice')
+        .map((u) => u.message?.content ?? '')
+        .join(''),
+      body,
+    );
+    assert.deepEqual(units.find((u) => u.message?.details).message.details, details);
+    assert.equal(units.filter((u) => u.type === 'prompt').length, 1);
+  }
+  assert.deepEqual(data, before);
+});
+
 test('full context preserves chronological blocks, native system/custom/images and excludes raw state', () => {
   const entries = [
     msg('system', null, 'system', '', {

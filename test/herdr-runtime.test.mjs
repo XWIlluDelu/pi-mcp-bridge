@@ -5,7 +5,8 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Bridge } from '../src/bridge.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+import { PiRpc, launchProfile } from '../src/rpc.mjs';
+import { fileURLToPath } from 'node:url';
 import { scheduleAutoRelease } from '../src/auto-release.mjs';
 import { findHerdr, HerdrControl } from '../src/herdr-control.mjs';
 import { HerdrRpcTransport } from '../src/herdr-rpc-transport.mjs';
@@ -36,11 +37,16 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   const bin = path.join(dir, 'bin');
   await fs.mkdir(bin);
   await fs.symlink(process.execPath, path.join(bin, 'node'));
-  const environment = { PATH: process.env.PATH, HOME: process.env.HOME };
+  const environment = { PATH: process.env.PATH, HOME: process.env.HOME },
+    intercomSession = process.env.PI_INTERCOM_TEST_SESSION;
   process.env.PATH = bin;
   process.env.HOME = dir;
+  process.env.PI_INTERCOM_TEST_SESSION = 'synthetic-session';
   const config = {
     ...isolatedRuntime(dir),
+    compatibilityModules: [
+      { module: fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url)) },
+    ],
     herdr: true,
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
@@ -50,6 +56,8 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   const bridge = await new Bridge(config).init();
   t.after(async () => {
     Object.assign(process.env, environment);
+    if (intercomSession === undefined) delete process.env.PI_INTERCOM_TEST_SESSION;
+    else process.env.PI_INTERCOM_TEST_SESSION = intercomSession;
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -60,10 +68,15 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   assert.equal(direct.child instanceof HerdrRpcTransport, false);
   await direct.stop();
   await fs.writeFile(path.join(bin, 'herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
-  t.mock.method(HerdrControl, 'open', async () => {
+  t.mock.method(HerdrControl, 'open', async (_binary, daemonEnvironment) => {
+    assert.equal(daemonEnvironment.PI_INTERCOM_TEST_SESSION, undefined);
+    assert.equal(process.env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
+    assert.equal(launchProfile({}).env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
     throw new Error('HERDR_UNAVAILABLE');
   });
-  const rejected = new PiRpc({ ...config, attachmentDir: bridge.pool.attachmentDir }, session);
+  const rejected = new PiRpc({ ...config, attachmentDir: bridge.pool.attachmentDir }, session, {
+    compatibility: bridge.compatibilityServices,
+  });
   await assert.rejects(rejected.start(), /HERDR_UNAVAILABLE/);
   assert.ok(rejected.child instanceof HerdrRpcTransport);
   assert.equal(rejected.child.pid, undefined);

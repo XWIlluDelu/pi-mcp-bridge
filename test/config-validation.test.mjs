@@ -46,6 +46,14 @@ test('configuration shape errors agree across init, reload reader and HTTP', asy
     { attachmentDir: '' },
     { attachmentExitTimeoutMs: 49 },
     { piArgs: '--offline' },
+    { compatibilityModules: 'module.mjs' },
+    { compatibilityModules: ['relative.mjs'] },
+    { compatibilityModules: [{ module: 'relative.mjs' }] },
+    { compatibilityModules: [{ module: '/absolute\0module.mjs' }] },
+    { compatibilityModules: [{ module: '/absolute.mjs', enabled: 'yes' }] },
+    { compatibilityModules: [{ module: '/absolute.mjs', options: [] }] },
+    { compatibilityModules: [{ module: '/absolute.mjs', unknown: true }] },
+    { compatibilityModules: [{ module: '/absolute.mjs' }, { module: '/absolute.mjs' }] },
     { piRuntime: { tools: ['unknown'] } },
     { http: { port: 0, tokenFile: f.config.http.tokenFile } },
   ];
@@ -117,6 +125,7 @@ test('scope reload stays read-only; fixed settings await restart without blockin
     { piArgs: ['--offline'] },
     { stateDir: path.join(f.dir, 'different-state') },
     { attachmentExitTimeoutMs: 6000 },
+    { compatibilityModules: [{ module: '/not-loaded-until-restart.mjs', enabled: false }] },
   ]) {
     await save({ ...f.config, ...patch });
     const context = await bridge.captureRequestContext();

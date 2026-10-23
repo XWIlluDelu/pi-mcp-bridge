@@ -2,8 +2,9 @@ import { readSchema, contextSelection } from './read-schema.mjs';
 import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
+import { validateReadAdapters } from './read-adapters.mjs';
 
-export const READ_CONTRACT = 'semantic_units_v5';
+export const READ_CONTRACT = 'semantic_units_v7';
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 export const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;
@@ -15,9 +16,9 @@ const ends = (values, n) =>
 
 /**
  * The projection, not timestamps or raw-file order, is the ordering authority.
- * Retain hidden user entries as empty boundaries before flattening messages.
+ * Retain hidden inputs as empty boundaries before flattening messages.
  */
-function timeline(projection) {
+function timeline(projection, readAdapters) {
   const records = [],
     prompts = [];
   let prompt = null;
@@ -32,11 +33,15 @@ function timeline(projection) {
     records.push(record);
     return record;
   }
-  function emptyPrompt(source, reason) {
+  function emptyPrompt(source, reason, role = 'user') {
     prompt = `empty:${source.entry_id}:${reason}`;
     prompts.push(prompt);
-    add('prompt', source, { synthetic: true, reason, message: { role: 'user', content: '' } });
+    add('prompt', source, { synthetic: true, reason, message: { role, content: '' } });
   }
+  const inputAdapter = (message) =>
+    message?.role === 'custom'
+      ? readAdapters.find((value) => value.inputCustomTypes.includes(message.customType))
+      : undefined;
   function requirePrompt(source) {
     if (prompt === null) {
       const { message_index, block_index, ...entrySource } = source;
@@ -46,12 +51,25 @@ function timeline(projection) {
   for (const [entryIndex, projected] of projection.entries.entries()) {
     const { sourceEntry: entry, messages } = projected;
     const base = { entry_id: entry.id, entry_index: entryIndex };
-    if (entry.type === 'message' && entry.message.role === 'user' && !messages.length) {
-      emptyPrompt(base, 'hidden_user');
+    if (!messages.length) {
+      const original =
+        entry.type === 'custom_message'
+          ? { role: 'custom', customType: entry.customType }
+          : entry.type === 'message'
+            ? entry.message
+            : null;
+      const adapter = inputAdapter(original);
+      if (original?.role === 'user') emptyPrompt(base, 'hidden_user');
+      else if (adapter)
+        emptyPrompt({ ...base, read_adapter: adapter.id }, 'hidden_input', 'custom');
     }
     for (const [messageIndex, message] of messages.entries()) {
       const source = { ...base, message_index: messageIndex };
-      if (message.role === 'user') {
+      const adapter = inputAdapter(message);
+      if (message.role === 'user' || adapter) {
+        // Classify the input before selection, without rewriting its native role
+        // or payload. Source links identify both the entry and opt-in mapping.
+        if (adapter) source.read_adapter = adapter.id;
         prompt = entry.id;
         prompts.push(prompt);
         add('prompt', source, { synthetic: false, message });
@@ -115,8 +133,8 @@ function timeline(projection) {
   return { records, prompts, units };
 }
 
-function selectTimeline(projected, selection) {
-  const { records, prompts, units } = timeline(projected);
+function selectTimeline(projected, selection, readAdapters) {
+  const { records, prompts, units } = timeline(projected, readAdapters);
   const selectedPrompts = new Set([
     ...take(prompts, selection.earliest_prompts),
     ...take(prompts, selection.recent_prompts, true),
@@ -277,7 +295,8 @@ function cleanBlock(block) {
   return boundedFields(block && typeof block === 'object' ? block : { value: block });
 }
 function cleanMessage(message) {
-  const result = boundedFields(pick(message, messageFields));
+  const fields = pick(message, messageFields);
+  const result = boundedFields(fields);
   if (message?.content !== undefined)
     result.content = Array.isArray(message.content)
       ? message.content.map(cleanBlock)
@@ -310,6 +329,8 @@ function cleanRecord(record) {
     'message_index',
     'block_index',
     'observation_index',
+    'reader_index',
+    'read_adapter',
   ];
   if (record.source) result.source = pick(record.source, sourceFields);
   if (record.call_source) result.call_source = pick(record.call_source, sourceFields);
@@ -589,7 +610,7 @@ export function appendUnits(target, record) {
     target.units.push(detached);
   }
 }
-export function prepareContextRead(data, rawArgs, { buildSessionProjection }) {
+export function prepareContextRead(data, rawArgs, { buildSessionProjection, readAdapters = [] }) {
   const parsed = readSchema.safeParse(rawArgs);
   if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
   const args = parsed.data;
@@ -605,7 +626,11 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection }) {
   if (leaf !== null && !data.entries.some((entry) => entry.id === leaf))
     throw new Error('ENTRY_NOT_FOUND');
   const byId = sessionEntryIndex(data.entries, leaf);
-  const selected = selectTimeline(buildSessionProjection(data.entries, leaf, byId), selection),
+  const selected = selectTimeline(
+      buildSessionProjection(data.entries, leaf, byId),
+      selection,
+      validateReadAdapters(readAdapters),
+    ),
     target = { units: [], accountedBytes: 0 };
   for (const record of selected.records) appendUnits(target, record);
   return {
@@ -725,13 +750,18 @@ export function renderPreparedContextRead(
     session_id: snapshot.session_id,
     view: snapshot.view ?? 'native',
     ...(snapshot.observation ? { observation: snapshot.observation } : {}),
+    ...(snapshot.reader ? { reader: snapshot.reader } : {}),
     source: snapshot.source ?? 'session_projection',
     leaf_id: snapshot.leaf_id,
     selection: snapshot.selection,
     omissions: { selection: snapshot.omissions },
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
-    ...(snapshot.view !== 'observed' && !cursor && args.leaf_id === undefined && runtimeEvents
+    ...(snapshot.view !== 'observed' &&
+    snapshot.view !== 'adapted' &&
+    !cursor &&
+    args.leaf_id === undefined &&
+    runtimeEvents
       ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
       : {}),
   };

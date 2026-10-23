@@ -1,7 +1,12 @@
 # Reading a Pi session
 
-`read` defaults to `view:"native"`: Pi's persisted session projection as readable,
-prompt-linked semantic units. Pi's native `buildSessionProjection` determines branch ancestry,
+`read` automatically uses a matching configured session reader, based on the
+target session's live or persisted extension evidence; otherwise it reads Pi's
+persisted native projection. Only explicit `view:"native"` forces native reading.
+Selection parameters go to the selected reader rather than changing the source.
+[Module management and routing](compatibility.md#session-specific-read-routing)
+define this boundary.
+Pi's native `buildSessionProjection` determines branch ancestry,
 compaction checkpoints and context edits. The Bridge pairs tools and applies
 selectors **before** sanitizing and segmenting selected records.
 
@@ -21,15 +26,15 @@ To continue, pass the returned cursor alone; the byte budget may change:
 { "cursor": "<next_cursor>", "max_bytes": 12000 }
 ```
 
-| Argument     | Meaning                                                                                       |
-| ------------ | --------------------------------------------------------------------------------------------- |
-| `session_id` | Required for the first read; optional with a cursor. Knowing an ID is not permission.         |
-| `view`       | `native` (default) or `observed`. Omitted on continuation: inherit.                           |
-| `preset`     | Initial default `latest`; alternatives `recent` and `full`. Omitted on continuation: inherit. |
-| `select`     | Overrides for the eight selectors below. Omitted continuation fields inherit.                 |
-| `max_bytes`  | UTF-8 limit for the entire structured page: default 24000, range 4096–65536.                  |
-| `cursor`     | Opaque backward continuation of one captured snapshot.                                        |
-| `leaf_id`    | Optional native leaf. Explicit `null` means the empty root, not the last file entry.          |
+| Argument     | Meaning                                                                                                                        |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `session_id` | Required for the first read; optional with a cursor. Knowing an ID is not permission.                                          |
+| `view`       | Omit for automatic routing; `native` forces projection, `observed` reads a capture. Continuations inherit the captured source. |
+| `preset`     | Initial default `latest`; alternatives `recent` and `full`. Omitted on continuation: inherit.                                  |
+| `select`     | Overrides for the eight selectors below. Omitted continuation fields inherit.                                                  |
+| `max_bytes`  | UTF-8 limit for the entire structured page: default 24000, range 4096–65536.                                                   |
+| `cursor`     | Opaque backward continuation of one captured snapshot.                                                                         |
+| `leaf_id`    | Optional native leaf. Explicit `null` means the empty root, not the last file entry.                                           |
 
 An explicit continuation preset, merged with its explicit selectors, must match
 all eight captured values. Without a preset, only explicitly supplied selector
@@ -39,6 +44,12 @@ return `STALE_CURSOR`. Defaults are not applied before deciding what to inherit.
 Every read, including a cursor-only read, uses its own receive-time permission
 snapshot and validates the current canonical file/native session identity.
 A cursor is not authorization. It cannot be reused across Bridge instances.
+
+Adapted reads return `view:"adapted"`, `reader.id`, and synthetic
+`source.reader_index` locators. They use the same cleaning, byte budgets and
+frozen pagination; native selector counts are null. Their contents come from the
+selected module. The result identifies the chosen source; the call needs no
+plugin-specific arguments.
 
 ## Observed request context
 
@@ -60,7 +71,7 @@ misidentifying synthetic history as native prompts. `selection` and
 `omissions.selection` are null. Items use `source.observation_index`, with
 content/part positions where split; no native entry or prompt IDs are invented.
 The same sanitization, Unicode-safe semantic paging, byte and batch budgets apply
-to both views. Cursor-only continuation inherits the view and freezes all
+to all views. Cursor-only continuation inherits the view and freezes all
 observation metadata; conflicting view or native-selector overrides reject.
 
 `observation.available:true` carries:
@@ -112,8 +123,8 @@ observations; an already-running old companion must be updated with the Bridge.
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `system`           | `0` omits native system instructions/sections; `-1` includes them in native order. Tool declarations also require nonzero `tools`. |
 | `summary`          | `0` omits summaries; `1` or `-1` includes all active summaries at their native positions.                                          |
-| `recent_prompts`   | Last N user entries, or all with `-1`.                                                                                             |
-| `earliest_prompts` | First N user entries, or all with `-1`.                                                                                            |
+| `recent_prompts`   | Last N inputs (native users and explicitly adapted custom messages), or all with `-1`.                                             |
+| `earliest_prompts` | First N inputs, or all with `-1`.                                                                                                  |
 | `text`             | Per selected prompt, first N **and** last N assistant text blocks; union by source position.                                       |
 | `thinking`         | Per selected prompt, first N **and** last N native thinking blocks.                                                                |
 | `tools`            | Per selected prompt, first N **and** last N logical tool units (a call with its result, or an unresolved/orphan unit).             |
@@ -125,7 +136,7 @@ nonnegative safe integers or `-1`; `summary` only accepts `-1`, `0` or `1`, and
 First/last overlap is included once, so a bidirectional count N selects at most
 2N units per prompt. Text that happens to be identical is not deduplicated.
 
-For an initial read, omitting `preset` is equivalent to `preset:"latest"`:
+For a native read, omitting `preset` is equivalent to `preset:"latest"`:
 
 ```json
 {
@@ -232,7 +243,7 @@ than being copied into every text segment.
 - Native image blocks become
   `{type:"image",mime_type:"image/png",data_omitted:true}`.
   No base64, image decoding or invented image link is returned.
-- Assistant text/thinking parts retain `stopReason` in both views, so an error or
+- Assistant text/thinking parts retain `stopReason` in all views, so an error or
   cancellation remains visible on the latest page. Large error details stay in
   shared metadata instead of repeating with each part.
 - Native text/thinking signatures, response IDs, replay metadata, usage/cost
@@ -257,6 +268,10 @@ than being copied into every text segment.
   selection above. Large known section text is segmented before arbitrary-object
   limits are applied.
 - Active summary provenance and global/context-prefix native content remain available. Custom and unknown native records attributable to a prompt follow that prompt window; `full` retains all of them, subject to explicit capacity limits.
+- Custom messages retain their native `content`, `customType`, `display` and
+  business `details`, subject to the same explicit capacity limits as other
+  messages. The core does not interpret plugin-private objects or remove text
+  merely because it repeats across fields.
 
 Prompt ownership and tool pairing do not change. A context-hidden user creates
 an empty synthetic boundary without leaking its hidden text. A retained suffix
@@ -264,6 +279,57 @@ without its user gets a `context_prefix` boundary. Calls/results are paired
 before sampling, even across a steering prompt. `pairing` distinguishes paired,
 unresolved and orphan units; reused call IDs resolve to the latest preceding
 unresolved call. Identical text from different source positions is not deduplicated.
+
+## Optional input mappings
+
+Bridge reads native Pi without other plugins or adapters. By default, custom
+messages remain custom context and follow the existing prompt window; native
+`custom` state entries are not conversation messages.
+
+An owner can opt into input mappings in `owner.json`:
+
+```json
+{
+  "compatibilityModules": [
+    { "module": "/path/to/pi-mcp-bridge/src/compatibility/intercom.mjs", "enabled": true }
+  ]
+}
+```
+
+Input mapping is one capability of the shared [compatibility module
+manager](compatibility.md), not a separate module loader. Modules register exact
+input types through `services.readInputs.register(id, inputCustomTypes)` during
+startup and register its cleanup with `onStop`. The same module can independently
+register other capabilities.
+
+Only Bridge imports module code. It passes validated, declarative mappings through
+existing read IPC to matching RPC observers, companions and hosts. Module paths
+and enablement are fixed for the service lifetime; changes require a normal
+service restart. Invalid descriptors, duplicate mapping IDs or overlapping input
+types fail registration with `INVALID_READ_ADAPTER`.
+
+After Pi's native projection, matching `role:"custom"` messages establish input
+boundaries before the existing `latest`, `recent`, earliest/recent prompt,
+assistant-block and tool selectors run. An adapted input has `type:"prompt"`,
+its native entry ID as `prompt_id`, and `source.read_adapter` naming the mapping.
+It keeps its original `message.role:"custom"`, custom type, content and details:
+this is an extension-origin input, not a claim that a human wrote a native user
+message. Context-hidden adapted inputs keep an empty `hidden_input` boundary,
+without exposing hidden content. Other custom messages and state entries do not
+become inputs.
+
+The supplied Intercom module maps only the native custom message type
+`intercom_message`. Sender/routing information, delivery metadata and attachments
+remain in the native payload. It does not deduplicate private renderer fields.
+Disabling the module and restarting restores ordinary custom-message reading.
+Both modes preserve the original session file; source IDs locate original native
+entries, and the existing raw fork snapshot remains unchanged, including
+unprojected state and image bytes. Readable pages still apply their documented
+sanitization and capacity bounds rather than acting as lossless exports.
+
+Mappings affect only native input selection. The observed request-stage capture
+keeps its existing order and semantics and does not apply these mappings.
+No Magic Context storage or read design is introduced.
 
 ## Capacity and continuation
 

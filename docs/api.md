@@ -111,7 +111,14 @@ pages; list is not a frozen export.
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-`view:"native"` is the default. Explicit `view:"observed"` reads the
+The default call uses a matching configured session reader based on the target
+session's live or persisted extension evidence, otherwise native projection.
+Only explicit `view:"native"` forces native projection. Selection parameters
+(`preset`, `select`, `leaf_id`) go to the selected reader and do not change the
+source. Adapted results identify `reader.id` and share frozen pagination. See
+[session routing](compatibility.md#session-specific-read-routing).
+
+Explicit `view:"observed"` reads the
 latest captured request-stage context, including MC transformations when
 observed; it has no native selectors or leaf override. Missing observations are
 explicitly unavailable, never recreated by running Pi. Owned observations survive

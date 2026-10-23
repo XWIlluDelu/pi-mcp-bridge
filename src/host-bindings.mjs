@@ -1,6 +1,7 @@
 // Bind existing owners through public SDK/RPC APIs. These helpers never open a
 // session, spawn a process, read stdio, or access private admission hooks.
 import { requireInterruptCompaction } from './compact.mjs';
+import { nativeReadFeatures } from './read-features.mjs';
 import { nativeBashResult } from './bash-execution.mjs';
 import { SEND_MODES, hasPromptSettings, promptOptions as options } from './prompt-input.mjs';
 import { modelState } from './models.mjs';
@@ -66,6 +67,12 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   });
   return {
     state,
+    readFeatures: () =>
+      nativeReadFeatures(
+        session.getAllTools?.(),
+        session.extensionRunner?.getRegisteredCommands?.(),
+        session.sessionManager?.getLeafId?.(),
+      ),
     snapshot: async () => {
       const before = identity(session);
       const entries = session.sessionManager.getEntries(),
@@ -224,6 +231,17 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
   };
   return {
     state,
+    readFeatures: async () => {
+      const before = await state();
+      const commands = await client.getCommands();
+      const snapshot = await client.getEntries();
+      assertIdentity(before, await state());
+      return nativeReadFeatures(
+        undefined,
+        commands.filter((command) => command.source === 'extension'),
+        snapshot.leafId,
+      );
+    },
     snapshot: async () => {
       const before = await state(),
         snapshot = await client.getEntries(),
