@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { RpcClient } from '@earendil-works/pi-coding-agent';
+import { RpcClient } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest, ownerSocket } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';

@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { nativeSdk } from './pi-installation.mjs';
 import {
   SEND_MODES,
   attachedPromptInput,
@@ -319,6 +320,7 @@ export default async function attachExtension(pi) {
                 activity: activity(),
               };
             else if (['read', 'snapshot'].includes(request.op)) {
+              const sdk = request.op === 'read' ? await nativeSdk(profile) : null;
               const entries = ctx.sessionManager.getEntries(),
                 leafId = ctx.sessionManager.getLeafId();
               const snapshotJson =
@@ -339,6 +341,7 @@ export default async function attachExtension(pi) {
                   ...prepareContextRead(
                     { header, entries, leafId, live: runtime.liveMessage.snapshot() },
                     args,
+                    sdk,
                   ),
                 };
               }

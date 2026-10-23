@@ -34,7 +34,8 @@ import { hash, atomicJson, assertPrivateDirectory, assertNativeDirectory } from 
 import { kernelLock } from './kernel-lock.mjs';
 import { stopReceipt, inlineWithdrawal, withdrawalOutput } from './stop-execution.mjs';
 import { bashOutput, inlineBashResult } from './bash-execution.mjs';
-import { PiRpc, RuntimePool } from './rpc.mjs';
+import { PiRpc, RuntimePool, launchProfile } from './rpc.mjs';
+import { nativeSdk } from './pi-installation.mjs';
 import {
   privateDirectory,
   readClaim,
@@ -268,7 +269,7 @@ export class Bridge {
           let runtime = await this.pool.forRead(session);
           if (!runtime) {
             await validateExecutionCwd(session.cwd);
-            await loadSavedSession(session);
+            await loadSavedSession(session, { config: this.config });
             checkInput();
             runtime = await this.pool.resolve(session);
           }
@@ -481,8 +482,12 @@ export class Bridge {
         )
           throw new Error('INVALID_RUNTIME_ENTRIES');
         s = { ...s, entries: active.entries, leafId: active.leafId, live: active.live };
-      } else s = await loadSavedSession(s, { omitImageData: true });
-      captured = prepareContextRead(s, args);
+      } else s = await loadSavedSession(s, { omitImageData: true, config: this.config });
+      captured = prepareContextRead(
+        s,
+        args,
+        await nativeSdk(this.config, launchProfile(this.config).env),
+      );
     }
     const current = await this.session(id);
     if (
@@ -536,7 +541,7 @@ export class Bridge {
       runtime = await this.pool.forRead(target);
       if (!runtime) {
         await validateExecutionCwd(target.cwd);
-        await loadSavedSession(target);
+        await loadSavedSession(target, { config: this.config });
         await authorized();
         runtime = await this.pool.resolve(target);
         markForAutoRelease(runtime);
@@ -585,7 +590,7 @@ export class Bridge {
           runtime = await this.pool.forRead(s);
           if (!runtime) {
             await validateExecutionCwd(s.cwd);
-            await loadSavedSession(s);
+            await loadSavedSession(s, { config: this.config });
             runtime = await this.pool.resolve(s);
             markForAutoRelease(runtime);
           }
@@ -682,7 +687,7 @@ export class Bridge {
             let runtime = await this.pool.forRead(session);
             if (!runtime) {
               await validateExecutionCwd(session.cwd);
-              await loadSavedSession(session);
+              await loadSavedSession(session, { config: this.config });
               runtime = await this.pool.resolve(session);
             }
             markForAutoRelease(runtime);
@@ -789,7 +794,10 @@ export class Bridge {
         if (runtime?.attached) {
           if (typeof runtime.snapshot !== 'function') throw new Error('SNAPSHOT_UNSUPPORTED');
           snapshot = await runtime.snapshot();
-        } else snapshot = runtime ? await runtime.entries() : await loadSavedSession(parent);
+        } else
+          snapshot = runtime
+            ? await runtime.entries()
+            : await loadSavedSession(parent, { config: this.config });
       }
       child = await prepareSession(this.config, folder.path, {
         name: args.name,

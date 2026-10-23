@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
-import { parseSessionEntries, migrateSessionEntries } from '@earendil-works/pi-coding-agent';
+import { nativeSdk } from './pi-installation.mjs';
 import path from 'node:path';
 import { hash, opaqueId, assertNativeDirectory } from './storage.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
@@ -111,7 +111,8 @@ export async function validateExecutionCwd(cwd) {
   }
   return cwd;
 }
-export async function loadSession(file, { omitImageData = false } = {}) {
+export async function loadSession(file, { omitImageData = false, config } = {}) {
+  const { parseSessionEntries, migrateSessionEntries } = await nativeSdk(config);
   const expected = await assertSingleSessionFile(file),
     fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
     records = [];

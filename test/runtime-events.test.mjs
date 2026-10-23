@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PiRpc, RuntimePool } from '../src/rpc.mjs';
 import { RuntimeEvents } from '../src/runtime-events.mjs';
-import { prepareContextRead } from '../src/context-read.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
 import { assertContextReadResponse } from './fixtures/read-pages.mjs';
 import { toolResultBytes } from '../src/response-budget.mjs';

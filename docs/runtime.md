@@ -231,14 +231,22 @@ Owner `piArgs --session-dir DIR` is allowed: it only sets the fresh session's
 storage directory. Existing-session selectors such as `--session`, `--session-id`,
 `--continue`, `--resume` and `--fork` remain blocked until the negotiated join.
 
-Cold RPC, create, reopen and the TUI launcher resolve the user's `pi` from the
-child environment's PATH. The Bridge ignores its own SDK binaries even when npm
-prepends them to PATH. It never silently substitutes that dependency for the
-user's installation. `piExecutable` selects an explicit absolute executable;
-missing or non-executable selections fail before spawning. Existing cooperating
-owners are reused as-is, without replacing their process or version.
+`pi-installation.mjs` resolves the user's installed Pi once at each acquisition
+boundary. `piExecutable` selects an absolute CLI path, including a symlink;
+otherwise the launch environment's PATH selects `pi`, with relative PATH entries
+resolved from the Bridge/launcher process cwd, not the target project. Its real CLI file identifies
+the Pi package, whose declared SDK entry and dependencies supply history parsing,
+projection, fork, model discovery, credentials and thinking capabilities. Helpers
+receive that resolved SDK path instead of resolving a second package next to Bridge.
+Opaque wrappers or executables without the matching SDK fail with
+`PI_INSTALLATION_UNAVAILABLE`; missing/non-executable selections fail before launch.
+An explicit selection never falls back to PATH. Bridge contains no Pi dependency,
+does not install one, and uses the selected installation regardless of its directory location.
+Existing cooperating owners are reused without replacing their process. After
+upgrading or replacing the selected Pi installation, restart Bridge and reopen
+affected Pi owners at a safe boundary: running processes retain loaded native modules.
 
-Pi 1.3.0 is the tested native/SDK baseline, not a production version override.
+Pi 1.4.0 is the tested external installation, not a production version override.
 `piRuntime` environment, agent-directory and tool overrides remain explicit owner
 choices. Otherwise native settings, packages, authentication, tools and extensions
 are discovered normally from the process environment and project.

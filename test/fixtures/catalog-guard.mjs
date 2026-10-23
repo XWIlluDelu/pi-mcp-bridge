@@ -1,3 +1,4 @@
+import { sdkEntry } from './pi.mjs';
 // Loaded only in the isolated catalog subprocess; never in a user's Pi.
 import fs from 'node:fs';
 import net from 'node:net';
@@ -5,12 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import tls from 'node:tls';
 import { syncBuiltinESMExports } from 'node:module';
-import {
-  ModelRuntime,
-  SessionManager,
-  DefaultResourceLoader,
-  AgentSession,
-} from '@earendil-works/pi-coding-agent';
+import { ModelRuntime, SessionManager, DefaultResourceLoader, AgentSession } from './pi.mjs';
 
 const mark = (value) => fs.appendFileSync(process.env.BRIDGE_CATALOG_MARKER, value + '\n');
 const forbidden = () => {
@@ -31,9 +27,7 @@ for (const method of ['create', 'open', 'continueRecent', 'inMemory', 'list', 'l
   SessionManager[method] = forbidden;
 DefaultResourceLoader.prototype.reload = forbidden;
 AgentSession.prototype.bindExtensions = forbidden;
-const { ReadOnlyAuthStorage } = await import(
-  new URL('./core/auth-storage.js', import.meta.resolve('@earendil-works/pi-coding-agent')).href
-);
+const { ReadOnlyAuthStorage } = await import(new URL('./core/auth-storage.js', sdkEntry).href);
 async function mustReject(fn) {
   try {
     await fn();

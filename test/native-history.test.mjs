@@ -7,11 +7,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { prepareSession } from '../src/create-session.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
-import {
-  SessionManager,
-  parseSessionEntries,
-  migrateSessionEntries,
-} from '@earendil-works/pi-coding-agent';
+import { SessionManager, parseSessionEntries, migrateSessionEntries } from './fixtures/pi.mjs';
 import { loadSession, loadSavedSession, readSessionIdentity } from '../src/data.mjs';
 
 for (const version of [1, 2, 3])
