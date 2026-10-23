@@ -1,4 +1,3 @@
-import { knownErrorCode } from './errors.mjs';
 import {
   MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
@@ -9,6 +8,7 @@ import { stopReceipt, inlineWithdrawal } from './stop-execution.mjs';
 import { inlineBashResult } from './bash-execution.mjs';
 import { hasPromptSettings } from './prompt-input.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { knownErrorCode } from './errors.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
 import { modelSettings } from './set-model.mjs';
@@ -16,7 +16,7 @@ import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { assertSingleSessionFile } from './data.mjs';
+import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
 export class AttachmentFailure extends Error {
@@ -115,66 +115,41 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
     }
     if (length > 8192) throw new Error();
     const record = JSON.parse(bytes.subarray(0, length).toString('utf8'));
-    const released = isReleasedOwner(record);
     const identified =
       Number.isSafeInteger(record?.owner?.pid) &&
       record.owner.pid > 0 &&
       typeof record.owner.start === 'string' &&
       typeof record.owner.boot === 'string';
-    // Establish scope from the bounded private inode before interpreting its
-    // protocol. An unrelated owner's mismatch must not block this session.
-    // Ambiguous path/identity or unsafe storage still fails closed.
-    if (
-      typeof record?.file !== 'string' ||
-      !path.isAbsolute(record.file) ||
-      record.file.includes('\0') ||
-      (!released && !identified)
-    )
-      throw new Error();
-    if (scope.file !== undefined && record.file !== scope.file) return null;
+    // A known other process is irrelevant to an exact-PID scan. An unidentified
+    // possible writer still prevents using such a scan as signal authority.
     if (
       scope.owner &&
+      (identified || isReleasedOwner(record)) &&
       (record.owner?.pid !== scope.owner.pid ||
         record.owner.start !== scope.owner.start ||
         record.owner.boot !== scope.owner.boot)
     )
       return null;
-    const fields = [
-      'kind',
-      'mode',
-      'file',
-      'sessionId',
-      'generation',
-      'owner',
-      'phase',
-      'socket',
-      'noColdReacquire',
-      'handoffId',
-      'releaseSupported',
-      'imagesSupported',
-      'readContract',
-    ];
-    if (Object.keys(record).some((key) => !fields.includes(key)))
-      throw new AttachmentFailure('ATTACHMENT_PROTOCOL_MISMATCH');
     if (
-      typeof record.sessionId !== 'string' ||
-      !['tui', 'rpc', 'host', 'extension', 'delete'].includes(record.kind) ||
-      typeof record.generation !== 'string'
+      typeof record?.file !== 'string' ||
+      !path.isAbsolute(record.file) ||
+      path.resolve(record.file) !== record.file ||
+      record.file.includes('\0')
     )
       throw new Error();
-    if (session && (record.file !== session.file || record.sessionId !== session.header.id))
-      throw new Error();
-    if (
-      (['tui', 'host', 'extension'].includes(record.kind) || record.socket !== undefined) &&
-      (typeof record.socket !== 'string' || path.dirname(record.socket) !== dir)
-    )
-      throw new Error();
+    // A known different path cannot own this target, even if its owner data is
+    // damaged. Unsafe storage or an ambiguous target path still rejects access.
+    if (scope.file !== undefined && record.file !== scope.file) return null;
+    if (!isReleasedOwner(record) && !identified) throw new Error();
+    if (session && record.file !== session.file) throw new Error();
     if (record.noColdReacquire !== undefined && typeof record.noColdReacquire !== 'boolean')
       throw new Error();
+    // Ownership evidence is independent of endpoint metadata, even for a live
+    // process. A native replacement can register fresh control without using or
+    // translating the previous endpoint. requestOnce validates live control.
     return record;
   } catch (e) {
     if (e.code === 'ENOENT') return null;
-    if (e instanceof AttachmentFailure) throw e;
     throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');
   } finally {
     await handle?.close();
@@ -182,22 +157,43 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
 }
 // Call while holding registryTransaction: a changed header must not bypass
 // an existing path owner merely because its claim has a different filename.
-// Without a header, check every claim on the path before native open. A local
-// session replacement may reuse this process; this read does not reserve it.
-export async function assertNoOtherLiveOwner(dir, session, { allowSameProcess = false } = {}) {
+// Without a header, check every claim on the path before native open. Only a
+// caller with native-context evidence may allowSameProcess; PID equality alone
+// does not prove replacement. This read does not reserve the target.
+export async function assertNoOtherLiveOwner(
+  dir,
+  session,
+  { allowSameProcess = false, completeHandoff = false } = {},
+) {
+  let opening = false;
   for (const name of await fs.readdir(dir)) {
     if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
     const other = await readOwnerRecord(dir, path.join(dir, name), undefined, {
       file: session.file,
     });
+    const completing =
+      completeHandoff &&
+      other?.kind === 'handoff' &&
+      other.phase === 'opening' &&
+      other.owner.pid === process.pid &&
+      (!session.header || other.sessionId === session.header.id) &&
+      (await ownerAlive(other.owner));
+    if (completing) opening = true;
     if (
       other &&
       other.file === session.file &&
       other.sessionId !== session.header?.id &&
+      !completing &&
       (!allowSameProcess || other.owner?.pid !== process.pid) &&
       (await ownerAlive(other.owner))
     )
       throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+  }
+  // Deletion blocks new admission, not completion of this process's already
+  // admitted native switch. It waits for that real writer before terminating.
+  if (!opening) {
+    const gate = await deletionGate(dir, session);
+    await gate.close();
   }
 }
 export async function reserveOwner(dir, session, kind, owner = undefined) {
@@ -250,12 +246,141 @@ export async function releaseOwner(dir, session, record) {
     }
   });
 }
+async function deletionGate(dir, session) {
+  try {
+    return await kernelLock('delete:' + path.resolve(dir) + '\0' + session.file, {
+      busy: 'LIVE_OWNER_UNREACHABLE',
+    });
+  } catch (error) {
+    if (error.message === 'LIVE_OWNER_UNREACHABLE')
+      throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+    throw error;
+  }
+}
+// Session-wide authority, separate from the writer claim. Keeping the claim
+// intact lets an existing owner finish/release normally without reopening
+// admission. The kernel drops the gate on Bridge death; no persistent lease.
+export async function acquireDeletion(dir, session) {
+  return registryTransaction(dir, async () => {
+    await assertSingleSessionFile(session.file);
+    await assertNoOtherLiveOwner(dir, session);
+    let record = await readClaim(dir, session);
+    if (record?.kind === 'handoff' && record.phase === 'reserved') {
+      // Revoke an unopened reservation without signalling its requester.
+      await fs.unlink(claimFile(dir, session));
+      record = null;
+    }
+    const gate = await deletionGate(dir, session);
+    return {
+      async writer() {
+        // Pi cannot cancel an in-progress switch atomically. Keep the deletion
+        // gate while that one admitted switch registers its writer, cancels,
+        // or its requester exits. Do not turn it into a user retry requirement.
+        while (record?.kind === 'handoff' && (await ownerAlive(record.owner))) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          record = await readClaim(dir, session);
+        }
+        return record?.kind === 'handoff' ? null : record;
+      },
+      async finish(moved = false) {
+        try {
+          if (moved)
+            await registryTransaction(dir, async () => {
+              const current = await readClaim(dir, session);
+              if (current && (await ownerAlive(current.owner)))
+                throw new AttachmentFailure('OWNER_STILL_ALIVE');
+              if (current) await fs.unlink(claimFile(dir, session));
+            });
+          // On failure leave the prior cold-resume pause untouched.
+        } finally {
+          await gate.close();
+        }
+      },
+    };
+  });
+}
 export async function waitOwnerExit(owner, timeout = 5000) {
   const until = Date.now() + timeout;
   while (await ownerAlive(owner)) {
     if (Date.now() >= until) throw new AttachmentFailure('OWNER_STILL_ALIVE');
     await new Promise((r) => setTimeout(r, 25));
   }
+}
+// Delete is explicit authority to interrupt the writer, not an idle handoff.
+// Recheck the native binding and exact process before EACH signal. Never signal
+// a process group, parent host, or a process that also owns another session.
+async function terminateOwnerForDelete(config, session, record) {
+  const signal = (name) =>
+    registryTransaction(config.attachmentDir, async () => {
+      const current = await readClaim(config.attachmentDir, session);
+      // Release can finish even when its ACK is lost, or while waiting to
+      // escalate. The target is closed; a shared host PID may remain alive.
+      if (!current || (current.generation === record.generation && isReleasedOwner(current)))
+        return true;
+      if (!(await ownerAlive(record.owner))) return false;
+      const identity = await readSessionIdentity(session.file);
+      if (
+        current?.generation !== record.generation ||
+        current.owner?.pid !== record.owner.pid ||
+        current.owner.start !== record.owner.start ||
+        current.owner.boot !== record.owner.boot ||
+        identity.header.id !== session.header.id ||
+        identity.header.cwd !== session.header.cwd
+      )
+        throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      if (record.owner.pid === process.pid) throw new AttachmentFailure('DELETE_SHARED_OWNER');
+      for (const name of await fs.readdir(config.attachmentDir)) {
+        if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
+        const other = await readOwnerRecord(
+          config.attachmentDir,
+          path.join(config.attachmentDir, name),
+          undefined,
+          { owner: record.owner },
+        );
+        if (
+          other &&
+          other.kind !== 'handoff' &&
+          (other.file !== session.file || other.sessionId !== session.header.id)
+        )
+          throw new AttachmentFailure('DELETE_SHARED_OWNER');
+      }
+      if (!(await ownerAlive(record.owner))) return;
+      try {
+        process.kill(record.owner.pid, name);
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error;
+      }
+    });
+  if (await signal('SIGTERM')) return;
+  try {
+    await waitOwnerExit(record.owner, config.attachmentExitTimeoutMs ?? 5000);
+  } catch (error) {
+    if (error.code !== 'OWNER_STILL_ALIVE') throw error;
+    if (await signal('SIGKILL')) return;
+    await waitOwnerExit(record.owner, config.attachmentExitTimeoutMs ?? 5000);
+  }
+  await registryTransaction(config.attachmentDir, async () => {
+    const current = await readClaim(config.attachmentDir, session);
+    if (current?.generation !== record.generation) return;
+    // Raw ownership metadata is not authority to unlink an arbitrary endpoint.
+    // Only clean a current-generation Unix socket in this registry.
+    if (
+      typeof record.socket === 'string' &&
+      path.dirname(record.socket) === config.attachmentDir &&
+      typeof record.generation === 'string' &&
+      path.basename(record.socket).endsWith(`-${record.generation.slice(0, 8)}.sock`)
+    ) {
+      const stat = await fs.lstat(record.socket).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+        return null;
+      });
+      if (stat?.isSocket())
+        await fs.unlink(record.socket).catch((error) => {
+          if (error.code !== 'ENOENT') throw error;
+        });
+    }
+  });
+  await releaseOwner(config.attachmentDir, session, record);
 }
 export class AttachedRuntime {
   constructor(config, session, record) {
@@ -285,7 +410,36 @@ export class AttachedRuntime {
     const current = await readClaim(this.config.attachmentDir, this.session);
     if (current?.generation !== this.record.generation)
       throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-    if (!(await ownerAlive(this.record.owner)) || current.phase !== 'ready')
+    const closingHost =
+      op === 'release' && current.kind === 'host' && current.phase === 'transitioning';
+    if (!(await ownerAlive(this.record.owner)))
+      throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+    // Reject unsupported live control interfaces, not historical ownership.
+    const fields = [
+      'kind',
+      'mode',
+      'file',
+      'sessionId',
+      'generation',
+      'owner',
+      'phase',
+      'socket',
+      'noColdReacquire',
+      'imagesSupported',
+      'readContract',
+    ];
+    if (
+      Object.keys(current).some((key) => !fields.includes(key)) ||
+      !['tui', 'rpc', 'extension', 'host'].includes(current.kind) ||
+      typeof current.generation !== 'string' ||
+      typeof current.sessionId !== 'string' ||
+      typeof current.socket !== 'string' ||
+      path.dirname(current.socket) !== this.config.attachmentDir
+    )
+      throw new AttachmentFailure('ATTACHMENT_PROTOCOL_MISMATCH');
+    if (current.sessionId !== this.session.header.id)
+      throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+    if (current.phase !== 'ready' && !closingHost)
       throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(this.record.socket);
@@ -518,23 +672,26 @@ export class AttachedRuntime {
     this.alive = false;
   } // Disconnect only. Never shut down external Pi on bridge close.
   async stopForDelete() {
-    // Public RPC extension shutdown is deferred, and this child is not ours.
-    // Keep its read/send endpoint alive; never request host exit or kill it.
-    if (this.record.kind === 'extension') throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
     if (this.record.kind === 'host') {
-      // A shared SDK host may keep other sessions alive. Only the host can
-      // close this session's admission and drain its own preparation work.
-      const result = await this.request('release', {}, this.config.attachmentExitTimeoutMs ?? 5000);
-      if (result?.released !== true) throw new AttachmentFailure('HOST_RELEASE_FAILED');
-      const current = await readClaim(this.config.attachmentDir, this.session);
-      if (current && !(isReleasedOwner(current) && current.generation === this.record.generation))
-        throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-      this.alive = false;
-      return;
+      // Prefer session-local close for SDK hosts that may share a process.
+      // Release is best effort, regardless of how a callback/transport fails.
+      // Process termination below independently revalidates the binding and
+      // shared-owner isolation; an error response is never signal authority.
+      let result;
+      try {
+        result = await this.request('release', {}, this.config.attachmentExitTimeoutMs ?? 5000);
+      } catch {
+        // Do not turn callback error names into an additional delete gate.
+      }
+      if (result?.released === true) {
+        const current = await readClaim(this.config.attachmentDir, this.session);
+        if (current && !(isReleasedOwner(current) && current.generation === this.record.generation))
+          throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+        this.alive = false;
+        return;
+      }
     }
-    await this.request('shutdown');
-    await waitOwnerExit(this.record.owner, this.config.attachmentExitTimeoutMs ?? 5000);
-    await releaseOwner(this.config.attachmentDir, this.session, this.record);
+    await terminateOwnerForDelete(this.config, this.session, this.record);
     this.alive = false;
   }
 }

@@ -1,11 +1,16 @@
 # Development principles
 
-This is an early-stage project. Support only the current Bridge and matching
-companion/host components. Do not add or retain compatibility with older Bridge
-protocols, configuration, parameters or behavior. Remove obsolete branches and
-their dedicated tests, fixtures and documentation; do not translate, migrate or
-silently accept old formats. Report a clear protocol mismatch and require the
-components to be updated together.
+This is an early-stage project. Support only the current Bridge control protocol
+and matching companion/host components. Do not add or retain compatibility with
+older requests, responses, configuration or parameters. Remove obsolete branches
+and their dedicated tests, fixtures and documentation; do not translate or migrate
+old control formats. Report a clear mismatch when using an unsupported live
+endpoint and require the components to be updated together.
+
+Ownership evidence is separate from control-interface compatibility. Scope
+checks to the target path or exact process, preserve live writers and explicit
+local pauses, and allow native replacement or confirmed process exit to end
+ephemeral claims. A fresh registration is not a translation of an old endpoint.
 
 Project quality, clear semantics and a simple correct design take precedence
 over implementation effort, minimal diffs and uninterrupted operation. Refactor

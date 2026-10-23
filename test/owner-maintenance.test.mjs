@@ -64,6 +64,11 @@ test(
       (await f.bridge.send({ session_id: f.id, text: 'NOT_SENT' })).reason,
       'COLD_REACQUIRE_BLOCKED',
     );
+    const paused = await readClaim(f.bridge.pool.attachmentDir, session);
+    await fs.writeFile(
+      claimFile(f.bridge.pool.attachmentDir, session),
+      JSON.stringify({ ...paused, unsupportedControlMetadata: true }),
+    );
     await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
     assert.ok(
       ['started', 'queued', 'handled'].includes(

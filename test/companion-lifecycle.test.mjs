@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
+import { randomUUID } from 'node:crypto';
 import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSessionRuntime,
@@ -15,7 +16,7 @@ import {
 } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import attachExtension from '../src/attach-extension.mjs';
-import { readClaim } from '../src/attachments.mjs';
+import { claimFile, readClaim } from '../src/attachments.mjs';
 import { pathToFileURL } from 'node:url';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createSdkHostBinding } from '../src/host-bindings.mjs';
@@ -146,6 +147,90 @@ async function fixture(t, { hosted = false, extension } = {}) {
   return { dir, config, bridge, a, b, runtime, modelRuntime, faux, finishers, binding, errors };
 }
 
+test('native replacement ignores old endpoint metadata and retains explicit pauses through reload and switch', async (t) => {
+  let f,
+    replaceMetadata = false;
+  f = await fixture(t, {
+    extension: (pi) => {
+      // Run after the companion has drained and closed its old context.
+      pi.on('session_shutdown', async () => {
+        if (!replaceMetadata) return;
+        replaceMetadata = false;
+        const file = claimFile(f.config.attachmentDir, f.a);
+        const old = JSON.parse(await fs.readFile(file, 'utf8'));
+        await fs.writeFile(
+          file,
+          JSON.stringify({
+            ...old,
+            kind: 'unsupported-endpoint',
+            generation: null,
+            socket: '/unusable/endpoint',
+            handoffId: 'unusable',
+            noColdReacquire: true,
+          }),
+        );
+      });
+    },
+  });
+  const before = await readClaim(f.config.attachmentDir, f.a);
+  replaceMetadata = true;
+  await f.runtime.session.reload();
+  const after = await readClaim(f.config.attachmentDir, f.a);
+  assert.equal(after.kind, 'tui');
+  assert.equal(after.phase, 'ready');
+  assert.notEqual(after.generation, before.generation);
+  for (const field of ['pid', 'start', 'boot'])
+    assert.equal(after.owner[field], before.owner[field]);
+  assert.equal(after.noColdReacquire, true);
+  assert.equal(after.handoffId, undefined);
+  assert.deepEqual(f.errors, []);
+  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'native');
+  await f.runtime.switchSession(f.b.file);
+  const pause = await readClaim(f.config.attachmentDir, f.a);
+  assert.equal(pause.owner, null);
+  assert.equal(pause.phase, 'released');
+  assert.equal(pause.noColdReacquire, true);
+});
+
+test('native UI rebinding retains the active writer endpoint', async (t) => {
+  const f = await fixture(t);
+  const before = await readClaim(f.config.attachmentDir, f.a);
+  await f.runtime.session.bindExtensions({ uiContext: { notify() {} } });
+  assert.deepEqual(await readClaim(f.config.attachmentDir, f.a), before);
+  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'native');
+  assert.deepEqual(f.errors, []);
+});
+
+test('native resume at the same path retires only the replaced native identity', async (t) => {
+  const f = await fixture(t);
+  const before = await readClaim(f.config.attachmentDir, f.a);
+  const header = { ...f.a.header, id: randomUUID() };
+  await fs.writeFile(f.a.file, JSON.stringify(header) + '\n');
+  assert.deepEqual(await f.runtime.switchSession(f.a.file), { cancelled: false });
+  const current = { file: f.a.file, header };
+  assert.equal(await readClaim(f.config.attachmentDir, f.a), null);
+  const after = await readClaim(f.config.attachmentDir, current);
+  assert.equal(after.sessionId, header.id);
+  assert.equal(after.phase, 'ready');
+  assert.notEqual(after.generation, before.generation);
+  assert.deepEqual(f.errors, []);
+});
+
+test('native reload does not replace the same process host controller with unsupported endpoint metadata', async (t) => {
+  const f = await fixture(t, { hosted: true });
+  const original = await readClaim(f.config.attachmentDir, f.a);
+  const file = claimFile(f.config.attachmentDir, f.a);
+  const unsupported = { ...original, generation: null, socket: '/unusable/endpoint' };
+  try {
+    await fs.writeFile(file, JSON.stringify(unsupported));
+    await f.runtime.session.reload();
+    assert.deepEqual(await readClaim(f.config.attachmentDir, f.a), unsupported);
+    assert.deepEqual(f.errors, []);
+  } finally {
+    await fs.writeFile(file, JSON.stringify(original));
+  }
+});
+
 test('companion observed contexts follow session replacement and never leak the previous session', async (t) => {
   const f = await fixture(t, {
     extension: (pi) => {
@@ -249,6 +334,8 @@ test(
     const claimA = await readClaim(config.attachmentDir, a),
       claimB = await readClaim(config.attachmentDir, b),
       before = await fs.readFile(b.file);
+    assert.ok(claimA, first.getStderr());
+    assert.ok(claimB, second.getStderr());
     assert.notEqual(claimA.owner.pid, claimB.owner.pid);
     const alias = path.join(dir, 'sessions', 'alias.jsonl');
     await fs.symlink(b.file, alias);

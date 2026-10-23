@@ -93,9 +93,10 @@ Each value is `true` (supported), `false` (known unsupported), or `null` (unconf
 The object is absent for `saved` and `unavailable` sessions.
 
 Bridge-owned RPC supports all three; ordinary TUI/RPC companions support only
-send. Hosts support send through their required submit callback. Updated host
-adapters report command only with both bash and stop callbacks, and stop with
-a stop callback. Current hosts must declare these boolean capabilities; a missing or malformed declaration requires a component update.
+send. Hosts support send through their required submit callback. Host adapters
+report command with a bash callback and either cancel or stop for lifecycle
+cancellation; remote stop independently requires a stop callback. Current hosts
+must declare these boolean capabilities; a missing or malformed declaration requires a component update.
 Capabilities are independent of permissions and busy/idle state: they neither
 grant access nor guarantee acceptance or success. Send mode still controls
 busy-input admission. Listing never starts Pi.
@@ -333,9 +334,31 @@ before deciding whether to create again.
 { "session_id": "ps_…" }
 ```
 
-Requires delete permission independently of stop/read. Stops the owned runtime,
-or uses a cooperating external owner's explicit release contract, then moves
-the session to private trash. It does not remove project files.
+Requires only delete permission, independently of list/read/send/stop. Delete
+authorizes interruption of the target writer, regardless of who launched it.
+It does not require idle, a responsive state endpoint, or release support.
+An authorized delete fences new input and overrides a waiting automatic release,
+local release or handoff, including a native shutdown hook already waiting after EOF.
+The operation takes exclusive deletion authority over the session: a transfer
+completed before that point is included, and another writer cannot take over
+while termination and the trash move are in progress.
+An unopened handoff reservation is revoked without terminating its requester.
+If native switching has already begun, the same delete call waits for that one
+switch to register its actual writer or confirm cancellation, then continues;
+other acquisitions remain blocked throughout. Pi has no atomic switch-cancel
+API, so a switch that never completes can leave deletion waiting.
+After verifying the native session and exact owner generation/PID/start/boot,
+Bridge sends SIGTERM and, if necessary, SIGKILL, then confirms exit before moving
+the session to private trash. It never sends a model prompt to request exit and
+does not remove project files. If the file move fails, an existing owner-local
+cold-resume pause remains in effect; the pause is cleared only after the file moves.
+
+A shared SDK host is closed through its session-local release callback. If that
+cannot close the target and the same process owns another session, Bridge reports
+`DELETE_SHARED_OWNER` instead of killing those other sessions. A dedicated host
+without release support uses the same verified process termination as ordinary
+Pi. Bridge-created Herdr scopes also reap their tool descendants; external parent
+processes and shared daemons are never signal targets.
 
 The result returns a `restore_token` and project authorization scope. Its
 restore manifest under `stateDir/trash` records original/trash paths. A repeated call is a new deletion attempt, not a lookup of the prior result.

@@ -27,12 +27,12 @@ export function scheduleAutoRelease(bridge, runtime) {
           if (idle.status !== 'idle' || !eligible()) return;
           await runtime.drainAcks();
           if (!eligible()) return;
-          const marker = { kind: 'auto_release', runtime };
+          const marker = { kind: 'auto_release', runtime, controller: new AbortController() };
           bridge.handoffs.set(id, marker);
           runtime.handoffPending = true;
           try {
             // Mutations hold this lane; readers that arrive now wait for this exit.
-            await runtime.gracefulExit();
+            await runtime.gracefulExit(marker.controller.signal);
             diagnostics.emit('runtime.auto_released', {
               kind: 'rpc',
               generation: runtime.generation,
@@ -40,7 +40,7 @@ export function scheduleAutoRelease(bridge, runtime) {
           } catch (error) {
             // New native work can arrive after idle proof. Leave this generation
             // open; its settlement/ACK events schedule the next idle check.
-            if (error.code !== 'RUNTIME_BUSY') throw error;
+            if (!marker.controller.signal.aborted && error.code !== 'RUNTIME_BUSY') throw error;
           } finally {
             if (bridge.handoffs.get(id) === marker) bridge.handoffs.delete(id);
             if (!runtime.gracefulExitPromise) runtime.handoffPending = false;

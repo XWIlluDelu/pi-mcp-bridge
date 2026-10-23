@@ -188,10 +188,7 @@ test('a protocol mismatch blocks attachment and replacement without retiring the
   const bridge = await observingBridge(f);
   try {
     await assert.rejects(bridge.pool.forRead(f.session), /ATTACHMENT_PROTOCOL_MISMATCH/);
-    await assert.rejects(
-      reserveOwner(f.attachmentDir, f.session, 'rpc'),
-      /ATTACHMENT_PROTOCOL_MISMATCH/,
-    );
+    await assert.rejects(reserveOwner(f.attachmentDir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
     assert.equal(await ownerAlive(record.owner), true);
   } finally {
     await fs.writeFile(claimFile(f.attachmentDir, f.session), JSON.stringify(record));
@@ -326,17 +323,18 @@ test('host state forwards only validated nonnegative integer pending counts', as
   }
 });
 test('list observes actual host callback support across IPC, independently of activity and grants', async (t) => {
-  for (const [bash, stop] of [
-    [false, false],
-    [true, false],
-    [false, true],
-    [true, true],
+  for (const [bash, stop, cancel] of [
+    [false, false, false],
+    [true, false, false],
+    [false, true, false],
+    [true, true, false],
+    [true, false, true],
   ]) {
-    await t.test(`bash=${bash}, stop=${stop}`, async (t) => {
+    await t.test(`bash=${bash}, stop=${stop}, cancel=${cancel}`, async (t) => {
       const f = await fixture(t),
         state = f.callbacks.state,
         calls = { send: 0, bash: 0, stop: 0 },
-        expected = { send: true, command: bash && stop, stop };
+        expected = { send: true, command: bash && (cancel || stop), stop };
       let activity = {};
       f.callbacks.state = () => ({
         ...state(),
@@ -359,6 +357,7 @@ test('list observes actual host callback support across IPC, independently of ac
           await onWithdraw({ steering: [], followUp: [] });
           return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
         };
+      if (cancel) f.callbacks.cancel = async () => {};
       await f.controller.ready(f.callbacks);
       assert.deepEqual((await request(f, 'state')).data.capabilities, expected);
       const bridge = await observingBridge(f);
@@ -375,7 +374,7 @@ test('list observes actual host callback support across IPC, independently of ac
           assert.equal(status.state, expectedState);
           assert.deepEqual(status.capabilities, expected);
         }
-        if (bash && stop) {
+        if (expected.command) {
           assert.equal(
             (await bridge.send({ session_id, text: 'fixture' })).reason,
             'NOT_FOUND_OR_DENIED',
@@ -407,7 +406,7 @@ test('list observes actual host callback support across IPC, independently of ac
         if (!expected.command) assert.equal(command.reason, 'BASH_UNSUPPORTED');
         assert.equal(stopped.status, stop ? 'accepted' : 'rejected');
         if (!stop) assert.equal(stopped.reason, 'STOP_UNSUPPORTED');
-        assert.deepEqual(calls, { send: 1, bash: Number(bash && stop), stop: Number(stop) });
+        assert.deepEqual(calls, { send: 1, bash: Number(expected.command), stop: Number(stop) });
         await f.controller.close();
         const { status } = await row();
         assert.equal(status.state, 'unavailable');
@@ -535,9 +534,10 @@ test('release cancels native bash before draining admitted result capture and cl
   assert.equal(closed, true);
   assert.equal(await readClaim(f.attachmentDir, f.session), null);
 });
-test('explicit host cancellation releases active preparation before the writer-close callback', async (t) => {
+test('host cancel drains preparation and native bash without a remote stop callback', async (t) => {
   const f = await fixture(t),
     entered = gate(),
+    bashEntered = gate(),
     finished = gate();
   let closed = false,
     cancels = 0;
@@ -546,6 +546,14 @@ test('explicit host cancellation releases active preparation before the writer-c
     await finished.promise;
     assert.equal(closed, false);
     return { status: 'unknown' };
+  };
+  f.callbacks.bash = async ({ onResult }) => {
+    bashEntered.resolve();
+    await finished.promise;
+    assert.equal(closed, false);
+    const result = { output: 'cancelled', exitCode: null, cancelled: true, truncated: false };
+    await onResult(result);
+    return result;
   };
   f.callbacks.cancel = async () => {
     cancels++;
@@ -557,12 +565,56 @@ test('explicit host cancellation releases active preparation before the writer-c
   };
   await f.controller.ready(f.callbacks);
   const sending = request(f, 'send', { text: 'preparing', mode: 'default' });
-  await entered.promise;
-  const releasing = f.controller.release();
-  await sending;
-  await releasing;
-  assert.equal(cancels, 1);
-  assert.equal(closed, true);
+  let bashing, releasing;
+  try {
+    assert.equal(
+      await Promise.race([entered.promise.then(() => true), sending.then(() => false)]),
+      true,
+    );
+    bashing = request(f, 'bash', { command: 'synthetic active bash' });
+    assert.equal(
+      await Promise.race([bashEntered.promise.then(() => true), bashing.then(() => false)]),
+      true,
+    );
+    releasing = f.controller.release();
+    await sending;
+    assert.equal((await bashing).data.cancelled, true);
+    await releasing;
+    assert.equal(cancels, 1);
+    assert.equal(closed, true);
+  } finally {
+    finished.resolve();
+    await Promise.allSettled([sending, bashing, releasing]);
+  }
+});
+test('confirmed writer closure is not repeated when claim cleanup is explicitly retried', async (t) => {
+  const f = await fixture(t);
+  let releases = 0,
+    failCleanup = true;
+  f.callbacks.release = async () => {
+    releases++;
+    return { released: true };
+  };
+  await f.controller.ready(f.callbacks);
+  const unlink = fs.unlink,
+    file = claimFile(f.attachmentDir, f.session);
+  t.mock.method(fs, 'unlink', async function (target, ...args) {
+    if (target === file && failCleanup) {
+      failCleanup = false;
+      throw Object.assign(new Error('fixture cleanup failure'), { code: 'EIO' });
+    }
+    return unlink.call(this, target, ...args);
+  });
+  try {
+    await assert.rejects(f.controller.release(), { code: 'EIO' });
+    assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'transitioning');
+    assert.equal(releases, 1);
+    assert.equal((await f.controller.release()).released, true);
+    assert.equal(await readClaim(f.attachmentDir, f.session), null);
+    assert.equal(releases, 1);
+  } finally {
+    t.mock.restoreAll();
+  }
 });
 test('controller close retains live writer claim and unsupported release remains explicit', async (t) => {
   const f = await fixture(t);
