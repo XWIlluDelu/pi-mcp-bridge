@@ -7,6 +7,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Bridge } from '../src/bridge.mjs';
+import { loadSavedSession } from '../src/data.mjs';
 import { makeServer } from '../src/server.mjs';
 import { assertContextReadResponse, chronological } from './fixtures/read-pages.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
@@ -376,4 +377,71 @@ test('read contract mismatch requests component update without sending an old op
     /LIVE_OWNER_UNREACHABLE/,
   );
   assert.equal(f.bridge.pool.instances.get(f.id), runtime);
+});
+
+test('saved and owned reads omit old image bytes before capture, but raw fork snapshots and later pages retain their native semantics', async (t) => {
+  const data = 'A'.repeat(512 * 1024),
+    entries = [
+      message('system', null, 'system', 'OWNED_RULES', {
+        toolsAdded: [{ name: 'owned_tool', parameters: { type: 'object' } }],
+      }),
+      message(
+        'old',
+        'system',
+        'user',
+        [text('OLD_IMAGE'), { type: 'image', mimeType: 'image/png', data }],
+        { details: { type: 'image', data: 'BUSINESS_DATA' } },
+      ),
+      {
+        type: 'custom_message',
+        id: 'custom',
+        parentId: 'old',
+        customType: 'image-context',
+        timestamp: '2026-01-01T00:00:00Z',
+        content: [{ type: 'image', mimeType: 'image/png', data }],
+        display: false,
+      },
+      message('latest', 'custom', 'user', 'LATEST_TASK'),
+      message('answer', 'latest', 'assistant', [text(paragraphs(80))]),
+    ],
+    f = await fixture(t, entries),
+    disk = await fs.readFile(f.saved.file);
+  const compact = await loadSavedSession(f.saved, { omitImageData: true }),
+    raw = await loadSavedSession(f.saved);
+  assert.equal(compact.entries.find((e) => e.id === 'old').message.content[1].data, undefined);
+  assert.equal(raw.entries.find((e) => e.id === 'old').message.content[1].data, data);
+  assert.equal(compact.entries.find((e) => e.id === 'old').message.details.data, 'BUSINESS_DATA');
+  assert.equal(compact.entries.find((e) => e.id === 'custom').content[0].data, undefined);
+  assert.equal(raw.entries.find((e) => e.id === 'custom').content[0].data, data);
+  const saved = await f.ok({ max_bytes: 4096 });
+  assert.equal(saved.source, 'saved');
+  assert.deepEqual(await fs.readFile(f.saved.file), disk);
+  const rpc = await f.bridge.pool.resolve(f.saved),
+    dispatch = rpc.dispatch.bind(rpc);
+  let snapshots = 0;
+  t.mock.method(rpc, 'dispatch', (command, ...args) => {
+    if (command.type === 'get_entries') snapshots++;
+    return dispatch(command, ...args);
+  });
+  const before = await fs.readFile(f.saved.file),
+    owned = await f.ok({ max_bytes: 4096 });
+  assert.equal(owned.source, 'rpc');
+  assert.deepEqual(owned.items, saved.items);
+  assert.equal(snapshots, 0, 'ordinary read must not transfer the raw native log');
+  const pages = await allPages(f, owned);
+  assert.equal(pages.at(-1).next_cursor, null);
+  assert.ok(JSON.stringify(pages).includes('LATEST_TASK'));
+  assert.ok(!JSON.stringify(pages).includes(data));
+  assert.ok(
+    pages.flatMap((page) => page.items).some((unit) => unit.message?.content === 'OWNED_RULES'),
+  );
+  assert.ok(!pages.flatMap((page) => page.items).some((unit) => unit.message?.toolsAdded));
+  const full = await rpc.read({ session_id: f.id, preset: 'full' });
+  assert.ok(full.units.some((unit) => unit.message?.toolsAdded?.[0].name === 'owned_tool'));
+  assert.deepEqual(await fs.readFile(f.saved.file), before);
+  const fork = await rpc.entries();
+  assert.deepEqual(fork.entries.find((entry) => entry.id === 'system').message, entries[0].message);
+  assert.equal(snapshots, 1);
+  assert.equal(fork.entries.find((e) => e.id === 'old').message.content[1].data, data);
+  assert.equal(fork.leafId, owned.leaf_id);
 });
