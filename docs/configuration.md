@@ -1,71 +1,123 @@
 # Owner configuration and permissions
 
-Use a canonical JSON file owned by the service user with no group/other permissions. Both direct transports and request policy reads enforce this; permissions are never repaired automatically. [The example](../deploy/owner.example.json) denies every operation. Replace its paths with directories you explicitly intend the Bridge to access. When only some projects are authorized, configure those projects' session roots rather than a broad parent.
+Use a canonical JSON file owned by the service user with no group/other
+permissions. [The example](../deploy/owner.example.json) denies every operation;
+replace its paths with the projects and native session roots intended for access.
+The Bridge rejects unsafe configuration files without changing their permissions.
 
 ## Settings
 
-Only the fields below are accepted. Unknown fields and incomplete baseline permissions are rejected. Project and session grants can override subsets of their applicable rights. Projects use canonical paths, not folder IDs; there is no caller `principal` field. Use the current example when updating a configuration, and update Bridge, companion and host bindings together.
+Unknown fields and incomplete baseline permissions are rejected. Project and
+session grants may override subsets of their applicable rights. Projects use
+canonical paths; there is no caller `principal` field.
 
-| Key                       | Meaning                                                                                                                                                                                                                                        |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `stateDir`                | Private Bridge state and recoverable session trash; also the namespace for service exclusivity.                                                                                                                                                |
-| `sessionRoots`            | Nonempty array of absolute native session storage directories.                                                                                                                                                                                 |
-| `folders`                 | Configured creation targets, each `{path}`; `path` is the absolute project cwd. Inclusion alone grants nothing.                                                                                                                                |
-| `defaults`                | Required baseline with all seven permission keys. Each value is boolean or `null`; `null` denies at this scope.                                                                                                                                |
-| `grants`                  | Project/session permission overrides.                                                                                                                                                                                                          |
-| `attachmentDir`           | Optional shared private registry directory; every cooperating owner must use the same canonical directory.                                                                                                                                     |
-| `attachmentExitTimeoutMs` | Optional 50–30000 ms owner-exit budget; explicit delete uses it as the SIGTERM grace period before SIGKILL (default 5000 ms).                                                                                                                  |
-| `piExecutable`            | Optional absolute path to your installed Pi CLI (symlinks allowed); otherwise the launch environment's PATH selects Pi. The same installation supplies its SDK and dependencies. Missing/unidentifiable installations fail without a fallback. |
-| `piArgs`                  | Optional additional native CLI arguments; the launcher and runtime reject incompatible ownership/selection flags.                                                                                                                              |
-| `compatibilityModules`    | Optional trusted plugin integrations: `{module,enabled?,options?}` entries, default empty. Absolute module paths; fixed for the service lifetime. See [module management](compatibility.md).                                                   |
-| `herdr`                   | Optional global boolean, default `false`. Use local Herdr for subsequent new RPC writers when installed; otherwise start directly. Hot-read at the launch boundary.                                                                            |
-| `piRuntime`               | Explicit launch overrides, described below.                                                                                                                                                                                                    |
-| `http`                    | Optional `{port,tokenFile}`; required for HTTP/proxy entry points.                                                                                                                                                                             |
+| Key                       | Meaning                                                                                                                  |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `stateDir`                | Private Bridge state, recoverable trash and service-exclusivity namespace.                                               |
+| `sessionRoots`            | Nonempty array of absolute native session-storage directories.                                                           |
+| `folders`                 | Configured creation targets, each `{path}` with an absolute project cwd. Inclusion grants no rights.                     |
+| `defaults`                | All seven permission keys, each boolean or `null`; `null` denies.                                                        |
+| `grants`                  | Project/session permission overrides.                                                                                    |
+| `attachmentDir`           | Shared private registry directory; defaults to `stateDir/ipc`. Cooperating owners must use the same canonical directory. |
+| `attachmentExitTimeoutMs` | Owner-exit budget, 50–30000 ms, default 5000. Delete uses it as the SIGTERM grace period before SIGKILL.                 |
+| `piExecutable`            | Absolute installed Pi CLI path, including symlinks. Omission selects Pi from the launch environment's PATH.              |
+| `piArgs`                  | Additional native CLI arguments; incompatible ownership/selection flags reject.                                          |
+| `compatibilityModules`    | Optional trusted plugin integrations; see [module configuration and API](compatibility.md#owner-configuration).          |
+| `herdr`                   | Boolean, default `false`; hot-read when launching a new RPC writer.                                                      |
+| `piRuntime`               | Explicit native environment overrides below.                                                                             |
+| `http`                    | `{port,tokenFile}` for HTTP/proxy entry points; see [transports](transports.md).                                         |
 
 ### Storage and project paths
 
-- Storage roots and state must not overlap or resolve through directory aliases. Session-file symlinks and hardlink aliases are rejected.
-- Existing `stateDir` and `attachmentDir` must belong to the service user and have no group/other permissions. Native session storage has a separate integrity rule, not a 0700 rule: Pi's ordinary 0755 directories and 0644 files are supported. An owned private ancestor protects descendants; otherwise the entire canonical directory chain and the actual file must not be writable by other users. Sticky temporary-directory ancestors are allowed. Unsafe storage is rejected without chmod.
-- `sessionRoots` bounds discovery and access; its order does not select the destination for `create`. New sessions use the target project's native Pi location: `piArgs --session-dir`, then inherited `PI_CODING_AGENT_SESSION_DIR`, then merged project/global `sessionDir`, otherwise Pi's per-project default under the effective agent directory. `piRuntime.agentDir` and `inheritEnv` apply to this selection just as they do to runtime launch.
-- The native destination must be inside an existing configured session root. Otherwise `create` rejects with `NATIVE_SESSION_OUTSIDE_ROOTS`, without publishing a session or sending a prompt; it never falls back to the first root or expands the roots. Destination directories must satisfy the native canonical-path integrity checks; unsafe existing directories are rejected, not chmodded. Existing sessions are not moved.
-- A saved session's project identity is the normalized absolute cwd recorded in its native header, independent of storage location and current filesystem availability. Project grants follow this recorded identity, not a later symlink target. Configure roots and project grants together; neither implies the other.
-- Workspace cleanup does not revoke project-level history, control or notification authorization. Creating a session or cold-starting a writer still requires the recorded project directory to exist at its canonical path; a file or symlink replacement cannot redirect execution elsewhere. Existing cooperating owners remain controllable under their current grants if their original cwd disappears.
+- Storage roots and state must not overlap or resolve through directory aliases.
+  Session-file symlinks and hardlink aliases reject.
+- `stateDir` and `attachmentDir` must be user-owned and private. Native Pi storage
+  may use ordinary 0755 directories and 0644 files: an owned private ancestor
+  protects descendants; otherwise the canonical directory chain and file must
+  not be writable by other users. Sticky temporary-directory ancestors are
+  allowed. Unsafe storage rejects without chmod.
+- `sessionRoots` bounds discovery and access. Creation follows native destination
+  precedence: `piArgs --session-dir`, inherited `PI_CODING_AGENT_SESSION_DIR`,
+  merged project/global `sessionDir`, then Pi's per-project default under the
+  effective agent directory. The destination must lie inside an existing
+  configured root; otherwise creation rejects with `NATIVE_SESSION_OUTSIDE_ROOTS`
+  before publication or prompting. Unsafe destination paths return
+  `UNSAFE_NATIVE_SESSION_STORAGE`.
+  Root order does not choose the destination, and existing sessions are not moved.
+- Project grants follow the normalized absolute cwd recorded in the native
+  header, independently of the storage location or current workspace existence.
+  Missing/empty cwd grants no project scope and cannot cold-start a writer;
+  session/default permissions may still authorize history access.
+- Workspace removal does not revoke history, control or notification rights.
+  Create and cold startup require the project directory at its canonical path;
+  file or symlink replacements cannot redirect execution. Existing cooperating
+  owners remain controllable under their grants if their original cwd disappears.
 
 ### Native environment
 
-By default the child runs the user's installed `pi` from the service process's PATH, inherits that process's environment and uses normal Pi discovery for tools, packages, extensions, skills and project context. Pi resolves authentication through its native configuration and inherited environment. A service may have a different PATH from your interactive shell; configure its environment or set `piExecutable` explicitly. Missing Pi returns `PI_EXECUTABLE_NOT_FOUND`; an explicitly selected non-executable path returns `PI_EXECUTABLE_NOT_EXECUTABLE`. Bridge has no bundled or development Pi dependency. Existing cooperating writers are reused without resolving or starting another executable.
+The child inherits the service process's environment and uses normal Pi discovery
+for authentication, tools, packages, extensions, skills and project context.
+A service's PATH may differ from an interactive shell; configure it or set
+`piExecutable` explicitly. Relative PATH entries resolve from the Bridge/launcher
+cwd, not the target project.
 
-Explicit `piRuntime` keys:
+The CLI's real path identifies the external Pi package whose declared SDK and
+dependencies supply all native APIs. Bridge has no bundled Pi dependency.
+Missing/non-executable selections report `PI_EXECUTABLE_NOT_FOUND` or
+`PI_EXECUTABLE_NOT_EXECUTABLE`; wrappers without an identifiable matching SDK
+report `PI_INSTALLATION_UNAVAILABLE`. An explicit selection does not fall back
+to PATH. Existing cooperating writers are reused without resolving another
+executable. After replacing Pi, restart Bridge and reopen affected owners at a
+safe boundary so their loaded native modules agree.
 
-- `agentDir`: absolute alternative native agent directory.
-- `inheritEnv`: environment-variable allowlist. Omitting it inherits the normal environment. An empty list removes inherited variables except `PATH`, which is always preserved for executable discovery (or defaults to `/usr/bin:/bin` if absent).
-- `tools`: subset of native read/write/edit/bash/grep/find/ls. Omitting it leaves native defaults; an empty array disables built-in tools.
+`piRuntime` accepts:
 
-A `piRuntime` override changes the runtime environment; it is not a permission grant. Model tools and installed extensions can run shell commands, access files or make network calls, so denying the Bridge's direct `command` tool does not sandbox a prompt authorized by `send`.
+- `agentDir`: absolute alternative native agent directory, supplied as
+  `PI_CODING_AGENT_DIR`.
+- `inheritEnv`: environment-variable allowlist. Omission inherits normally; an
+  empty list removes inherited variables except PATH, which is preserved or
+  defaults to `/usr/bin:/bin`.
+- `tools`: subset of native read/write/edit/bash/grep/find/ls. Omission uses
+  native defaults; an empty array disables built-in tools.
+
+These settings change the runtime, not its permission grants. Model tools and
+extensions can access files, shell and network: denying the direct Bridge
+`command` tool does not sandbox an authorized prompt.
 
 ### Herdr process placement
 
-Set `"herdr": true` in the owner file to run new Pi RPC writers in Herdr. Bridge checks its own PATH, then `~/.local/bin/herdr`. A missing executable selects direct startup; an installed but unavailable or incompatible Herdr reports a startup error rather than retrying a possibly launched writer elsewhere. The Herdr path requires Linux and a working user-systemd bus for worker scopes. It can start a local daemon if none is running; it does not restart an existing daemon or change service enablement/linger.
+With `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
+writers. Missing Herdr selects direct startup; installed but unavailable or
+incompatible Herdr fails without relaunching a possibly started writer elsewhere.
+Herdr requires Linux and a working user-systemd bus. Bridge may start its local
+daemon but does not restart an existing daemon or change service enablement/linger.
 
-Existing connected Pi owners always take priority. The switch applies to both new sessions and cold starts of saved sessions; edits affect only later process launches. Turning it off neither moves nor stops current writers. There is no per-call override or saved session backend preference.
-
-Herdr receives a dedicated, unfocused RPC pane, not an interactive Pi TUI. Pi uses the same executable, arguments, native resources, authentication and Bridge observer as direct startup; private sockets carry its unchanged RPC stream. Herdr pane context identifies the new pane. Native EOF, task auto-release, Stop and owner identity checks retain their existing meanings. Worker cleanup waits for actual process-scope exit and removes only the allocated pane and private IPC files. Explicit delete may escalate to SIGKILL within that dedicated scope; ordinary EOF and service shutdown never force-kill on a timeout. Bridge and Inspire do not import or share transport implementations.
+Existing owners take priority. Edits affect subsequent new-session and cold-start
+launches without moving or stopping current writers; there is no per-call or
+saved-session backend choice. Each launch gets an unfocused RPC pane with the
+same Pi executable, resources and environment as direct startup. Private sockets
+carry the native RPC stream. [Runtime lifecycle](runtime.md) governs EOF, release
+and deletion of the allocated worker/tool scope.
 
 ### Native control permissions
 
-- `models`: requires effective `send`, `command` or `create` on a configured project, or effective `send`/`command` on an existing in-scope native session. Normal per-right override priority applies; a superseded grant or nonexistent ID is insufficient. Authorization may read identity metadata, never history or owner state. Catalog access neither starts nor binds a session and grants no session operation.
-- Session `send`: model/thinking prompt settings and manual `compact`.
-- `create`: a `create` call's initial model selection.
-- `stop`: required in addition to `send` only for explicit `compact(interrupt:true)`. Default idle compaction does not need it.
-- `read`: protects compaction summaries.
+`set_model`, prompt settings and `compact` use session `send`; a create call's
+initial settings use `create`. Explicit `compact(interrupt:true)` additionally
+requires `stop`, while summary content requires `read`.
 
-See [model control](model-control.md) for details.
+`models` requires effective `send`, `command` or `create` on a configured project,
+or effective `send`/`command` on an existing in-scope session. Normal overrides
+apply; superseded grants and nonexistent IDs do not authorize it. Catalog
+admission may read identity metadata, but no history or owner state. See
+[model control](model-control.md) for operation behavior.
 
 ## Seven independent rights
 
-`list`, `read`, `send`, `command`, `stop`, `create` and `delete` are independent. All seven can be set at the default and project tiers. A session can override all except `create`, because creation targets a project, not an existing session.
+`list`, `read`, `send`, `command`, `stop`, `create` and `delete` resolve independently.
+All apply at default/project tiers; sessions may override all except `create`,
+which targets a project.
 
-Example project override (set only the rights you intend):
+Example project override:
 
 ```json
 {
@@ -80,63 +132,102 @@ Example project override (set only the rights you intend):
 }
 ```
 
-A session-specific override is `{"session_id":"ps_…","send":false}`.
+A session override is `{"session_id":"ps_…","send":false}`. Each right resolves
+in this order:
 
-Each right resolves separately, in this order:
+1. Latest explicit boolean for the exact session.
+2. Latest explicit boolean at the most specific containing project path, then
+   less-specific ancestors.
+3. The default value; `null` denies.
 
-1. The latest explicit boolean for the exact session.
-2. The latest explicit boolean at the most specific containing project path, then its less-specific ancestors.
-3. The `defaults` value for that right; `null` denies.
+A missing grant field leaves earlier entries unchanged. Explicit `null` removes
+that scope's override and restores inheritance. Unknown keys and values other
+than booleans or `null` reject.
 
-Within a project or session scope, a missing field leaves earlier entries unchanged. An explicit `null` removes that scope's override and restores inheritance. In project and session grants, unknown fields and values that are neither boolean nor `null` fail validation, including misspelled permission names.
-
-Consequences:
-
-- `list:false, read:true`: a known ID can be read but not discovered.
-- `list:true, read:false`: listing metadata is visible, conversation content is not.
-- `stop:true, read:false`: permits stop and its own withdrawn-input result.
-- `command:true, read:false`: permits command output without granting history read.
-- `create:true, send:false`: permits the initial prompt; later prompts need `send`. A fork also needs the parent's `read`.
-- `delete:true` needs no `list`, `read`, `send` or `stop`, and grants no access to project files.
+- `list:false, read:true` allows reading a known ID without discovery.
+- `list:true, read:false` exposes metadata without conversation content.
+- `stop` includes its own withdrawn-input result; `command` includes its output.
+  Neither needs history `read`.
+- `create:true, send:false` allows the initial prompt; later prompts need `send`.
+  Fork additionally needs the parent's `read`.
+- `delete` needs none of the other rights and grants no project-file access.
 
 ### Request permission snapshots
 
-The authoritative Bridge starts one policy read when it receives a complete, schema-valid business request, before executor or session queues. The resulting independent, immutable snapshot includes `defaults`, `grants`, `folders` and `sessionRoots`. It governs that request's directory scope, permission checks, execution and returned data, including waits, cold startup, native ACKs and inline output delivery. Later permission and scope edits affect new requests only; they neither revoke nor add access to an in-flight request. The stdio proxy only forwards requests; client/proxy timestamps and the later native execution time do not select the policy.
+The authoritative Bridge starts one policy read on receipt of a complete,
+schema-valid business request, before executor/session queues. Its immutable
+`defaults`, `grants`, `folders` and `sessionRoots` snapshot governs admission,
+execution and returned data through waits, cold startup and ACK handling.
+Later edits affect new requests only. Proxy/client timestamps and native
+execution time do not select the policy.
 
-All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, independently authorized `creatable_projects`, model catalogs and health diagnostics also use the request snapshot.
+Batch items share the outer snapshot; fork source and destination checks share
+it too. Every new call, including a read cursor page, captures a new policy.
+Invalid or unreadable policy rejects without reusing an older snapshot.
+Identity, cwd, generation, owner state, Stop and handoff checks remain live.
+Input requests register their Stop fence before policy I/O. Late ACKs finish
+identity checks using the admitted request's rights without replaying work.
 
-Every new call captures a new policy, including every new mutation and each read cursor page. A read cursor is not an authorization token. Late ACKs finish native identity checks without replaying work or acquiring rights from another request; permission snapshots are process-local, not persisted credentials.
+`defaults`, `grants`, `folders` and `sessionRoots` hot-update together. Startup
+provisions its roots; later policy reads create no directories. Discovery skips
+missing roots and validates existing ones on access; native creation provisions
+its selected destination. Removed roots exclude new requests, including known-ID
+and cursor reads, without terminating writers or withdrawing admitted work.
+Removing a folder removes a creation target, not grants for existing sessions.
+Hot scope must remain non-overlapping with both proposed and active storage.
 
-Snapshot authorization does not freeze session/file/native IDs, cwd, generation, owner or execution state. Identity checks, single-writer protection, Stop/handoff fences, cancellation and lifecycle checks still apply throughout execution. Input requests register their Stop fence before waiting for policy I/O. Invalid/unreadable policy rejects a new request without falling back to an older policy. `folders` and `sessionRoots` hot-update together with `defaults` and `grants`; they do not require a Bridge restart. Request snapshots never create storage directories. Startup provisions its configured roots; after a scope edit, discovery skips missing roots and validates existing roots when accessing them. Native creation provisions its selected destination on demand. Non-overlap validation still applies to the configuration, and actual session accesses retain their native storage integrity checks. Removed roots exclude new requests, including known session IDs and cursor continuations; they do not terminate writers, withdraw already-admitted work or remove ownership claims. Removing a folder removes that creation target, not access to existing sessions whose native cwd is there.
+`herdr` is read separately at each writer launch. Other settings remain fixed
+until service restart; pending changes appear by name in unscoped
+`health.restart_required`, while active values continue serving requests.
+An IPC namespace change additionally rejects new writer acquisition with
+`CONFIG_RESTART_REQUIRED`, because the old registry cannot establish ownership
+in the new namespace. Existing owner reuse and reads remain available.
 
-`herdr` is read separately at each new writer launch, rather than frozen into the permission snapshot. Other settings remain fixed for the service lifetime. `stateDir` and `attachmentDir` identify held locks, trash and IPC ownership; HTTP settings identify the bound listener and token; Pi executable, arguments and environment select the running native runtime. Changes apply only after restarting the relevant service. Until then, the active values remain in use: pending changes do not impose a global business-request gate. A proposed IPC namespace change still refuses new writer acquisition with `CONFIG_RESTART_REQUIRED`: the old registry cannot establish that the new namespace has no writer. Existing owner reuse and reads remain available. Unscoped `health({})` reports their names in `restart_required`, never their values. Hot scope is also validated against active storage so a proposed `stateDir` cannot hide an overlap with the currently held state directory.
-
-An installed companion rereads directory scope before native session registration and resume admission. Existing registered writers retain their claims through a scope removal; admitted Bridge requests still use their captured scope. A Pi already open outside the former scope and never registered is not discovered merely by editing the file: use one native safe reload to register it before remote use. No Bridge restart or background directory watcher is required.
+Companions reread scope before native registration and resume admission.
+Registered writers retain claims after scope removal. A previously unregistered
+Pi newly brought into scope needs one safe native reload to register; there is
+no background registration watcher.
 
 ### Diagnose combinations
 
-`health({})` reports noteworthy permission combinations and, when present, the fixed settings awaiting restart. A healthy configuration with no pending restart returns `{"domain":"permissions","status":"ok"}`. Issues include their relevant allowed/blocked conditions and source rules; the same inherited issue is reported once, without normal permission tables or repeated project configuration. Add a known `session_id` to diagnose only that session; source labels show the tier without disclosing its project or name. `health` never changes permissions.
+`health({})` reports permission issues and pending restart settings. Healthy
+policy with no restart pending returns `{"domain":"permissions","status":"ok"}`.
+Issues identify allowed/blocked conditions and source rules, deduplicating
+inherited issues. A known `session_id` limits diagnosis to that session without
+exposing its project or name. Health never changes permissions.
 
-Warnings cover known-ID-only access, work without progress reading, work without stop, restricted access to newly created sessions, and the difference between direct shell permission and model tools. These are valid configurations, not validation errors or implicit permission dependencies.
-
-Unscoped health also reports `events:{status:"unavailable",reason:"…"}` when the
-private subscription store cannot be safely loaded. This is separate from the
-permission-domain status: core operations remain available, while event methods
-report their own unavailability. See [event storage](events.md#authorization-storage-and-delivery)
-for owner repair and restart.
+Warnings cover known-ID-only access, work without progress reading or stop,
+restricted access to new sessions, and direct shell versus model-tool access.
+These combinations remain valid policies. Unscoped health also reports
+unavailable [event storage](events.md#authorization-storage-and-delivery)
+independently of core operation availability.
 
 ### Native human menu
 
-Load `src/owner-permissions-extension.mjs` into Pi with `PI_MCP_OWNER_CONFIG=/absolute/path/owner.json`, then press **Ctrl+Alt+P** in a native TUI. Choose this session, this project (the native working-directory path), another configured project or the defaults. Other projects come from configured creation targets and project-grant rules; neither listing nor editing a grant adds a creation target. Each field offers Allow, Block or Inherit and shows its effective source. Session menus omit `create` and use the native header's project identity to display inheritance.
+Load `src/owner-permissions-extension.mjs` with
+`PI_MCP_OWNER_CONFIG=/absolute/path/owner.json` and press **Ctrl+Alt+P** in a TUI.
+Choose this session, the current native working-directory project, another
+configured/granted project, or defaults. The session menu shows inheritance from
+its recorded project. Fields offer Allow, Block or Inherit with their effective
+source; session menus omit `create`. Editing grants does not add creation targets.
 
-Permission edits address normalized recorded paths, without requiring the workspace to exist or following a replacement symlink. Default edits do not depend on the current workspace. A persistent native session can receive its own grant before its first message is written, using its reserved canonical file path and native ID; in-memory sessions, out-of-root paths and file aliases are not eligible. Editing permissions never starts Pi or writes session history. Create and cold execution still validate the current canonical cwd separately.
-
-The menu is a human shortcut, not a model tool or slash command. It writes only the chosen field, preserves other settings, rejects concurrent edits and closes on native session lifecycle changes.
+Edits use recorded normalized paths without requiring a workspace or following
+replacement symlinks. A persistent session can receive a grant before its first
+message, using its reserved canonical file and native ID; in-memory sessions,
+out-of-root paths and aliases are ineligible. The owner-local menu changes only
+the chosen field, rejects concurrent edits and closes on session lifecycle
+changes. It neither starts Pi nor writes history.
 
 ## Startup and deployment
 
-Startup validates configuration and filesystem boundaries directly. For HTTP, create a private random token file and add the `http` block described in [transports](transports.md).
+Startup validates configuration and filesystem boundaries. For HTTP, create a
+private random token file as described in [transports](transports.md).
+`deploy/pi-mcp-bridge.service` is an optional user-systemd template; review its
+paths, environment and stop budget. Autostart/linger and tunnel authentication
+remain owner deployment choices.
 
-`deploy/pi-mcp-bridge.service` is an optional user-systemd template. Review its installation paths, environment and stop budget before use. Autostart/linger, tunnel organization login and external authentication are owner deployment decisions.
-
-Service exclusivity and permission edits use independent Linux kernel-owned mutexes. A crash releases each mutex; permission edits still compare the captured revision before atomic replacement. After obtaining service exclusivity, startup removes only its own namespace's stale owner-control socket. It does not remove session writer claims: surviving native writers still block takeover through exact PID/start/boot and generation checks. An explicit local pause has a separate reset procedure in [runtime](runtime.md).
+Service exclusivity and permission edits use separate kernel-owned mutexes;
+crashes release them. Edits compare the captured revision before atomic
+replacement. Startup removes only its own stale owner-control socket after
+obtaining service exclusivity. Session writer claims and explicit pauses follow
+the [runtime ownership rules](runtime.md).
