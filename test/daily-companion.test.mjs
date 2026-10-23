@@ -46,11 +46,10 @@ for (const mode of ['tui', 'rpc'])
         ),
       );
       const config = {
-        principal: 'daily',
         stateDir: path.join(dir, 'state'),
         attachmentDir: path.join(dir, 'ipc'),
         sessionRoots: [root],
-        folders: [{ id: 'project', path: cwd }],
+        folders: [{ path: cwd }],
         defaults: denyAllPermissions(),
         grants: [{ folder: cwd, list: true, read: true, send: true }],
       };
@@ -182,7 +181,19 @@ export default pi=>{
       const saved = await until(async () =>
         (await bridge.sessions()).find((s) => s.file === meta.file),
       );
-      await bridge.send({ session_id: saved.id, request_id: 'remote-first', text: 'REMOTE_DAILY' });
+      const status = (await bridge.list({ session_id: saved.id })).sessions[0].status;
+      assert.equal(claim.kind, mode === 'tui' ? 'tui' : 'extension');
+      assert.deepEqual(status.capabilities, { send: true, command: false, stop: false });
+      assert.equal((await readClaim(config.attachmentDir, session)).owner.pid, meta.pid);
+      assert.equal(
+        (await fs.readFile(meta.file, 'utf8'))
+          .trim()
+          .split('\n')
+          .map(JSON.parse)
+          .filter((e) => e.message?.role === 'user').length,
+        1,
+      );
+      await bridge.send({ session_id: saved.id, text: 'REMOTE_DAILY' });
       await until(async () => {
         const entries = (await fs.readFile(meta.file, 'utf8')).trim().split('\n').map(JSON.parse);
         return entries.some(
@@ -202,7 +213,7 @@ export default pi=>{
       for (const key of ['pid', 'start', 'boot']) assert.equal(claim.owner[key], before.owner[key]);
       assert.equal(await exists(before.socket), false);
       assert.deepEqual(await sockets(), [path.basename(claim.socket)]);
-      await bridge.send({ session_id: saved.id, request_id: 'after-reload', text: 'AFTER_RELOAD' });
+      await bridge.send({ session_id: saved.id, text: 'AFTER_RELOAD' });
       await until(
         async () =>
           (await fs.readFile(meta.file, 'utf8')).includes('AFTER_RELOAD') &&

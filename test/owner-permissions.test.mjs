@@ -21,14 +21,10 @@ async function fixture(t) {
   await fs.mkdir(child, { recursive: true });
   const file = path.join(dir, 'owner.json');
   const config = {
-    principal: 'test-agent',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [
-      { id: 'project', path: cwd },
-      { id: 'child', path: child },
-    ],
+    folders: [{ path: cwd }, { path: child }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     piRuntime: { inheritEnv: ['PATH'], tools: ['read'] },
   };
@@ -68,10 +64,7 @@ test('live reload rejects malformed denial rather than silently retaining prior 
   const f = await fixture(t),
     bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
   try {
-    const made = await savedSession(bridge, {
-      folder_id: 'project',
-      request_id: 'scope-regression',
-    });
+    const made = await savedSession(bridge);
     await bridge.read({ session_id: made.session_id });
     for (const session_id of [17, null, '']) {
       await fs.writeFile(
@@ -181,7 +174,7 @@ test('running bridge reloads only valid permission edits and fails closed on oth
   const f = await fixture(t);
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
   try {
-    const made = await savedSession(bridge, { folder_id: 'project', request_id: 'create' });
+    const made = await savedSession(bridge);
     let snapshot = await readOwnerConfig(f.file);
     await editPermission(f.file, snapshot.revision, { session_id: made.session_id }, 'read', false);
     assert.deepEqual(
@@ -189,7 +182,7 @@ test('running bridge reloads only valid permission edits and fails closed on oth
       [made.session_id],
     );
     await assert.rejects(bridge.read({ session_id: made.session_id }), /NOT_FOUND_OR_DENIED/);
-    await fs.writeFile(f.file, JSON.stringify({ ...f.config, principal: 'changed-principal' }));
+    await fs.writeFile(f.file, JSON.stringify({ ...f.config, piArgs: ['--offline'] }));
     await assert.rejects(bridge.list(), /CONFIG_RESTART_REQUIRED/);
     await fs.writeFile(f.file, 'broken');
     await assert.rejects(bridge.list(), /INVALID_OWNER_CONFIG/);
@@ -198,13 +191,13 @@ test('running bridge reloads only valid permission edits and fails closed on oth
   }
 });
 
-test('shutdown prevents dispatch after an asynchronous permission reload', async (t) => {
+test('shutdown prevents dispatch after an asynchronous permission snapshot', async (t) => {
   const f = await fixture(t);
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'create' });
+  const made = await savedSession(bridge);
   const send = bridge.send({
     session_id: made.session_id,
-    request_id: 'closing',
+
     text: 'must not dispatch',
   });
   const closed = bridge.close();

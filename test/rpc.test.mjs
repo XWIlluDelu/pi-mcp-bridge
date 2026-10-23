@@ -54,7 +54,7 @@ for (const field of ['inheritEnv', 'tools'])
     }
   });
 
-test('switched Pi runtime stops before reading or sending under original identity', async () => {
+test('mismatched Pi state refuses read/send without terminating or dispatching under the wrong identity', async () => {
   for (const command of [{ type: 'get_entries' }, { type: 'prompt', message: 'fixture' }]) {
     const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } });
     let stopped = false;
@@ -67,7 +67,7 @@ test('switched Pi runtime stops before reading or sending under original identit
       return { sessionFile: '/sessions/b.jsonl', sessionId: 'b' };
     };
     await assert.rejects(rpc.command(command), { code: 'RUNTIME_SESSION_CHANGED' });
-    assert.equal(stopped, true);
+    assert.equal(stopped, false);
     assert.deepEqual(calls, ['get_state']);
   }
 });
@@ -91,7 +91,7 @@ test('identity change during read suppresses content; during prompt preserves un
   }
 });
 
-test('authoritative Pi rejection still verifies identity and stops a switched process', async () => {
+test('authoritative Pi rejection still verifies identity without terminating a switched process', async () => {
   const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } });
   let states = 0,
     stopped = false;
@@ -108,12 +108,13 @@ test('authoritative Pi rejection still verifies identity and stops a switched pr
     rpc.command({ type: 'prompt' }),
     (error) => error.code === 'RUNTIME_SESSION_CHANGED' && error.uncertain,
   );
-  assert.equal(stopped, true);
+  assert.equal(stopped, false);
   assert.equal(states, 2);
 });
 
 test('RPC pipe failure still requires confirmed process exit before stop returns', async () => {
   const rpc = new PiRpc({}, {});
+  rpc.assertProcessIdentity = async () => {}; // Synthetic child, not an OS process.
   const child = new EventEmitter();
   let terminated = false,
     exited = false;
@@ -131,21 +132,25 @@ test('RPC pipe failure still requires confirmed process exit before stop returns
   assert.equal(terminated, true);
   assert.equal(exited, true);
 });
-test('a failed SIGTERM can be retried explicitly without a stale stop promise', async () => {
+test('shutdown preparation reports failed SIGTERM and explicit stop can retry without a stale promise', async () => {
   const rpc = new PiRpc({}, {}),
     child = new EventEmitter(),
     signals = [];
   rpc.child = child;
+  rpc.assertProcessIdentity = async () => {}; // Synthetic child.
   rpc.alive = true;
   child.kill = (signal) => {
     signals.push(signal);
     throw Object.assign(new Error('test signal denied'), { code: 'EPERM' });
   };
   await assert.rejects(rpc.stop(), { code: 'EPERM' });
-  assert.equal(child.listenerCount('exit'), 0);
+  assert.equal(child.listenerCount('exit'), 1); // One reusable lifetime exit observer.
   child.kill = () => false;
-  await assert.rejects(rpc.stop(), { code: 'RUNTIME_STOP_FAILED' });
-  assert.equal(child.listenerCount('exit'), 0);
+  const pool = new RuntimePool({});
+  pool.instances.set('synthetic', rpc);
+  rpc.gracefulExitPromise = Promise.resolve();
+  await assert.rejects(pool.prepareClose(), { code: 'RUNTIME_STOP_FAILED' });
+  assert.equal(child.listenerCount('exit'), 1); // One reusable lifetime exit observer.
   child.kill = (signal) => {
     signals.push(signal);
     queueMicrotask(() => child.emit('exit', 0));
@@ -160,6 +165,7 @@ test('owner termination waits for exit without timer-based SIGKILL', async () =>
     child = new EventEmitter(),
     signals = [];
   rpc.child = child;
+  rpc.assertProcessIdentity = async () => {}; // Synthetic child.
   rpc.alive = true;
   child.kill = (signal) => {
     signals.push(signal);
@@ -261,6 +267,7 @@ test('unresolved prompt admission survives timeout, idle, malformed and old-gene
 test('write uncertainty retains admission; authoritative rejection or confirmed exit releases it', async () => {
   for (const failure of ['callback', 'throw']) {
     const rpc = new PiRpc({}, {});
+    rpc.assertProcessIdentity = async () => {}; // Synthetic child.
     rpc.alive = true;
     let written;
     const child = new EventEmitter();
@@ -351,41 +358,6 @@ test('silent live child does not retain expired read requests while prompt ACK r
   assert.equal(rpc.promptAdmission, null);
 });
 
-test('entry read reuses its identity postcheck for activity without another RPC', async () => {
-  const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } }),
-    calls = [];
-  rpc.promptAdmission = { id: 'unresolved', generation: rpc.generation };
-  rpc.dispatch = async (command) => {
-    calls.push(command.type);
-    if (command.type === 'get_entries') return { entries: [], leafId: null };
-    return {
-      sessionFile: rpc.session.file,
-      sessionId: 'a',
-      isStreaming: false,
-      isCompacting: false,
-      pendingMessageCount: 2,
-    };
-  };
-  const result = await rpc.entries();
-  assert.deepEqual(calls, ['get_state', 'get_entries', 'get_state']);
-  assert.equal(result.activity.source, 'rpc_get_state');
-  assert.equal(result.activity.streaming, false);
-  assert.equal(result.activity.idle, null);
-  assert.equal(result.activity.preparing, null);
-  assert.equal(result.activity.pending_messages, true);
-  assert.equal(result.activity.pending_message_count, 2);
-  assert.equal(result.activity.bridge_admission.pending, true);
-  assert.ok(Date.parse(result.activity.observed_at));
-  rpc.dispatch = async (command) =>
-    command.type === 'get_entries'
-      ? { entries: [], leafId: null }
-      : { sessionFile: rpc.session.file, sessionId: 'a' };
-  const missing = (await rpc.entries()).activity;
-  assert.equal(missing.streaming, null);
-  assert.equal(missing.pending_messages, null);
-  assert.equal(missing.pending_message_count, null);
-});
-
 test('actual RPC launch rejects null, missing and symlink-replaced cwd without spawning', async (t) => {
   const fs = await import('node:fs/promises'),
     path = await import('node:path');
@@ -434,5 +406,45 @@ test('actual RPC launch rejects null, missing and symlink-replaced cwd without s
       t.mock.restoreAll();
       await rpc.stop();
     }
+  }
+});
+
+test('post-ACK identity failures preserve already observed UI facts and uncertainty', async () => {
+  const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } });
+  let states = 0;
+  const ui = { cancel_sent: ['confirm'], completion: 'unconfirmed' };
+  rpc.dispatch = async (command) => {
+    if (command.type === 'get_state') {
+      if (++states === 1) return { sessionFile: rpc.session.file, sessionId: 'a' };
+      throw new RpcFailure('RUNTIME_DISCONNECTED');
+    }
+    return { disposition: 'handled', ui };
+  };
+  await assert.rejects(rpc.command({ type: 'prompt', message: 'x' }), (error) => {
+    assert.equal(error.uncertain, true);
+    assert.deepEqual(error.ui, ui);
+    return true;
+  });
+});
+
+test('stop tolerates exact natural exit during identity validation, but never signals a live mismatched process', async () => {
+  for (const exited of [true, false]) {
+    const rpc = new PiRpc({}, {}),
+      child = new EventEmitter();
+    rpc.child = child;
+    rpc.alive = true;
+    let signals = 0;
+    child.kill = () => {
+      signals++;
+      return true;
+    };
+    rpc.assertProcessIdentity = async () => {
+      if (exited) child.emit('exit', 0, null);
+      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    };
+    if (exited) await rpc.stop();
+    else await assert.rejects(rpc.stop(), /RUNTIME_SESSION_CHANGED/);
+    assert.equal(signals, 0);
+    assert.equal(rpc.exited, exited);
   }
 });

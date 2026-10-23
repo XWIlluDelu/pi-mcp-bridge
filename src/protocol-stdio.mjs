@@ -6,7 +6,7 @@ import {
   MCP_INPUT_LIMIT,
 } from './protocol.mjs';
 
-// A bounded newline transport multiplexes modern requests and the legacy SDK.
+// One bounded newline transport serves per-request MCP and the pinned MCP SDK.
 // It never instantiates another Bridge or replays application work.
 export class BridgeStdioTransport {
   constructor(bridge, { input = process.stdin, output = process.stdout } = {}) {
@@ -18,7 +18,7 @@ export class BridgeStdioTransport {
     this.discarding = false;
     this.tasks = new Set();
     this.modern = new Map();
-    this.legacyOpened = false;
+    this.sdkInitialized = false;
     this.data = (chunk) => this.read(chunk);
   }
   async start() {
@@ -38,7 +38,7 @@ export class BridgeStdioTransport {
   }
   async close() {
     this.input.off('data', this.data);
-    for (const request of this.modern.values()) request.controller.abort();
+    for (const request of this.modern.values()) request.cancelled = true;
     this.onclose?.();
   }
   async drain() {
@@ -99,10 +99,9 @@ export class BridgeStdioTransport {
     if (body?.method === 'notifications/cancelled' && this.modern.has(body.params?.requestId)) {
       const record = this.modern.get(body.params.requestId);
       record.cancelled = true;
-      record.controller.abort();
       return;
     }
-    if (body?.method === 'notifications/cancelled' && !this.legacyOpened) return;
+    if (body?.method === 'notifications/cancelled' && !this.sdkInitialized) return;
     if (
       !body ||
       typeof body !== 'object' ||
@@ -120,8 +119,8 @@ export class BridgeStdioTransport {
       this.track(this.write(rpcError(null, -32600, 'Invalid request')));
       return;
     }
-    if (body?.method === 'initialize') this.legacyOpened = true;
-    if (!modernMessage(body) && this.legacyOpened) {
+    if (body?.method === 'initialize') this.sdkInitialized = true;
+    if (!modernMessage(body) && this.sdkInitialized) {
       this.onmessage?.(body);
       return;
     }
@@ -130,13 +129,11 @@ export class BridgeStdioTransport {
       this.track(this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID')));
       return;
     }
-    const record = { controller: new AbortController(), cancelled: false };
+    const record = { cancelled: false };
     this.modern.set(body.id, record);
     const task = (async () => {
       try {
-        const { message } = await dispatchModern(this.bridge, body, {
-          signal: record.controller.signal,
-        });
+        const { message } = await dispatchModern(this.bridge, body);
         if (!record.cancelled) await this.write(message);
       } catch (error) {
         if (!record.cancelled) await this.write(rpcError(body?.id, -32603, 'REQUEST_FAILED'));

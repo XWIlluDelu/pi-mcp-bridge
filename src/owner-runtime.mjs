@@ -13,6 +13,16 @@ export function ownerSocket(config) {
 export async function serveOwnerControl(bridge) {
   const socket = ownerSocket(bridge.config);
   await privateDirectory(path.dirname(socket));
+  // Called only after acquiring this service namespace's lifetime mutex.
+  const previous = await fs.lstat(socket).catch((error) => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (previous) {
+    if (!previous.isSocket() || previous.uid !== process.getuid())
+      throw new Error('INVALID_OWNER_SOCKET');
+    await fs.unlink(socket);
+  }
   const connections = new Set(),
     operations = new Set(),
     handoffs = new Set();

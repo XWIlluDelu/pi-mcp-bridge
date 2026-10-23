@@ -1,29 +1,36 @@
+import { Bridge } from '../src/bridge.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { executeBatch, preflightBatch } from '../src/batch.mjs';
-const send = (session_id, request_id) => ({
+const mockBridge = (methods) => ({
+  inputs: new Set(),
+  locks: new Map(),
+  registerInput: Bridge.prototype.registerInput,
+  ...methods,
+});
+const send = (session_id, text) => ({
   op: 'send',
-  args: { session_id, request_id, text: 'hello' },
+  args: { session_id, text },
 });
 test('batch is a transparent wrapper with per-item validation and original-order results', async () => {
   const calls = [],
-    bridge = {
+    bridge = mockBridge({
       send: async (args) => {
-        calls.push(args.request_id);
+        calls.push(args.text);
         return { status: 'accepted' };
       },
       read: async () => {
         throw new Error('NOT_FOUND_OR_DENIED');
       },
       health: async () => ({ ok: true }),
-    };
+    });
   const result = await executeBatch(bridge, {
     operations: [
       send('a', 'one'),
       { op: 'read', args: { session_id: 'denied' } },
       null,
       { op: 'batch', args: {} },
-      { op: 'health', args: { domain: 'permissions' } },
+      { op: 'health', args: {} },
       send('a', 'two'),
     ],
   });
@@ -41,16 +48,16 @@ test('different sessions progress independently while each session retains input
   const entered = Promise.withResolvers(),
     release = Promise.withResolvers(),
     events = [];
-  const bridge = {
+  const bridge = mockBridge({
     send: async (args) => {
-      events.push(args.request_id);
-      if (args.request_id === 'a1') {
+      events.push(args.text);
+      if (args.text === 'a1') {
         entered.resolve();
         await release.promise;
       }
       return { status: 'accepted' };
     },
-  };
+  });
   const pending = executeBatch(bridge, {
     operations: [send('a', 'a1'), send('a', 'a2'), send('b', 'b1')],
   });
@@ -63,12 +70,12 @@ test('different sessions progress independently while each session retains input
 });
 test('outer size/shape bounds reject before any operation but bad item args do not', async () => {
   let calls = 0;
-  const bridge = {
+  const bridge = mockBridge({
     send: async () => {
       calls++;
       return { status: 'accepted' };
     },
-  };
+  });
   for (const input of [
     { operations: [] },
     { operations: Array.from({ length: 11 }, () => send('a', 'x')) },
@@ -79,7 +86,7 @@ test('outer size/shape bounds reject before any operation but bad item args do n
   }
   const result = await executeBatch(bridge, {
     operations: [
-      { op: 'send', args: { session_id: 'a', request_id: 'bad', text: '', mode: 'invented' } },
+      { op: 'send', args: { session_id: 'a', text: '', mode: 'invented' } },
       send('a', 'good'),
     ],
   });
@@ -89,7 +96,7 @@ test('outer size/shape bounds reject before any operation but bad item args do n
 });
 test('fork shares its source lane; list and health do not add mutation permissions', async () => {
   const events = [],
-    bridge = {
+    bridge = mockBridge({
       send: async () => {
         events.push('send');
       },
@@ -99,13 +106,13 @@ test('fork shares its source lane; list and health do not add mutation permissio
       },
       list: async () => ({ sessions: [] }),
       health: async () => ({ ok: true }),
-    };
+    });
   const result = await executeBatch(bridge, {
     operations: [
       send('parent', 's'),
       {
         op: 'create',
-        args: { project: '/project', fork_from: 'parent', request_id: 'fork', text: 'first' },
+        args: { project: '/project', fork_from: 'parent', text: 'first' },
       },
       { op: 'list', args: {} },
       { op: 'health', args: { domain: 'runtime' } },

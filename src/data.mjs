@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
-import { createReadStream, constants } from 'node:fs';
+import { constants } from 'node:fs';
+import { parseSessionEntries, migrateSessionEntries } from '@earendil-works/pi-coding-agent';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import { hash, opaqueId, assertNativeDirectory } from './storage.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
@@ -38,10 +38,12 @@ function validateHeader(header) {
     typeof header.id !== 'string' ||
     !header.id ||
     header.id.length > 128 ||
-    !path.isAbsolute(header.cwd ?? '')
+    (header.cwd !== undefined &&
+      header.cwd !== '' &&
+      (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd)))
   )
     throw new Error('INVALID_SESSION');
-  if (header.version !== 3) throw new Error('UNSUPPORTED_SESSION_VERSION');
+  if (![1, 2, 3].includes(header.version ?? 1)) throw new Error('UNSUPPORTED_SESSION_VERSION');
   return header;
 }
 // Identity discovery never parses transcript bodies. Bound the control header,
@@ -85,11 +87,13 @@ export async function readSessionIdentity(file) {
     await fd.close();
   }
   let cwd = null;
-  try {
-    const resolved = await fs.realpath(header.cwd);
-    if ((await fs.stat(resolved)).isDirectory()) cwd = resolved;
-  } catch {
-    /* Explicit session grants remain usable without a project directory. */
+  if (header.cwd) {
+    try {
+      const resolved = await fs.realpath(header.cwd);
+      if ((await fs.stat(resolved)).isDirectory()) cwd = resolved;
+    } catch {
+      /* Explicit session grants remain usable without a project directory. */
+    }
   }
   return { header, file, id: opaqueId(`${file}\0${header.id}`), cwd };
 }
@@ -108,60 +112,92 @@ export async function validateExecutionCwd(cwd) {
   return cwd;
 }
 export async function loadSession(file) {
-  await assertSingleSessionFile(file);
-  const digest = createHash('sha256'),
-    entries = [],
-    seen = new Set();
-  let header,
-    fragments = [];
-  function parse(line) {
+  const expected = await assertSingleSessionFile(file),
+    fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
+    records = [];
+  let fragments = [],
+    skipped = 0,
+    unterminated = false;
+  const parse = (line) => {
     if (!line.trim()) return;
-    let entry;
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      throw new Error('INVALID_SESSION');
+    const parsed = parseSessionEntries(line);
+    if (!parsed.length) skipped++;
+    else records.push(...parsed);
+  };
+  try {
+    const opened = await fd.stat();
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1 ||
+      opened.ino !== expected.ino ||
+      opened.dev !== expected.dev
+    )
+      throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+    // Native pure parsing skips malformed records; never call a loader which
+    // repairs a missing LF or opens/migrates the user's file for writing.
+    for await (const chunk of fd.createReadStream({ encoding: 'utf8', autoClose: false })) {
+      let start = 0,
+        end;
+      while ((end = chunk.indexOf('\n', start)) !== -1) {
+        fragments.push(chunk.slice(start, end));
+        parse(fragments.join(''));
+        fragments = [];
+        start = end + 1;
+      }
+      if (start < chunk.length) fragments.push(chunk.slice(start));
     }
-    if (!header) {
-      header = validateHeader(entry);
-      return;
-    }
+    const tail = fragments.join('');
+    unterminated = Boolean(tail);
+    parse(tail);
+    const current = await assertSingleSessionFile(file);
+    if (current.ino !== opened.ino || current.dev !== opened.dev)
+      throw new Error('RUNTIME_SESSION_CHANGED');
+  } finally {
+    await fd.close();
+  }
+  validateHeader(records[0]);
+  migrateSessionEntries(records);
+  const [header, ...entries] = records,
+    byId = new Map();
+  for (const entry of entries) {
     if (
       !entry ||
       typeof entry.id !== 'string' ||
       entry.id.length > 128 ||
-      seen.has(entry.id) ||
-      (entry.parentId != null && !seen.has(entry.parentId))
+      byId.has(entry.id) ||
+      (entry.parentId != null && typeof entry.parentId !== 'string')
     )
       throw new Error('INVALID_SESSION_TREE');
     if (entry.type === 'message' && (!entry.message || typeof entry.message.role !== 'string'))
       throw new Error('INVALID_SESSION');
-    seen.add(entry.id);
-    entries.push(entry);
+    byId.set(entry.id, entry);
   }
-  // LF only: Unicode line separators are valid inside JSON strings. Stream the
-  // file so no second full transcript string/line array is retained in memory.
-  for await (const chunk of createReadStream(file, { encoding: 'utf8' })) {
-    digest.update(chunk);
-    let start = 0,
-      end;
-    while ((end = chunk.indexOf('\n', start)) !== -1) {
-      fragments.push(chunk.slice(start, end));
-      parse(fragments.join(''));
-      fragments = [];
-      start = end + 1;
-    }
-    if (start < chunk.length) fragments.push(chunk.slice(start));
-  }
-  parse(fragments.join(''));
-  if (!header) throw new Error('INVALID_SESSION');
+  sessionEntryIndex(entries, entries.at(-1)?.id ?? null, byId);
   return {
     header,
     entries,
     leafId: entries.at(-1)?.id ?? null,
-    revision: digest.digest('hex'),
     file,
+    ...(skipped || unterminated
+      ? {
+          history: { skipped_malformed_lines: skipped, unterminated_tail: unterminated },
+        }
+      : {}),
   };
+}
+// Native projection and getBranch follow parent links without a cycle guard.
+// Check only the requested path, not abandoned branches or missing parents.
+export function sessionEntryIndex(entries, leafId, byId) {
+  if (!byId) {
+    byId = new Map();
+    for (const entry of entries) byId.set(entry.id, entry);
+  }
+  const visited = new Set();
+  for (let entry = byId.get(leafId); entry; entry = byId.get(entry.parentId)) {
+    if (visited.has(entry.id)) throw new Error('INVALID_SESSION_TREE');
+    visited.add(entry.id);
+  }
+  return byId;
 }
 export async function loadSavedSession(session) {
   const data = await loadSession(session.file);
@@ -188,20 +224,6 @@ export async function discover(config) {
   for (const root of config.sessionRoots) await walk(root);
   return found.sort((a, b) => a.id.localeCompare(b.id));
 }
-function cursorSignature({ session_id, operation, request_id }) {
-  return hash({ session_id, operation, request_id });
-}
-// Receipt-output cursors bind the result and operation selector.
-export function textCursor(args, revision, offset) {
-  return Buffer.from(
-    JSON.stringify({
-      kind: 'control_output',
-      signature: cursorSignature(args),
-      revision,
-      offset,
-    }),
-  ).toString('base64url');
-}
 export const textBoundary = (text, offset) =>
   !(
     offset > 0 &&
@@ -211,32 +233,15 @@ export const textBoundary = (text, offset) =>
     text.charCodeAt(offset) >= 0xdc00 &&
     text.charCodeAt(offset) <= 0xdfff
   );
-export function fitDecodedText(text, maxChars, render) {
+export function fitDecodedText(text, maxChars, render, fits = () => true) {
   let low = 0,
     high = Math.min(text.length, maxChars);
   while (low < high) {
     const mid = Math.ceil((low + high) / 2),
       end = textBoundary(text, mid) ? mid : mid - 1;
-    if (JSON.stringify(render(text.slice(0, end))).length <= maxChars) low = mid;
+    const value = render(text.slice(0, end));
+    if (JSON.stringify(value).length <= maxChars && fits(value)) low = mid;
     else high = mid - 1;
   }
   return textBoundary(text, low) ? low : low - 1;
-}
-export function textCursorOffset(args, revision) {
-  if (!args.cursor) return 0;
-  let cursor;
-  try {
-    cursor = JSON.parse(Buffer.from(args.cursor, 'base64url').toString());
-  } catch {
-    throw new Error('INVALID_CURSOR');
-  }
-  if (
-    !cursor ||
-    cursor.kind !== 'control_output' ||
-    cursor.signature !== cursorSignature(args) ||
-    cursor.revision !== revision
-  )
-    throw new Error('STALE_CURSOR');
-  if (!Number.isSafeInteger(cursor.offset) || cursor.offset < 0) throw new Error('INVALID_CURSOR');
-  return cursor.offset;
 }

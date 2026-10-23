@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readOwnerConfig } from './owner-config.mjs';
+import { readOwnerConfig, validateLaunchArgs } from './owner-config.mjs';
 import { discover, validateExecutionCwd } from './data.mjs';
 import { launchProfile, piCommand } from './rpc.mjs';
 
@@ -17,20 +17,11 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   env.PI_MCP_OWNER_CONFIG = configFile;
   env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
   const executable = await piCommand(config, env, session.cwd);
-  // Owner piArgs may set a provider or load resources, but may not select or
+  // --session-dir only chooses storage for the fresh session. Owner piArgs
+  // may set that directory, a provider or resources, but may not select or
   // fork any saved session before the safe /bridge-join reservation.
   const extra = config.piArgs ?? [];
-  if (
-    extra.some(
-      (arg) =>
-        /^(?:--(?:session(?:-id|-dir)?|continue|resume|fork|no-session|mode|print|export)|-[crp])(?:=|$)/.test(
-          arg,
-        ) ||
-        arg.startsWith('@') ||
-        arg === '--',
-    )
-  )
-    throw new Error('UNSAFE_OPEN_PI_ARGS');
+  validateLaunchArgs(extra, 'UNSAFE_OPEN_PI_ARGS');
   // No --session TARGET: Pi migrates/opens it before loading extensions.
   return {
     command: executable.command,

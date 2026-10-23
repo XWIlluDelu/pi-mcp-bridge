@@ -1,20 +1,22 @@
 // Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
-import {
-  modelPage,
-  modelSettingsSchema,
-  sameModel,
-  assertThinkingLevel,
-  modelSetting,
-} from './models.mjs';
+import { compactInputSchema, compactMetadata, requireInterruptCompaction } from './compact.mjs';
+import { modelState } from './models.mjs';
 import net from 'node:net';
 import path from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
-import { renderContextRead } from './context-read.mjs';
-import { SEND_MODES, attachedPromptInput, assertImageModel } from './prompt-input.mjs';
-import { activityObservation } from './activity.mjs';
+import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import {
+  SEND_MODES,
+  attachedPromptInput,
+  remotePromptRejection,
+  assertImageModel,
+  hasPromptSettings,
+} from './prompt-input.mjs';
 import {
   MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
@@ -41,6 +43,36 @@ export default async function attachExtension(pi) {
   const { dir, file } = profile;
   let active;
   joinExtension(pi, { dir, file });
+  pi.on('session_before_switch', async (event, ctx) => {
+    if (
+      !['tui', 'rpc'].includes(ctx.mode) ||
+      event.reason !== 'resume' ||
+      typeof event.targetSessionFile !== 'string'
+    )
+      return;
+    let targetFile = event.targetSessionFile;
+    if (targetFile.startsWith('file://')) targetFile = fileURLToPath(targetFile);
+    else if (targetFile === '~' || targetFile.startsWith('~/'))
+      targetFile = path.join(homedir(), targetFile.slice(1));
+    targetFile = path.resolve(targetFile);
+    if (!companionIncludes(profile, targetFile)) return;
+    try {
+      // Refuse an already-owned target before SessionManager.open can switch us.
+      // This is a read-only admission check, not an atomic open reservation.
+      await assertSingleSessionFile(targetFile, { allowMissing: true });
+      await registryTransaction(dir, () =>
+        assertNoOtherLiveOwner(dir, { file: targetFile }, { allowSameProcess: true }),
+      );
+    } catch {
+      try {
+        ctx.ui.notify(
+          'Session switch cancelled: target ownership could not be cleared. Use /bridge-join or host coordination.',
+          'warning',
+        );
+      } catch {}
+      return { cancel: true }; // Pi reports hook errors without cancelling.
+    }
+  });
   async function retirePreviousClaims(currentFile, owner) {
     // Replacement/reload can reconstruct this extension, so use native identity
     // rather than closure state. Never retire a controller or a different process.
@@ -55,7 +87,7 @@ export default async function attachExtension(pi) {
       for (const name of await fs.readdir(dir)) {
         if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
         const file = path.join(dir, name);
-        const other = await readOwnerRecord(dir, file);
+        const other = await readOwnerRecord(dir, file, undefined, { owner });
         if (
           other?.file !== currentFile &&
           ['tui', 'extension'].includes(other?.kind) &&
@@ -63,9 +95,7 @@ export default async function attachExtension(pi) {
           other.owner.start === owner.start &&
           other.owner.boot === owner.boot
         ) {
-          if (other.noColdReacquire)
-            await atomicJson(file, { ...other, phase: 'released', owner: null });
-          else await fs.unlink(file);
+          await fs.unlink(file);
         }
       }
     });
@@ -117,15 +147,9 @@ export default async function attachExtension(pi) {
     });
   // These events occur after the relevant persistence; every IPC request also
   // validates, including the first request after a previously absent file appears.
-  pi.on('agent_settled', async (event) => {
+  pi.on('agent_settled', async () => {
     if (!active?.ready) return;
     active.liveMessage.reset();
-    active.settlement = {
-      generation: active.record.generation,
-      sequence: active.settlement.sequence + 1,
-      observed_at: new Date().toISOString(),
-      aborted: event.aborted,
-    };
     await validateStorage(active);
   });
   for (const event of ['session_info_changed', 'session_compact'])
@@ -141,11 +165,11 @@ export default async function attachExtension(pi) {
       await updateOwner(dir, runtime.session, runtime.record, { phase: 'transitioning' });
     } finally {
       await closeServer(runtime);
+      // IPC disconnect is not completion: keep the old claim and native
+      // context until admitted setters/compaction can no longer append.
+      await Promise.allSettled([...runtime.mutations]);
     }
-    // A real quit is not reload/session replacement. Permit cold resume only
-    // once this exact TUI process is dead; never release a still-live writer.
-    if (event.reason === 'quit' && runtime.ctx.mode === 'tui')
-      await updateOwner(dir, runtime.session, runtime.record, { coldReacquireAfterExit: true });
+    // The identified claim blocks until exact death or successful switch-away.
     // Keep the claim through quit/reload/replacement until exact process death or a fresh session_start.
   });
   pi.on('session_start', async (_event, ctx) => {
@@ -209,24 +233,25 @@ export default async function attachExtension(pi) {
         record,
         connections,
         ready: false,
+        compacting: false,
+        mutations: new Set(),
         server: null,
         ctx,
         fileObserved,
         liveMessage: new LiveMessageObserver('extension_message_events'),
-        settlement: {
-          generation: record.generation,
-          sequence: 0,
-          observed_at: null,
-          aborted: null,
-        },
       };
-      let selecting = false;
-      const activity = () =>
-        activityObservation('attached_context', {
-          idle: ctx.isIdle(),
-          pending: ctx.hasPendingMessages(),
-          settlement: runtime.settlement,
-        });
+      const activity = () => ({
+        idle: ctx.isIdle() && runtime.mutations.size === 0,
+        pending_messages: ctx.hasPendingMessages(),
+      });
+      async function trackMutation(operation) {
+        runtime.mutations.add(operation);
+        try {
+          return await operation;
+        } finally {
+          runtime.mutations.delete(operation);
+        }
+      }
       function check(request) {
         if (
           active !== runtime ||
@@ -264,18 +289,16 @@ export default async function attachExtension(pi) {
           try {
             const request = JSON.parse(buffer.slice(0, end));
             check(request);
-            if (request.op === 'set_model' && Number.isInteger(request.body?.timeout_ms))
-              socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
             await validateStorage(runtime);
             check(request);
             let data;
             const args = request.body ?? {};
-            if (selecting && ['send', 'set_model'].includes(request.op))
-              throw new AttachmentFailure('MODEL_SELECTION_PENDING');
             if (request.op === 'state')
               data = {
                 sessionFile: file,
                 sessionId: header.id,
+                sessionName: ctx.sessionManager.getSessionName?.() ?? null,
+                ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
                 isStreaming: !ctx.isIdle(),
                 generation: record.generation,
                 activity: activity(),
@@ -283,70 +306,66 @@ export default async function attachExtension(pi) {
             else if (['read', 'snapshot'].includes(request.op)) {
               const entries = ctx.sessionManager.getEntries(),
                 leafId = ctx.sessionManager.getLeafId();
-              const revisionInput =
+              const snapshotJson =
                 request.op === 'snapshot'
                   ? JSON.stringify({ entries, leaf: leafId, generation: record.generation })
                   : null;
               if (
                 request.op === 'snapshot' &&
-                Buffer.byteLength(revisionInput) > MAX_ATTACHMENT_SNAPSHOT_BYTES
+                Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
               )
                 throw new AttachmentFailure('SESSION_TOO_LARGE');
-              data =
-                request.op === 'snapshot'
-                  ? { sessionFile: file, sessionId: header.id, entries, leafId }
-                  : renderContextRead(
-                      { header, entries, leafId, live: runtime.liveMessage.snapshot() },
-                      args,
-                    );
-            } else if (request.op === 'set_model') {
-              const parsed = modelSettingsSchema.safeParse(args);
-              if (!parsed.success) throw new AttachmentFailure('INVALID_MODEL_ARGUMENTS');
-              const target = ctx.modelRegistry
-                .getAvailable()
-                .find((m) => sameModel(m, args.model ?? ctx.model));
-              if (!target) throw new AttachmentFailure('MODEL_UNAVAILABLE');
-              assertThinkingLevel(target, args.thinking_level);
-              const previous = pi.getThinkingLevel();
-              selecting = true;
-              try {
-                try {
-                  if (args.model && !sameModel(ctx.model, target) && !(await pi.setModel(target)))
-                    throw new Error('MODEL_UNAVAILABLE');
-                  check(request);
-                  if (args.thinking_level !== undefined) pi.setThinkingLevel(args.thinking_level);
-                } catch {
-                  throw new AttachmentFailure('MODEL_SELECTION_FAILED', true);
-                }
-                if (!sameModel(ctx.model, target))
-                  throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
+              if (request.op === 'snapshot')
+                data = { sessionFile: file, sessionId: header.id, entries, leafId };
+              else {
                 data = {
-                  status: 'accepted',
-                  ...modelSetting(ctx.model, pi.getThinkingLevel(), previous, args.thinking_level),
-                  scope: 'session',
+                  sessionFile: file,
+                  sessionId: header.id,
+                  ...prepareContextRead(
+                    { header, entries, leafId, live: runtime.liveMessage.snapshot() },
+                    args,
+                  ),
                 };
-              } finally {
-                selecting = false;
               }
-            } else if (request.op === 'models') {
-              data = modelPage(
-                ctx.modelRegistry.getAvailable(),
-                ctx.model,
-                pi.getThinkingLevel(),
-                request.body ?? {},
-              );
+            } else if (request.op === 'compact') {
+              if (typeof ctx.compact !== 'function')
+                throw new AttachmentFailure('COMPACT_UNSUPPORTED');
+              const input = compactInputSchema.safeParse(args);
+              if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
+              if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
+              requireInterruptCompaction(input.data, {
+                isIdle: ctx.isIdle(),
+                hasPendingMessages: ctx.hasPendingMessages(),
+              });
+              check(request);
+              runtime.compacting = true;
+              socket.setTimeout(0); // Disconnect only suppresses the receipt.
+              try {
+                const value = await trackMutation(
+                  new Promise((resolve, reject) =>
+                    ctx.compact({
+                      customInstructions: input.data.instructions,
+                      onComplete: resolve,
+                      onError: () => reject(new AttachmentFailure('PI_REJECTED')),
+                    }),
+                  ),
+                );
+                check(request);
+                data = compactMetadata(value);
+              } finally {
+                runtime.compacting = false;
+              }
             } else if (request.op === 'send') {
+              if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
               const input = attachedPromptInput(args);
-              if (input.model) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
+              if (hasPromptSettings(input))
+                throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
               if (!SEND_MODES.includes(args.mode))
                 throw new AttachmentFailure('INVALID_ATTACHED_SEND');
               assertImageModel(input.images, ctx.model);
-              // This command reaches owner-local control, outside MCP grants.
-              // Pi dispatches slash commands before input events, so refuse them
-              // at this remote admission boundary, including collision suffixes.
-              if (/^\/bridge-join(?::\d+)?(?:\s|$)/.test(args.text))
-                data = { status: 'rejected', reason: 'OWNER_LOCAL_COMMAND_REQUIRED' };
-              else if (args.mode === 'idle_only' && !ctx.isIdle())
+              const rejection = remotePromptRejection(input.text);
+              if (rejection) data = rejection;
+              else if (args.mode === 'idle_only' && (!ctx.isIdle() || ctx.hasPendingMessages()))
                 data = { status: 'skipped', reason: 'busy' };
               else {
                 const options = { expandPromptTemplates: true };
@@ -360,11 +379,11 @@ export default async function attachExtension(pi) {
                 );
                 data = {
                   status: 'unknown',
-                  dispatch: 'submitted',
                   reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-                  completion: 'not_tracked',
                 };
               }
+            } else if (request.op === 'bash') {
+              throw new AttachmentFailure('BASH_UNSUPPORTED');
             } else if (request.op === 'stop') {
               // TUI ctx.abort + getEditorText can recover joined text (including
               // prior draft), but no public context API aborts independent bash.
@@ -407,8 +426,7 @@ export default async function attachExtension(pi) {
       await updateOwner(dir, session, record, {
         phase: 'ready',
         imagesSupported: true,
-        modelsSupported: true,
-        modelSelectionSupported: true,
+        readContract: READ_CONTRACT,
       });
       // A successful replacement lifecycle conclusively releases this process's previous native identity.
       await retirePreviousClaims(file, owner);

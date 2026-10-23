@@ -46,11 +46,10 @@ test(
       }),
     );
     const config = {
-      principal: 'rpc-companion',
       defaults: denyAllPermissions(),
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ id: 'project', path: cwd }],
+      folders: [{ path: cwd }],
       grants: [
         {
           folder: cwd,
@@ -68,7 +67,7 @@ test(
     const configFile = path.join(dir, 'owner.json');
     await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     const setup = await new Bridge(config).init(),
-      made = await savedSession(setup, { folder_id: 'project' }),
+      made = await savedSession(setup),
       saved = await setup.session(made.session_id);
     await setup.close();
     const env = Object.fromEntries(Object.keys(process.env).map((key) => [key, undefined]));
@@ -130,33 +129,27 @@ test(
       'delete',
       'health',
       'list',
-      'models',
       'read',
-      'reload',
       'send',
-      'set_model',
       'stop',
     ]);
     assert.equal(
       (
         await ok('command', {
           session_id: saved.id,
-          request_id: 'unsupported-command',
+
           command: 'MUST_NOT_EXECUTE',
         })
       ).reason,
       'BASH_UNSUPPORTED',
     );
-    assert.equal(
-      (await ok('stop', { session_id: saved.id, request_id: 'unsupported-stop' })).reason,
-      'STOP_UNSUPPORTED',
-    );
+    assert.equal((await ok('stop', { session_id: saved.id })).reason, 'STOP_UNSUPPORTED');
     assert.equal((await call('read', { session_id: saved.id, view: 'raw' })).isError, true);
     const initial = await ok('read', { session_id: saved.id, max_bytes: 4096 });
-    assert.equal(initial.format, 'context_timeline');
+    assert.equal(initial.session_id, saved.id);
     const submitted = await ok('send', {
       session_id: saved.id,
-      request_id: 'remote-once',
+
       text: 'REMOTE_ORDINARY_RPC',
     });
     assert.equal(submitted.status, 'unknown');
@@ -164,7 +157,7 @@ test(
     const live = await until(async () => {
       const result = await ok('read', { session_id: saved.id, max_bytes: 4096 });
       assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 4096);
-      return result.live?.message?.content.some((block) => block.type === 'text' && block.text)
+      return result.live?.items?.some((unit) => unit.type === 'text' && unit.block.text)
         ? result
         : null;
     });
@@ -172,7 +165,7 @@ test(
     assert.equal(live.live.transient, true);
     const queued = await ok('send', {
       session_id: saved.id,
-      request_id: 'default-busy',
+
       text: 'DEFAULT_BUSY_INPUT',
     });
     assert.equal(queued.status, 'unknown');
@@ -182,7 +175,7 @@ test(
     );
     const history = await ok('read', { session_id: saved.id, preset: 'recent' });
     assert.ok(history.items.some((item) => item.type === 'text'));
-    assert.equal(history.live.message, null);
+    assert.deepEqual(history.live.items, []);
     const entries = (await local.getEntries()).entries;
     assert.equal(entries.filter((entry) => text(entry) === 'REMOTE_ORDINARY_RPC').length, 1);
     assert.equal(entries.filter((entry) => text(entry) === 'DEFAULT_BUSY_INPUT').length, 1);
@@ -192,7 +185,6 @@ test(
     assert.deepEqual(snapshot.entries, entries);
     const deleted = await ok('delete', {
       session_id: saved.id,
-      request_id: 'unsupported-live-delete',
     });
     assert.equal(deleted.reason, 'HOST_RELEASE_UNSUPPORTED');
     assert.equal(await ownerAlive(owner.owner), true);
@@ -201,10 +193,7 @@ test(
     assert.equal(await ownerAlive(owner.owner), true);
     remote = new Client({ name: 'companion-restart', version: '1' });
     await connect();
-    assert.deepEqual(
-      await ok('send', { session_id: saved.id, request_id: 'remote-once' }),
-      submitted,
-    );
+
     await local.switchSession(saved.file);
     await local.getState();
     const replacement = await until(async () => {
@@ -217,7 +206,7 @@ test(
     assert.equal((await call('read', { session_id: saved.id })).isError, true);
     const sendOnly = await ok('send', {
       session_id: saved.id,
-      request_id: 'send-only',
+
       text: 'SEND_ONLY_NO_TRANSCRIPT',
     });
     assert.equal(sendOnly.status, 'unknown');
@@ -230,7 +219,7 @@ test(
       assert.equal((await call('read', { session_id: saved.id })).isError, true);
       const rejected = await ok('send', {
         session_id: saved.id,
-        request_id: 'unreachable',
+
         text: 'NO_FALLBACK_WRITER',
       });
       assert.equal(rejected.reason, 'LIVE_OWNER_UNREACHABLE');

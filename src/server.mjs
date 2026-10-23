@@ -23,7 +23,6 @@ export function makeServer(bridge, { execute = (run) => run() } = {}) {
       (args, extra) =>
         callBridgeTool(bridge, name, args, {
           execute,
-          signal: extra.signal,
           requestId: extra.requestId,
         }),
     );
@@ -45,12 +44,12 @@ async function main() {
     if (closing) return closing;
     diagnostics.emit('service.stopping', { transport: 'stdio' });
     process.stdin.pause();
-    bridge.closing = true;
     // Init may still acquire its lock after a stop arrives. Wait for it to settle
     // before cleanup; never let init create resources after close has finished.
     closing = (async () => {
       await initializing?.catch(() => {});
       try {
+        await bridge.prepareClose();
         await transport?.drain();
         await bridge.close();
       } catch {
@@ -91,7 +90,13 @@ async function main() {
     initializing = bridge.init();
     await initializing;
     if (closing) return closing;
-    server = makeServer(bridge);
+    server = makeServer(bridge, {
+      execute: (run) => {
+        const task = Promise.resolve().then(run);
+        transport.track(task);
+        return task;
+      },
+    });
     server.server.onclose = () => {
       void close();
     };

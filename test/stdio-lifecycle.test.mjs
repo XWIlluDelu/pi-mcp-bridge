@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
+import { ownerRequest } from '../src/owner-runtime.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -43,17 +44,16 @@ async function fixture(t) {
   );
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'lifecycle-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
     attachmentDir: path.join(dir, 'ipc'),
     piArgs: ['--offline', '-e', extension],
   };
   const bridge = await new Bridge(config).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' });
+  const made = await savedSession(bridge);
   const session = await bridge.session(made.session_id);
   await bridge.close();
   const configFile = path.join(dir, 'owner.json');
@@ -67,7 +67,6 @@ async function fixture(t) {
     session,
     id: made.session_id,
     marker,
-    lock: path.join(config.stateDir, 'bridge.lock'),
   };
 }
 function launch(t, f, nodeArgs = []) {
@@ -121,7 +120,7 @@ function launch(t, f, nodeArgs = []) {
     ]);
   const call = async (name, args) => {
     const result = (await bounded(request('tools/call', { name, arguments: args }))).result;
-    assert.ok(result && !result.isError);
+    assert.ok(result && !result.isError, JSON.stringify(result));
     return result.structuredContent;
   };
   return {
@@ -130,10 +129,10 @@ function launch(t, f, nodeArgs = []) {
     request,
     done,
     stderr: () => stderr,
-    initialize: async () => {
+    initialize: async (protocolVersion = '2024-11-05') => {
       const r = await bounded(
         request('initialize', {
-          protocolVersion: '2024-11-05',
+          protocolVersion,
           capabilities: {},
           clientInfo: { name: 'lifecycle-fixture', version: '1' },
         }),
@@ -149,7 +148,6 @@ function launch(t, f, nodeArgs = []) {
   };
 }
 async function stopped(f, owner) {
-  assert.equal(await exists(f.lock), false);
   if (owner) assert.equal(await ownerAlive(owner), false);
   assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
 }
@@ -160,7 +158,7 @@ async function ownClaim(f) {
   });
 }
 
-for (const stage of ['before-open', 'after-open', 'write-failure'])
+for (const stage of ['before-acquire', 'after-acquire', 'owner-listen-failure'])
   test(`stop during initialization waits for ${stage} and releases only its acquired lock`, async (t) => {
     const f = await fixture(t),
       preload = path.join(f.dir, 'pause-init.mjs'),
@@ -168,7 +166,7 @@ for (const stage of ['before-open', 'after-open', 'write-failure'])
       release = path.join(f.dir, 'init-release');
     await fs.writeFile(
       preload,
-      `import fs from 'node:fs/promises';const open=fs.open.bind(fs);fs.open=async(file,...args)=>{if(file!==${JSON.stringify(f.lock)})return open(file,...args);let handle;if(${JSON.stringify(stage)}!=='before-open')handle=await open(file,...args);await fs.writeFile(${JSON.stringify(reached)},'ready');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));handle??=await open(file,...args);if(${JSON.stringify(stage)}==='write-failure')handle.writeFile=async()=>{throw new Error('FIXTURE_INIT_FAILURE');};return handle;};`,
+      `import {holdInit} from ${JSON.stringify(new URL('./fixtures/init-gate.mjs', import.meta.url).href)};holdInit(${JSON.stringify({ config: f.config, stage, reached, release })});`,
     );
     const server = launch(t, f, ['--import', preload]);
     await until(() => exists(reached));
@@ -182,7 +180,7 @@ for (const stage of ['before-open', 'after-open', 'write-failure'])
       'Signal handlers must be active before init acquires resources',
     );
     await fs.writeFile(release, 'continue');
-    assert.equal(await server.exit(), stage === 'write-failure' ? 1 : 0);
+    assert.equal(await server.exit(), stage === 'owner-listen-failure' ? 1 : 0);
     await stopped(f);
     const restarted = launch(t, f);
     await restarted.initialize();
@@ -191,7 +189,7 @@ for (const stage of ['before-open', 'after-open', 'write-failure'])
     await stopped(f);
   });
 
-test('modern stdio discovers without initialize and EOF drains a native receipt before recovery', async (t) => {
+test('modern stdio discovers without initialize and EOF drains native input before restart', async (t) => {
   const f = await fixture(t),
     server = launch(t, f);
   const _meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
@@ -201,10 +199,10 @@ test('modern stdio discovers without initialize and EOF drains a native receipt 
   const missing = await server.request('tools/list', {});
   assert.equal(missing.error.code, -32602);
   const listed = await server.request('tools/list', { _meta });
-  assert.equal(listed.result.tools.length, 13);
+  assert.ok(listed.result.tools.some((tool) => tool.name === 'compact'));
   const pending = server.request('tools/call', {
     name: 'send',
-    arguments: { session_id: f.id, request_id: 'modern-eof', text: '/lifecycle-fixture' },
+    arguments: { session_id: f.id, text: '/lifecycle-fixture' },
     _meta,
   });
   await until(() => exists(f.marker));
@@ -212,16 +210,20 @@ test('modern stdio discovers without initialize and EOF drains a native receipt 
   server.child.stdin.end();
   const response = await pending;
   assert.equal(response.result.resultType, 'complete');
-  assert.equal(response.result.structuredContent.status, 'accepted');
+  assert.equal(response.result.structuredContent.status, 'handled');
   assert.equal(await server.exit(), 0);
   await stopped(f, claim.owner);
   const second = launch(t, f);
-  const recovered = await second.request('tools/call', {
-    name: 'send',
-    arguments: { session_id: f.id, request_id: 'modern-eof' },
-    _meta,
-  });
-  assert.deepEqual(recovered.result.structuredContent, response.result.structuredContent);
+  assert.equal(
+    (
+      await second.request('tools/call', {
+        name: 'list',
+        arguments: { session_id: f.id },
+        _meta,
+      })
+    ).result.structuredContent.sessions.length,
+    1,
+  );
   second.child.stdin.end();
   assert.equal(await second.exit(), 0);
   await stopped(f);
@@ -239,29 +241,26 @@ test('stdin EOF without a runtime releases its lock and permits normal restart',
   assert.equal(await second.exit(), 0);
   await stopped(f);
 });
-test('stdin EOF drains an in-flight official RPC receipt, stops its child and preserves replay', async (t) => {
+test('stdin EOF drains in-flight native input and permits a fresh service', async (t) => {
   const f = await fixture(t),
     first = launch(t, f);
   await first.initialize();
   const pending = first.call('send', {
     session_id: f.id,
-    request_id: 'in-flight',
+
     text: '/lifecycle-fixture',
   });
   await until(() => exists(f.marker));
   const claim = await ownClaim(f);
   first.child.stdin.end();
   const receipt = await pending;
-  assert.equal(receipt.status, 'accepted');
-  assert.equal(receipt.disposition, 'handled');
+  assert.ok(['started', 'queued', 'handled'].includes(receipt.status), JSON.stringify(receipt));
+  assert.equal(receipt.status, 'handled');
   assert.equal(await first.exit(), 0);
   await stopped(f, claim.owner);
   const second = launch(t, f);
   await second.initialize();
-  assert.deepEqual(
-    await second.call('send', { session_id: f.id, request_id: 'in-flight' }),
-    receipt,
-  );
+
   assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
   second.child.kill('SIGINT');
   assert.equal(await second.exit(), 0);
@@ -273,7 +272,7 @@ test('broken stdout drains a pending receipt and cleans up the owned official RP
   await server.initialize();
   server.request('tools/call', {
     name: 'send',
-    arguments: { session_id: f.id, request_id: 'owned', text: '/lifecycle-fixture' },
+    arguments: { session_id: f.id, text: '/lifecycle-fixture' },
   });
   await until(() => exists(f.marker));
   const claim = await ownClaim(f);
@@ -284,9 +283,7 @@ test('broken stdout drains a pending receipt and cleans up the owned official RP
   assert.ok(!server.stderr().includes('Unhandled'));
   const bridge = await new Bridge(f.config).init();
   try {
-    const receipt = await bridge.send({ session_id: f.id, request_id: 'owned' });
-    assert.equal(receipt.status, 'accepted');
-    assert.equal(receipt.disposition, 'handled');
+    assert.equal((await bridge.list({ session_id: f.id })).sessions.length, 1);
     assert.equal(bridge.pool.instances.size, 0);
   } finally {
     await bridge.close();
@@ -298,7 +295,7 @@ test('repeated stop signals share draining cleanup rather than interrupting the 
   await server.initialize();
   const pending = server.call('send', {
     session_id: f.id,
-    request_id: 'signals',
+
     text: '/lifecycle-fixture',
   });
   await until(() => exists(f.marker));
@@ -306,7 +303,10 @@ test('repeated stop signals share draining cleanup rather than interrupting the 
   server.child.kill('SIGTERM');
   await new Promise((r) => setTimeout(r, 30));
   server.child.kill('SIGINT');
-  assert.equal((await pending).status, 'accepted');
+  assert.ok(
+    ['started', 'queued', 'handled'].includes((await pending).status),
+    'Expected native prompt admission',
+  );
   assert.equal(await server.exit(), 0);
   await stopped(f, claim.owner);
 });
@@ -366,15 +366,143 @@ test('EOF disconnects an actual external Pi TUI without stopping it', async (t) 
   await server.call('read', { session_id: f.id });
   server.child.stdin.end();
   assert.equal(await server.exit(), 0);
-  assert.equal(await exists(f.lock), false);
   assert.equal(await ownerAlive(claim.owner), true);
   assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, claim.generation);
 });
-test('an existing crash lock is neither removed nor bypassed on startup failure', async (t) => {
-  const f = await fixture(t);
-  await fs.writeFile(f.lock, 'retained-crash-fixture\n');
-  const server = launch(t, f);
-  assert.equal(await server.exit(), 1);
-  assert.equal(await fs.readFile(f.lock, 'utf8'), 'retained-crash-fixture\n');
-  assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+
+test('stdio shutdown drains an admitted SDK history read before closing the Bridge', async (t) => {
+  const f = await fixture(t),
+    preload = path.join(f.dir, 'read-gate.mjs'),
+    reached = path.join(f.dir, 'read-reached'),
+    release = path.join(f.dir, 'read-release');
+  await fs.writeFile(
+    preload,
+    `import fs from 'node:fs/promises';const open=fs.open;fs.open=async(file,...args)=>{const fd=await open(file,...args);if(file===${JSON.stringify(f.session.file)}){const stream=fd.createReadStream.bind(fd);fd.createReadStream=options=>(async function*(){const input=stream(options);await fs.writeFile(${JSON.stringify(reached)},'yes');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));yield* input;})();}return fd;};`,
+  );
+  const server = launch(t, f, ['--import', preload]);
+  await server.initialize();
+  const reading = server.call('read', { session_id: f.id });
+  await until(() => exists(reached));
+  server.child.stdin.end();
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(
+      server.child.exitCode,
+      null,
+      'SDK tool must remain in the same transport drain as per-request tools',
+    );
+    await fs.writeFile(release, 'go');
+    assert.equal((await reading).session_id, f.id);
+    assert.equal(await server.exit(), 0);
+  } finally {
+    await fs.writeFile(release, 'go');
+    await reading.catch(() => {});
+  }
 });
+
+for (const modern of [false, true])
+  for (const endInput of [false, true])
+    test(
+      (modern ? 'modern' : 'SDK') +
+        ' stdio batch ' +
+        (endInput
+          ? 'EOF finishes dispatched work but rejects the next lane mutation'
+          : 'keeps both lane mutations while the service remains open'),
+      { timeout: 15000 },
+      async (t) => {
+        const f = await fixture(t),
+          trace = path.join(f.dir, 'calls.log');
+        await fs.writeFile(
+          path.join(f.dir, 'command.mjs'),
+          'import fs from "node:fs/promises";export default pi=>pi.registerCommand("lifecycle-fixture",{handler:async(args)=>{await fs.appendFile(' +
+            JSON.stringify(trace) +
+            ',args+"\\n");await fs.writeFile(' +
+            JSON.stringify(f.marker) +
+            ',"started");await new Promise(r=>setTimeout(r,300));}});',
+        );
+        const server = launch(t, f);
+        await server.initialize(modern ? MODERN_VERSION : '2024-11-05');
+        const result = server.request('tools/call', {
+          name: 'batch',
+          arguments: {
+            operations: ['FIRST', 'SECOND'].map((text) => ({
+              op: 'send',
+              args: { session_id: f.id, text: '/lifecycle-fixture ' + text },
+            })),
+          },
+          ...(modern
+            ? {
+                _meta: {
+                  [META + 'protocolVersion']: MODERN_VERSION,
+                  [META + 'clientCapabilities']: {},
+                },
+              }
+            : {}),
+        });
+        await until(() => exists(f.marker));
+        if (endInput) server.child.stdin.end();
+        const response = (await result).result;
+        assert.ok(!response.isError, JSON.stringify(response));
+        const items = response.structuredContent.results;
+        assert.equal(items[0].result.status, 'handled');
+        if (endInput) assert.equal(items[1].error.code, 'BRIDGE_CLOSING');
+        else assert.equal(items[1].result.status, 'handled');
+        assert.deepEqual(
+          (await fs.readFile(trace, 'utf8')).trim().split('\n'),
+          endInput ? ['FIRST'] : ['FIRST', 'SECOND'],
+        );
+        if (!endInput) server.child.stdin.end();
+        assert.equal(await server.exit(), 0);
+      },
+    );
+
+test(
+  'stdio EOF drains an owner-local release already waiting on an owned shutdown hook',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t),
+      shutdown = path.join(f.dir, 'shutdown'),
+      release = path.join(f.dir, 'shutdown-go'),
+      admitted = path.join(f.dir, 'owner-admitted');
+    await fs.writeFile(
+      path.join(f.dir, 'command.mjs'),
+      'import fs from "node:fs/promises";export default pi=>{pi.registerCommand("lifecycle-fixture",{handler:async()=>{}});pi.on("session_shutdown",async()=>{await fs.writeFile(' +
+        JSON.stringify(shutdown) +
+        ',"yes");while(!await fs.stat(' +
+        JSON.stringify(release) +
+        ').then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));});};',
+    );
+    const preload = path.join(f.dir, 'owner-observer.mjs');
+    await fs.writeFile(
+      preload,
+      'import fs from "node:fs/promises";import {Bridge} from ' +
+        JSON.stringify(new URL('../src/bridge.mjs', import.meta.url).href) +
+        ';const release=Bridge.prototype.releaseForLocal;Bridge.prototype.releaseForLocal=async function(...args){const result=release.apply(this,args);await fs.writeFile(' +
+        JSON.stringify(admitted) +
+        ',"yes");return result;};',
+    );
+    const server = launch(t, f, ['--import', preload]);
+    let pending;
+    try {
+      await server.initialize();
+      await server.call('send', { session_id: f.id, text: '/lifecycle-fixture' });
+      const owner = (await ownClaim(f)).owner;
+      pending = ownerRequest(f.config, { op: 'release', session_id: f.id }).catch((error) => ({
+        reason: error.message,
+      }));
+      await until(() => exists(admitted));
+      await until(() => exists(shutdown));
+      server.child.stdin.end();
+      await pending;
+      assert.equal(await server.exit(), 0);
+      assert.equal(await ownerAlive(owner), false);
+      const paused = await readClaim(f.config.attachmentDir, f.session);
+      assert.equal(paused.owner, null);
+      assert.equal(paused.noColdReacquire, true);
+    } finally {
+      await fs.writeFile(release, 'go');
+      server.child.stdin.end();
+      await pending;
+    }
+  },
+);

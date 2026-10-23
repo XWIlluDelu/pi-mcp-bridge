@@ -17,11 +17,10 @@ async function fixture(t) {
     file = path.join(dir, 'owner.json');
   await fs.writeFile(tokenFile, 'T'.repeat(48), { mode: 0o600 });
   const config = {
-    principal: 'fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: dir }],
+    folders: [{ path: dir }],
     http: { port: 43125, tokenFile },
   };
   return { dir, file, config };
@@ -29,9 +28,6 @@ async function fixture(t) {
 test('configuration shape errors agree across init, reload reader and HTTP', async (t) => {
   const f = await fixture(t);
   const invalid = [
-    { principal: 42 },
-    { principal: ' ' },
-    { version: 2 },
     { arbitrary: 'unknown' },
     { defaults: undefined, grants: [{ folder: f.dir, command: true }] },
     { defaults: { command: true }, grants: [{ folder: f.dir, command: true }] },
@@ -41,12 +37,9 @@ test('configuration shape errors agree across init, reload reader and HTTP', asy
     { sessionRoots: ['relative'] },
     { grants: [{ folder: `${f.dir}\0`, command: false }] },
     { folders: {} },
-    { folders: [{ id: 'folder', path: f.dir, command: true }] },
+    { folders: [{ path: f.dir, command: true }] },
     {
-      folders: [
-        { id: 'duplicate', path: f.dir },
-        { id: 'duplicate', path: f.dir },
-      ],
+      folders: [{ path: f.dir }, { path: f.dir }],
     },
     { attachmentDir: '' },
     { attachmentExitTimeoutMs: 49 },
@@ -75,7 +68,7 @@ test('configuration shape errors agree across init, reload reader and HTTP', asy
     await assert.rejects(fs.stat(f.config.stateDir), { code: 'ENOENT' });
   }
 });
-test('current policy validates without mutation and refresh rejects invalid changes', async (t) => {
+test('current policy validates without mutation and snapshot rejects invalid changes', async (t) => {
   const f = await fixture(t),
     snapshot = structuredClone(f.config);
   assert.strictEqual(validateOwnerConfig(f.config), f.config);
@@ -83,15 +76,19 @@ test('current policy validates without mutation and refresh rejects invalid chan
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
   try {
     await fs.writeFile(f.file, JSON.stringify({ ...f.config, grants: [] }), { mode: 0o600 });
-    await bridge.refreshPermissions();
-    assert.deepEqual(bridge.config.grants, []);
-    await fs.writeFile(f.file, JSON.stringify({ ...f.config, principal: 42 }));
-    await assert.rejects(bridge.refreshPermissions(), /INVALID_OWNER_CONFIG/);
+    const context = await bridge.captureRequestContext();
+    assert.deepEqual(context.permissions.grants, []);
+    assert.deepEqual(bridge.config, snapshot);
+    assert.ok(Object.isFrozen(context.permissions.defaults));
+    assert.ok(Object.isFrozen(context.permissions.grants));
+    await fs.writeFile(
+      f.file,
+      JSON.stringify({ ...f.config, defaults: { ...f.config.defaults, send: 'invalid' } }),
+    );
+    await assert.rejects(bridge.captureRequestContext(), /INVALID_OWNER_CONFIG/);
   } finally {
     await bridge.close();
   }
-  const withMetadata = { ...snapshot, notes: { futureOwnerField: true } };
-  assert.throws(() => validateOwnerConfig(withMetadata), /INVALID_OWNER_CONFIG/);
 });
 
 for (const which of ['stateDir'])
@@ -110,17 +107,17 @@ for (const which of ['stateDir'])
     assert.equal((await fs.stat(dir)).mode & 0o777, 0o777);
   });
 
-test('private owner file checks agree across refresh, readers and direct stdio startup', async (t) => {
+test('private owner file checks agree across snapshot, readers and direct stdio startup', async (t) => {
   const f = await fixture(t);
   await fs.writeFile(f.file, JSON.stringify(f.config), { mode: 0o600 });
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
   try {
-    await bridge.refreshPermissions();
+    await bridge.captureRequestContext();
     await fs.chmod(f.file, 0o666);
     for (const op of [
       () => readOwnerConfig(f.file),
       () => loadHttpConfig(f.file),
-      () => bridge.refreshPermissions(),
+      () => bridge.captureRequestContext(),
     ])
       await assert.rejects(op, /OWNER_CONFIG_NOT_PRIVATE/);
     await assert.rejects(

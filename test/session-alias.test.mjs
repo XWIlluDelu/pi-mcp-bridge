@@ -66,6 +66,7 @@ test('initial attachment rechecks first persistence after a missing-file snapsho
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -126,6 +127,7 @@ test('initial attachment rejects a persisted file belonging to a different nativ
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -169,6 +171,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -218,7 +221,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
       assert.equal(stopped, false);
       const runtime = new AttachedRuntime(f.config, session, claim);
       assert.equal((await runtime.state()).sessionId, session.header.id);
-      assert.equal((await runtime.read({ session_id: 'fixture' })).items.length, 1);
+      assert.equal((await runtime.read({ session_id: 'fixture' })).units.length, 1);
     }
   } finally {
     await handlers.session_shutdown({});
@@ -234,11 +237,13 @@ test('persisted paths retain protection against a different live native owner cl
   const a = {},
     b = {};
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       a[name] = fn;
     },
   });
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       b[name] = fn;
     },
@@ -291,16 +296,15 @@ async function fixture(t) {
   await fs.mkdir(cwd);
   const config = {
     piExecutable: nativePiCli,
-    principal: 'alias-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
     attachmentDir: path.join(dir, 'ipc'),
   };
   const bridge = await new Bridge(config).init();
-  const created = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const created = await savedSession(bridge),
     session = await bridge.session(created.session_id);
   t.after(async () => {
     await bridge.close();
@@ -374,6 +378,7 @@ test('TUI claim rejects hardlink and symlink aliases before publishing a record'
     const handlers = {};
     let shutdown = false;
     await attachExtension({
+      getThinkingLevel: () => 'off',
       on: (name, fn) => {
         handlers[name] = fn;
       },
@@ -401,6 +406,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -433,7 +439,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
         timestamp: Date.now(),
       });
       await handlers.agent_settled({ aborted: false });
-      assert.equal((await runtime.read({ session_id: 'fixture' })).items.length, 1);
+      assert.equal((await runtime.read({ session_id: 'fixture' })).units.length, 1);
       await assert.rejects(
         reserveOwner(f.config.attachmentDir, session, 'rpc'),
         /LIVE_OWNER_UNREACHABLE/,
@@ -462,6 +468,7 @@ test('missing targets do not bypass canonical parent or observed-file checks', a
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -518,6 +525,7 @@ test('RPC extension storage failure retains ownership without shutting down its 
   const handlers = {};
   let shutdowns = 0;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -566,6 +574,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
   const handlers = {};
   let stopped = false;
   await attachExtension({
+    getThinkingLevel: () => 'off',
     on: (name, fn) => {
       handlers[name] = fn;
     },
@@ -622,7 +631,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
             await handlers.session_info_changed({ name: 'public fixture' });
           assert.equal((await runtime.state()).sessionId, session.header.id);
           assert.equal(stopped, false);
-          assert.equal((await runtime.read({ session_id: 'fixture' })).items.length, 1);
+          assert.equal((await runtime.read({ session_id: 'fixture' })).units.length, 1);
         } else {
           await assert.rejects(runtime.state());
           assert.equal(stopped, true);

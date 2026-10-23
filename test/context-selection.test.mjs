@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderContextRead } from '../src/context-read.mjs';
+import { renderContextRead } from './fixtures/read-pages.mjs';
 
 const text = (value) => ({ type: 'text', text: value });
 function history(messages) {
@@ -39,7 +39,7 @@ test('tool floods do not displace selected instructions, interior conclusions or
   messages.push(answer('CORRECTION_RESPONSE'), user('continue'), answer('OK'));
   const entries = history(messages),
     before = JSON.stringify(entries);
-  const result = read(entries, { select: { thinking: 0, tools: 2 } });
+  const result = read(entries, { preset: 'full', select: { thinking: 0, tools: 2 } });
   for (const marker of [
     'INITIAL_DIRECTION',
     'INTERIOR_INSTRUCTION',
@@ -76,7 +76,7 @@ test('first/last sampling is source-stable with thousands of blocks and reports 
   assert.ok(!JSON.stringify(result).includes('BLOCK_499'));
   const repeated = read(entries, { select: { text: 1, thinking: 0, tools: 0 }, max_bytes: 4096 });
   assert.deepEqual(repeated.selection, result.selection);
-  assert.equal(repeated.snapshot, result.snapshot);
+  assert.deepEqual(repeated.items, result.items);
   assert.deepEqual(repeated.omissions.selection, result.omissions.selection);
 });
 
@@ -150,7 +150,7 @@ test('failed result remains an orphan after native context edit hides its origin
     targetId: 'e1',
     replacement: null,
   });
-  const result = read(entries),
+  const result = read(entries, { select: { tools: -1 } }),
     record = result.items.find((r) => r.type === 'tool_result');
   assert.equal(record.pairing, 'orphan_result');
   assert.equal(record.message.isError, true);
@@ -196,9 +196,12 @@ test('active summaries exclude superseded and context-hidden parts at each nativ
     result.items
       .filter((r) => r.type === 'summary')
       .flatMap((r) => r.parts.map((p) => p.message.summary));
-  assert.deepEqual(summaries(read(entries)), ['ACTIVE']);
-  assert.deepEqual(summaries(read(entries, { leaf_id: 'branch' })), ['ACTIVE', 'HIDDEN_BRANCH']);
-  assert.deepEqual(summaries(read(entries, { leaf_id: 'kept' })), ['SUPERSEDED']);
+  assert.deepEqual(summaries(read(entries, { preset: 'recent' })), ['ACTIVE']);
+  assert.deepEqual(summaries(read(entries, { preset: 'recent', leaf_id: 'branch' })), [
+    'ACTIVE',
+    'HIDDEN_BRANCH',
+  ]);
+  assert.deepEqual(summaries(read(entries, { preset: 'recent', leaf_id: 'kept' })), ['SUPERSEDED']);
   assert.deepEqual(summaries(read(entries, { leaf_id: null })), []);
 });
 
@@ -221,7 +224,7 @@ test('split-turn compaction keeps failed/repaired tools and conclusion attached 
     },
     { type: 'message', id: 'new', parentId: 'split', message: user('NEW_CORRECTION') },
   );
-  const result = read(entries),
+  const result = read(entries, { preset: 'recent', select: { tools: -1 } }),
     prefix = result.items.find((r) => r.type === 'prompt' && r.synthetic);
   assert.equal(prefix.reason, 'context_prefix');
   const records = result.items.filter((r) => ['tool_call', 'tool_result', 'text'].includes(r.type));

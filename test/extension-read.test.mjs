@@ -6,7 +6,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import {
+  fauxAssistantMessage,
+  fauxToolCall,
+  fauxProvider,
+  InMemoryCredentialStore,
+} from '@earendil-works/pi-ai';
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -24,15 +29,14 @@ async function fixture(t) {
   await fs.mkdir(cwd);
   const config = {
     ...isolatedRuntime(dir),
-    principal: 'extension-fixture',
     defaults: denyAllPermissions(),
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ id: 'project', path: cwd }],
+    folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
   };
   const bridge = await new Bridge(config).init();
-  const made = await savedSession(bridge, { folder_id: 'project', request_id: 'seed' }),
+  const made = await savedSession(bridge),
     saved = await bridge.session(made.session_id);
   t.after(async () => {
     await bridge.close();
@@ -40,7 +44,7 @@ async function fixture(t) {
   });
   return { dir, cwd, config, bridge, saved, id: made.session_id };
 }
-async function sdk(t, f, factory, expectedCalls = 0) {
+async function sdk(t, f, factory, expectedCalls = 0, tools = []) {
   const manager = SessionManager.open(f.saved.file),
     old = manager.appendMessage({ role: 'user', content: 'PUBLIC_OLD', timestamp: 1 });
   manager.appendMessage(fauxAssistantMessage('PUBLIC_PRIOR_REPLY'));
@@ -78,7 +82,7 @@ async function sdk(t, f, factory, expectedCalls = 0) {
     modelRuntime,
     model: faux.getModel(),
     thinkingLevel: 'off',
-    tools: [],
+    tools,
     resourceLoader: loader,
     sessionManager: manager,
     settingsManager: settings,
@@ -117,13 +121,12 @@ test('original custom compaction hook preserves native summary, retained boundar
   assert.equal(compactCalls, 1);
   const entry = manager.getEntries().find((e) => e.type === 'compaction');
   assert.equal(entry.fromHook, true);
-  const context = await f.bridge.read({ session_id: f.id });
+  const context = await f.bridge.read({ session_id: f.id, preset: 'recent' });
   const parts = context.items.find((x) => x.type === 'summary').parts;
   assert.equal(parts[0].source.entry_id, entry.id);
   assert.equal(parts[0].message.summary, 'PUBLIC_EXTENSION_CHECKPOINT');
   assert.ok(JSON.stringify(context).includes('PUBLIC_KEPT'));
   assert.ok(!JSON.stringify(context).includes('PUBLIC_OLD'));
-  assert.equal(context.context_kind, 'pi_session_projection_not_final_provider_payload');
   const raw = await loadSavedSession(f.saved);
   assert.equal(raw.entries.find((x) => x.id === entry.id).firstKeptEntryId, kept);
   assert.equal(raw.entries.find((x) => x.id === entry.id).fromHook, true);
@@ -141,7 +144,7 @@ test('display-hidden custom messages remain projected while custom extension sta
       );
     }),
   );
-  const context = await f.bridge.read({ session_id: f.id }),
+  const context = await f.bridge.read({ session_id: f.id, preset: 'full' }),
     raw = await loadSavedSession(f.saved);
   assert.ok(
     context.items.some(
@@ -155,7 +158,7 @@ test('display-hidden custom messages remain projected while custom extension sta
   assert.ok(JSON.stringify(raw).includes('PUBLIC_CUSTOM_STATE'));
   assert.ok(raw.entries.some((x) => x.type === 'custom_message' && x.display === false));
   f.config.grants.push({ session_id: f.id, read: false });
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(f.bridge.read({ session_id: f.id, preset: 'full' }), /NOT_FOUND_OR_DENIED/);
 });
 test('request-time filtering differs from saved projection; reads neither replay hooks nor call a provider', async (t) => {
   const f = await fixture(t);
@@ -183,7 +186,7 @@ test('request-time filtering differs from saved projection; reads neither replay
     1,
   );
   const fileBefore = await fs.readFile(f.saved.file, 'utf8'),
-    readBefore = await f.bridge.read({ session_id: f.id });
+    readBefore = await f.bridge.read({ session_id: f.id, preset: 'full' });
   assert.ok(JSON.stringify(readBefore).includes('PUBLIC_OLD_PLAN'));
   assert.equal(contextCalls, 0);
   assert.equal(beforeCalls, 0);
@@ -204,9 +207,8 @@ test('request-time filtering differs from saved projection; reads neither replay
   assert.equal(requestMessages[0].content, 'PUBLIC_FORCED_MEMORY');
   const afterPrompt = await fs.readFile(f.saved.file, 'utf8');
   assert.notEqual(afterPrompt, fileBefore);
-  const readAfter = await f.bridge.read({ session_id: f.id });
+  const readAfter = await f.bridge.read({ session_id: f.id, preset: 'full' });
   assert.ok(JSON.stringify(readAfter).includes('PUBLIC_OLD_PLAN'));
-  assert.equal(readAfter.context_kind, 'pi_session_projection_not_final_provider_payload');
   assert.ok(!JSON.stringify(readAfter).includes('PUBLIC_FORCED_MEMORY'));
   assert.equal(await fs.readFile(f.saved.file, 'utf8'), afterPrompt);
   assert.equal(contextCalls, 1);
@@ -237,10 +239,7 @@ test('selected agentDir discovers extensions; an explicit disable flag remains a
     assert.ok((await rpc.entries()).entries.some((x) => x.customType === 'profile-marker'));
     await rpc.stop();
     // Use a new native file so a previous persisted marker cannot mask discovery.
-    const made = await savedSession(f.bridge, {
-        folder_id: 'project',
-        request_id: 'disabled-profile',
-      }),
+    const made = await savedSession(f.bridge),
       saved = await f.bridge.session(made.session_id);
     f.config.piArgs = ['--offline', '--no-extensions'];
     rpc = await new PiRpc(f.config, saved).start();
@@ -252,4 +251,51 @@ test('selected agentDir discovers extensions; an explicit disable flag remains a
   } finally {
     await rpc?.stop();
   }
+});
+
+test('real nested tool failure remains visible under its successful outer tool in a read-only native projection', async (t) => {
+  const f = await fixture(t);
+  const { session, faux, manager } = await sdk(
+    t,
+    f,
+    (pi) => {
+      pi.registerTool({
+        name: 'inner_failure',
+        exposure: 'deferred',
+        label: 'Inner',
+        description: 'Native nested failure',
+        parameters: { type: 'object', properties: {} },
+        async execute() {
+          throw new Error('NESTED_REAL_FAILURE');
+        },
+      });
+      pi.registerTool({
+        name: 'outer_success',
+        label: 'Outer',
+        description: 'Native outer success',
+        parameters: { type: 'object', properties: {} },
+        async execute(_id, _params, _signal, _update, ctx) {
+          const result = await ctx.executeTool('inner_failure', {});
+          assert.equal(result.isError, true);
+          return { content: [{ type: 'text', text: 'OUTER_SUCCESS' }], details: {} };
+        },
+      });
+      pi.on('session_start', () => pi.setActiveTools(['outer_success']));
+    },
+    2,
+    ['outer_success', 'inner_failure'],
+  );
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall('outer_success', {})], { stopReason: 'toolUse' }),
+    fauxAssistantMessage('NESTED_FINISHED'),
+  ]);
+  await session.prompt('RUN_NESTED');
+  const raw = manager.getEntries().find((e) => e.message?.role === 'toolResult').message;
+  assert.equal(raw.isError, false, JSON.stringify(raw));
+  assert.equal(raw.nestedCalls.calls[0].status, 'error');
+  assert.match(raw.nestedCalls.calls[0].error, /NESTED_REAL_FAILURE/);
+  const read = await f.bridge.read({ session_id: f.id, preset: 'full' });
+  const outer = read.items.find((u) => u.type === 'tool_result').message;
+  assert.equal(outer.isError, false);
+  assert.deepEqual(outer.nestedCalls, raw.nestedCalls);
 });

@@ -1,23 +1,38 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { compactSchema, compactReceipt } from './compact.mjs';
-import { reloadSchema, reopenOwned } from './reload.mjs';
-import { setModelSchema, sameModel } from './models.mjs';
+import { compactReceipt } from './compact.mjs';
+import { modelSettings } from './set-model.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema } from './read-schema.mjs';
-import { stopSchema, bashSchema } from './tool-schemas.mjs';
+import { readSchema, contextSelection } from './read-schema.mjs';
+import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { permitted, permissionsHealth } from './permissions.mjs';
-import { sessionMetadata, runtimeStatus } from './session-metadata.mjs';
+import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
-import { SEND_MODES, promptInput, assertImageModel } from './prompt-input.mjs';
-import { renderContextRead } from './context-read.mjs';
-import { discover, readSessionIdentity, loadSavedSession, validateExecutionCwd } from './data.mjs';
+import {
+  SEND_MODES,
+  promptInput,
+  hasPromptSettings,
+  assertImageModel,
+  assertPromptSelection,
+  promptOptions,
+  promptResult,
+  attachedPromptResult,
+} from './prompt-input.mjs';
+import { ContextReadCache } from './read-cache.mjs';
+import { prepareContextRead } from './context-read.mjs';
+import {
+  discover,
+  readSessionIdentity,
+  loadSavedSession,
+  validateExecutionCwd,
+  assertSingleSessionFile,
+} from './data.mjs';
 import { hash, atomicJson, assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
-import { stopReceipt, recoveredWithdrawal, withdrawalPage } from './stop-execution.mjs';
-import { bashOutputPage, recoveredBash } from './bash-execution.mjs';
+import { kernelLock } from './kernel-lock.mjs';
+import { stopReceipt, inlineWithdrawal, withdrawalOutput } from './stop-execution.mjs';
+import { bashOutput, inlineBashResult } from './bash-execution.mjs';
 import { PiRpc, RuntimePool } from './rpc.mjs';
-import { Journal } from './journal.mjs';
 import {
   privateDirectory,
   readClaim,
@@ -31,6 +46,7 @@ import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { prepareTrash } from './trash.mjs';
 import { idleHandoff, cancelHandoff } from './idle-handoff.mjs';
+import { optionalResultFields } from './response-budget.mjs';
 export class Bridge {
   constructor(config, factory, { configFile } = {}) {
     this.config = config;
@@ -38,12 +54,13 @@ export class Bridge {
     const { grants, defaults, ...settings } = config;
     this.ownerSettings = structuredClone(settings);
     this.pool = new RuntimePool(config, factory);
-    this.journal = new Journal(config);
+    this.pendingMutations = new Set();
     this.locks = new Map();
     this.handoffs = new Map();
     this.inputs = new Set();
     this.sessionFiles = new Map();
     this.titleCache = new Map();
+    this.readCache = new ContextReadCache();
   }
   async init() {
     validateOwnerConfig(this.config);
@@ -56,15 +73,14 @@ export class Bridge {
     await privateDirectory(this.pool.attachmentDir);
     // Configured execution directories may be offline while saved history is
     // still accessible. Create and cold resume validate their cwd on demand.
-    // One bridge process per state directory. Do not automatically steal stale locks.
-    this.lockPath = path.join(this.config.stateDir, 'bridge.lock');
-    this.lock = await fs.open(this.lockPath, 'wx', 0o600);
-    await this.lock.writeFile(`${process.pid}\n`);
+    // Service lifetime exclusivity is independent of the short registry mutex.
+    this.lock = await kernelLock('bridge:' + this.config.stateDir, {
+      busy: 'BRIDGE_ALREADY_RUNNING',
+    });
     try {
       this.ownerControl = await serveOwnerControl(this);
     } catch (error) {
       await this.lock.close();
-      await fs.unlink(this.lockPath);
       this.lock = null;
       throw error;
     }
@@ -80,11 +96,15 @@ export class Bridge {
       if (this.locks.get(id) === next) this.locks.delete(id);
     }
   }
-  async withInput(sessionId, fn) {
-    // Keep cancellation on this request across permission, receipt and state I/O.
-    // A completed stop must not revive input that has not reached Pi yet.
+  registerInput(sessionId) {
     const input = { sessionId, stopped: this.locks.has(`stop:${sessionId}`) };
     this.inputs.add(input);
+    return input;
+  }
+  async withInput(sessionId, input, fn) {
+    input ??= this.registerInput(sessionId);
+    // Keep cancellation across batch lanes, permission and state I/O.
+    // A completed stop must not revive input that has not reached Pi yet.
     const beforeDispatch = () => {
       this.assertOpen();
       if (input.stopped || this.locks.has(`stop:${sessionId}`)) throw new Error('STOP_IN_PROGRESS');
@@ -100,7 +120,7 @@ export class Bridge {
     this.sessionFiles = new Map(sessions.map((s) => [s.id, s.file]));
     return sessions;
   }
-  async mutationLock(id, action, save, fn, lockId = id) {
+  async mutationLock(id, action, requestContext, fn, lockId = id) {
     const blockedReason = () =>
       this.handoffs.has(id)
         ? 'HANDOFF_PENDING'
@@ -109,10 +129,10 @@ export class Bridge {
           : null;
     const blocked = async (reason) => {
       try {
-        this.check(action, await this.session(id));
-        return save({ status: 'rejected', reason });
+        this.check(action, await this.session(id), requestContext);
+        return { status: 'rejected', reason };
       } catch (error) {
-        return save({ status: 'rejected', reason: safeReason(error) });
+        return { status: 'rejected', reason: safeReason(error) };
       }
     };
     const reason = blockedReason();
@@ -122,26 +142,21 @@ export class Bridge {
       return reason ? blocked(reason) : fn();
     });
   }
-  async refreshPermissions() {
-    if (!this.configFile) return;
-    const task = diagnostics.measure('permission.reload', {}, () =>
-      (this.permissionsReload ?? Promise.resolve())
-        .catch(() => {})
-        .then(async () => {
-          const { config } = await readOwnerConfig(this.configFile);
-          const { grants, defaults, ...settings } = config;
-          if (!isDeepStrictEqual(settings, this.ownerSettings))
-            throw new Error('CONFIG_RESTART_REQUIRED');
-          this.config.grants = grants ?? [];
-          this.config.defaults = defaults ?? {};
-        }),
-    );
-    this.permissionsReload = task;
-    try {
-      await task;
-    } finally {
-      if (this.permissionsReload === task) this.permissionsReload = null;
-    }
+  async captureRequestContext() {
+    this.assertOpen();
+    return diagnostics.measure('permission.snapshot', {}, async () => {
+      let policy = this.config;
+      if (this.configFile) {
+        const { config } = await readOwnerConfig(this.configFile);
+        const { grants, defaults, ...settings } = config;
+        if (!isDeepStrictEqual(settings, this.ownerSettings))
+          throw new Error('CONFIG_RESTART_REQUIRED');
+        policy = config;
+      }
+      const defaults = Object.freeze({ ...policy.defaults });
+      const grants = Object.freeze((policy.grants ?? []).map((rule) => Object.freeze({ ...rule })));
+      return Object.freeze({ permissions: Object.freeze({ defaults, grants }) });
+    });
   }
   async session(id) {
     const file = this.sessionFiles.get(id);
@@ -154,251 +169,95 @@ export class Bridge {
     if (!s) throw new Error('NOT_FOUND_OR_DENIED');
     return s;
   }
-  check(action, s) {
-    const allowed = permitted(this.config, action, s);
+  check(action, s, requestContext) {
+    const allowed = permitted(requestContext.permissions, action, s);
     diagnostics.emit('permission.check', { op: action, allowed });
     if (!allowed) throw new Error('NOT_FOUND_OR_DENIED');
   }
-  async models(args) {
+  send(args, options) {
+    return this.#mutation('send', args, options, this.#send);
+  }
+  create(args, options) {
+    return this.#mutation('create', args, options, this.#create);
+  }
+  command(args, options) {
+    return this.#mutation('command', args, options, this.#command);
+  }
+  stop(args, options) {
+    return this.#mutation('stop', args, options, this.#stop);
+  }
+  compact(args, options) {
+    return this.#mutation('compact', args, options, this.#compact);
+  }
+  delete(args, options) {
+    return this.#mutation('delete', args, options, this.#delete);
+  }
+
+  async #mutation(op, input, options, action) {
+    const parsed = publicOperationSchemas[op].safeParse(input);
+    if (!parsed.success) throw new Error('INVALID_ARGUMENTS');
     this.assertOpen();
-    if (this.configFile) await this.refreshPermissions();
-    const session = await this.session(args.session_id);
-    this.check('send', session);
-    const inspect = async () => {
-      if (this.configFile) await this.refreshPermissions();
-      this.check('send', session);
-      if (args.start && this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
-      let runtime = await this.pool.forRead(session);
-      if (!runtime && args.start) {
-        await validateExecutionCwd(session.cwd);
-        await loadSavedSession(session);
-        runtime = await this.pool.resolve(session);
-      }
-      const page = runtime
-        ? await runtime.models(args)
-        : {
-            source: 'inactive',
-            availability: 'unknown',
-            current: null,
-            models: null,
-            total: null,
-            next_offset: null,
+    const work = action.call(this, parsed.data, options);
+    this.pendingMutations.add(work);
+    const settled = () => this.pendingMutations.delete(work);
+    work.then(settled, settled);
+    return work;
+  }
+  async #compact(args, { requestContext, pendingInput } = {}) {
+    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
+      requestContext = await (requestContext ?? this.captureRequestContext());
+      this.assertOpen();
+      const session = await this.session(args.session_id);
+      this.check('send', session, requestContext);
+      if (args.interrupt) this.check('stop', session, requestContext);
+      const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
+      return this.mutationLock(session.id, 'send', requestContext, async () => {
+        try {
+          let runtime = await this.pool.forRead(session);
+          if (!runtime) {
+            await validateExecutionCwd(session.cwd);
+            await loadSavedSession(session);
+            checkInput();
+            runtime = await this.pool.resolve(session);
+          }
+          if (!runtime.attached && !body.interrupt)
+            await runtime.assertIdle({
+              busy: 'COMPACT_BUSY',
+              unconfirmed: 'COMPACT_IDLE_UNCONFIRMED',
+            });
+          const authorized = async () => {
+            checkInput();
+            this.check('send', session, requestContext);
+            if (body.interrupt) this.check('stop', session, requestContext);
           };
-      if (this.configFile) await this.refreshPermissions();
-      this.check('send', session);
-      return {
-        session_id: session.id,
-        ...page,
-        model_selection: !runtime
-          ? 'unknown'
-          : !runtime.attached || runtime.record.modelSelectionSupported === true
-            ? 'session'
-            : 'unsupported',
-        prompt_model_selection: !runtime
-          ? 'unknown'
-          : !runtime.attached
-            ? 'idle_only_session'
-            : 'unsupported',
-      };
-    };
-    return args.start ? this.locked(session.id, inspect) : inspect();
-  }
-  async set_model(args) {
-    if (!setModelSchema.safeParse(args).success) throw new Error('INVALID_MODEL_ARGUMENTS');
-    return this.withInput(args.session_id, async (checkInput) => {
-      this.assertOpen();
-      if (this.configFile) await this.refreshPermissions();
-      const session = await this.session(args.session_id);
-      this.check('send', session);
-      const body =
-        args.model !== undefined || args.thinking_level !== undefined
-          ? { model: args.model, thinking_level: args.thinking_level }
-          : undefined;
-      return this.journal.run(args.request_id, 'set_model', session.id, body, (save) =>
-        this.mutationLock(session.id, 'send', save, async () => {
-          try {
-            let runtime = await this.pool.forRead(session);
-            if (!runtime) {
-              await validateExecutionCwd(session.cwd);
-              await loadSavedSession(session);
-              checkInput();
-              runtime = await this.pool.resolve(session);
-            }
-            if (this.configFile) await this.refreshPermissions();
-            const authorized = async () => {
-              if (this.configFile) await this.refreshPermissions();
-              checkInput();
-              this.check('send', session);
-            };
-            await authorized();
-            if (runtime.attached)
-              return await save(await runtime.set_model({ ...args, beforeDispatch: authorized }));
-            const configured = await runtime.selectModel(args.model, {
-              thinkingLevel: args.thinking_level,
-              timeout: args.timeout_ms ?? 5000,
-              beforeDispatch: authorized,
-              onLate: async (result) => {
-                if (!result.ok) return save({ status: 'rejected', reason: result.code });
-                const current = await runtime.state();
-                if (!sameModel(current.model, result.selected_model))
-                  return save({ status: 'unknown', reason: 'MODEL_SELECTION_CHANGED' });
-                if (result.phase === 'model' && args.thinking_level !== undefined)
-                  return save({
-                    status: 'rejected',
-                    reason: 'MODEL_SELECTED_THINKING_NOT_SET',
-                    model: result.selected_model,
-                    thinking_level: current.thinkingLevel ?? null,
-                    thinking_adjustment: 'unknown',
-                    scope: 'session',
-                  });
-                return save({
-                  status: 'accepted',
-                  model: result.selected_model,
-                  thinking_level: current.thinkingLevel ?? null,
-                  thinking_adjustment: 'unknown',
-                  scope: 'session',
-                });
-              },
-            });
-            return await save({ status: 'accepted', ...configured, scope: 'session' });
-          } catch (error) {
-            return save({
-              status: error.uncertain ? 'unknown' : 'rejected',
-              reason: safeReason(error),
-            });
-          }
-        }),
-      );
-    });
-  }
-  async reload(args) {
-    if (!reloadSchema.safeParse(args).success) throw new Error('INVALID_RELOAD_ARGUMENTS');
-    return this.withInput(args.session_id, async (checkInput) => {
-      const session = await this.session(args.session_id);
-      const authorize = async () => {
-        if (this.configFile) await this.refreshPermissions();
-        checkInput();
-        this.check('send', session);
-      };
-      await authorize();
-      // A lookup of an in-progress request observes its durable phase immediately.
-      // It does not enqueue another reopen, even after a caller's timeout.
-      if (await this.journal.get(args.request_id))
-        return this.journal.execute(args.request_id, 'reload', session.id, {}, undefined);
-      const work = this.journal.run(args.request_id, 'reload', session.id, {}, (save) =>
-        this.mutationLock(session.id, 'send', save, async () => {
-          try {
-            return await reopenOwned(this, session, save, authorize);
-          } catch (error) {
-            return save({
-              status: error.uncertain ? 'unknown' : 'rejected',
-              ...error.reload_details,
-              reason: safeReason(error),
-            });
-          }
-        }),
-      );
-      let timer;
-      try {
-        return await Promise.race([
-          work,
-          new Promise((resolve) => {
-            timer = setTimeout(
-              () =>
-                resolve({
-                  request_id: args.request_id,
-                  operation: 'reload',
-                  status: 'unknown',
-                  method: 'rpc_reopen',
-                  session_id: session.id,
-                  reason: 'ACK_TIMEOUT',
-                }),
-              args.timeout_ms ?? 5000,
-            );
-          }),
-        ]);
-      } finally {
-        clearTimeout(timer);
-      }
-    });
-  }
-  async compact(args) {
-    if (
-      !compactSchema.safeParse(args).success ||
-      (args.recover && (args.instructions !== undefined || args.interrupt !== undefined))
-    )
-      throw new Error('INVALID_COMPACT_ARGUMENTS');
-    return this.withInput(args.session_id, async (checkInput) => {
-      this.assertOpen();
-      if (this.configFile) await this.refreshPermissions();
-      const session = await this.session(args.session_id);
-      this.check('send', session);
-      // Recovery of an interrupting call still requires its original grant.
-      const prior = await this.journal.get(args.request_id);
-      if (args.interrupt || prior?.receipt.interrupt_requested) this.check('stop', session);
-      const body = args.recover
-        ? undefined
-        : { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
-      return this.journal.run(args.request_id, 'compact', session.id, body, (persist) => {
-        const save = (result) => persist({ interrupt_requested: body.interrupt, ...result });
-        return this.mutationLock(session.id, 'send', save, async () => {
-          try {
-            await save({ status: 'unknown' });
-            let runtime = await this.pool.forRead(session);
-            if (runtime?.attached) throw new Error('COMPACT_UNSUPPORTED');
-            if (!runtime) {
-              await validateExecutionCwd(session.cwd);
-              await loadSavedSession(session);
-              checkInput();
-              runtime = await this.pool.resolve(session);
-            }
-            if (!body.interrupt)
-              await runtime.assertIdle({
-                busy: 'COMPACT_BUSY',
-                unconfirmed: 'COMPACT_IDLE_UNCONFIRMED',
-              });
-            if (this.configFile) await this.refreshPermissions();
-            const authorized = async () => {
-              if (this.configFile) await this.refreshPermissions();
-              checkInput();
-              this.check('send', session);
-              if (body.interrupt) this.check('stop', session);
-            };
-            await authorized();
-            const late = (result) =>
-              save(
-                result.ok
-                  ? compactReceipt(result.data)
-                  : {
-                      status: 'rejected',
-                      reason: result.code,
-                      native_effects: 'native_compact_attempted',
-                    },
+          await authorized();
+          const late = () => {}; // Keep native late-ACK identity validation.
+          const result = runtime.attached
+            ? await runtime.compact(body, args.timeout_ms ?? 5000, authorized)
+            : await runtime.command(
+                { type: 'compact', customInstructions: body.instructions },
+                args.timeout_ms ?? 5000,
+                late,
+                authorized,
               );
-            const result = await runtime.command(
-              { type: 'compact', customInstructions: body.instructions },
-              args.timeout_ms ?? 5000,
-              late,
-              authorized,
-            );
-            return await save(compactReceipt(result));
-          } catch (error) {
-            return save({
-              status: error.uncertain ? 'unknown' : 'rejected',
-              reason: safeReason(error),
-              native_effects:
-                error.code === 'PI_REJECTED' || error.uncertain
-                  ? 'native_compact_attempted'
-                  : 'none',
-            });
-          }
-        });
+          return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
+        } catch (error) {
+          return {
+            status: error.uncertain ? 'unknown' : 'rejected',
+            reason: safeReason(error),
+            native_effects:
+              error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
+          };
+        }
       });
     });
   }
-  async list(args = {}) {
+  async list(args = {}, { requestContext } = {}) {
+    const parsed = publicOperationSchemas.list.safeParse(args);
+    if (!parsed.success) throw new Error('INVALID_ARGUMENTS');
+    args = parsed.data;
+    requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    if (this.configFile) await this.refreshPermissions();
     const sessions = args.session_id
       ? await this.session(args.session_id).then(
           (s) => [s],
@@ -419,7 +278,7 @@ export class Bridge {
       !query || (value ?? '').toLocaleLowerCase().includes(query.toLocaleLowerCase());
     const candidates = [];
     for (const session of sessions) {
-      if (!permitted(this.config, 'list', session)) continue;
+      if (!permitted(requestContext.permissions, 'list', session)) continue;
       if (args.session_id && session.id !== args.session_id) continue;
       if (!matches(session.header.cwd, args.project)) continue;
       let stat;
@@ -442,7 +301,19 @@ export class Bridge {
       selected = [];
     let matching = 0,
       hasMore = false;
-    for (const candidate of candidates) {
+    // Keep status polling concurrent across the ordinary page, as before name
+    // and status began sharing the same native observation.
+    const observations = new Map();
+    if (!args.name)
+      for (const { session } of candidates.slice(offset, offset + limit))
+        observations.set(session.id, runtimeMetadata(this.pool, session));
+    for (const [index, candidate] of candidates.entries()) {
+      // Only native state is prefetched. Saved metadata is read in result order,
+      // and scanning stops after the page plus one additional matching row.
+      if (args.name)
+        for (const next of candidates.slice(index, index + 4))
+          if (!observations.has(next.session.id))
+            observations.set(next.session.id, runtimeMetadata(this.pool, next.session));
       // With no title filter, earlier pages need no transcript scan at all.
       if (!args.name && matching++ < offset) continue;
       if (!args.name && selected.length === limit) {
@@ -451,8 +322,13 @@ export class Bridge {
       }
       const session = candidate.session;
       let metadata;
+      const observed = await (observations.get(session.id) ?? runtimeMetadata(this.pool, session));
+      observations.delete(session.id);
       try {
-        metadata = await sessionMetadata(session, this.titleCache);
+        metadata =
+          observed.name !== undefined
+            ? { name: observed.name }
+            : await sessionMetadata(session, this.titleCache);
       } catch {
         continue;
       }
@@ -465,100 +341,122 @@ export class Bridge {
       const parent = sessions.find((other) => other.file === session.header.parentSession);
       selected.push({
         session_id: session.id,
-        project: session.header.cwd,
+        project: session.header.cwd || null,
         name: metadata.name,
-        parent_session_id: parent && permitted(this.config, 'list', parent) ? parent.id : null,
+        parent_session_id:
+          parent && permitted(requestContext.permissions, 'list', parent) ? parent.id : null,
         last_activity: candidate.last_activity,
-        session,
+        status: observed.status,
       });
     }
-    const page = await Promise.all(
-      selected.map(async ({ session, ...row }) => ({
-        ...row,
-        status: await runtimeStatus(this.pool, session),
-      })),
-    );
-    if (this.configFile) await this.refreshPermissions();
-    this.assertOpen();
     return {
-      sessions: page
-        .filter((row) =>
-          permitted(
-            this.config,
-            'list',
-            selected.find((item) => item.session_id === row.session_id).session,
-          ),
-        )
-        .map((row) => {
-          const parent = sessions.find((session) => session.id === row.parent_session_id);
-          return {
-            ...row,
-            parent_session_id: parent && permitted(this.config, 'list', parent) ? parent.id : null,
-          };
-        }),
+      sessions: selected,
       next_offset: hasMore ? offset + limit : null,
-      projects: this.config.folders
-        .filter((folder) => permitted(this.config, 'create', { cwd: folder.path }))
-        .map((folder) => folder.path),
+      creatable_projects: [...new Set(selected.map((row) => row.project))].filter(
+        (project) =>
+          this.config.folders.some((folder) => folder.path === project) &&
+          permitted(requestContext.permissions, 'create', { cwd: project }),
+      ),
     };
   }
-  async health({ domain = 'permissions', session_id } = {}) {
+  async health(args = {}, { requestContext } = {}) {
+    const { session_id } = publicOperationSchemas.health.parse(args);
+    requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    if (domain !== 'permissions') throw new Error('UNSUPPORTED_HEALTH_DOMAIN');
-    if (this.configFile) await this.refreshPermissions();
     // Diagnose only the requested session, without its metadata or source paths.
     if (session_id) {
       const target = await this.session(session_id).catch(() => ({ id: session_id, cwd: null }));
-      return permissionsHealth(this.config, { session_id, cwd: target.cwd });
+      return permissionsHealth(
+        { ...requestContext.permissions, folders: this.config.folders },
+        { session_id, cwd: target.cwd },
+      );
     }
-    return permissionsHealth(this.config);
+    return permissionsHealth({ ...requestContext.permissions, folders: this.config.folders });
   }
-  async read(args) {
+  async read(args, { requestContext, resultBudget, readPins } = {}) {
+    const parsed = readSchema.safeParse(args);
+    if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
+    args = parsed.data;
+    requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    if (this.configFile) {
-      await this.refreshPermissions();
-      this.assertOpen();
+    // Routing metadata only. Cached content is accessed after authorization and
+    // today's canonical path/native identity check; a cursor is never a grant.
+    const id = args.session_id ?? this.readCache.identity(args.cursor).session_id;
+    let s = await this.session(id);
+    this.check('read', s, requestContext);
+    const identity = {
+      session_id: id,
+      file: s.file,
+      native_id: s.header.id,
+      native_cwd: s.header.cwd,
+    };
+    if (args.cursor) {
+      const captured = this.readCache.get(args, identity);
+      return this.readCache.render(captured.snapshot, args, {
+        ...captured,
+        identity,
+        resultBudget,
+        readPins,
+      });
     }
-    let s = await this.session(args.session_id);
-    this.check('read', s);
-    if (!readSchema.safeParse(args).success) throw new Error('INVALID_READ_ARGUMENTS');
+    args = { ...args, session_id: id };
     const runtime = await this.pool.forRead(s);
     diagnostics.emit('read.source', {
       kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
     });
-    if (runtime?.attached) {
-      const result = await runtime.read(args);
-      if (this.configFile) await this.refreshPermissions();
-      this.check('read', s);
-      return result;
+    let captured;
+    if (runtime?.attached) captured = await runtime.read(args);
+    else {
+      if (runtime) {
+        const active = await runtime.entries();
+        if (
+          !active.entries.every(
+            (entry) => typeof entry.id === 'string' && entry.id.length <= 128,
+          ) ||
+          !(
+            active.leafId === null ||
+            (typeof active.leafId === 'string' && active.leafId.length <= 128)
+          )
+        )
+          throw new Error('INVALID_RUNTIME_ENTRIES');
+        s = { ...s, entries: active.entries, leafId: active.leafId, live: active.live };
+      } else s = await loadSavedSession(s);
+      captured = prepareContextRead(s, args);
     }
-    if (runtime) {
-      const active = await runtime.entries();
-      if (
-        active.entries.some((e) => typeof e.id !== 'string' || e.id.length > 128) ||
-        (active.leafId !== null &&
-          (typeof active.leafId !== 'string' || active.leafId.length > 128))
-      )
-        throw new Error('INVALID_RUNTIME_ENTRIES');
-      s.entries = active.entries;
-      s.leafId = active.leafId;
-      s.activity = active.activity;
-      s.live = active.live;
-    }
-    if (!runtime) s = await loadSavedSession(s);
-    const result = renderContextRead(s, args);
-    if (this.configFile) await this.refreshPermissions();
-    this.check('read', s);
-    return result;
+    const current = await this.session(id);
+    if (
+      current.file !== identity.file ||
+      current.header.id !== identity.native_id ||
+      current.header.cwd !== identity.native_cwd
+    )
+      throw new Error('RUNTIME_SESSION_CHANGED');
+    this.check('read', current, requestContext);
+    const live = captured.live,
+      snapshot = {
+        session_id: id,
+        leaf_id: captured.leaf_id,
+        selection: captured.selection,
+        omissions: captured.omissions,
+        ...(captured.history ? { history: captured.history } : {}),
+        units: captured.units,
+        source: runtime ? (runtime.attached ? runtime.record.kind : 'rpc') : 'saved',
+      };
+    const events = (runtime?.runtimeEvents ?? this.pool.runtimeEvents.get(id))?.snapshot(
+      Math.min(4096, Math.floor((args.max_bytes ?? 24000) / 4)),
+    );
+    return this.readCache.render(snapshot, args, {
+      identity,
+      resultBudget,
+      live,
+      runtimeEvents: events,
+      readPins,
+    });
   }
-  async send(args) {
+  async #send(args, { requestContext, pendingInput } = {}) {
     if (!SEND_MODES.includes(args.mode ?? 'default')) throw new Error('INVALID_ARGUMENTS');
-    return this.withInput(args.session_id, async (beforeDispatch) => {
+    return this.withInput(args.session_id, pendingInput, async (beforeDispatch) => {
+      requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
-      if (this.configFile) {
-        await this.refreshPermissions();
-        this.assertOpen();
-      }
       const input = promptInput(args);
       const body = input === undefined ? undefined : { ...input, mode: args.mode ?? 'default' };
       let target;
@@ -566,456 +464,338 @@ export class Bridge {
         target = await this.session(args.session_id);
       } catch {
         return {
-          request_id: args.request_id,
-          operation: 'send',
           status: 'rejected',
           reason: 'NOT_FOUND_OR_DENIED',
         };
       }
-      if (!permitted(this.config, 'send', target))
+      if (!permitted(requestContext.permissions, 'send', target))
         return {
-          request_id: args.request_id,
-          operation: 'send',
           status: 'rejected',
           reason: 'NOT_FOUND_OR_DENIED',
         };
-      return this.journal.run(args.request_id, 'send', args.session_id, body, (save) =>
-        this.mutationLock(args.session_id, 'send', save, async () => {
-          const selection = body.model
-            ? {
-                model_selection: { requested: body.model, scope: 'session', status: 'not_changed' },
-              }
-            : {};
-          try {
+      return this.mutationLock(args.session_id, 'send', requestContext, async () => {
+        const selection = {};
+        let runtime;
+        try {
+          beforeDispatch();
+          const s = await this.session(args.session_id);
+          this.check('send', s, requestContext);
+          // Existing owners remain readable/controllable independently of whether
+          // their original working directory still exists. Only a new execution
+          // needs a validated directory and a valid saved transcript.
+          runtime = await this.pool.forRead(s);
+          if (!runtime) {
+            await validateExecutionCwd(s.cwd);
+            await loadSavedSession(s);
+            runtime = await this.pool.resolve(s);
+          }
+          const authorized = async () => {
             beforeDispatch();
-            const s = await this.session(args.session_id);
-            this.check('send', s);
-            // Existing owners remain readable/controllable independently of whether
-            // their original working directory still exists. Only a new execution
-            // needs a validated directory and a valid saved transcript.
-            let runtime = await this.pool.forRead(s);
-            if (!runtime) {
-              await validateExecutionCwd(s.cwd);
-              await loadSavedSession(s);
-              runtime = await this.pool.resolve(s);
-            }
-            const authorized = async () => {
-              if (this.configFile) await this.refreshPermissions();
-              beforeDispatch();
-              this.check('send', s);
+            this.check('send', s, requestContext);
+          };
+          await authorized();
+          if (runtime.attached)
+            return attachedPromptResult(
+              await runtime.send({ ...args, ...body, beforeDispatch: authorized }),
+            );
+          if (hasPromptSettings(body) && body.mode === 'idle_only') {
+            const idle = await runtime.idleSnapshot();
+            if (idle.status === 'busy') return { ...selection, status: 'skipped', reason: 'busy' };
+            if (idle.status !== 'idle') throw new Error('MODEL_SELECTION_IDLE_UNCONFIRMED');
+          }
+          if (hasPromptSettings(body)) {
+            const actual = await runtime.selectModel(body.model, {
+              thinkingLevel: body.thinking_level,
+              images: body.images,
+              idle: true,
+              timeout: args.timeout_ms ?? 5000,
+              beforeDispatch: authorized,
+            });
+            selection.model_selection = {
+              model: actual.model,
+              thinking_level: actual.thinking_level,
             };
             await authorized();
-            if (runtime.attached)
-              return save(await runtime.send({ ...args, ...body, beforeDispatch: authorized }));
-            if (body.model && body.mode === 'idle_only') {
-              const state = await runtime.state();
-              if (
-                runtime.promptAdmission ||
+          }
+          if (body.mode === 'idle_only' || body.images) {
+            const state = await runtime.state();
+            assertImageModel(body.images, state.model);
+            if (
+              body.mode === 'idle_only' &&
+              (runtime.promptAdmission ||
                 state.isStreaming ||
                 state.isCompacting ||
-                state.pendingMessageCount > 0
-              )
-                return save({ ...selection, status: 'skipped', reason: 'busy' });
-            }
-            if (body.model) {
-              await runtime.selectModel(body.model, {
-                images: body.images,
-                idle: true,
-                timeout: args.timeout_ms ?? 5000,
-                beforeDispatch: authorized,
-                report: (status) => {
-                  selection.model_selection.status = status;
-                },
-                onLate: (result) => save(modelSelectedWithoutPrompt(result, selection, body.model)),
-              });
-              await authorized();
-            }
-            if (body.mode === 'idle_only' || body.images) {
-              const state = await runtime.state();
-              assertImageModel(body.images, state.model);
-              if (
-                body.mode === 'idle_only' &&
-                (runtime.promptAdmission ||
-                  state.isStreaming ||
-                  state.isCompacting ||
-                  state.isIdle === false ||
-                  state.pendingMessageCount > 0)
-              )
-                return save({ status: 'skipped', reason: 'busy' });
-            }
-            await authorized();
-            const command = {
-              type: 'prompt',
-              message: body.text,
-              ...(body.images ? { images: body.images } : {}),
-            };
-            command.streamingBehavior = body.mode === 'follow_up' ? 'followUp' : 'steer';
-            const late = (result) =>
-              save(
-                result.ok
-                  ? {
-                      ...selection,
-                      status: 'accepted',
-                      disposition: result.data.disposition,
-                      completion: 'not_tracked',
-                    }
-                  : { ...selection, status: 'rejected', reason: result.code },
-              );
-            const result = await runtime.command(
-              command,
-              args.timeout_ms ?? 5000,
-              late,
-              authorized,
-            );
-            return save({
-              ...selection,
-              status: 'accepted',
-              disposition: result.disposition,
-              completion: 'not_tracked',
-            });
-          } catch (e) {
-            return save({
-              ...selection,
-              status: e.uncertain ? 'unknown' : 'rejected',
-              reason: safeReason(e),
-            });
+                state.isIdle === false ||
+                state.pendingMessageCount > 0)
+            )
+              return { ...selection, status: 'skipped', reason: 'busy' };
           }
-        }),
-      );
-    });
-  }
-  command(args) {
-    return this.bash(args);
-  }
-  async bash(args) {
-    return this.withInput(args.session_id, async (checkInput) => {
-      this.assertOpen();
-      if (!bashSchema.safeParse(args).success) throw new Error('INVALID_BASH_ARGS');
-      if (this.configFile) await this.refreshPermissions();
-      const session = await this.session(args.session_id);
-      this.check('command', session);
-      const recovery_id = hash({
-        principal: this.config.principal,
-        session: session.id,
-        request: args.request_id,
+          await authorized();
+          const command = {
+            type: 'prompt',
+            message: body.text,
+            ...(body.images ? { images: body.images } : {}),
+            // Native admission must also refuse a hook that turns busy after selection.
+            ...promptOptions(hasPromptSettings(body) ? 'idle_only' : body.mode),
+          };
+          const late = () => {}; // Keep native late-ACK identity validation.
+          const result = await runtime.command(command, args.timeout_ms ?? 5000, late, () =>
+            beforePromptDispatch(runtime, body, selection, authorized),
+          );
+          return { ...selection, ...promptResult({ ok: true, data: result }) };
+        } catch (e) {
+          return {
+            ...selection,
+            ...promptResult({
+              ok: false,
+              code: safeReason(e),
+              uncertain: e.uncertain,
+            }),
+          };
+        }
       });
-      const body = args.command === undefined ? undefined : { command: args.command };
-      const receipt = await this.journal.run(
-        args.request_id,
-        'command',
-        session.id,
-        body,
-        args.cursor !== undefined
-          ? undefined
-          : async (save) => {
-              if (this.locks.has(`bash:${session.id}`))
-                return save({ status: 'rejected', reason: 'BASH_IN_PROGRESS' });
-              return this.locked(`bash:${session.id}`, async () => {
-                let generation;
-                try {
-                  const beforeDispatch = async () => {
-                    if (this.configFile) await this.refreshPermissions();
-                    checkInput();
-                    this.check('command', session);
-                    if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
-                  };
-                  await beforeDispatch();
-                  let runtime = await this.pool.forRead(session);
-                  if (!runtime) {
-                    await validateExecutionCwd(session.cwd);
-                    await loadSavedSession(session);
-                    runtime = await this.pool.resolve(session);
-                  }
-                  await beforeDispatch();
-                  if (typeof runtime.executeBash !== 'function')
-                    throw new Error('BASH_UNSUPPORTED');
-                  generation = runtime.generation ?? runtime.record?.generation ?? null;
-                  await save({ status: 'unknown', generation });
-                  await runtime.executeBash({
-                    ...args,
-                    recovery_id,
-                    beforeDispatch,
-                    onLate: () =>
-                      save({ status: 'accepted', completion: 'native_bash_result', generation }),
-                  });
-                  return save({ status: 'accepted', completion: 'native_bash_result', generation });
-                } catch (error) {
-                  return save({
-                    status: error.uncertain ? 'unknown' : 'rejected',
-                    reason: safeReason(error),
-                    ...(generation ? { generation } : {}),
-                  });
-                }
-              });
-            },
-      );
-      if (this.configFile) await this.refreshPermissions();
+    });
+  }
+  async #command(args, { requestContext, resultBudget, pendingInput } = {}) {
+    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
+      requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
-      this.check('command', session);
-      const result = receipt.generation
-        ? await recoveredBash(this.pool.attachmentDir, session, receipt.generation, recovery_id)
-        : null;
-      if (!result) {
-        if (receipt.status === 'accepted') throw new Error('BASH_RECOVERY_MISSING');
-        return { ...receipt, output_available: false };
-      }
-      return bashOutputPage(receipt, result, args);
-    });
-  }
-  async stop(args) {
-    this.assertOpen();
-    if (!stopSchema.safeParse(args).success) throw new Error('INVALID_STOP_ARGS');
-    if (this.configFile) await this.refreshPermissions();
-    const session = await this.session(args.session_id);
-    this.check('stop', session);
-    const recovery_id = hash({
-      principal: this.config.principal,
-      session: session.id,
-      request: args.request_id,
-    });
-    const receipt = await this.journal.run(
-      args.request_id,
-      'stop',
-      session.id,
-      args.cursor !== undefined ? undefined : {},
-      (save) =>
-        this.mutationLock(
-          session.id,
-          'stop',
-          save,
-          async () => {
-            let generation;
-            try {
-              this.assertOpen();
-              // Invalidate pending input without waiting behind its admission lock.
-              for (const input of this.inputs)
-                if (input.sessionId === session.id) input.stopped = true;
-              // Independent of prompt admission's lock; never start a writer.
-              const runtime = await this.pool.forRead(session);
-              this.assertOpen();
-              if (this.configFile) await this.refreshPermissions();
-              this.check('stop', session);
-              if (!runtime) return save({ status: 'skipped', reason: 'not_running' });
-              if (typeof runtime.stopExecution !== 'function') throw new Error('STOP_UNSUPPORTED');
-              generation = runtime.generation ?? runtime.record?.generation ?? null;
-              await save({ status: 'unknown', generation });
-              if (this.configFile) await this.refreshPermissions();
-              this.assertOpen();
-              this.check('stop', session);
-              // A join may have begun during owner lookup, ACL reload or receipt I/O.
-              // No stop command has been dispatched yet, so this is a definite refusal.
+      const session = await this.session(args.session_id);
+      this.check('command', session, requestContext);
+      let output;
+      const receipt = await (async () => {
+        if (this.locks.has(`bash:${session.id}`))
+          return { status: 'rejected', reason: 'BASH_IN_PROGRESS' };
+        return this.locked(`bash:${session.id}`, async () => {
+          let generation;
+          try {
+            const beforeDispatch = async () => {
+              checkInput();
+              this.check('command', session, requestContext);
               if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
-              const result = stopReceipt(await runtime.stopExecution({ ...args, recovery_id }));
-              return save({ ...result, generation });
-            } catch (error) {
-              return save({
-                status: error.uncertain ? 'unknown' : 'rejected',
-                reason: safeReason(error),
-                ...(generation ? { generation } : {}),
-              });
+            };
+            await beforeDispatch();
+            let runtime = await this.pool.forRead(session);
+            if (!runtime) {
+              await validateExecutionCwd(session.cwd);
+              await loadSavedSession(session);
+              runtime = await this.pool.resolve(session);
             }
-          },
-          `stop:${session.id}`,
-        ),
-    );
-    // Returning/replaying withdrawn content always rechecks current ACLs.
-    if (this.configFile) await this.refreshPermissions();
-    this.assertOpen();
-    this.check('stop', session);
-    const withdrawn = receipt.generation
-      ? await recoveredWithdrawal(this.pool.attachmentDir, session, receipt.generation, recovery_id)
-      : null;
-    if (withdrawn === null) {
-      if (receipt.status === 'skipped')
-        return withdrawalPage(
-          receipt,
-          { generation: null, text: '', includesEditorDraft: false },
-          args,
-        );
-      if (receipt.status === 'accepted') throw new Error('WITHDRAWAL_RECOVERY_MISSING');
-      return { ...receipt, withdrawn_available: false };
-    }
-    return withdrawalPage(receipt, withdrawn, args);
+            await beforeDispatch();
+            if (typeof runtime.executeBash !== 'function') throw new Error('BASH_UNSUPPORTED');
+            generation = runtime.generation ?? runtime.record?.generation ?? null;
+            output = inlineBashResult(await runtime.executeBash({ ...args, beforeDispatch }));
+            return { status: 'accepted', generation };
+          } catch (error) {
+            if (error.result) output = inlineBashResult(error.result);
+            return {
+              status: error.uncertain ? 'unknown' : 'rejected',
+              reason: safeReason(error),
+              ...(generation ? { generation } : {}),
+            };
+          }
+        });
+      })();
+      this.check('command', session, requestContext);
+      return output
+        ? bashOutput(receipt, output, args, resultBudget)
+        : { ...receipt, output_available: false };
+    });
   }
-  async create(args) {
+  async #stop(args, { requestContext, resultBudget, retainedInputs } = {}) {
+    requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
-    if (this.configFile) await this.refreshPermissions();
+    const session = await this.session(args.session_id);
+    this.check('stop', session, requestContext);
+    let withdrawn;
+    const receipt = await this.mutationLock(
+      session.id,
+      'stop',
+      requestContext,
+      async () => {
+        let generation;
+        try {
+          this.assertOpen();
+          for (const input of this.inputs)
+            if (input.sessionId === session.id && !retainedInputs?.has(input)) input.stopped = true;
+          const runtime = await this.pool.forRead(session);
+          this.assertOpen();
+          this.check('stop', session, requestContext);
+          if (!runtime) return { status: 'skipped', reason: 'not_running' };
+          if (typeof runtime.stopExecution !== 'function') throw new Error('STOP_UNSUPPORTED');
+          generation = runtime.generation ?? runtime.record?.generation ?? null;
+          if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
+          const result = await runtime.stopExecution(args);
+          withdrawn = inlineWithdrawal(result.withdrawal);
+          return { ...stopReceipt(result), generation };
+        } catch (error) {
+          if (error.result?.withdrawal) withdrawn = inlineWithdrawal(error.result.withdrawal);
+          return {
+            status: error.uncertain ? 'unknown' : 'rejected',
+            reason: safeReason(error),
+            ...(generation ? { generation } : {}),
+          };
+        }
+      },
+      `stop:${session.id}`,
+    );
+    this.check('stop', session, requestContext);
+    if (receipt.status === 'skipped')
+      withdrawn = { text: '', includesEditorDraft: false, complete: true };
+    return withdrawn
+      ? withdrawalOutput(receipt, withdrawn, args, resultBudget)
+      : { ...receipt, withdrawn_available: false };
+  }
+  async #create(args, { requestContext } = {}) {
+    requestContext = await (requestContext ?? this.captureRequestContext());
+    this.assertOpen();
     const folder = this.config.folders.find((folder) => folder.path === args.project);
-    if (!folder || !permitted(this.config, 'create', { cwd: folder.path }))
+    if (!folder || !permitted(requestContext.permissions, 'create', { cwd: folder.path }))
       return {
-        request_id: args.request_id,
-        operation: 'create',
         status: 'rejected',
         reason: 'NOT_FOUND_OR_DENIED',
       };
     const input = promptInput(args);
-    const body =
-      input === undefined ? undefined : { ...input, name: args.name, fork_from: args.fork_from };
-    return this.journal.run(args.request_id, 'create', folder.path, body, (save) =>
-      this.locked(`project:${folder.path}`, async () => {
-        let child,
-          created = false;
-        const selection = input.model
-          ? { model_selection: { requested: input.model, scope: 'session', status: 'not_changed' } }
-          : {};
-        const outcome = (send) => ({
-          status: send.status,
-          created,
-          session_id: child?.id,
-          send: { ...selection, ...send },
-        });
-        try {
-          await validateExecutionCwd(folder.path);
-          let parent, snapshot;
-          if (args.fork_from) {
-            parent = await this.session(args.fork_from);
-            this.check('read', parent);
-            const runtime = await this.pool.forRead(parent);
-            if (runtime?.attached) {
-              if (typeof runtime.snapshot !== 'function') throw new Error('SNAPSHOT_UNSUPPORTED');
-              snapshot = await runtime.snapshot();
-            } else snapshot = runtime ? await runtime.entries() : await loadSavedSession(parent);
-          }
-          child = prepareSession(this.config, folder.path, { name: args.name, parent, snapshot });
-          // Persist the chosen child identity before creating a file. Retries never
-          // create another child or replay an uncertain first prompt.
-          await save(outcome({ status: 'unknown', phase: 'creating' }));
-          if (this.configFile) await this.refreshPermissions();
-          this.check('create', { cwd: folder.path });
-          if (parent) this.check('read', parent);
-          this.assertOpen();
-          return await this.locked(child.id, () =>
-            this.withInput(child.id, async (checkInput) => {
-              const beforeDispatch = async () => {
-                if (this.configFile) await this.refreshPermissions();
-                this.check('create', { cwd: folder.path });
-                if (parent) this.check('read', parent);
-                checkInput();
-                if (this.handoffs.has(child.id)) throw new Error('HANDOFF_PENDING');
-              };
-              await beforeDispatch();
-              await persistSession(child);
-              created = true;
-              await save(outcome({ status: 'unknown', phase: 'starting' }));
-              const runtime = await this.pool.resolve(child);
-              await beforeDispatch();
-              if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
-              if (input.model) {
-                await runtime.selectModel(input.model, {
-                  images: input.images,
-                  idle: true,
-                  timeout: args.timeout_ms ?? 5000,
-                  beforeDispatch,
-                  report: (status) => {
-                    selection.model_selection.status = status;
-                  },
-                  onLate: (result) =>
-                    save(outcome(modelSelectedWithoutPrompt(result, selection, input.model))),
-                });
-                await beforeDispatch();
-              }
-              if (input.images) {
-                assertImageModel(input.images, (await runtime.state()).model);
-                await beforeDispatch();
-              }
-              const onLate = (result) =>
-                save(
-                  outcome(
-                    result.ok
-                      ? {
-                          status: 'accepted',
-                          disposition: result.data.disposition,
-                          completion: 'not_tracked',
-                        }
-                      : { status: 'rejected', reason: result.code },
-                  ),
-                );
-              const result = await runtime.command(
-                {
-                  type: 'prompt',
-                  message: input.text,
-                  ...(input.images ? { images: input.images } : {}),
-                  streamingBehavior: 'steer',
-                },
-                args.timeout_ms ?? 5000,
-                onLate,
-                beforeDispatch,
-              );
-              return save(
-                outcome({
-                  status: 'accepted',
-                  disposition: result.disposition,
-                  completion: 'not_tracked',
-                }),
-              );
-            }),
-          );
-        } catch (error) {
-          if (error.sessionPublished) created = true;
-          const result = {
-            status: error.uncertain ? 'unknown' : 'rejected',
-            reason: safeReason(error),
-          };
-          return save(child ? outcome(result) : result);
-        }
-      }),
-    );
-  }
-  async delete(args) {
-    this.assertOpen();
-    if (this.configFile) {
-      await this.refreshPermissions();
+    let child,
+      created = false;
+    const selection = {};
+    const outcome = (send) => ({
+      status: send.status,
+      created,
+      session_id: child?.id,
+      send: { ...selection, ...send },
+    });
+    try {
+      await validateExecutionCwd(folder.path);
+      let parent, snapshot;
+      if (args.fork_from) {
+        parent = await this.session(args.fork_from);
+        this.check('read', parent, requestContext);
+        const runtime = await this.pool.forRead(parent);
+        if (runtime?.attached) {
+          if (typeof runtime.snapshot !== 'function') throw new Error('SNAPSHOT_UNSUPPORTED');
+          snapshot = await runtime.snapshot();
+        } else snapshot = runtime ? await runtime.entries() : await loadSavedSession(parent);
+      }
+      child = await prepareSession(this.config, folder.path, {
+        name: args.name,
+        parent,
+        snapshot,
+      });
+      // Keep the chosen child identity in partial failure responses.
+
+      this.check('create', { cwd: folder.path }, requestContext);
+      if (parent) this.check('read', parent, requestContext);
       this.assertOpen();
+      return await this.locked(child.id, () =>
+        this.withInput(child.id, this.registerInput(child.id), async (checkInput) => {
+          const beforeDispatch = async () => {
+            this.check('create', { cwd: folder.path }, requestContext);
+            if (parent) this.check('read', parent, requestContext);
+            checkInput();
+            if (this.handoffs.has(child.id)) throw new Error('HANDOFF_PENDING');
+          };
+          await beforeDispatch();
+          await persistSession(child);
+          created = true;
+
+          const runtime = await this.pool.resolve(child);
+          await beforeDispatch();
+          if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
+          if (hasPromptSettings(input)) {
+            const actual = await runtime.selectModel(input.model, {
+              thinkingLevel: input.thinking_level,
+              images: input.images,
+              idle: true,
+              timeout: args.timeout_ms ?? 5000,
+              beforeDispatch,
+            });
+            selection.model_selection = {
+              model: actual.model,
+              thinking_level: actual.thinking_level,
+            };
+            await beforeDispatch();
+          }
+          if (input.images) {
+            assertImageModel(input.images, (await runtime.state()).model);
+            await beforeDispatch();
+          }
+          const onLate = () => {}; // No public late-result lookup.
+          const result = await runtime.command(
+            {
+              type: 'prompt',
+              message: input.text,
+              ...(input.images ? { images: input.images } : {}),
+              ...promptOptions(hasPromptSettings(input) ? 'idle_only' : 'default'),
+            },
+            args.timeout_ms ?? 5000,
+            onLate,
+            () => beforePromptDispatch(runtime, input, selection, beforeDispatch),
+          );
+          return outcome(promptResult({ ok: true, data: result }));
+        }),
+      );
+    } catch (error) {
+      if (error.sessionPublished) created = true;
+      const result = promptResult({
+        ok: false,
+        code: safeReason(error),
+        uncertain: error.uncertain,
+      });
+      return child ? outcome(result) : result;
     }
-    const prior = await this.journal.get(args.request_id);
+  }
+  async #delete(args, { requestContext, resultBudget } = {}) {
+    requestContext = await (requestContext ?? this.captureRequestContext());
+    this.assertOpen();
     const target = await this.session(args.session_id).catch(() => null);
     if (
       !permitted(
-        this.config,
+        requestContext.permissions,
         'delete',
         target ?? {
           id: args.session_id,
-          cwd: prior?.key === `delete:${args.session_id}` ? prior.receipt.project : null,
+          cwd: null,
         },
       )
     )
       return {
-        request_id: args.request_id,
-        operation: 'delete',
         status: 'rejected',
         reason: 'NOT_FOUND_OR_DENIED',
       };
-    return this.journal.run(args.request_id, 'delete', args.session_id, {}, (save) =>
-      this.mutationLock(args.session_id, 'delete', save, async () => {
-        let trash, release;
-        try {
-          const s = await this.session(args.session_id);
-          this.check('delete', s);
-          trash = await prepareTrash(this.config, s);
-          if (this.configFile) await this.refreshPermissions();
-          this.check('delete', s);
-          release = await this.pool.stopForDelete(s); // Hold ownership through the move.
-          if (this.configFile) await this.refreshPermissions();
-          this.check('delete', s);
-          await trash.move();
-          return save({
+    return this.mutationLock(args.session_id, 'delete', requestContext, async () => {
+      let trash, release;
+      try {
+        const s = await this.session(args.session_id);
+        this.check('delete', s, requestContext);
+        trash = await prepareTrash(this.config, s);
+        this.check('delete', s, requestContext);
+        release = await this.pool.stopForDelete(s); // Hold ownership through the move.
+        this.check('delete', s, requestContext);
+        await trash.move();
+        return optionalResultFields(
+          {
             status: 'deleted',
             recoverable: true,
             restore_token: trash.token,
-            project: s.cwd,
-          });
-        } catch (e) {
-          return save({
+          },
+          { project: s.cwd },
+          resultBudget,
+        );
+      } catch (e) {
+        return optionalResultFields(
+          {
             status: trash?.moved ? 'unknown' : 'rejected',
             reason: safeReason(e),
-            project: target?.cwd ?? null,
-          });
-        } finally {
-          await trash?.cancel().catch(() => {});
-          await release?.();
-        }
-      }),
-    );
+          },
+          { project: target?.cwd ?? null },
+          resultBudget,
+        );
+      } finally {
+        await trash?.cancel().catch(() => {});
+        await release?.();
+      }
+    });
   }
   handoffForLocal(request, options) {
     return idleHandoff(this, request, options);
@@ -1026,6 +806,17 @@ export class Bridge {
   async releaseForLocal({ session_id, interrupt = false }) {
     this.assertOpen();
     if (typeof interrupt !== 'boolean') throw new Error('INVALID_OWNER_COMMAND');
+    // EOF can be held indefinitely by a native shutdown hook. Interrupt must
+    // reach that exact closing child without waiting behind its session lane.
+    const closing = this.pool.instances.get(session_id);
+    if (interrupt && closing instanceof PiRpc && closing.gracefulExitPromise && !closing.exited) {
+      await closing.assertProcessIdentity();
+      await updateOwner(this.pool.attachmentDir, closing.session, closing.ownerRecord, {
+        noColdReacquire: true,
+      });
+      await closing.stop();
+      return { session_id, status: 'released', no_cold_reacquire: true };
+    }
     if (this.handoffs.has(session_id)) throw new Error('HANDOFF_PENDING');
     const priorStop = this.locks.get(`stop:${session_id}`),
       release = { kind: 'release' };
@@ -1035,29 +826,49 @@ export class Bridge {
         // An admitted stop finishes its receipt capture before owner shutdown.
         await priorStop?.catch(() => {});
         this.assertOpen();
-        const session = await this.session(session_id),
-          dir = this.pool.attachmentDir;
+        const owned = this.pool.instances.get(session_id);
+        let session;
+        // Missing history must not strand a child we already own. Existing
+        // replacement or unsafe files still require normal identity discovery.
+        if (
+          owned instanceof PiRpc &&
+          owned.alive &&
+          (await assertSingleSessionFile(owned.session.file, { allowMissing: true })) === null
+        ) {
+          await owned.assertProcessIdentity();
+          session = owned.session;
+        } else session = await this.session(session_id);
+        const dir = this.pool.attachmentDir;
         if (this.pool.starting.has(session_id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
         const runtime = await this.pool.forRead(session);
         if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
         if (runtime) {
           if (!(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
           runtime.handoffPending = true;
+          const previousNoCold = runtime.ownerRecord?.noColdReacquire === true;
           try {
             if (interrupt) {
-              await runtime.checkedState();
-              const owner = runtime.ownerRecord?.owner;
-              if (owner?.pid !== runtime.child?.pid || !(await ownerAlive(owner)))
-                throw new Error('RUNTIME_SESSION_CHANGED');
+              await runtime.state();
+              await runtime.assertProcessIdentity();
             } else await runtime.assertReleasable();
-            await runtime.drainRecovery();
-            if (!interrupt && runtime.recoveryError()) throw runtime.recoveryError();
+            await runtime.drainAcks();
             await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
             if (interrupt) await this.pool.stop(session_id);
             else {
               await runtime.gracefulExit();
               this.pool.instances.delete(session_id);
             }
+          } catch (error) {
+            if (
+              error.code === 'RUNTIME_BUSY' &&
+              !runtime.gracefulExitPromise &&
+              runtime.ownerRecord &&
+              (runtime.ownerRecord.noColdReacquire === true) !== previousNoCold
+            )
+              await updateOwner(dir, session, runtime.ownerRecord, {
+                noColdReacquire: previousNoCold,
+              });
+            throw error;
           } finally {
             if (!runtime.gracefulExitPromise && !runtime.stopPromise)
               runtime.handoffPending = false;
@@ -1102,49 +913,50 @@ export class Bridge {
   assertOpen() {
     if (this.closing) throw new Error('BRIDGE_CLOSING');
   }
+  prepareClose() {
+    // Freeze business admission before transport drain: already-dispatched
+    // work finishes, queued mutations cannot start another writer.
+    this.closing = true;
+    return (this.closePreparation ??= Promise.all([
+      this.pool.prepareClose?.(),
+      this.ownerControl?.close(),
+    ]));
+  }
   async close() {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    this.readCache.clear();
     this.closePromise = (async () => {
-      await this.ownerControl?.close();
-      await Promise.allSettled([...this.journal.running.values()]);
-      await this.pool.drainRecovery?.();
+      await this.prepareClose();
+      while (this.pendingMutations.size) await Promise.allSettled([...this.pendingMutations]);
+      await this.pool.drainAcks?.();
       await this.pool.close();
-      await Promise.allSettled([...this.journal.transitions.values()]);
-      await Promise.allSettled([...this.journal.writes.values()]);
       if (this.lock) {
         await this.lock.close();
-        await fs.unlink(this.lockPath);
         this.lock = null;
-      }
-      const recoveryError = this.pool.recoveryError?.();
-      if (recoveryError) throw recoveryError;
-      if (this.journal.writeFailures.size) {
-        const error = new Error('RECEIPT_PERSIST_FAILED');
-        error.uncertain = true;
-        throw error;
       }
     })();
     return this.closePromise;
   }
 }
-function modelSelectedWithoutPrompt(result, selection, requested) {
-  const selected = result.ok && sameModel(result.data, requested);
-  return {
-    status: 'rejected',
-    reason: selected
-      ? 'MODEL_SELECTED_PROMPT_NOT_SENT'
-      : result.ok
-        ? 'MODEL_SELECTION_CHANGED'
-        : result.code,
-    model_selection: { ...selection.model_selection, status: selected ? 'selected' : 'unknown' },
-  };
+async function beforePromptDispatch(runtime, input, selection, authorize) {
+  if (hasPromptSettings(input) || input.images) {
+    const current = await runtime.state();
+    assertPromptSelection(input, current);
+    if (hasPromptSettings(input))
+      selection.model_selection = modelSettings({
+        model: current.model,
+        thinking_level: current.thinkingLevel,
+      });
+  }
+  // Native selection can change locally while observations are awaited. Check
+  // Stop/handoff admission last; never restore a model to make preflight pass.
+  await authorize();
 }
 function safeReason(error) {
   const code = error.code ?? error.message;
   diagnostics.emit('operation.failure', { code, uncertain: error.uncertain === true });
   return [
-    'RECEIPT_PERSIST_FAILED',
     'IMAGE_INPUT_UNSUPPORTED',
     'MODEL_IMAGE_INPUT_UNSUPPORTED',
     'MODEL_SELECTION_UNSUPPORTED',
@@ -1157,21 +969,19 @@ function safeReason(error) {
     'THINKING_LEVEL_UNSUPPORTED',
     'THINKING_SUPPORT_UNKNOWN',
     'MODEL_REQUIRES_PROMPT',
-    'MODELS_UNSUPPORTED',
     'COMPACT_UNSUPPORTED',
+    'HOST_COMPACT_UNCERTAIN',
     'COMPACTION_PENDING',
     'INVALID_COMPACT_RESULT',
     'COMPACT_BUSY',
     'COMPACT_IDLE_UNCONFIRMED',
-    'RELOAD_BUSY',
-    'RELOAD_IDLE_UNCONFIRMED',
-    'RELOAD_NOT_RUNNING',
-    'RELOAD_UNSUPPORTED',
-    'RELOAD_OWNER_CHANGED',
     'RUNTIME_EXIT_ABNORMAL',
-    'RECOVERY_PERSIST_FAILED',
+    'RUNTIME_EXIT_BEFORE_EOF',
+    'EXTENSION_UI_STARTUP_UNAVAILABLE',
+    'EXTENSION_UI_SHUTDOWN_UNAVAILABLE',
     'BRIDGE_CLOSING',
     'INVALID_PROMPT_INPUT',
+    'INVALID_PROMPT_RESULT',
     'SNAPSHOT_UNSUPPORTED',
     'SESSION_TOO_LARGE',
     'INVALID_HOST_SNAPSHOT',
@@ -1189,10 +999,13 @@ function safeReason(error) {
     'HOST_NOT_READY',
     'HOST_SUBMIT_UNCERTAIN',
     'EXECUTION_CWD_UNAVAILABLE',
+    'STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY',
+    'UNSAFE_NATIVE_SESSION_STORAGE',
     'INVALID_SESSION',
     'INVALID_SESSION_TREE',
     'NOT_FOUND_OR_DENIED',
     'ATTACHMENT_REQUEST_TOO_LARGE',
+    'ATTACHMENT_PROTOCOL_MISMATCH',
     'PROMPT_ADMISSION_PENDING',
     'PI_REJECTED',
     'ACK_TIMEOUT',

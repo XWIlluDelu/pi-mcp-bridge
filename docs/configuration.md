@@ -1,17 +1,16 @@
 # Owner configuration and permissions
 
-Use a canonical JSON file owned by the service user with no group/other permissions. Both direct transports and permission refresh enforce this; permissions are never repaired automatically. [The example](../deploy/owner.example.json) denies every operation. Replace its paths with directories you explicitly intend the Bridge to access. When only some projects are authorized, configure those projects' session roots rather than a broad parent.
+Use a canonical JSON file owned by the service user with no group/other permissions. Both direct transports and request policy reads enforce this; permissions are never repaired automatically. [The example](../deploy/owner.example.json) denies every operation. Replace its paths with directories you explicitly intend the Bridge to access. When only some projects are authorized, configure those projects' session roots rather than a broad parent.
 
 ## Settings
 
-Only the fields below are accepted. Unknown fields and incomplete baseline permissions are rejected. Project and session grants can override subsets of their applicable rights.
+Only the fields below are accepted. Unknown fields and incomplete baseline permissions are rejected. Project and session grants can override subsets of their applicable rights. Projects use canonical paths, not folder IDs; there is no caller `principal` field. Use the current example when updating a configuration, and update Bridge, companion and host bindings together.
 
 | Key                       | Meaning                                                                                                                       |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `principal`               | Stable caller/receipt namespace. One service uses one policy identity.                                                        |
-| `stateDir`                | Private Bridge state: receipts, lock and recoverable trash.                                                                   |
+| `stateDir`                | Private Bridge state and recoverable session trash; also the namespace for service exclusivity.                               |
 | `sessionRoots`            | Nonempty array of absolute native session storage directories.                                                                |
-| `folders`                 | Authorized configuration scope, each `{id,path}`; `path` is the absolute project cwd. Inclusion alone grants nothing.         |
+| `folders`                 | Authorized configuration scope, each `{path}`; `path` is the absolute project cwd. Inclusion alone grants nothing.            |
 | `defaults`                | Required baseline with all seven permission keys. Each value is boolean or `null`; `null` denies at this scope.               |
 | `grants`                  | Project/session permission overrides.                                                                                         |
 | `attachmentDir`           | Optional shared private registry directory; every cooperating owner must use the same canonical directory.                    |
@@ -31,21 +30,21 @@ Only the fields below are accepted. Unknown fields and incomplete baseline permi
 
 ### Native environment
 
-By default the child runs the user's installed `pi` from the service process's PATH, inherits that process's environment and uses normal Pi discovery for tools, packages, extensions, skills and project context. Pi resolves authentication through its native configuration and inherited environment. A service may have a different PATH from your interactive shell; configure its environment or set `piExecutable` explicitly. Missing Pi returns `PI_EXECUTABLE_NOT_FOUND`; an explicitly selected non-executable path returns `PI_EXECUTABLE_NOT_EXECUTABLE`. Neither error falls back to the Bridge's development dependency. Existing cooperating writers are reused without resolving or starting another executable.
+By default the child runs the user's installed `pi` from the service process's PATH, inherits that process's environment and uses normal Pi discovery for tools, packages, extensions, skills and project context. Pi resolves authentication through its native configuration and inherited environment. A service may have a different PATH from your interactive shell; configure its environment or set `piExecutable` explicitly. Missing Pi returns `PI_EXECUTABLE_NOT_FOUND`; an explicitly selected non-executable path returns `PI_EXECUTABLE_NOT_EXECUTABLE`. Bridge has no bundled or development Pi dependency. Existing cooperating writers are reused without resolving or starting another executable.
 
 Explicit `piRuntime` keys:
 
 - `agentDir`: absolute alternative native agent directory.
-- `inheritEnv`: environment-variable allowlist. Omitting it inherits the normal environment; an empty list isolates it.
+- `inheritEnv`: environment-variable allowlist. Omitting it inherits the normal environment. An empty list removes inherited variables except `PATH`, which is always preserved for executable discovery (or defaults to `/usr/bin:/bin` if absent).
 - `tools`: subset of native read/write/edit/bash/grep/find/ls. Omitting it leaves native defaults; an empty array disables built-in tools.
 
 A `piRuntime` override changes the runtime environment; it is not a permission grant. Model tools and installed extensions can run shell commands, access files or make network calls, so denying the Bridge's direct `command` tool does not sandbox a prompt authorized by `send`.
 
 ### Native control permissions
 
-- `send`: model discovery, model/thinking settings, manual `compact` and idle RPC `reload`.
+- Session `send`: model/thinking prompt settings and manual `compact`.
 - `create`: a `create` call's initial model selection.
-- `stop`: required in addition to `send` only for explicit `compact(interrupt:true)`. Default idle compaction and idle reopen do not need it.
+- `stop`: required in addition to `send` only for explicit `compact(interrupt:true)`. Default idle compaction does not need it.
 - `read`: protects compaction summaries.
 
 See [model control](model-control.md) for details.
@@ -84,11 +83,19 @@ Consequences:
 - `list:false, read:true`: a known ID can be read but not discovered.
 - `list:true, read:false`: listing metadata is visible, conversation content is not.
 - `stop:true, read:false`: permits stop and its own withdrawn-input result.
-- `command:true, read:false`: permits command output and receipt recovery.
+- `command:true, read:false`: permits command output without granting history read.
 - `create:true, send:false`: permits the initial prompt; later prompts need `send`. A fork also needs the parent's `read`.
 - `delete:true` needs no `list`, `read`, `send` or `stop`, and grants no access to project files.
 
-Backend checks apply to batch items, receipt recovery and read continuations. Permission edits are reloaded before each request and after significant owner or snapshot waits. Revocation does not roll back work already admitted to Pi. Configuration changes outside `defaults` and `grants` need a service restart.
+### Request permission snapshots
+
+The authoritative Bridge starts one policy read when it receives a complete, schema-valid business request, before executor or session queues. The resulting independent, immutable `defaults`/`grants` snapshot governs that request's checks, execution and returned data, including waits, cold startup, native ACKs and inline output delivery. Later permission edits affect new requests only; they neither revoke nor add rights to an in-flight request. The stdio proxy only forwards requests; client/proxy timestamps and the later native execution time do not select the policy.
+
+All items of one batch share its outer request's snapshot. Fork source `read` and destination `create` checks use that same snapshot. Listing, parent references, page-local `creatable_projects`, health diagnostics also use the request snapshot.
+
+Every new call captures a new policy, including every new mutation and each read cursor page. A read cursor is not an authorization token. Late ACKs finish native identity checks without replaying work or acquiring rights from another request; permission snapshots are process-local, not persisted credentials.
+
+Snapshot authorization does not freeze session/file/native IDs, cwd, generation, owner or execution state. Identity checks, single-writer protection, Stop/handoff fences, cancellation and lifecycle checks still apply throughout execution. Input requests register their Stop fence before waiting for policy I/O. Invalid/unreadable policy rejects a new request without falling back to an older policy. Configuration changes outside `defaults` and `grants` need a service restart.
 
 ### Diagnose combinations
 
@@ -102,10 +109,10 @@ Load `src/owner-permissions-extension.mjs` into Pi with `PI_MCP_OWNER_CONFIG=/ab
 
 The menu is a human shortcut, not a model tool or slash command. It writes only the chosen field, preserves other settings, rejects concurrent edits and closes on native session lifecycle changes. A saved session outside the configured roots cannot be edited through this session's menu.
 
-## Deployment
+## Startup and deployment
 
-Bridge validates configuration and storage when initializing. For HTTP, create a private random token file and add the `http` block described in [transports](transports.md).
+Startup validates configuration and filesystem boundaries directly. For HTTP, create a private random token file and add the `http` block described in [transports](transports.md).
 
 `deploy/pi-mcp-bridge.service` is an optional user-systemd template. Review its installation paths, environment and stop budget before use. Autostart/linger, tunnel organization login and external authentication are owner deployment decisions.
 
-After a Bridge process crash, its state lock is retained. Confirm that the exact former Bridge and all owned native writers have exited before removing `stateDir/bridge.lock`. Never delete the registry's writer claims to make an unreachable live owner look dead. Local handoff fences have a separate reset procedure in [runtime](runtime.md).
+Service exclusivity and permission edits use independent Linux kernel-owned mutexes. A crash releases each mutex; permission edits still compare the captured revision before atomic replacement. After obtaining service exclusivity, startup removes only its own namespace's stale owner-control socket. It does not remove session writer claims: surviving native writers still block takeover through exact PID/start/boot and generation checks. An explicit local pause has a separate reset procedure in [runtime](runtime.md).

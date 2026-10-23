@@ -1,46 +1,14 @@
-import { createHash } from 'node:crypto';
 import { buildSessionProjection } from '@earendil-works/pi-coding-agent';
 import { readSchema, contextSelection } from './read-schema.mjs';
+import { jsonBytes, fitsResult } from './response-budget.mjs';
+import { boundRuntimeEvents } from './runtime-events.mjs';
+import { sessionEntryIndex } from './data.mjs';
 
-const FORMAT = 'context_timeline';
-const VERSION = 1;
-const bytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
-const digest = (value) =>
-  createHash('sha256')
-    .update(JSON.stringify(value) ?? 'undefined')
-    .digest('base64url');
-const boundary = (text, at) =>
-  !(
-    at > 0 &&
-    at < text.length &&
-    text.charCodeAt(at - 1) >= 0xd800 &&
-    text.charCodeAt(at - 1) <= 0xdbff &&
-    text.charCodeAt(at) >= 0xdc00 &&
-    text.charCodeAt(at) <= 0xdfff
-  );
-const encodeCursor = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
-function decodeCursor(value) {
-  try {
-    if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
-    const cursor = JSON.parse(Buffer.from(value, 'base64url').toString('utf8'));
-    if (
-      cursor?.kind !== FORMAT ||
-      cursor.version !== VERSION ||
-      typeof cursor.session !== 'string' ||
-      typeof cursor.selection !== 'string' ||
-      typeof cursor.projection !== 'string' ||
-      !(cursor.leaf_id === null || typeof cursor.leaf_id === 'string') ||
-      !Number.isSafeInteger(cursor.index) ||
-      cursor.index < 0 ||
-      !Number.isSafeInteger(cursor.offset) ||
-      cursor.offset < 1
-    )
-      throw new Error();
-    return cursor;
-  } catch {
-    throw new Error('INVALID_CURSOR');
-  }
-}
+export const READ_CONTRACT = 'semantic_units_v2';
+export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
+export const READ_PAGE_LIMIT = 65536;
+const UNIT_TARGET = 2048;
+
 const take = (values, n, reverse = false) =>
   n === -1 ? values : n === 0 ? [] : reverse ? values.slice(-n) : values.slice(0, n);
 const ends = (values, n) =>
@@ -52,10 +20,8 @@ const ends = (values, n) =>
  */
 function timeline(projection) {
   const records = [],
-    prompts = [],
-    summaryParts = [];
-  let prompt = null,
-    summaryRecord;
+    prompts = [];
+  let prompt = null;
   function add(type, source, extra = {}, owner = prompt) {
     const record = {
       id: `${source.entry_id}:${source.message_index ?? 'boundary'}:${source.block_index ?? 'message'}:${type}`,
@@ -91,8 +57,7 @@ function timeline(projection) {
         prompts.push(prompt);
         add('prompt', source, { synthetic: false, message });
       } else if (message.role === 'compactionSummary' || message.role === 'branchSummary') {
-        if (!summaryRecord) summaryRecord = add('summary', source, { parts: summaryParts }, null);
-        summaryParts.push({ source, message });
+        add('summary', source, { parts: [{ source, message }] }, null);
       } else if (message.role === 'system') {
         add('system', source, { message }, null);
       } else if (message.role === 'assistant') {
@@ -211,26 +176,27 @@ function selectTimeline(projected, selection) {
     included.commands++;
   }
   for (const record of records) {
+    if (record.type === 'system' && selection.tools === 0) {
+      // Tool declarations follow tools selection; instructions remain global.
+      const { toolsAdded, toolsRemoved, ...message } = record.message;
+      if (!message.content?.length && !Object.keys(message.sections ?? {}).length) continue;
+      record.message = message;
+    }
     if (record.type === 'prompt' && selectedPrompts.has(record.prompt_id)) chosen.add(record);
     if (record.type === 'summary' && selection.summary !== 0) {
       chosen.add(record);
       included.summary = 1;
     }
-    // Seven selectors do not describe system/custom/unknown native content.
-    // Preserve it rather than silently redefining "full" as text-only.
-    if (['system', 'custom', 'native'].includes(record.type)) {
-      if (
-        record.type !== 'native' ||
-        (!record.metadata && record.message?.role !== 'assistant') ||
-        selectedPrompts.has(record.prompt_id)
-      )
-        chosen.add(record);
-    }
+    // System/context prefixes are global. Custom and unknown native records
+    // after a prompt belong to that prompt's window, just like its text.
+    if (
+      ['system', 'custom', 'native'].includes(record.type) &&
+      (record.prompt_id === null || selectedPrompts.has(record.prompt_id))
+    )
+      chosen.add(record);
   }
   return {
-    records: records
-      .filter((r) => chosen.has(r))
-      .map((r, index) => ({ ...r, record_index: index })),
+    records: records.filter((r) => chosen.has(r)),
     latestPrompt: prompts.at(-1) ?? null,
     latestPromptSelected: selectedPrompts.has(prompts.at(-1)),
     omissions: Object.fromEntries(
@@ -239,462 +205,577 @@ function selectTimeline(projected, selection) {
   };
 }
 
-// Live output is an explicitly transient preview, never part of a historical
-// cursor. Bound its share so an enormous partial answer cannot starve history.
-function livePreview(live, selection, selected, maxBytes) {
-  if (!live) return null;
+// Only native fields are reduced. Tool arguments, details and unknown business
+// objects are not recursively filtered by property name.
+const pick = (value, keys) =>
+  Object.fromEntries(
+    keys.filter((key) => value?.[key] !== undefined).map((key) => [key, value[key]]),
+  );
+const messageFields = [
+  'role',
+  'timestamp',
+  'model',
+  'provider',
+  'thinkingLevel',
+  'stopReason',
+  'errorMessage',
+  'toolCallId',
+  'toolName',
+  'isError',
+  'customType',
+  'display',
+  'details',
+  'command',
+  'exitCode',
+  'cancelled',
+  'truncated',
+  'excludeFromContext',
+  'fullOutputPath',
+  'fromId',
+  'firstKeptEntryId',
+  'tokensBefore',
+];
+function boundedFields(value) {
+  const result = Object.create(null);
+  for (const [key, field] of Object.entries(value)) {
+    if (jsonBytes(field) > READ_PAGE_LIMIT) {
+      result[key + '_omitted'] = true;
+      result.complete = false;
+      result.reason = 'oversized_indivisible_content';
+    } else result[key] = structuredClone(field);
+  }
+  return result;
+}
+function cleanBlock(block) {
+  if (block?.type === 'image')
+    return {
+      type: 'image',
+      mime_type: block.mimeType ?? block.mime_type ?? null,
+      data_omitted: true,
+    };
+  if (block?.type === 'text') return { type: 'text', text: block.text ?? '' };
+  if (block?.type === 'thinking')
+    return { type: 'thinking', thinking: block.thinking ?? '', ...pick(block, ['redacted']) };
+  if (block?.type === 'toolCall')
+    return boundedFields(
+      pick(block, [
+        'type',
+        'id',
+        'name',
+        'namespace',
+        'arguments',
+        'argumentsError',
+        'arguments_error',
+      ]),
+    );
+  return boundedFields(block && typeof block === 'object' ? block : { value: block });
+}
+function cleanMessage(message) {
+  const result = boundedFields(pick(message, messageFields));
+  if (message?.content !== undefined)
+    result.content = Array.isArray(message.content)
+      ? message.content.map(cleanBlock)
+      : message.content;
+  if (message?.nestedCalls !== undefined) result.nestedCalls = structuredClone(message.nestedCalls);
+  // Known system sections/tool declarations are splittable reading content.
+  // They must not be discarded as one oversized metadata object.
+  for (const key of ['summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'])
+    if (message?.[key] !== undefined) result[key] = message[key];
+  return result;
+}
+function cleanRecord(record) {
+  const result = {
+    ...pick(record, [
+      'type',
+      'prompt_id',
+      'source',
+      'synthetic',
+      'reason',
+      'tool_id',
+      'call_id',
+      'pairing',
+      'call_source',
+      'in_model_context',
+    ]),
+  };
+  const sourceFields = ['entry_id', 'entry_index', 'message_index', 'block_index'];
+  if (record.source) result.source = pick(record.source, sourceFields);
+  if (record.call_source) result.call_source = pick(record.call_source, sourceFields);
+  if (record.block) {
+    result.block = cleanBlock(record.block);
+    const metadata = boundedFields(
+      pick(record.metadata, [
+        'timestamp',
+        'model',
+        'provider',
+        'thinkingLevel',
+        'stopReason',
+        'errorMessage',
+      ]),
+    );
+    if (Object.keys(metadata).length) result.metadata = metadata;
+  }
+  if (record.message) result.message = cleanMessage(record.message);
+  if (record.parts)
+    result.parts = record.parts.map(({ source, message }) => ({
+      source,
+      message: cleanMessage(message),
+    }));
+  return result;
+}
+
+// Prefer paragraphs and lines; long lines split at whitespace where possible,
+// otherwise at Unicode code point boundaries. Parts retain the original source.
+function* longLineParts(line) {
+  let group = '',
+    bytes = 2;
+  for (const point of line) {
+    const size = jsonBytes(point) - 2;
+    if (bytes + size > UNIT_TARGET) {
+      const whitespace = group.match(/\s+(?=\S*$)/u),
+        end =
+          whitespace && whitespace.index > group.length / 2
+            ? whitespace.index + whitespace[0].length
+            : group.length;
+      yield group.slice(0, end);
+      group = group.slice(end);
+      bytes = jsonBytes(group);
+    }
+    group += point;
+    bytes += size;
+  }
+  if (group) yield group;
+}
+function* textParts(text) {
+  if (typeof text !== 'string' || jsonBytes(text) <= UNIT_TARGET) {
+    yield text;
+    return;
+  }
+  let group = '',
+    groupBytes = 0;
+  for (const [paragraph] of text.matchAll(/[\s\S]+?(?:\r?\n[ \t]*\r?\n|$)/g)) {
+    const pieces =
+      jsonBytes(paragraph) <= UNIT_TARGET ? [paragraph] : paragraph.matchAll(/[^\n]*\n|[^\n]+$/g);
+    for (const piece of pieces) {
+      const line = typeof piece === 'string' ? piece : piece[0],
+        size = jsonBytes(line);
+      if (group && groupBytes + size > UNIT_TARGET) {
+        yield group;
+        group = '';
+        groupBytes = 0;
+      }
+      if (size > UNIT_TARGET) yield* longLineParts(line);
+      else {
+        group += line;
+        groupBytes += size;
+      }
+    }
+  }
+  if (group) yield group;
+}
+function* splitText(record, text, replace) {
+  const parts = textParts(text),
+    first = parts.next(),
+    second = parts.next();
+  if (second.done) {
+    yield record;
+    return;
+  }
+  let index = 1;
+  yield { ...replace(first.value), part: index++ };
+  yield { ...replace(second.value), part: index++ };
+  for (const part of parts) yield { ...replace(part), part: index++ };
+}
+// Shared message metadata is one complete unit, not copied into every text part.
+// Nested calls are saved native records, not fabricated tool results.
+function* splitMessage(record, message, replace) {
+  const bodyKeys = ['content', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'];
+  const essentials = pick(message, ['role', 'toolCallId', 'toolName', 'isError', 'customType']);
+  if (message.role === 'bashExecution') {
+    // Repeat small execution facts, not arbitrary command/path metadata.
+    Object.assign(essentials, pick(message, ['exitCode', 'cancelled', 'truncated']));
+    for (const key of ['command', 'fullOutputPath'])
+      if (typeof message[key] === 'string' && jsonBytes(message[key]) <= 256)
+        essentials[key] = message[key];
+  }
+  const metadata = Object.fromEntries(
+    Object.entries(message).filter(([key]) => !bodyKeys.includes(key)),
+  );
+  const nested = metadata.nestedCalls;
+  const separateCalls =
+    Array.isArray(nested?.calls) && nested.calls.length && jsonBytes(nested) > UNIT_TARGET;
+  if (separateCalls) delete metadata.nestedCalls;
+  if (
+    !bodyKeys.some((key) => Object.hasOwn(message, key)) ||
+    Object.keys(metadata).some((key) => !Object.hasOwn(essentials, key))
+  )
+    yield { ...replace(metadata), type: 'message_metadata' };
+  if (separateCalls) {
+    for (const [index, call] of nested.calls.entries())
+      yield {
+        ...replace(essentials),
+        type: 'nested_call',
+        source: { ...record.source, nested_call_index: index },
+        nested_call: boundedFields(call),
+        nested_calls_complete: nested.complete,
+      };
+  }
+  const body = { ...essentials, ...pick(message, bodyKeys) };
+  if (bodyKeys.some((key) => Object.hasOwn(body, key)))
+    yield* splitMessageBody(replace(body), body, replace);
+}
+function* splitMessageBody(record, message, replace) {
+  if (message.sections || message.toolsAdded || message.toolsRemoved) {
+    const { sections, toolsAdded, toolsRemoved, content, ...rest } = message;
+    for (const [name, value] of Object.entries(sections ?? {})) {
+      const make = (text) => replace({ ...rest, sections: { [name]: text } }),
+        base = make(value);
+      if (typeof value === 'string') yield* splitText(base, value, make);
+      else yield base;
+    }
+    for (const key of ['toolsAdded', 'toolsRemoved'])
+      for (const tool of message[key] ?? []) {
+        if (tool && typeof tool === 'object') {
+          const { description, ...fields } = tool,
+            reduced = boundedFields(fields),
+            make = (text) =>
+              replace({
+                ...rest,
+                [key]: [
+                  { ...reduced, ...(description === undefined ? {} : { description: text }) },
+                ],
+              }),
+            base = make(description);
+          if (typeof description === 'string') yield* splitText(base, description, make);
+          else yield base;
+        } else yield replace({ ...rest, [key]: [tool] });
+      }
+    if (content) yield* splitMessage(replace({ ...rest, content }), { ...rest, content }, replace);
+    return;
+  }
+  for (const key of ['summary', 'output'])
+    if (typeof message[key] === 'string') {
+      yield* splitText(record, message[key], (text) => replace({ ...message, [key]: text }));
+      return;
+    }
+  if (typeof message.content === 'string') {
+    yield* splitText(record, message.content, (text) => replace({ ...message, content: text }));
+    return;
+  }
+  if (Array.isArray(message.content) && message.content.length) {
+    for (const [index, block] of message.content.entries()) {
+      const make = (block) => {
+        const unit = replace({ ...message, content: [block] });
+        return { ...unit, source: { ...unit.source, content_index: index } };
+      };
+      const base = make(block);
+      const key = block.type === 'text' ? 'text' : block.type === 'thinking' ? 'thinking' : null;
+      if (key) yield* splitText(base, block[key], (text) => make({ ...block, [key]: text }));
+      else yield base;
+    }
+    return;
+  }
+  yield record;
+}
+export function* semanticUnits(raw) {
+  const record = cleanRecord(raw);
+  if (jsonBytes(record) <= UNIT_TARGET) {
+    yield record;
+    return;
+  }
+  if (record.block && ['text', 'thinking'].includes(record.block.type)) {
+    const { metadata, ...body } = record;
+    if (metadata) {
+      const { block, ...shared } = record;
+      yield { ...shared, type: 'message_metadata' };
+      if (metadata.stopReason !== undefined) body.metadata = { stopReason: metadata.stopReason };
+    }
+    const key = record.block.type;
+    yield* splitText(body, body.block[key], (text) => ({
+      ...body,
+      block: { ...body.block, [key]: text },
+    }));
+  } else if (record.message) {
+    yield* splitMessage(record, record.message, (message) => ({ ...record, message }));
+  } else if (record.parts) {
+    for (const part of record.parts) {
+      const base = { ...record, parts: [part] };
+      yield* splitMessage(base, part.message, (message) => ({
+        ...base,
+        parts: [{ source: part.source, message }],
+      }));
+    }
+  } else yield record;
+}
+const metadataUnit = (unit) => ['message_metadata', 'nested_call'].includes(unit.type);
+function fitMetadata(unit, fits) {
+  const result = structuredClone(unit);
+  const fields =
+    result.type === 'nested_call'
+      ? result.nested_call
+      : (result.message ?? result.parts?.[0]?.message ?? result.metadata);
+  if (!fields) return result;
+  const essential = [
+    'role',
+    'toolCallId',
+    'toolName',
+    'isError',
+    'id',
+    'name',
+    'status',
+    'stopReason',
+    'exitCode',
+    'cancelled',
+    'truncated',
+  ];
+  for (const key of Object.keys(fields)
+    .filter((key) => !essential.includes(key))
+    .sort((a, b) => jsonBytes(fields[b]) - jsonBytes(fields[a]))) {
+    delete fields[key];
+    (result.omitted_fields ??= []).push(key);
+    result.complete = false;
+    result.reason = 'oversized_indivisible_content';
+    if (fits(result)) break;
+  }
+  return result;
+}
+export function omittedUnit(unit) {
+  return {
+    ...pick(unit, [
+      'type',
+      'prompt_id',
+      'source',
+      'tool_id',
+      'call_id',
+      'pairing',
+      'call_source',
+      'part',
+    ]),
+    complete: false,
+    reason: 'oversized_indivisible_content',
+    content_omitted: true,
+  };
+}
+export function appendUnits(target, record) {
+  for (const unit of semanticUnits(record)) {
+    // No encoded record or native entry is retained. Clone each sanitized unit
+    // so sliced strings and arbitrary business objects cannot retain raw input.
+    let bounded = unit;
+    if (metadataUnit(unit) && jsonBytes(unit) > READ_PAGE_LIMIT)
+      bounded = fitMetadata(unit, (candidate) => jsonBytes(candidate) <= READ_PAGE_LIMIT);
+    const detached =
+      jsonBytes(bounded) > READ_PAGE_LIMIT ? omittedUnit(bounded) : structuredClone(bounded);
+    target.accountedBytes += jsonBytes(detached) * 4 + 256;
+    if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
+    target.units.push(detached);
+  }
+}
+export function prepareContextRead(data, rawArgs) {
+  const parsed = readSchema.safeParse(rawArgs);
+  if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
+  const args = parsed.data;
+  if (args.cursor !== undefined) throw new Error('INVALID_READ_ARGUMENTS');
+  const selection = contextSelection(args),
+    leaf =
+      args.leaf_id === undefined
+        ? data.leafId === undefined
+          ? (data.entries.at(-1)?.id ?? null)
+          : data.leafId
+        : args.leaf_id;
+  if (leaf !== null && !data.entries.some((entry) => entry.id === leaf))
+    throw new Error('ENTRY_NOT_FOUND');
+  const byId = sessionEntryIndex(data.entries, leaf);
+  const selected = selectTimeline(buildSessionProjection(data.entries, leaf, byId), selection),
+    target = { units: [], accountedBytes: 0 };
+  for (const record of selected.records) appendUnits(target, record);
+  return {
+    contract: READ_CONTRACT,
+    session_id: args.session_id,
+    leaf_id: leaf,
+    selection,
+    omissions: selected.omissions,
+    units: target.units,
+    ...(data.history ? { history: data.history } : {}),
+    live: args.leaf_id === undefined ? cleanLive(data.live, selection, selected) : null,
+  };
+}
+
+export function cleanLive(raw, selection, selected) {
+  if (!raw)
+    return {
+      available: false,
+      source: 'snapshot',
+      transient: true,
+      reason: 'native_events_unavailable',
+    };
   const base = {
-    source: String(live.source ?? 'native_message_events').slice(0, 100),
-    available: live.available !== false,
-    observed_at: typeof live.observed_at === 'string' ? live.observed_at.slice(0, 100) : null,
+    source: String(raw.source ?? 'native_message_events').slice(0, 100),
+    available: raw.available !== false,
     transient: true,
+    complete: false,
+    observed_at: typeof raw.observed_at === 'string' ? raw.observed_at.slice(0, 100) : null,
     prompt_id: selected.latestPrompt,
   };
-  if (live.available === false)
-    return { ...base, reason: String(live.reason ?? 'unavailable').slice(0, 200) };
-  if (selected.latestPrompt !== null && !selected.latestPromptSelected) {
+  if (!base.available)
+    return { ...base, reason: String(raw.reason ?? 'unavailable').slice(0, 200) };
+  if (
+    raw.omitted_by_selection ||
+    (selected.latestPrompt !== null && !selected.latestPromptSelected)
+  )
     return { ...base, omitted_by_selection: true };
-  }
-  const message = live.message;
-  if (message === null) return { ...base, format: 'message', message: null, complete: true };
-  if (!message || message.role !== 'assistant' || !Array.isArray(message.content))
+  const message = raw.message;
+  if (message === null) return { ...base, items: [] };
+  if (message?.role !== 'assistant' || !Array.isArray(message.content))
     return { ...base, available: false, reason: 'invalid_live_message' };
-  const chosen = new Set(),
-    omissions = { text: 0, thinking: 0, tools: 0 };
-  for (const [type, key] of [
+  const indices = new Set(),
+    omissions = { ...raw.selection_omissions };
+  for (const [kind, key] of [
     ['text', 'text'],
     ['thinking', 'thinking'],
     ['toolCall', 'tools'],
   ]) {
     const group = message.content
-      .map((block, index) => ({ block, index }))
-      .filter((item) => item.block.type === type);
-    const keep = ends(group, selection[key]);
-    omissions[key] = group.length - keep.size;
-    for (const item of keep) chosen.add(item.index);
+        .map((block, index) => ({ block, index }))
+        .filter((item) => item.block.type === kind),
+      keep = ends(group, selection[key]);
+    omissions[key] = (omissions[key] ?? 0) + group.length - keep.size;
+    for (const { index } of keep) indices.add(index);
   }
   message.content.forEach((block, index) => {
-    if (!['text', 'thinking', 'toolCall'].includes(block.type)) chosen.add(index);
+    if (!['text', 'thinking', 'toolCall'].includes(block.type)) indices.add(index);
   });
-  const indices = [...chosen].sort((a, b) => a - b);
-  const selectedMessage = { ...message, content: indices.map((index) => message.content[index]) };
-  const native = {
+  const result = {
     ...base,
-    format: 'message',
-    message: selectedMessage,
-    block_indices: indices,
+    items: [],
     selection_omissions: omissions,
-    complete: live.complete !== false && live.truncated !== true,
-    ...(live.truncated === true ? { upstream_truncated: true } : {}),
-    ...(live.omitted_units === undefined ? {} : { upstream_omitted_units: live.omitted_units }),
+    ...(raw.truncated || raw.upstream_truncated ? { upstream_truncated: true } : {}),
   };
-  if (bytes(native) <= maxBytes) return native;
-  const encoded = JSON.stringify(selectedMessage);
-  const make = (end) => ({
-    ...base,
-    format: 'json_fragment',
-    offset_unit: 'utf16_code_units',
-    offset: 0,
-    total_units: encoded.length,
-    json_fragment: encoded.slice(0, end),
-    complete: false,
-    selection_omissions: omissions,
-    omitted_units: encoded.length - end,
-    ...(live.complete === false || live.truncated === true ? { upstream_complete: false } : {}),
-  });
-  let low = 0,
-    high = encoded.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2),
-      end = boundary(encoded, mid) ? mid : mid - 1;
-    if (bytes(make(end)) <= maxBytes) low = mid;
-    else high = mid - 1;
+  for (const index of [...indices].sort((a, b) => a - b)) {
+    const block = cleanBlock(message.content[index]),
+      type = block.type === 'toolCall' ? 'tool_call' : block.type;
+    result.items.push({ type, block });
   }
-  const end = boundary(encoded, low) ? low : low - 1;
-  return bytes(make(end)) <= maxBytes
-    ? make(end)
-    : { ...base, complete: false, omitted_by_capacity: true };
+  return smallLive(result, READ_PAGE_LIMIT);
 }
-
-function page(base, items, next) {
-  const first = items[0],
-    last = items.at(-1);
-  const fragmented = items.some((item) => item.type === 'fragment');
-  return {
+function smallLive(live, budget) {
+  if (!live || jsonBytes(live) <= budget) return live;
+  const result = { ...live, items: [], complete: false, omitted_by_capacity: true };
+  const fits = (item) => jsonBytes({ ...result, items: [item, ...result.items] }) <= budget;
+  for (const item of [...(live.items ?? [])].reverse()) {
+    if (fits(item)) {
+      result.items.unshift(item);
+      continue;
+    }
+    const key = item.block?.type;
+    if (['text', 'thinking'].includes(key) && typeof item.block[key] === 'string') {
+      const text = item.block[key],
+        make = (length) => {
+          let start = text.length - length;
+          if (
+            start > 0 &&
+            /[\uDC00-\uDFFF]/.test(text[start]) &&
+            /[\uD800-\uDBFF]/.test(text[start - 1])
+          )
+            start++;
+          return { ...item, truncated: true, block: { ...item.block, [key]: text.slice(start) } };
+        };
+      let low = 0,
+        high = text.length;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (fits(make(mid))) low = mid;
+        else high = mid - 1;
+      }
+      if (low && fits(make(low))) result.items.unshift(make(low));
+    }
+    break;
+  }
+  return jsonBytes(result) <= budget ? result : null;
+}
+export function renderPreparedContextRead(
+  snapshot,
+  args,
+  { cursor, encode, resultBudget, live, runtimeEvents } = {},
+) {
+  const end = cursor?.before ?? snapshot.units.length,
+    max = args.max_bytes ?? 24000;
+  if (end < 0 || end > snapshot.units.length) throw new Error('INVALID_CURSOR');
+  const base = {
+    session_id: snapshot.session_id,
+    source: snapshot.source ?? 'session_projection',
+    leaf_id: snapshot.leaf_id,
+    selection: snapshot.selection,
+    omissions: { selection: snapshot.omissions },
+    ...(snapshot.history ? { history: snapshot.history } : {}),
+    live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
+    ...(!cursor && args.leaf_id === undefined && runtimeEvents
+      ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
+      : {}),
+  };
+  const page = (items, before) => ({
     ...base,
     items,
-    next_cursor: next,
+    next_cursor: before > 0 ? encode(before) : null,
     omissions: {
-      selection: base.omissions.selection,
-      capacity: {
-        records_before: first?.record_index ?? 0,
-        records_after: last ? base.total_items - last.record_index - 1 : 0,
-        fragmented,
-      },
+      selection: snapshot.omissions,
+      capacity: { earlier_units: before, later_units: snapshot.units.length - end },
     },
-  };
-}
-function nextAt(binding, index, offset) {
-  return index < 0 ? null : encodeCursor({ ...binding, index, offset });
-}
-function previous(binding, record) {
-  return record.record_index === 0
-    ? null
-    : // offset = 0 is never a real record boundary. This sentinel resolves the
-      // preceding complete record without storing its serialized size in a page.
-      encodeCursor({ ...binding, index: record.record_index - 1, offset: Number.MAX_SAFE_INTEGER });
-}
-function fragment(record, encoded, start, end) {
-  return {
-    id: record.id,
-    type: 'fragment',
-    record_type: record.type,
-    prompt_id: record.prompt_id,
-    source: record.source,
-    record_index: record.record_index,
-    encoding: 'json',
-    offset_unit: 'utf16_code_units',
-    offset: start,
-    total_units: encoded.length,
-    json_fragment: encoded.slice(start, end),
-  };
-}
-function fitSuffix(record, encoded, end, budget, build) {
-  let low = 0,
-    high = end;
-  const make = (length) => {
-    let start = end - length;
-    if (!boundary(encoded, start)) start++;
-    return { start, item: fragment(record, encoded, start, end) };
-  };
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2),
-      candidate = make(mid);
-    if (bytes(build(candidate.item, candidate.start)) <= budget) low = mid;
-    else high = mid - 1;
-  }
-  return make(low);
-}
-
-/**
- * Synchronous pure renderer shared by saved snapshots and cooperative owners.
- * Authorization and snapshot acquisition belong to Bridge/runtime, not here.
- */
-export function renderContextRead(data, rawArgs) {
-  const parsed = readSchema.safeParse(rawArgs);
-  if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
-  const args = parsed.data,
-    selection = contextSelection(args);
-  const cursor = args.cursor ? decodeCursor(args.cursor) : null;
-  const session = digest([args.session_id, data.header?.id ?? null]);
-  const selectionHash = digest(selection);
-  if (
-    cursor &&
-    (cursor.session !== session ||
-      cursor.selection !== selectionHash ||
-      (args.leaf_id !== undefined && args.leaf_id !== cursor.leaf_id))
-  )
-    throw new Error('STALE_CURSOR');
-  const leaf = cursor
-    ? cursor.leaf_id
-    : args.leaf_id !== undefined
-      ? args.leaf_id
-      : data.leafId === undefined
-        ? (data.entries.at(-1)?.id ?? null)
-        : data.leafId;
-  if (leaf !== null && !data.entries.some((e) => e.id === leaf))
-    throw new Error(cursor ? 'STALE_CURSOR' : 'ENTRY_NOT_FOUND');
-  const selected = selectTimeline(buildSessionProjection(data.entries, leaf), selection);
-  const projection = digest(selected.records);
-  if (cursor && cursor.projection !== projection) throw new Error('STALE_CURSOR');
-  const binding = {
-    kind: FORMAT,
-    version: VERSION,
-    session,
-    selection: selectionHash,
-    projection,
-    leaf_id: leaf,
-  };
-  const budget = args.max_bytes ?? 24000;
-  const live =
-    !cursor && args.leaf_id === undefined
-      ? livePreview(
-          data.live ?? {
-            source: 'snapshot',
-            available: false,
-            reason: 'native_events_unavailable',
-          },
-          selection,
-          selected,
-          Math.min(4096, Math.floor(budget / 4)),
-        )
-      : null;
-  const base = {
-    format: FORMAT,
-    version: VERSION,
-    session_id: args.session_id,
-    leaf_id: leaf,
-    context_kind: 'pi_session_projection_not_final_provider_payload',
-    selection,
-    snapshot: projection,
-    snapshot_session: session,
-    total_items: selected.records.length,
-    order: 'chronological',
-    continuation: 'backward',
-    live,
-    omissions: { selection: selected.omissions },
-  };
+  });
+  const fits = (value, limit = max) => jsonBytes(value) <= limit && fitsResult(value, resultBudget);
   const items = [];
-  let index = cursor?.index ?? selected.records.length - 1;
-  if (index >= selected.records.length) throw new Error('INVALID_CURSOR');
-  if (index < 0) return page(base, [], null);
-  let end = cursor?.offset ?? Number.MAX_SAFE_INTEGER;
-  while (index >= 0) {
-    const record = selected.records[index],
-      encoded = JSON.stringify(record);
-    if (end === Number.MAX_SAFE_INTEGER) end = encoded.length;
-    if (end > encoded.length || !boundary(encoded, end)) throw new Error('INVALID_CURSOR');
-    const next = previous(binding, record);
-    const candidate = end === encoded.length ? record : fragment(record, encoded, 0, end);
-    if (bytes(page(base, [candidate, ...items], next)) <= budget) {
-      items.unshift(candidate);
-      index--;
-      end = Number.MAX_SAFE_INTEGER;
-      continue;
+  let before = end;
+  while (before > 0) {
+    let unit = snapshot.units[before - 1];
+    const minimal = page([unit], before - 1);
+    // Previews never prevent committed history from fitting.
+    if (!fits(minimal) && !items.length) {
+      base.live = smallLive(base.live, 256);
+      delete base.runtime_events;
+      if (!fits(page([unit], before - 1))) base.live = null;
     }
-    if (items.length) {
-      end = Number.MAX_SAFE_INTEGER;
-      break;
+    if (metadataUnit(unit) && !items.length && !fits(page([unit], before - 1)))
+      unit = fitMetadata(unit, (candidate) => fits(page([candidate], before - 1)));
+    const maximum = { ...page([unit], before - 1), live: null };
+    delete maximum.runtime_events;
+    if (jsonBytes(maximum) > READ_PAGE_LIMIT)
+      unit = metadataUnit(unit)
+        ? fitMetadata(
+            unit,
+            (candidate) =>
+              jsonBytes({ ...page([candidate], before - 1), live: null }) <= READ_PAGE_LIMIT,
+          )
+        : omittedUnit(unit);
+    if (!fits(page([unit, ...items], before - 1))) {
+      if (items.length) break;
+      if (jsonBytes(page([unit], before - 1)) <= max && resultBudget)
+        throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
+      const error = new Error('READ_BUDGET_TOO_SMALL');
+      error.minimum_max_bytes = jsonBytes({ ...page([unit], before - 1), live: null });
+      throw error;
     }
-    const build = (item, start) => page(base, [item], start ? nextAt(binding, index, start) : next);
-    const fitted = fitSuffix(record, encoded, end, budget, build);
-    if (!fitted.item.json_fragment.length) throw new Error('READ_BUDGET_TOO_SMALL');
-    return build(fitted.item, fitted.start);
+    items.unshift(unit);
+    before--;
   }
-  const next = index < 0 ? null : nextAt(binding, index, end);
-  return page(base, items, next);
+  const result = page(items, before);
+  if (!fits(result)) throw new Error('READ_BUDGET_TOO_SMALL');
+  return structuredClone(result);
 }
-
-/** Reject old owners that silently ignored the new public read contract. */
-export function assertContextReadResponse(result, rawArgs) {
-  const args = readSchema.parse(rawArgs),
-    reject = () => {
-      throw new Error('OWNER_READ_REFRESH_REQUIRED');
-    };
+export function assertReadSnapshot(value, args) {
+  if (value?.contract !== READ_CONTRACT) throw new Error('OWNER_READ_REFRESH_REQUIRED');
   if (
-    !result ||
-    result.format !== FORMAT ||
-    result.version !== VERSION ||
-    result.session_id !== args.session_id ||
-    digest(result.selection) !== digest(contextSelection(args)) ||
-    result.context_kind !== 'pi_session_projection_not_final_provider_payload' ||
-    !(result.leaf_id === null || typeof result.leaf_id === 'string') ||
-    (args.leaf_id !== undefined && args.leaf_id !== result.leaf_id) ||
-    typeof result.snapshot !== 'string' ||
-    typeof result.snapshot_session !== 'string' ||
-    !Number.isSafeInteger(result.total_items) ||
-    result.total_items < 0 ||
-    result.order !== 'chronological' ||
-    result.continuation !== 'backward' ||
-    !Array.isArray(result.items) ||
-    !result.omissions?.selection ||
-    !result.omissions?.capacity ||
-    bytes(result) > (args.max_bytes ?? 24000) ||
-    !(result.next_cursor === null || typeof result.next_cursor === 'string')
-  )
-    reject();
-  let last = -1;
-  for (const item of result.items) {
-    if (
-      !item ||
-      typeof item.id !== 'string' ||
-      typeof item.type !== 'string' ||
-      !(item.prompt_id === null || typeof item.prompt_id === 'string') ||
-      typeof item.source?.entry_id !== 'string' ||
-      !Number.isSafeInteger(item.record_index) ||
-      item.record_index <= last ||
-      item.record_index >= result.total_items
-    )
-      reject();
-    if (
-      item.type === 'fragment' &&
-      (typeof item.json_fragment !== 'string' ||
-        !item.json_fragment.length ||
-        !Number.isSafeInteger(item.offset) ||
-        item.offset < 0 ||
-        !Number.isSafeInteger(item.total_units) ||
-        item.total_units < item.offset + item.json_fragment.length ||
-        item.offset_unit !== 'utf16_code_units' ||
-        item.encoding !== 'json')
-    )
-      reject();
-    last = item.record_index;
-  }
-  const incoming = args.cursor ? decodeCursor(args.cursor) : null;
-  if (
-    incoming &&
-    (incoming.leaf_id !== result.leaf_id ||
-      incoming.projection !== result.snapshot ||
-      incoming.session !== result.snapshot_session ||
-      incoming.selection !== digest(result.selection))
-  )
-    reject();
-  if (result.next_cursor !== null) {
-    const next = decodeCursor(result.next_cursor),
-      first = result.items[0];
-    if (
-      !first ||
-      next.leaf_id !== result.leaf_id ||
-      next.projection !== result.snapshot ||
-      next.selection !== digest(result.selection) ||
-      next.session !== result.snapshot_session ||
-      (incoming && next.session !== incoming.session) ||
-      (first.type === 'fragment' && first.offset > 0
-        ? next.index !== first.record_index || next.offset !== first.offset
-        : next.index !== first.record_index - 1 || next.offset !== Number.MAX_SAFE_INTEGER)
-    )
-      reject();
-  }
-  if (result.total_items && !result.items.length) reject();
-  const first = result.items[0],
-    tail = result.items.at(-1),
-    capacity = result.omissions.capacity;
-  const omissionKeys = ['summary', 'prompts', 'text', 'thinking', 'tools', 'commands'];
-  if (omissionKeys.some((key) => !Object.hasOwn(result.omissions.selection, key))) reject();
-  if (
-    capacity.records_before !== (first?.record_index ?? 0) ||
-    capacity.records_after !== (tail ? result.total_items - tail.record_index - 1 : 0) ||
-    capacity.fragmented !== result.items.some((item) => item.type === 'fragment') ||
-    Object.values(result.omissions.selection).some(
-      (value) => !Number.isSafeInteger(value) || value < 0,
+    value.session_id !== args.session_id ||
+    !Array.isArray(value.units) ||
+    ['summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
+      (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
+    ) ||
+    !(value.leaf_id === null || typeof value.leaf_id === 'string') ||
+    (args.leaf_id !== undefined && value.leaf_id !== args.leaf_id) ||
+    JSON.stringify(value.selection) !== JSON.stringify(contextSelection(args)) ||
+    jsonBytes(value) > READ_SNAPSHOT_LIMIT ||
+    value.units.some(
+      (unit) => typeof unit?.type !== 'string' || typeof unit.source?.entry_id !== 'string',
     )
   )
-    reject();
-  if (
-    result.next_cursor === null &&
-    first &&
-    (first.record_index !== 0 || (first.type === 'fragment' && first.offset !== 0))
-  )
-    reject();
-  if (incoming && tail) {
-    if (tail.record_index !== incoming.index) reject();
-    if (
-      incoming.offset !== Number.MAX_SAFE_INTEGER &&
-      (tail.type !== 'fragment' || tail.offset + tail.json_fragment.length !== incoming.offset)
-    )
-      reject();
-  }
-  if ((args.cursor || args.leaf_id !== undefined) && result.live !== null) reject();
-  if (result.live !== null) {
-    const live = result.live;
-    if (
-      !live ||
-      typeof live !== 'object' ||
-      typeof live.available !== 'boolean' ||
-      typeof live.source !== 'string' ||
-      live.transient !== true ||
-      !(live.prompt_id === null || typeof live.prompt_id === 'string')
-    )
-      reject();
-    if (live.available && !live.omitted_by_capacity && !live.omitted_by_selection) {
-      if (live.format === 'message') {
-        if (live.message !== null && live.message?.role !== 'assistant') reject();
-      } else if (live.format === 'json_fragment') {
-        if (
-          typeof live.json_fragment !== 'string' ||
-          live.offset !== 0 ||
-          !Number.isSafeInteger(live.total_units) ||
-          live.total_units < live.json_fragment.length ||
-          live.offset_unit !== 'utf16_code_units' ||
-          live.complete !== false
-        )
-          reject();
-      } else reject();
-    }
-  }
-}
-
-/** Resize a captured authorized page without reacquiring mutable session data. */
-export function rebudgetContextRead(result, args, maxBytes) {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) return null;
-  if (bytes(result) <= maxBytes) return result;
-  if (result?.format !== FORMAT || !Array.isArray(result.items)) return null;
-  const binding = {
-    kind: FORMAT,
-    version: VERSION,
-    session: result.snapshot_session,
-    selection: digest(result.selection),
-    projection: result.snapshot,
-    leaf_id: result.leaf_id,
-  };
-  const base = { ...result };
-  delete base.items;
-  delete base.next_cursor;
-  // A moving live preview has no historical continuation. Drop its payload
-  // before reducing captured history and make that capacity omission explicit.
-  if (base.live?.available && bytes(base.live) > Math.floor(maxBytes / 4)) {
-    const { source, observed_at, transient, prompt_id } = base.live;
-    base.live = {
-      source,
-      available: true,
-      observed_at,
-      transient,
-      prompt_id,
-      complete: false,
-      omitted_by_capacity: true,
-    };
-  }
-  const items = [];
-  if (!result.items.length) {
-    const reduced = page(base, [], result.next_cursor);
-    return bytes(reduced) <= maxBytes ? reduced : null;
-  }
-  for (let i = result.items.length - 1; i >= 0; i--) {
-    const record = result.items[i],
-      next =
-        record.type === 'fragment' && record.offset > 0
-          ? nextAt(binding, record.record_index, record.offset)
-          : previous(binding, record);
-    const candidate = page(base, [record, ...items], next);
-    if (bytes(candidate) <= maxBytes) {
-      items.unshift(record);
-      continue;
-    }
-    if (items.length) {
-      const first = items[0];
-      const before =
-        first.type === 'fragment' && first.offset > 0
-          ? nextAt(binding, first.record_index, first.offset)
-          : previous(binding, first);
-      return page(base, items, before);
-    }
-    if (record.type === 'fragment') {
-      // Keep offsets relative to the original serialized record, not this page.
-      const encoded = record.json_fragment,
-        end = encoded.length;
-      const build = (part, start) => {
-        const item = {
-          ...record,
-          offset: record.offset + start,
-          json_fragment: part.json_fragment,
-        };
-        const before = item.offset
-          ? nextAt(binding, item.record_index, item.offset)
-          : previous(binding, item);
-        return page(base, [item], before);
-      };
-      const fitted = fitSuffix(record, encoded, end, maxBytes, build);
-      return fitted.item.json_fragment.length ? build(fitted.item, fitted.start) : null;
-    }
-    const encoded = JSON.stringify(record);
-    const build = (item, start) =>
-      page(
-        base,
-        [item],
-        start ? nextAt(binding, record.record_index, start) : previous(binding, record),
-      );
-    const fitted = fitSuffix(record, encoded, encoded.length, maxBytes, build);
-    return fitted.item.json_fragment.length ? build(fitted.item, fitted.start) : null;
-  }
-  return page(base, items, result.next_cursor);
+    throw new Error('INVALID_OWNER_READ');
+  return value;
 }

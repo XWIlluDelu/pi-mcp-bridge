@@ -66,13 +66,12 @@ test('known-ID-only and restricted new-session access remain advisory diagnostic
   assert.equal(policy.defaults.list, false);
 });
 
-test('health refreshes permission edits and opens no native runtime', async (t) => {
+test('health snapshots each new request without mutating shared policy or opening Pi', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-health-');
   const policy = {
-    principal: 'health-test',
     stateDir: dir + '/state',
     sessionRoots: [dir + '/sessions'],
-    folders: [{ id: 'p', path: dir }],
+    folders: [{ path: dir }],
     defaults: open(),
   };
   const file = dir + '/owner.json';
@@ -92,5 +91,9 @@ test('health refreshes permission edits and opens no native runtime', async (t) 
     ['NO_REMOTE_STOP'],
   );
   assert.equal(bridge.pool.instances.size, 0);
-  assert.equal(permitted(bridge.config, 'stop', { id: 's', cwd: dir }), false);
+  assert.equal(permitted(bridge.config, 'stop', { id: 's', cwd: dir }), true);
+  assert.equal(
+    permitted((await bridge.captureRequestContext()).permissions, 'stop', { id: 's', cwd: dir }),
+    false,
+  );
 });

@@ -3,18 +3,20 @@ import {
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
 } from './attachment-protocol.mjs';
 import { readLfLines } from './lf-lines.mjs';
-import { assertContextReadResponse } from './context-read.mjs';
-import { stopReceipt } from './stop-execution.mjs';
+import { assertReadSnapshot, READ_CONTRACT } from './context-read.mjs';
+import { stopReceipt, inlineWithdrawal } from './stop-execution.mjs';
+import { inlineBashResult } from './bash-execution.mjs';
+import { hasPromptSettings } from './prompt-input.mjs';
 import { diagnostics } from './diagnostics.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
-import { cleanModelPage, cleanModelSetting, sameModel } from './models.mjs';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile } from './data.mjs';
 import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
+import { kernelLock } from './kernel-lock.mjs';
 export class AttachmentFailure extends Error {
   constructor(code, uncertain = false, options) {
     super(code, options);
@@ -75,93 +77,25 @@ export async function privateDirectory(dir) {
 export function claimFile(dir, session) {
   return path.join(dir, `${opaqueId(`${session.file}\0${session.header.id}`)}.owner.json`);
 }
-async function recoverRegistryLock(dir, lock) {
-  let handle, gate;
-  try {
-    // Keep the observed inode open: unlink/recreate must not let a new holder
-    // reuse its inode number while we check the old process identity.
-    handle = await fs.open(lock, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const observed = await handle.stat({ bigint: true });
-    if (!observed.isFile() || observed.size > 1024) return;
-    const bytes = Buffer.alloc(1025),
-      { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    let owner;
-    try {
-      owner = JSON.parse(bytes.subarray(0, bytesRead).toString('utf8'));
-    } catch (error) {
-      if (error instanceof SyntaxError) return;
-      throw error;
-    }
-    if (
-      !Number.isSafeInteger(owner?.pid) ||
-      owner.pid < 1 ||
-      typeof owner.start !== 'string' ||
-      !/^(0|[1-9]\d*)$/.test(owner.start) ||
-      typeof owner.boot !== 'string' ||
-      !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(owner.boot) ||
-      (await ownerAlive(owner))
-    )
-      return;
-    // Only recovery needs this kernel-owned gate. It vanishes on process death;
-    // unlike another lockfile it cannot itself leave a stale recovery lock.
-    gate = net.createServer((socket) => socket.destroy());
-    try {
-      await new Promise((resolve, reject) => {
-        gate.once('error', reject);
-        gate.listen('\0pi-mcp-registry-' + opaqueId(path.resolve(dir)), resolve);
-      });
-    } catch (error) {
-      if (error.code === 'EADDRINUSE') return;
-      throw error;
-    }
-    const current = await fs.lstat(lock, { bigint: true });
-    if (current.dev === observed.dev && current.ino === observed.ino) await fs.unlink(lock);
-  } catch (error) {
-    if (!['ENOENT', 'ELOOP'].includes(error.code)) throw error;
-  } finally {
-    try {
-      await handle?.close();
-    } finally {
-      if (gate?.listening) await new Promise((resolve) => gate.close(resolve));
-    }
-  }
-}
+// Linux abstract sockets provide one process-owned short mutex. The canonical
+// private directory is the namespace; this is NOT the long-lived writer claim.
 export async function registryTransaction(dir, action) {
   await privateDirectory(dir);
-  const lock = path.join(dir, 'registry.lock'),
-    tmp = `${lock}.${process.pid}.${randomUUID()}.tmp`;
-  let acquired = false;
+  const mutex = await kernelLock('registry:' + path.resolve(dir), {
+    attempts: 100,
+    busy: 'ATTACHMENT_REGISTRY_BUSY',
+  });
   try {
-    // Publish a complete identity atomically before entering the critical section.
-    // A crash before publication leaves only an unclaimed temporary file.
-    await fs.writeFile(tmp, JSON.stringify(await processIdentity()), { flag: 'wx', mode: 0o600 });
-    for (let attempt = 0; attempt < 100; attempt++) {
-      try {
-        await fs.link(tmp, lock);
-        acquired = true;
-        break;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        await recoverRegistryLock(dir, lock);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    if (!acquired) throw new AttachmentFailure('ATTACHMENT_REGISTRY_BUSY');
-    await fs.unlink(tmp);
     return await action();
   } finally {
-    try {
-      if (acquired) await fs.unlink(lock);
-    } finally {
-      await fs.rm(tmp, { force: true });
-    }
+    await mutex.close();
   }
 }
 export async function readClaim(dir, session) {
   await privateDirectory(dir);
   return readOwnerRecord(dir, claimFile(dir, session), session);
 }
-export async function readOwnerRecord(dir, file, session) {
+export async function readOwnerRecord(dir, file, session, scope = {}) {
   let handle;
   try {
     // Validate the opened inode and bound the read itself, including growth after stat.
@@ -185,12 +119,45 @@ export async function readOwnerRecord(dir, file, session) {
       record.owner.pid > 0 &&
       typeof record.owner.start === 'string' &&
       typeof record.owner.boot === 'string';
+    // Establish scope from the bounded private inode before interpreting its
+    // protocol. An unrelated owner's mismatch must not block this session.
+    // Ambiguous path/identity or unsafe storage still fails closed.
     if (
       typeof record?.file !== 'string' ||
+      !path.isAbsolute(record.file) ||
+      record.file.includes('\0') ||
+      (!released && !identified)
+    )
+      throw new Error();
+    if (scope.file !== undefined && record.file !== scope.file) return null;
+    if (
+      scope.owner &&
+      (record.owner?.pid !== scope.owner.pid ||
+        record.owner.start !== scope.owner.start ||
+        record.owner.boot !== scope.owner.boot)
+    )
+      return null;
+    const fields = [
+      'kind',
+      'mode',
+      'file',
+      'sessionId',
+      'generation',
+      'owner',
+      'phase',
+      'socket',
+      'noColdReacquire',
+      'handoffId',
+      'releaseSupported',
+      'imagesSupported',
+      'readContract',
+    ];
+    if (Object.keys(record).some((key) => !fields.includes(key)))
+      throw new AttachmentFailure('ATTACHMENT_PROTOCOL_MISMATCH');
+    if (
       typeof record.sessionId !== 'string' ||
       !['tui', 'rpc', 'host', 'extension', 'delete'].includes(record.kind) ||
-      typeof record.generation !== 'string' ||
-      (!released && !identified)
+      typeof record.generation !== 'string'
     )
       throw new Error();
     if (session && (record.file !== session.file || record.sessionId !== session.header.id))
@@ -202,14 +169,10 @@ export async function readOwnerRecord(dir, file, session) {
       throw new Error();
     if (record.noColdReacquire !== undefined && typeof record.noColdReacquire !== 'boolean')
       throw new Error();
-    if (
-      record.coldReacquireAfterExit !== undefined &&
-      typeof record.coldReacquireAfterExit !== 'boolean'
-    )
-      throw new Error();
     return record;
   } catch (e) {
     if (e.code === 'ENOENT') return null;
+    if (e instanceof AttachmentFailure) throw e;
     throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');
   } finally {
     await handle?.close();
@@ -217,14 +180,19 @@ export async function readOwnerRecord(dir, file, session) {
 }
 // Call while holding registryTransaction: a changed header must not bypass
 // an existing path owner merely because its claim has a different filename.
-export async function assertNoOtherLiveOwner(dir, session) {
+// Without a header, check every claim on the path before native open. A local
+// session replacement may reuse this process; this read does not reserve it.
+export async function assertNoOtherLiveOwner(dir, session, { allowSameProcess = false } = {}) {
   for (const name of await fs.readdir(dir)) {
     if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
-    const other = await readOwnerRecord(dir, path.join(dir, name));
+    const other = await readOwnerRecord(dir, path.join(dir, name), undefined, {
+      file: session.file,
+    });
     if (
       other &&
       other.file === session.file &&
-      other.sessionId !== session.header.id &&
+      other.sessionId !== session.header?.id &&
+      (!allowSameProcess || other.owner?.pid !== process.pid) &&
       (await ownerAlive(other.owner))
     )
       throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
@@ -236,17 +204,12 @@ export async function reserveOwner(dir, session, kind, owner = undefined) {
     await assertNoOtherLiveOwner(dir, session);
     const old = await readClaim(dir, session);
     if (old && (await ownerAlive(old.owner))) throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-    const quitTui =
-      old?.kind === 'tui' &&
-      old.phase === 'transitioning' &&
-      old.coldReacquireAfterExit === true &&
-      old.owner !== null;
-    // ownerAlive was checked above under the registry lock. Only a companion's
-    // actual quit marker and exact process death lift the local handoff fence.
-    if (kind === 'rpc' && old?.noColdReacquire && !quitTui)
+    // Only explicit owner-local release pauses cold resume. Ordinary join
+    // reservations are protected by their exact live process identity.
+    if (kind === 'rpc' && old?.noColdReacquire)
       throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
     const record = {
-      ...(old?.noColdReacquire && !(kind === 'rpc' && quitTui) ? { noColdReacquire: true } : {}),
+      ...(old?.noColdReacquire ? { noColdReacquire: true } : {}),
       kind,
       file: session.file,
       sessionId: session.header.id,
@@ -306,7 +269,7 @@ export class AttachedRuntime {
     );
   }
   async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
-    const mutating = ['send', 'set_model', 'stop', 'bash'].includes(op);
+    const mutating = ['send', 'stop', 'bash', 'compact'].includes(op);
     const serialized =
       JSON.stringify({
         op,
@@ -325,6 +288,7 @@ export class AttachedRuntime {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(this.record.socket);
       let bytes = 0,
+        partial,
         written = false,
         done = false,
         lines;
@@ -334,6 +298,7 @@ export class AttachedRuntime {
         clearTimeout(timer);
         lines?.close();
         socket.destroy();
+        if (error && partial !== undefined) error.result = partial;
         error ? reject(error) : resolve(value);
       };
       const timer = setTimeout(
@@ -359,7 +324,14 @@ export class AttachedRuntime {
       });
       socket.on('data', (chunk) => {
         bytes += chunk.length;
-        if (bytes > (op === 'snapshot' ? MAX_ATTACHMENT_SNAPSHOT_BYTES + 2048 : 256 * 1024 + 2048))
+        if (
+          bytes >
+          (['snapshot', 'read'].includes(op)
+            ? MAX_ATTACHMENT_SNAPSHOT_BYTES + 2048
+            : ['bash', 'stop'].includes(op)
+              ? MAX_ATTACHMENT_REQUEST_BYTES
+              : 256 * 1024 + 2048)
+        )
           finish(
             new AttachmentFailure(
               op === 'snapshot' ? 'SESSION_TOO_LARGE' : 'INVALID_ATTACHMENT_RESPONSE',
@@ -372,10 +344,32 @@ export class AttachedRuntime {
         try {
           const response = JSON.parse(line);
           if (response.generation !== this.record.generation) throw new Error();
+          if (response.partial === true) {
+            if (op === 'bash') partial = inlineBashResult(response.data);
+            else if (op === 'stop')
+              partial = { withdrawal: inlineWithdrawal(response.data?.withdrawal) };
+            else throw new Error();
+            return;
+          }
           if (
-            ['send', 'set_model'].includes(op) &&
+            op === 'compact' &&
+            [
+              'COMPACT_UNSUPPORTED',
+              'COMPACT_IDLE_UNCONFIRMED',
+              'COMPACT_BUSY',
+              'COMPACTION_PENDING',
+              'PI_REJECTED',
+              'INVALID_ARGUMENTS',
+            ].includes(response.error)
+          )
+            return finish(new AttachmentFailure(response.error));
+          if (op === 'compact' && response.error === 'HOST_COMPACT_UNCERTAIN')
+            return finish(new AttachmentFailure(response.error, true));
+          if (
+            op === 'send' &&
             [
               'MODEL_SELECTION_UNSUPPORTED',
+              'COMPACTION_PENDING',
               'MODEL_SELECTION_PENDING',
               'MODEL_UNAVAILABLE',
               'THINKING_LEVEL_UNSUPPORTED',
@@ -389,26 +383,17 @@ export class AttachedRuntime {
             return finish(new AttachmentFailure(response.error));
           if (mutating && ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS'].includes(response.error))
             return finish(new AttachmentFailure(response.error));
-          if (
-            op === 'bash' &&
-            ['BASH_UNSUPPORTED', 'INVALID_ATTACHED_OPERATION'].includes(response.error)
-          )
+          if (op === 'bash' && response.error === 'BASH_UNSUPPORTED')
             return finish(new AttachmentFailure('BASH_UNSUPPORTED'));
-          if (
-            op === 'stop' &&
-            ['STOP_UNSUPPORTED', 'INVALID_ATTACHED_OPERATION'].includes(response.error)
-          )
+          if (op === 'stop' && response.error === 'STOP_UNSUPPORTED')
             return finish(new AttachmentFailure('STOP_UNSUPPORTED'));
-          if (op === 'snapshot' && response.error === 'INVALID_ATTACHED_OPERATION')
-            return finish(new AttachmentFailure('SNAPSHOT_UNSUPPORTED'));
           if (response.error)
             return finish(
               new AttachmentFailure(
                 [
                   'MODEL_SELECTION_CHANGED',
                   'MODEL_SELECTION_FAILED',
-                  'MODELS_UNSUPPORTED',
-                  'INVALID_MODEL_METADATA',
+                  'INVALID_MODEL_SELECTION',
                   'THINKING_LEVEL_UNSUPPORTED',
                   'THINKING_SUPPORT_UNKNOWN',
                   'BASH_UNSUPPORTED',
@@ -428,6 +413,8 @@ export class AttachedRuntime {
                   'HOST_NOT_READY',
                   'HOST_SUBMIT_UNCERTAIN',
                   'READ_BUDGET_TOO_SMALL',
+                  'READ_SNAPSHOT_TOO_LARGE',
+                  'INVALID_OWNER_READ',
                   'READ_SNAPSHOT_CHANGED',
                   'INVALID_HOST_SNAPSHOT',
                 ].includes(response.error)
@@ -447,34 +434,24 @@ export class AttachedRuntime {
     await this.state();
     return this;
   }
-  state(timeout = 5000) {
-    return this.request('state', {}, timeout);
-  }
-  async set_model(args) {
-    if (this.record.modelSelectionSupported !== true)
-      throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
-    const result = await this.request(
-      'set_model',
-      {
-        model: args.model,
-        thinking_level: args.thinking_level,
-        timeout_ms: args.timeout_ms ?? 5000,
-      },
-      args.timeout_ms ?? 5000,
-      args.beforeDispatch,
-    );
-    if (result?.status !== 'accepted' || (args.model && !sameModel(result.model, args.model)))
-      throw new AttachmentFailure('MODEL_SELECTION_CHANGED', true);
-    return { status: 'accepted', ...cleanModelSetting(result), scope: 'session' };
-  }
-  async models(args = {}) {
-    if (this.record.modelsSupported !== true) throw new AttachmentFailure('MODELS_UNSUPPORTED');
-    return cleanModelPage(await this.request('models', { offset: args.offset, limit: args.limit }));
+  async state(timeout = 5000) {
+    const state = await this.request('state', {}, timeout);
+    if (
+      this.record.kind === 'host' &&
+      (state?.capabilities?.send !== true ||
+        typeof state.capabilities.command !== 'boolean' ||
+        typeof state.capabilities.stop !== 'boolean')
+    )
+      throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
+    return state;
   }
   async read(args) {
+    if (this.record.readContract !== READ_CONTRACT)
+      throw new AttachmentFailure('OWNER_READ_REFRESH_REQUIRED');
     const result = await this.request('read', args);
-    assertContextReadResponse(result, args);
-    return result;
+    if (result?.sessionFile !== this.session.file || result?.sessionId !== this.session.header.id)
+      throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+    return assertReadSnapshot(result, args);
   }
   async snapshot() {
     const result = await this.request('snapshot');
@@ -492,7 +469,7 @@ export class AttachedRuntime {
     return result;
   }
   send(args) {
-    if (args.model) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
+    if (hasPromptSettings(args)) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
     if (args.images && this.record.imagesSupported !== true)
       throw new AttachmentFailure('IMAGE_INPUT_UNSUPPORTED');
     return this.request(
@@ -506,20 +483,28 @@ export class AttachedRuntime {
       args.beforeDispatch,
     );
   }
-  async executeBash({ command, recovery_id, timeout_ms = 5000, beforeDispatch }) {
+  async executeBash({ command, max_chars, timeout_ms = 5000, beforeDispatch }) {
     await beforeDispatch?.();
     const result = await this.request(
       'bash',
-      { command, recovery_id, timeout_ms },
+      { command, max_chars, timeout_ms },
       timeout_ms,
       beforeDispatch,
     );
-    if (result?.completed !== true) throw new AttachmentFailure('INVALID_BASH_RESULT', true);
-  }
-  async stopExecution({ recovery_id, timeout_ms = 5000 }) {
-    const result = await this.request('stop', { recovery_id, timeout_ms }, timeout_ms);
     try {
-      return stopReceipt(result);
+      return inlineBashResult(result);
+    } catch (error) {
+      error.uncertain = true;
+      throw error;
+    }
+  }
+  compact(body, timeout, beforeDispatch) {
+    return this.request('compact', body, timeout, beforeDispatch);
+  }
+  async stopExecution({ max_chars, timeout_ms = 5000 } = {}) {
+    const result = await this.request('stop', { max_chars, timeout_ms }, timeout_ms);
+    try {
+      return { ...stopReceipt(result), withdrawal: inlineWithdrawal(result?.withdrawal) };
     } catch (error) {
       error.uncertain = true;
       throw error;

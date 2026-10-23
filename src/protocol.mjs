@@ -18,36 +18,27 @@ import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
 export const descriptions = {
-  models:
-    'Inspect a known session’s native available chat-model snapshot and current selection. Requires send permission; never returns credentials or full provider configuration. start:true explicitly allows cold-starting that saved session without a prompt. Inactive sessions otherwise return availability unknown. Includes input modes, limits, reasoning and native thinking levels; null means unknown. Standalone set_model changes persistent session state, including while busy. send/create with model require an exclusively Bridge-owned idle runtime.',
-  reload:
-    'Reload a proven-idle Bridge-owned RPC by normal EOF exit and reopening the same saved session (method:rpc_reopen). This is not SDK hot reload or arbitrary slash execution. Requires send permission, never stop; refuses busy, unconfirmed idle, inactive sessions and external owners. Reapplies native launch settings/extensions, including explicit CLI overrides; reports new generation and current model/thinking. Does not restart the Bridge service or tunnel. Required request_id recovers the existing outcome without reopening again. Timeout returns unknown while the fenced operation continues; never retry with a new ID.',
   compact:
-    'Manually compact through native Pi. Defaults to idle-only with send permission; refuses busy or unproven idle. Only explicit interrupt:true permits native abort-before-compaction and additionally requires stop permission. An interrupting call may abort the agent even if summarization later fails. It does not emulate stop-all or withdraw queues. Supported on Bridge-owned RPC only; other owners explicitly reject. Returns bounded completion metadata, never summary text; use read for the native summary. Timeout means unknown: recover with same request_id and recover:true, never repeat with a new ID. Native stop can cancel compaction; no arbitrary slash command execution.',
-  set_model:
-    'Set the persistent session model through native Pi without sending a prompt. Requires send permission. Busy switching is allowed: in-flight provider requests keep their model, subsequent agent calls (including tool continuations and queued prompts) use the then-current selection. This does not bind models to individual prompts or change global defaults. Supply model:{provider,id} and/or thinking_level, plus session_id and request_id. Explicit unsupported thinking is rejected before changing model; native model-only adjustment is reported with actual thinking_level. Omit both model and thinking_level with the same request_id to recover, never resubmit with a new ID after uncertainty.',
-  list: 'List authorized Pi sessions with project, name, recent activity and coarse runtime status. Filters combine; newest activity first. list permission is independent of read.',
-  read: 'Read the effective Pi context as a chronological timeline grouped by prompt. Select summaries, earliest/recent prompts and each prompt’s text, thinking and tool records. Defaults select all. Continue next_cursor with the same selectors; sampling omissions differ from capacity pagination.',
-  send: 'Send text and/or native images to the session’s single reusable Pi instance. images are base64 PNG/JPEG/GIF/WebP blocks; no fixed image-count cap, total decoded size at most 5 MiB. Requires an image-capable model and owner. Optional model:{provider,id} selects the session model before sending; busy/queued/unsupported owners reject explicit selection. default maps to steer; idle_only rejects busy sessions; steer and follow_up select native queues. Required stable request_id identifies one submission, not completion. Omit text, images and model to recover its receipt. Never replay unknown work under a new ID.',
+    'Manually compact through native Pi. Defaults to idle-only with send permission; refuses busy or unproven idle. Only explicit interrupt:true permits native abort-before-compaction and additionally requires stop permission. An interrupting call may abort the agent even if summarization later fails. It does not emulate stop-all or withdraw queues. Owned RPC supports idle compact; companions and supplied SDK/RPC bindings support explicit interrupt and reject unconfirmed idle without aborting. Returns bounded completion metadata, never summary text; use read for the native summary. Timeout means unknown; inspect list/read before deciding whether to submit again. Each call is a new operation. Native stop can cancel compaction where supported; no arbitrary slash command execution.',
+  list: 'List authorized Pi sessions with project, name, recent activity and coarse runtime status, including current model identity and thinking_level when observed from a live owner (otherwise null). Never starts a runtime. creatable_projects contains only configured create-permitted projects represented on the returned page, deduplicated. It does not limit create targets. Filters combine; newest activity first. list permission is independent of read.',
+  read: 'Read the effective Pi context as a chronological timeline grouped by prompt. Defaults to latest: last prompt, all assistant text and first/last 2 thinking blocks, without summary, extra earliest prompts, tool units or commands. preset:recent includes active summaries and last 3 prompts with first/last 3 thinking blocks; preset:full selects all. select overrides individual fields. Tool units include call arguments and paired result output, sampled first/last N per selected prompt. Returns sanitized readable units, not JSON fragments; images are honest descriptors without base64. Continue with cursor alone: session, selection and frozen leaf are inherited; explicit conflicting overrides reject. max_bytes may change. READ_BUDGET_TOO_SMALL asks for minimum_max_bytes; indivisible content larger than the maximum page is explicitly omitted. Sampling omissions differ from capacity pagination; live is transient and incomplete.',
+  send: 'Send text and/or native images to the session’s native Pi owner. images are base64 PNG/JPEG/GIF/WebP blocks; no fixed image-count cap, total decoded size at most 5 MiB. Requires an image-capable model and owner. Optional model:{provider,id} and/or thinking_level apply session settings immediately before the prompt. Busy/queued/unsupported owners reject explicit settings; omitted fields follow native session behavior. default maps to steer; idle_only rejects busy sessions; steer and follow_up select native queues. Text or images are required. Returns status:started|queued|handled|skipped|rejected|unknown and reason only when needed, not model completion. Explicit settings may add verified model_selection:{model:{provider,id},thinking_level}; no requested/scope/status/actual wrapper. Every call is a new submission; no deduplication or result lookup. If unknown, inspect list/read before deciding whether to submit again.',
   command:
-    'Execute a native Pi !command, not a model prompt, with independent command permission. Required request_id prevents repeated shell execution. Omit command to recover output; continue next_cursor with the same ID. timeout_ms is an acknowledgement budget, not a shell kill deadline. Unsupported hosts return BASH_UNSUPPORTED.',
-  stop: 'Stop current execution and withdraw queued prompts while retaining the session and process. Requires only stop permission and request_id. An existing receipt is replayed without stopping a later run; without one, omitting cursor can execute stop. After a lost response, use the same ID with cursor:"" for receipt-only recovery from the first page; missing receipts return RECEIPT_NOT_FOUND without dispatch. Preserve the empty string, do not drop it with a truthy filter. Continue withdrawn text via next_cursor with the same ID. Unsupported hosts return STOP_UNSUPPORTED.',
+    'Execute a native Pi !command, not a model prompt, with independent command permission. command is required and every call executes a new operation. Returns bounded output with output_complete:false if cut short; no continuation or result lookup. Inspect list/read after an unknown outcome, do not automatically resubmit. timeout_ms is an acknowledgement budget, not a shell kill deadline. Unsupported hosts return BASH_UNSUPPORTED.',
+  stop: 'Stop current execution and withdraw queued prompts while retaining saved history. Requires only stop permission. Each call performs a new stop; never cold-starts Pi. Returns bounded withdrawn text with withdrawn_complete:false if cut short; no continuation or result lookup. Unsupported hosts return STOP_UNSUPPORTED.',
   create:
-    'Create a session in project (absolute project directory) and send initial text and/or images. Images and optional model:{provider,id} use the same rules as send. Optional name and fork_from copy the parent’s committed tail without switching its owner. Requires target create permission and source read when forking. Omit text, images and model only to recover an existing request_id. A partial receipt retains the created session ID and send status.',
+    'Create a session in project (absolute project directory) and send initial text and/or images. Images and optional model:{provider,id} and/or thinking_level use the same rules as send, including the first prompt. Optional name and fork_from copy the parent’s committed tail without switching its owner. Requires target create permission and source read when forking. Text or images are required. A partial result retains the created session ID and send status. Each call creates a new session; after an unknown result inspect list/read, do not automatically resubmit.',
   delete:
-    'Recoverably move an authorized session to Bridge trash, stopping its owned live runtime. Project files are retained. Repeat request_id to recover the receipt.',
+    'Recoverably move an authorized session to Bridge trash, stopping its owned live runtime. Project files are retained. Each call is a new deletion attempt; there is no result lookup.',
   batch:
-    'Wrap 1–10 operations (all tools except batch). Same-session operations execute serially through submission receipts; different sessions run concurrently. Each item keeps its own permissions and recovery semantics. Item failure does not cancel other items.',
+    'Wrap 1–10 operations (all tools except batch). Same-session operations execute serially through submission results; different sessions run concurrently. Each item keeps its own permissions. Every mutation item is a new operation, including in repeated batches; no outer replay or deduplication. Item failure does not cancel other items. Results share preallocated UTF-8/JSON/wire budgets: command/stop may return a smaller prefix than max_chars, with accurate completeness flags; auxiliary command.fullOutputPath/delete.project may be omitted. Captured query pages may shrink or explicitly refuse; mutation results are retained.',
   health:
-    'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Defaults to the sole permissions domain; does not change authorization.',
+    'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Takes no domain selector; does not change authorization.',
 };
 export const toolNames = [
   'list',
   'read',
-  'models',
-  'set_model',
   'compact',
-  'reload',
   'send',
   'command',
   'stop',
@@ -80,7 +71,7 @@ export async function callBridgeTool(
   bridge,
   name,
   input,
-  { signal, requestId, execute = (run) => run() } = {},
+  { requestId, execute = (run) => run() } = {},
 ) {
   const schema = Object.hasOwn(publicSchemas, name) ? publicSchemas[name] : null;
   if (!schema) return toolError('UNKNOWN_TOOL');
@@ -92,20 +83,25 @@ export async function callBridgeTool(
         .slice(0, 12),
     });
   const args = parsed.data;
+  // Start at the authoritative receive boundary, not when a delayed executor runs.
+  const context = bridge.captureRequestContext?.();
+  // A delayed/rejected executor must not leave an early policy failure unhandled.
+  void context?.catch(() => {});
   return execute(async () => {
     try {
+      // Input methods register their existing Stop fence before awaiting policy I/O.
+      const requestContext = context;
       const result = await diagnostics.measure(
         'tool',
         {
           op: name,
           mcp_id_ref: diagnosticRef(requestId),
-          mutation_ref: diagnosticRef(args.request_id),
           session_ref: diagnosticRef(args.session_id),
         },
         () =>
           name === 'batch'
-            ? executeBatch(bridge, args, { signal })
-            : bridge[name](args, { signal }),
+            ? executeBatch(bridge, args, { requestContext })
+            : bridge[name](args, { requestContext }),
       );
       return {
         content: [{ type: 'text', text: JSON.stringify(result) }],
@@ -114,9 +110,15 @@ export async function callBridgeTool(
     } catch (error) {
       return toolError(
         publicError(error),
-        error?.uncertain
-          ? { uncertain: true, recovery: 'SAME_REQUEST_ID', request_id: args.request_id }
-          : {},
+        error?.minimum_max_bytes
+          ? { minimum_max_bytes: error.minimum_max_bytes }
+          : error?.uncertain
+            ? {
+                uncertain: true,
+                recovery:
+                  'OUTCOME_UNKNOWN; inspect list/read before deciding whether to submit again. No automatic replay.',
+              }
+            : {},
       );
     }
   });
@@ -147,12 +149,13 @@ export function unsupportedVersion(id, requested) {
   });
 }
 // Applies to the entire serialized JSON-RPC envelope, including escaped text
-// duplication, metadata and request ID. Never truncates JSON or mutation receipts.
+// duplication, metadata and request ID. Never truncates JSON.
 export function boundMessage(message, limit = MCP_RESPONSE_LIMIT) {
   if (Buffer.byteLength(JSON.stringify(message), 'utf8') <= limit) return message;
   const modern = message.result?.resultType !== undefined;
   const result = toolError('RESPONSE_TOO_LARGE', {
-    retry: 'READ_SEPARATELY_OR_RECOVER_WITH_SAME_REQUEST_ID',
+    recovery:
+      'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
   });
   const replacement = {
     jsonrpc: '2.0',
