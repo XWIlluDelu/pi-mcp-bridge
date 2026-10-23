@@ -55,7 +55,7 @@ For multiple clients, start one shared HTTP service; each stdio-only client can 
 | `create`    | `project`, `request_id`, text and/or images; optional name/fork_from | Target `create`; source `read` for fork |
 | `delete`    | `session_id`, `request_id`                                           | `delete`                                |
 | `batch`     | 1–10 `{op,args}` items                                               | Each wrapped operation's own permission |
-| `health`    | Optional known `session_id`; permissions by default                  | Diagnostics; does not change grants     |
+| `health`    | Optional known `session_id`; permissions by default                  | Issues only; does not change grants     |
 
 Every mutation requires a `request_id`. Native acceptance is not model completion, and a timeout can leave the outcome `unknown`: recover using the same `request_id` rather than submitting the work again. See [API](docs/api.md) and [reading](docs/reading.md).
 

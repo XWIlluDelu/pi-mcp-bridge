@@ -127,6 +127,7 @@ const enums = {
   ],
   status: [
     'ok',
+    'warning',
     'error',
     'accepted',
     'unknown',

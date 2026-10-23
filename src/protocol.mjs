@@ -39,7 +39,7 @@ export const descriptions = {
   batch:
     'Wrap 1–10 operations (all tools except batch). Same-session operations execute serially through submission receipts; different sessions run concurrently. Each item keeps its own permissions and recovery semantics. Item failure does not cancel other items.',
   health:
-    'Report effective independent grants, their sources and advisory combinations. Optional known session_id adds its permission report. Defaults to the sole permissions domain; does not change authorization.',
+    'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Defaults to the sole permissions domain; does not change authorization.',
 };
 export const toolNames = [
   'list',
