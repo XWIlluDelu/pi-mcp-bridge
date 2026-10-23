@@ -435,7 +435,9 @@ for (const overlap of [false, true])
       );
       const fresh = f.bridge.pool.get(f.id);
       assert.notEqual(fresh.generation, owned.generation);
-      await until(async () => (await fresh.idleSnapshot()).status === 'idle');
+      await until(() => fresh.exited && !f.bridge.autoReleases.size);
+      assert.equal(fresh.child.exitCode, 0);
+      assert.equal(fresh.child.signalCode, null);
       const projected = await f.bridge.read({ session_id: f.id });
       assert.ok(JSON.stringify(projected).includes('AFTER_MAINTENANCE'));
     },

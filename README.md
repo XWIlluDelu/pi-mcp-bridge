@@ -6,7 +6,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions to other agent
 
 - **Inspect:** list authorized sessions with title, project, activity and coarse status. Read the effective native context as a chronological, prompt-linked timeline, selecting summaries, prompts, text, thinking, tools and commands. Reads default to `latest`: the last prompt, all assistant text and first/last two thinking blocks, without summary, tools or commands. Explicit `recent` includes summaries and the last three prompts; selectors can override either preset, and `full` selects everything. Pages start with the newest selected content and continue backwards.
 - **Send:** submit text and/or images with default, idle-only, steer or follow-up delivery, or run native Pi `!` commands through the separate `command` tool.
-- **Control:** apply model and thinking settings with prompts, compact context (idle by default). Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
+- **Control:** apply model and thinking settings with prompts, compact context (idle by default). Owned RPCs release safely between tasks and cold-resume when later work needs them. Stop execution and withdraw queued input, returning a single bounded text prefix with an explicit incompleteness flag when cut short.
 - **Manage:** create a session and send its initial prompt, optionally forking a parent's current committed branch without switching its running instance. Recoverably delete sessions while retaining project files.
 - **Batch:** run 1–10 operations, serially per session and concurrently across independent sessions.
 - **Permissions:** seven independent permissions at default, project and session tiers; `health` reports unusual combinations without changing them.
@@ -72,7 +72,7 @@ node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
 
 The launcher starts a fresh TUI, negotiates the current owner's shutdown, waits for admitted work and a normal EOF exit, then switches to the saved session. The session file is not opened before negotiation. Ordinary TUI/RPC instances participate by loading the companion extension. See [runtime integration](docs/runtime.md).
 
-Bridge-owned RPCs remain open between operations. Owner-local release and TUI handoff close them through normal EOF. External TUI/RPC hosts manage their own lifecycle.
+Bridge-owned prompt runtimes also release normally after their run and queues finish and idle is proven. Saved history remains available; the next send can resume the session. Unconfirmed work stays owned, and external TUI/RPC hosts manage their own lifecycle.
 
 **Native boundaries:**
 

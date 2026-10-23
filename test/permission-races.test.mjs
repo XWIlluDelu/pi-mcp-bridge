@@ -8,7 +8,7 @@ import { withdrawalCollector } from '../src/stop-execution.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
-import { completedEntries, fixture as nativeFixture } from './fixtures/model-runtime.mjs';
+import { releasedEntries, fixture as nativeFixture } from './fixtures/model-runtime.mjs';
 for (const operation of ['send', 'create', 'command'])
   test(
     operation + ' retains admission permissions through slow native identity observation',
@@ -59,7 +59,7 @@ for (const operation of ['send', 'create', 'command'])
       assert.equal(dispatched.length, 1);
       if (operation === 'create') {
         assert.equal(result.created, true);
-        const entries = await completedEntries(bridge, result.session_id);
+        const entries = await releasedEntries(bridge, result.session_id);
         assert.ok(entries.some((e) => e.message?.role === 'user'));
       }
     },

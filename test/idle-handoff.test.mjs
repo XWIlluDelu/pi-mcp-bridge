@@ -605,7 +605,7 @@ test(
     assert.equal(sent.status, 'handled');
     assert.equal(sent.reason, 'EXTENSION_UI_CANCEL_SENT');
     assert.equal(sent.ui, undefined);
-    await until(async () => (await f.bridge.pool.get(f.id).idleSnapshot()).status === 'idle');
+    await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
     assert.deepEqual(
       (await fs.readFile(f.session.file, 'utf8'))
         .trim()
@@ -614,6 +614,8 @@ test(
         .find((e) => e.customType === 'dialog-results').data,
       [true, false, null, null, null],
     );
+    assert.equal((await f.bridge.list({})).sessions[0].status.state, 'saved');
+    assert.equal((await f.bridge.stop({ session_id: f.id })).status, 'skipped');
     assert.ok(
       ['started', 'queued', 'handled'].includes(
         (await f.bridge.send({ session_id: f.id, text: 'NO_DIALOG' })).status,
@@ -1026,8 +1028,7 @@ for (const mode of [
         (await f.bridge.send({ session_id: f.id, text: 'AFTER_SWITCH_AWAY' })).status,
         'started',
       );
-      await until(async () => (await f.bridge.pool.get(f.id).idleSnapshot()).status === 'idle');
-      await f.bridge.pool.stop(f.id);
+      await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
       process.kill(owner.owner.pid, 'SIGTERM');
       await waitOwnerExit(owner.owner);
       assert.equal(
