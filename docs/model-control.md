@@ -125,8 +125,9 @@ Both `send` and `create` accept `model` and/or `thinking_level`, including creat
 Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, restricted to the native target's supported set. Unsupported explicit levels return `THINKING_LEVEL_UNSUPPORTED`; unknown reasoning support returns `THINKING_SUPPORT_UNKNOWN`. Global user defaults are unchanged.
 
 Explicit settings require a proven-idle Bridge-owned RPC with no pending input. Busy returns `MODEL_SELECTION_BUSY`; `idle_only` skips busy work without changing settings. Unproven idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`. Shared hosts and companions return `MODEL_SELECTION_UNSUPPORTED` before settings or input dispatch. Plain queued sends continue to use native settings when consumed. Immediately
-before prompt dispatch, explicit settings and image support are checked against
-the current native selection. A conflicting local change refuses the prompt;
+before prompt dispatch, explicit settings are checked against the current native
+selection. Image interpretation stays with native input extensions and the final
+Pi/provider path, as described in [image input](api.md#image-input-send-and-create). A conflicting local change refuses the prompt;
 Bridge does not restore an old model to make preflight pass.
 
 Selection and prompt submission use separate native commands. The Bridge serializes its own calls, rechecks identity and execution state, uses the request's [receive-time permission snapshot](configuration.md#request-permission-snapshots), and omits native queue behavior on a settings-bearing prompt so a hook that starts concurrent work causes refusal. Pi offers no atomic settings-plus-input transaction or per-message settings binding against independent native extension work. A failed prompt or later setting step can leave an earlier native setting in place; settings are not rolled back.

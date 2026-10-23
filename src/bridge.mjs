@@ -15,7 +15,6 @@ import {
   SEND_MODES,
   promptInput,
   hasPromptSettings,
-  assertImageModel,
   assertPromptSelection,
   promptOptions,
   promptResult,
@@ -699,7 +698,6 @@ export class Bridge {
           if (hasPromptSettings(body)) {
             const actual = await runtime.selectModel(body.model, {
               thinkingLevel: body.thinking_level,
-              images: body.images,
               idle: true,
               timeout: args.timeout_ms ?? 5000,
               beforeDispatch: authorized,
@@ -710,16 +708,14 @@ export class Bridge {
             };
             await authorized();
           }
-          if (body.mode === 'idle_only' || body.images) {
+          if (body.mode === 'idle_only') {
             const state = await runtime.state();
-            assertImageModel(body.images, state.model);
             if (
-              body.mode === 'idle_only' &&
-              (runtime.promptAdmission ||
-                state.isStreaming ||
-                state.isCompacting ||
-                state.isIdle === false ||
-                state.pendingMessageCount > 0)
+              runtime.promptAdmission ||
+              state.isStreaming ||
+              state.isCompacting ||
+              state.isIdle === false ||
+              state.pendingMessageCount > 0
             )
               return { ...selection, status: 'skipped', reason: 'busy' };
           }
@@ -916,7 +912,6 @@ export class Bridge {
           if (hasPromptSettings(input)) {
             const actual = await runtime.selectModel(input.model, {
               thinkingLevel: input.thinking_level,
-              images: input.images,
               idle: true,
               timeout: args.timeout_ms ?? 5000,
               beforeDispatch,
@@ -925,10 +920,6 @@ export class Bridge {
               model: actual.model,
               thinking_level: actual.thinking_level,
             };
-            await beforeDispatch();
-          }
-          if (input.images) {
-            assertImageModel(input.images, (await runtime.state()).model);
             await beforeDispatch();
           }
           const onLate = () => {}; // No public late-result lookup.
@@ -1153,14 +1144,13 @@ export class Bridge {
   }
 }
 async function beforePromptDispatch(runtime, input, selection, authorize) {
-  if (hasPromptSettings(input) || input.images) {
+  if (hasPromptSettings(input)) {
     const current = await runtime.state();
     assertPromptSelection(input, current);
-    if (hasPromptSettings(input))
-      selection.model_selection = modelSettings({
-        model: current.model,
-        thinking_level: current.thinkingLevel,
-      });
+    selection.model_selection = modelSettings({
+      model: current.model,
+      thinking_level: current.thinkingLevel,
+    });
   }
   // Native selection can change locally while observations are awaited. Check
   // Stop/handoff admission last; never restore a model to make preflight pass.

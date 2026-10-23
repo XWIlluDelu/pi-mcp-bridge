@@ -216,8 +216,9 @@ settings are supplied. Identical image submissions are independent operations.
   A batch shares that envelope limit; it is not multiplied by its item count.
 - The Bridge validates base64, size and format signatures before dispatch.
   Pi retains its normal decoding, resizing and extension input behavior.
-  A selected model without image input is rejected with
-  `MODEL_IMAGE_INPUT_UNSUPPORTED`.
+  Extensions may consume or transform images or select a different model before
+  the request. Bridge does not reject input based on the pre-hook model; the final
+  Pi/provider path handles image support using its native rules.
 - Images enter native user-message image blocks, not descriptions, OCR text or
   base64 embedded in a text prompt. Native history and forked context retain
   those blocks; read pagination remains bounded even for large image records.
@@ -225,7 +226,8 @@ settings are supplied. Identical image submissions are independent operations.
   before sending, even when text accompanies the image. Custom hosts must
   declare and implement image support; installed components must also be loaded
   by the running owner. See [image-capable owners](runtime.md#image-capable-owners).
-  Images are never silently dropped in favor of text-only delivery.
+  Bridge forwards the image blocks unchanged rather than falling back to text-only
+  delivery. Native extensions and provider conversion may then transform them.
 
 A native ACK confirms admission, not successful visual interpretation. Model
 responses and any native image-processing diagnostics are read from the session.
