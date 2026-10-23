@@ -16,7 +16,7 @@ import { uiFacts, uiSnapshot } from './rpc-ui.mjs';
 import { RuntimeEvents } from './runtime-events.mjs';
 import { limitBashResult } from './bash-execution.mjs';
 import { requestRpcStop, withdrawalCollector } from './stop-execution.mjs';
-import { validatePiRuntime, validateLaunchArgs } from './owner-config.mjs';
+import { validatePiRuntime, validateLaunchArgs, readOwnerConfig } from './owner-config.mjs';
 import {
   reserveOwner,
   updateOwner,
@@ -820,13 +820,22 @@ export class PiRpc {
   }
 }
 export class RuntimePool {
-  constructor(config, factory) {
+  constructor(config, factory, { configFile } = {}) {
     this.config = config;
     this.attachmentDir =
       config.attachmentDir ?? (config.stateDir ? path.join(config.stateDir, 'ipc') : undefined);
     this.factory =
       factory ??
-      ((session) => new PiRpc({ ...config, attachmentDir: this.attachmentDir }, session).start());
+      (async (session) => {
+        const desired = configFile ? (await readOwnerConfig(configFile)).config : config;
+        const desiredRegistry =
+          desired.attachmentDir ??
+          (desired.stateDir ? path.join(desired.stateDir, 'ipc') : undefined);
+        // A different namespace cannot prove this target has no writer. This
+        // affects only acquisition, not reads or reuse of an existing owner.
+        if (desiredRegistry !== this.attachmentDir) throw new RpcFailure('CONFIG_RESTART_REQUIRED');
+        return new PiRpc({ ...config, attachmentDir: this.attachmentDir }, session).start();
+      });
     this.instances = new Map();
     // Keep the latest owned generation's bounded observations through normal
     // release, without persisting native notifications into session history.

@@ -24,7 +24,11 @@ import {
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
-import { companionProfile, companionIncludes } from './companion-profile.mjs';
+import {
+  companionProfile,
+  currentCompanionScope,
+  companionIncludes,
+} from './companion-profile.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { ContextObservation } from './context-observation.mjs';
 import {
@@ -58,11 +62,24 @@ export default async function attachExtension(pi) {
     else if (targetFile === '~' || targetFile.startsWith('~/'))
       targetFile = path.join(homedir(), targetFile.slice(1));
     targetFile = path.resolve(targetFile);
-    if (!companionIncludes(profile, targetFile)) return;
     try {
+      if (companionIncludes(await currentCompanionScope(profile), targetFile)) {
+        await assertSingleSessionFile(targetFile, { allowMissing: true });
+      } else {
+        // Scope removal does not end an existing writer. Check only the existing
+        // registry and target path metadata; do not register or read its history.
+        const registry = await fs.stat(dir).catch((error) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (!registry) return;
+        targetFile = await fs.realpath(targetFile).catch((error) => {
+          if (error.code === 'ENOENT') return targetFile;
+          throw error;
+        });
+      }
       // Refuse an already-owned target before SessionManager.open can switch us.
       // This is a read-only admission check, not an atomic open reservation.
-      await assertSingleSessionFile(targetFile, { allowMissing: true });
       await registryTransaction(dir, () =>
         assertNoOtherLiveOwner(dir, { file: targetFile }, { allowSameProcess: true }),
       );
@@ -185,7 +202,7 @@ export default async function attachExtension(pi) {
       const file = ctx.sessionManager.getSessionFile();
       // Check only path metadata before inspecting entries or publishing IPC.
       // No-session runs and sessions outside the owner's roots remain ordinary Pi.
-      if (!companionIncludes(profile, file)) {
+      if (!companionIncludes(await currentCompanionScope(profile), file)) {
         await retirePreviousClaims(file, await processIdentity());
         return;
       }

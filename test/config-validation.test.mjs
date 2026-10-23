@@ -91,6 +91,49 @@ test('current policy validates without mutation and snapshot rejects invalid cha
   }
 });
 
+test('scope reload stays read-only; fixed settings await restart without blocking requests', async (t) => {
+  const f = await fixture(t),
+    bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init(),
+    root = path.join(f.dir, 'new-root'),
+    alias = path.join(f.dir, 'root-alias');
+  t.after(() => bridge.close());
+  const save = (config) => fs.writeFile(f.file, JSON.stringify(config), { mode: 0o600 });
+  await save({ ...f.config, sessionRoots: [root], folders: [] });
+  const context = await bridge.captureRequestContext();
+  assert.deepEqual(context.scope, { sessionRoots: [root], folders: [] });
+  await bridge.health();
+  assert.deepEqual((await bridge.list()).sessions, []);
+  await assert.rejects(fs.stat(root), { code: 'ENOENT' });
+  await fs.mkdir(root, { mode: 0o700 });
+  await fs.symlink(root, alias);
+  await save({ ...f.config, sessionRoots: [alias] });
+  await bridge.health();
+  await assert.rejects(bridge.list(), /UNSAFE_NATIVE_SESSION_STORAGE/);
+  await save({ ...f.config, sessionRoots: [f.config.stateDir] });
+  await assert.rejects(bridge.captureRequestContext(), /OVERLAPPING_STORAGE/);
+  for (const patch of [
+    { piArgs: ['--offline'] },
+    { stateDir: path.join(f.dir, 'different-state') },
+    { attachmentExitTimeoutMs: 6000 },
+  ]) {
+    await save({ ...f.config, ...patch });
+    const context = await bridge.captureRequestContext();
+    assert.deepEqual(context.restartRequired, Object.keys(patch));
+    assert.ok(Object.isFrozen(context.restartRequired));
+    assert.deepEqual((await bridge.list()).sessions, []);
+    assert.deepEqual((await bridge.health()).restart_required, Object.keys(patch));
+  }
+  assert.equal(bridge.config.attachmentExitTimeoutMs, undefined);
+  await save({
+    ...f.config,
+    stateDir: path.join(f.dir, 'different-state'),
+    sessionRoots: [f.config.stateDir],
+  });
+  await assert.rejects(bridge.captureRequestContext(), /OVERLAPPING_STORAGE/);
+  await save(f.config);
+  assert.deepEqual(await bridge.health(), { domain: 'permissions', status: 'ok' });
+});
+
 for (const which of ['stateDir'])
   test(`private storage checks agree for ${which}`, async (t) => {
     const f = await fixture(t),
