@@ -1,18 +1,7 @@
 node_modules/
 .npm-cache/
-upstream-pi/
-demo/state/
-demo/agent/
-demo/sessions/
-demo/owner-config.json
 
 # Owner-local operations, credentials and generated research artifacts.
 /.local/
 /owner.json
 /owner-config.json
-
-# Generated transcripts, not reusable tests or research documentation.
-/*_TEST_RESULTS.txt
-/TEST_RESULTS.txt
-/research/DEEPSEEK_REVIEW*.txt
-/research/long-session-reading-results.txt
