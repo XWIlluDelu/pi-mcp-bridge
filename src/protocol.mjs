@@ -4,6 +4,7 @@ import { publicSchemas } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { publicError } from './errors.mjs';
+import { EventError } from './events.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
 export const SUPPORTED_VERSIONS = [
@@ -225,11 +226,27 @@ export async function dispatchModern(bridge, body, options = {}) {
     case 'server/discover':
       result = {
         supportedVersions: SUPPORTED_VERSIONS,
-        capabilities: { tools: {} },
+        capabilities: { tools: {}, events: {} },
         ttlMs: 0,
         cacheScope: 'private',
       };
       break;
+    case 'events/list':
+    case 'events/subscribe':
+    case 'events/unsubscribe': {
+      try {
+        result = await bridge.events.handle(body.method, body.params, options);
+      } catch (error) {
+        return {
+          status: error instanceof EventError && error.code !== -32603 ? 400 : 500,
+          message:
+            error instanceof EventError
+              ? rpcError(id, error.code, error.message, error.data)
+              : rpcError(id, -32603, 'REQUEST_FAILED'),
+        };
+      }
+      break;
+    }
     case 'ping':
       result = {};
       break;

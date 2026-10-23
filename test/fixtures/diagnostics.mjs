@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Bridge } from '../../src/bridge.mjs';
 import { PiRpc } from '../../src/rpc.mjs';
+import { CallbackError } from '../../src/event-webhook.mjs';
+import { META, MODERN_VERSION } from '../../src/protocol.mjs';
 import { createHttpService, TOKEN_HEADER } from '../../src/http-server.mjs';
 import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'PRIVATE_PATH-')),
@@ -69,6 +71,54 @@ try {
   });
   assert.equal(denied.status, 401);
   await denied.text();
+  // Exercise the response boundary without creating any subscription or callback.
+  const post = bridge.events.post;
+  bridge.events.post = async () => {
+    throw new CallbackError('challenge_failed');
+  };
+  const eventBody = {
+    jsonrpc: '2.0',
+    id: 'PRIVATE_RPC_EVENT',
+    method: 'events/subscribe',
+    params: {
+      name: 'session.settled',
+      arguments: { session_id: created.session_id },
+      delivery: {
+        mode: 'webhook',
+        url: 'https://callback.example/PRIVATE_PATH?PRIVATE_QUERY',
+        secret: 'whsec_' + Buffer.alloc(32, 7).toString('base64'),
+      },
+      _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
+    },
+  };
+  const eventHeaders = {
+    'Content-Type': 'application/json',
+    [TOKEN_HEADER]: token,
+    'MCP-Protocol-Version': MODERN_VERSION,
+    'Mcp-Method': 'events/subscribe',
+  };
+  for (const mismatch of [false, true]) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { ...eventHeaders, ...(mismatch ? { 'Mcp-Method': 'events/list' } : {}) },
+      body: JSON.stringify(eventBody),
+    });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.code, mismatch ? -32020 : -32015);
+  }
+  bridge.events.post = post;
+  assert.equal(bridge.events.records.size, 0);
+  const listed = await fetch(url, {
+    method: 'POST',
+    headers: { ...eventHeaders, 'Mcp-Method': 'events/list' },
+    body: JSON.stringify({
+      ...eventBody,
+      method: 'events/list',
+      params: { _meta: eventBody.params._meta },
+    }),
+  });
+  assert.equal(listed.status, 200);
+  assert.ok((await listed.json()).result.events);
   // Controlled bridge transport fixture: no Pi method is modified.
   let command;
   const rpc = new PiRpc(config, saved);

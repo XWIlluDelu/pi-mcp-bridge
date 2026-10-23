@@ -29,6 +29,14 @@ test('attached state diagnostics retain built-in failures but suppress unknown s
     op: 'PRIVATE_OPERATION',
     code: 'PRIVATE_CODE',
     message: 'PRIVATE_MESSAGE',
+    method: 'PRIVATE_METHOD',
+    rpc_status: 'PRIVATE_STATUS',
+    callback_reason: 'PRIVATE_REASON',
+    rpc_code: 'PRIVATE_CODE',
+    url: 'PRIVATE_URL',
+    secret: 'PRIVATE_SECRET',
+    headers: { Authorization: 'PRIVATE_AUTH' },
+    callback_hostname: 'callback.example/PRIVATE_PATH?PRIVATE_QUERY',
   });
   assert.equal(rows.at(-1).code, 'OTHER_ERROR');
   assert.equal(rows.at(-1).op, undefined);
@@ -139,13 +147,19 @@ test('enabled HTTP, RPC and timeout diagnostics remain private and correlated', 
     process.execPath,
     [fileURLToPath(new URL('./fixtures/diagnostics.mjs', import.meta.url))],
     {
-      env: { PATH: process.env.PATH, HOME: '/tmp', PI_OFFLINE: '1', PI_MCP_LOG: '1' },
+      env: {
+        PATH: process.env.PATH,
+        HOME: '/tmp',
+        PI_OFFLINE: '1',
+        PI_MCP_LOG: '1',
+        PI_MCP_LOG_CALLBACK_HOST: '1',
+      },
       timeout: 20000,
       maxBuffer: 1024 * 1024,
     },
   );
   assert.deepEqual(JSON.parse(stdout), { ok: true });
-  assert.equal(/PRIVATE_(TOKEN|BODY|PATH|RPC)/.test(stderr), false);
+  assert.equal(stderr.includes('PRIVATE_'), false);
   const rows = stderr.trim().split('\n').map(JSON.parse);
   const started = rows.find((r) => r.event === 'tool.start' && r.op === 'read');
   assert.ok(started);
@@ -167,6 +181,38 @@ test('enabled HTTP, RPC and timeout diagnostics remain private and correlated', 
     related.some((r) => r.event === 'session.discover.end'),
     false,
   ); // Warm read revalidates one file.
+  for (const [code, reason] of [
+    [-32015, 'challenge_failed'],
+    [-32020, undefined],
+  ]) {
+    const response = rows.find((r) => r.event === 'http.rpc_response' && r.rpc_code === code);
+    assert.ok(response);
+    assert.equal(response.http_status, 400);
+    assert.equal(response.rpc_status, 'error');
+    assert.equal(response.callback_reason, reason);
+    assert.ok(
+      rows.some(
+        (r) =>
+          r.trace_id === response.trace_id &&
+          r.event === 'http.request' &&
+          r.method === 'events/subscribe',
+      ),
+    );
+  }
+  const callback = rows.find((r) => r.event === 'events.callback_target');
+  assert.equal(callback.callback_hostname, 'callback.example');
+  assert.ok(rows.some((r) => r.trace_id === callback.trace_id && r.rpc_code === -32015));
+  assert.equal(stderr.includes('whsec_'), false);
+  const eventList = rows.find((r) => r.event === 'http.request' && r.method === 'events/list');
+  assert.ok(
+    rows.some(
+      (r) =>
+        r.trace_id === eventList.trace_id &&
+        r.event === 'http.rpc_response' &&
+        r.http_status === 200 &&
+        r.rpc_status === 'result',
+    ),
+  );
   assert.ok(rows.some((r) => r.event === 'http.closed' && r.response_finished === true));
   assert.ok(rows.some((r) => r.event === 'http.rejected' && r.http_status === 401));
   assert.ok(rows.some((r) => r.event === 'runtime.spawned'));

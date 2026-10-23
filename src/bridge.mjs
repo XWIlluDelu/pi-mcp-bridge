@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { EventSubscriptions } from './events.mjs';
 import { publicError } from './errors.mjs';
 import path from 'node:path';
 import { compactReceipt, nativeCompactReason } from './compact.mjs';
@@ -77,6 +78,7 @@ export class Bridge {
     this.titleCache = new Map();
     this.readCache = new ContextReadCache();
     this.autoReleases = new Set();
+    this.events = new EventSubscriptions(this);
     this.pool.onIdleCandidate = (runtime) => scheduleAutoRelease(this, runtime);
   }
   async init() {
@@ -95,6 +97,7 @@ export class Bridge {
       busy: 'BRIDGE_ALREADY_RUNNING',
     });
     try {
+      await this.events.init();
       this.ownerControl = await serveOwnerControl(this);
     } catch (error) {
       await this.lock.close();
@@ -485,6 +488,7 @@ export class Bridge {
       ...(requestContext.restartRequired?.length
         ? { restart_required: requestContext.restartRequired }
         : {}),
+      ...(this.events.storeError ? { events: this.events.health() } : {}),
     };
   }
   async read(args, { requestContext, resultBudget, readPins } = {}) {
@@ -1023,6 +1027,30 @@ export class Bridge {
     runtime.observeInputActivity(request);
     return {};
   }
+  settledForLocal(request) {
+    this.assertOpen();
+    const runtime = this.pool.instances.get(request.session_id);
+    if (
+      !(runtime instanceof PiRpc) ||
+      !runtime.alive ||
+      request.generation !== runtime.ownerRecord?.generation ||
+      !Number.isSafeInteger(request.sequence) ||
+      request.sequence <= (runtime.completionSequence ?? 0) ||
+      !(
+        request.leafId === null ||
+        (typeof request.leafId === 'string' &&
+          request.leafId.length > 0 &&
+          request.leafId.length <= 128)
+      ) ||
+      typeof request.aborted !== 'boolean' ||
+      typeof request.timestamp !== 'string' ||
+      !Number.isFinite(Date.parse(request.timestamp))
+    )
+      throw new Error('INVALID_OWNER_COMMAND');
+    runtime.completionSequence = request.sequence;
+    this.events.observe(runtime.session, request);
+    return {};
+  }
   handoffForLocal(request, options) {
     return idleHandoff(this, request, options);
   }
@@ -1152,6 +1180,7 @@ export class Bridge {
     return (this.closePreparation ??= Promise.all([
       this.pool.prepareClose?.(),
       this.ownerControl?.close(),
+      this.events.close(),
     ]));
   }
   async close() {
