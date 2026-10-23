@@ -67,6 +67,7 @@ export function validateOwnerConfig(config) {
     'piExecutable',
     'piArgs',
     'piRuntime',
+    'herdr',
   ]);
   if (Object.keys(config).some((key) => !fields.has(key))) throw new Error('INVALID_OWNER_CONFIG');
   const paths = new Set();
@@ -87,6 +88,7 @@ export function validateOwnerConfig(config) {
     throw new Error('INVALID_OWNER_CONFIG');
   validateGrants(config.grants);
   if (
+    (config.herdr !== undefined && typeof config.herdr !== 'boolean') ||
     (config.attachmentDir !== undefined && !absolute(config.attachmentDir)) ||
     (config.attachmentExitTimeoutMs !== undefined &&
       (!Number.isInteger(config.attachmentExitTimeoutMs) ||

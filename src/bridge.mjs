@@ -63,7 +63,7 @@ export class Bridge {
   constructor(config, factory, { configFile } = {}) {
     this.config = config;
     this.configFile = configFile;
-    const { grants, defaults, folders, sessionRoots, ...settings } = config;
+    const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
     this.ownerSettings = structuredClone(settings);
     this.pool = new RuntimePool(config, factory, { configFile });
     this.pendingMutations = new Set();
@@ -175,7 +175,7 @@ export class Bridge {
       let restartRequired = [];
       if (this.configFile) {
         const { config } = await readOwnerConfig(this.configFile);
-        const { grants, defaults, folders, sessionRoots, ...settings } = config;
+        const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
         restartRequired = [
           ...new Set([...Object.keys(this.ownerSettings), ...Object.keys(settings)]),
         ].filter((key) => !isDeepStrictEqual(settings[key], this.ownerSettings[key]));
