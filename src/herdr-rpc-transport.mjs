@@ -18,7 +18,7 @@ const exec = promisify(execFile);
 // Same child-shaped byte transport as spawn(). The scope covers the worker and
 // Pi (including detached native tool children); it is not a session owner registry.
 export class HerdrRpcTransport extends EventEmitter {
-  constructor(binary, launch) {
+  constructor(binary, launch, { signal } = {}) {
     super();
     this.stdin = new PassThrough();
     this.stdout = new PassThrough();
@@ -27,7 +27,7 @@ export class HerdrRpcTransport extends EventEmitter {
     this.sockets = new Set();
     this.channels = {};
     this.token = randomBytes(32).toString('hex');
-    this.ready = Promise.resolve().then(() => this.start(binary, launch));
+    this.ready = Promise.resolve().then(() => this.start(binary, launch, signal));
   }
   async scopeActive() {
     const { stdout } = await exec(
@@ -37,11 +37,20 @@ export class HerdrRpcTransport extends EventEmitter {
     );
     return !['inactive', 'failed'].includes(stdout.trim());
   }
-  async waitForScope() {
-    while (await this.scopeActive()) await delay(25);
+  async waitForScope(forceAfterMs) {
+    let deadline = forceAfterMs === undefined ? Infinity : Date.now() + forceAfterMs;
+    while (await this.scopeActive()) {
+      if (Date.now() >= deadline) {
+        await this.signalScope('SIGKILL');
+        deadline = Infinity;
+      }
+      await delay(25);
+    }
   }
-  async start(binary, launch) {
-    const signal = AbortSignal.timeout(30000);
+  async start(binary, launch, cancellation) {
+    const timeout = AbortSignal.timeout(30000);
+    const signal = cancellation ? AbortSignal.any([timeout, cancellation]) : timeout;
+    signal.throwIfAborted();
     this.directory = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-bridge-herdr-'));
     const address = path.join(this.directory, 'rpc.sock');
     const ticket = path.join(this.directory, 'launch.json');
@@ -66,6 +75,7 @@ export class HerdrRpcTransport extends EventEmitter {
     });
     connected.catch(() => {});
     signal.addEventListener('abort', () => rejectChannels(signal.reason), { once: true });
+    signal.throwIfAborted();
     this.server.on('error', rejectChannels);
     await new Promise((resolve, reject) => {
       this.server.once('error', reject);
@@ -78,12 +88,14 @@ export class HerdrRpcTransport extends EventEmitter {
     this.control = await HerdrControl.open(binary);
     // A scope is required before granting Pi startup. No force-kill timeout is used.
     await exec('systemctl', ['--user', 'show-environment'], { timeout: 8000 });
+    signal.throwIfAborted();
     const created = await this.control.request('workspace.create', {
       cwd: launch.cwd,
       label: 'Bridge RPC',
       focus: false,
     });
     this.pane = created.root_pane.pane_id;
+    signal.throwIfAborted();
     this.scopeMayExist = true;
     const result = await this.control.request('layout.apply', {
       tab_id: created.tab.tab_id,
@@ -164,20 +176,25 @@ export class HerdrRpcTransport extends EventEmitter {
     });
     this.emit('spawn');
   }
-  async terminateScope() {
+  async signalScope(signal) {
+    try {
+      await exec(
+        'systemctl',
+        ['--user', 'kill', '--kill-whom=all', '--signal=' + signal, this.scope],
+        { timeout: 8000 },
+      );
+    } catch (error) {
+      // Normal EOF can empty/collect the scope between observation and signal.
+      // Only confirmed inactivity makes a failed kill harmless.
+      if (await this.scopeActive()) throw error;
+    }
+  }
+  async terminateScope(forceAfterMs) {
     if (this.scopeMayExist && (await this.scopeActive())) {
-      try {
-        await exec(
-          'systemctl',
-          ['--user', 'kill', '--kill-whom=all', '--signal=SIGTERM', this.scope],
-          { timeout: 8000 },
-        );
-      } catch (error) {
-        // Normal EOF can empty/collect the scope between observation and signal.
-        // Only confirmed inactivity makes a failed kill harmless.
-        if (await this.scopeActive()) throw error;
-      }
-      await this.waitForScope();
+      await this.signalScope('SIGTERM');
+      // Only explicit delete supplies a force deadline. This scope was created
+      // for this writer, never inferred from an external owner's process group.
+      await this.waitForScope(forceAfterMs);
     }
   }
   async terminate() {

@@ -12,6 +12,8 @@ import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import {
   readClaim,
+  registryTransaction,
+  assertNoOtherLiveOwner,
   processIdentity,
   ownerAlive,
   waitOwnerExit,
@@ -125,6 +127,55 @@ async function cancel(f) {
   return ownerRequest(f.config, { ...f.request, op: 'handoff_cancel' });
 }
 
+for (const stage of ['running', 'busy_handoff', 'handoff_eof', 'release_eof'])
+  test(`delete ends the session during ${stage}`, { timeout: 15000 }, async (t) => {
+    const f = await fixture(
+      t,
+      `
+      pi.on('agent_before_settle', async()=>{await mark('settling');await wait('settle');});
+      pi.on('session_shutdown', async()=>{await mark('shutdown');await wait('shutdown-go');});
+    `,
+    );
+    f.cleanup.push(() => Promise.all([f.mark('settle'), f.mark('shutdown-go')]));
+    f.config.attachmentExitTimeoutMs = 50;
+    await f.bridge.send({ session_id: f.id, text: 'DELETE_OVERRIDES_LIFECYCLE' });
+    const rpc = f.bridge.pool.get(f.id),
+      owner = structuredClone(rpc.ownerRecord.owner);
+    await until(() => exists(path.join(f.dir, 'settling')));
+    let lifecycle;
+    if (stage === 'release_eof') {
+      // Exercise explicit local release rather than racing automatic release.
+      rpc.autoReleaseWanted = false;
+      await rpc.autoReleaseTask;
+      await f.mark('settle');
+      await rpc.waitForHandoff();
+      lifecycle = f.bridge.releaseForLocal({ session_id: f.id });
+    } else if (stage !== 'running') lifecycle = transfer(f);
+    const outcome = lifecycle?.then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+    if (lifecycle) await until(() => f.bridge.handoffs.has(f.id));
+    if (stage === 'handoff_eof') await f.mark('settle');
+    if (['handoff_eof', 'release_eof'].includes(stage))
+      await until(() => exists(path.join(f.dir, 'shutdown')));
+    const deleted = await f.bridge.delete({ session_id: f.id });
+    assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+    if (outcome)
+      assert.ok((await outcome).error, 'cancelled lifecycle must not report a successful handoff');
+    assert.equal(await ownerAlive(owner), false);
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+    assert.equal(f.bridge.handoffs.has(f.id), false);
+    await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(f.config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
+        'utf8',
+      ),
+    );
+    assert.match(await fs.readFile(manifest.trash_path, 'utf8'), /DELETE_OVERRIDES_LIFECYCLE/);
+  });
+
 test(
   'handoff drains queued work and awaits a slow native EOF shutdown before reserving latest history',
   { timeout: 25000 },
@@ -174,17 +225,10 @@ test(
     assert.equal(stopReceipt.status, 'rejected');
     assert.equal(stopReceipt.reason, 'HANDOFF_PENDING');
 
-    for (const action of ['send', 'delete'])
-      assert.equal(
-        (
-          await f.bridge[action]({
-            session_id: f.id,
-
-            ...(action === 'send' ? { text: 'NEVER_SENT' } : {}),
-          })
-        ).reason,
-        'HANDOFF_PENDING',
-      );
+    assert.equal(
+      (await f.bridge.send({ session_id: f.id, text: 'NEVER_SENT' })).reason,
+      'HANDOFF_PENDING',
+    );
     const grants = f.config.grants;
     f.config.grants = [];
     for (const action of ['send', 'delete'])
@@ -234,7 +278,8 @@ test(
     assert.equal(held.generation, result.generation);
     assert.equal(held.owner.pid, process.pid);
     assert.equal(held.noColdReacquire, undefined);
-    assert.equal(held.phase, 'starting');
+    assert.equal(held.kind, 'handoff');
+    assert.equal(held.phase, 'reserved');
     await assert.rejects(
       reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
       /LIVE_OWNER_UNREACHABLE/,
@@ -288,7 +333,7 @@ test(
       );
     }, 'native settled and queues drained');
     // All queued RPC work is accounted for by ACK and settlement evidence.
-    assert.equal((await observer.state()).nonRpcInputSeen, false);
+    assert.equal((await observer.state()).pendingInputs, 0);
     // The immediate owner release must use the same completed-work evidence.
     await rpc.assertReleasable();
     const result = await transfer(f);
@@ -560,26 +605,34 @@ test(
   },
 );
 
-test('independent extension input is refused without shutdown', { timeout: 15000 }, async (t) => {
-  const f = await fixture(
-    t,
-    `pi.registerCommand('start-external',{handler:async()=>{pi.sendUserMessage('EXTERNAL_HELD');}});
+test(
+  'independent extension input completes before lossless handoff',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.registerCommand('start-external',{handler:async()=>{pi.sendUserMessage('EXTERNAL_HELD');}});
     pi.on('before_agent_start',async event=>{if(event.prompt==='EXTERNAL_HELD'){await mark('external');await wait('external-go');}});`,
-  );
-  f.cleanup.push(() => f.mark('external-go'));
-  const rpc = await f.bridge.pool.resolve(f.session);
-  await rpc.command({ type: 'prompt', message: '/start-external' });
-  await until(() => exists(path.join(f.dir, 'external')));
-  const old = structuredClone(rpc.ownerRecord);
-  assert.equal((await rpc.state()).isStreaming, true);
-  const refused = assert.rejects(transfer(f), /RUNTIME_IDLE_UNCONFIRMED/);
-  await until(() => rpc.handoffPending);
-  assert.equal(await ownerAlive(old.owner), true);
-  assert.equal(rpc.gracefulExitPromise, undefined);
-  await f.mark('external-go');
-  await refused;
-  await until(() => rpc.settlement.sequence === 1);
-});
+    );
+    f.cleanup.push(() => f.mark('external-go'));
+    const rpc = await f.bridge.pool.resolve(f.session);
+    await rpc.command({ type: 'prompt', message: '/start-external' });
+    await until(() => exists(path.join(f.dir, 'external')));
+    const old = structuredClone(rpc.ownerRecord);
+    assert.equal((await rpc.state()).isStreaming, true);
+    const joining = transfer(f);
+    void joining.catch(() => {});
+    await until(() => rpc.handoffPending);
+    assert.equal(await ownerAlive(old.owner), true);
+    assert.equal(rpc.gracefulExitPromise, undefined);
+    await f.mark('external-go');
+    assert.equal((await joining).status, 'reserved');
+    assert.equal(rpc.settlement.sequence, 1);
+    assert.equal(rpc.child.exitCode, 0);
+    assert.equal(rpc.child.signalCode, null);
+    await cancel(f);
+  },
+);
 
 test(
   'owned RPC cancels unsupported dialogs and reports them without approving',
@@ -646,20 +699,24 @@ test(
     assert.equal(rpc.promptAdmission, null);
     assert.equal((await rpc.state()).isStreaming, false);
     const observer = new AttachedRuntime(f.config, f.session, rpc.ownerRecord);
-    assert.equal((await observer.state()).nonRpcInputSeen, true);
-    await assert.rejects(transfer(f), /RUNTIME_IDLE_UNCONFIRMED/);
+    assert.equal((await observer.state()).pendingInputs, 1);
+    const joining = transfer(f);
+    void joining.catch(() => {});
+    await until(() => f.bridge.handoffs.has(f.id));
     assert.equal(rpc.child.stdin.writableEnded, false);
     await f.mark('input-go');
-    await until(() => rpc.settlement.sequence > 0);
+    assert.equal((await joining).status, 'reserved');
+    const entries = (await fs.readFile(f.session.file, 'utf8')).trim().split('\n').map(JSON.parse);
     assert.ok(
-      (await rpc.entries()).entries.some(
+      entries.some(
         (e) =>
           e.message?.role === 'user' &&
           JSON.stringify(e.message.content).includes('INDEPENDENT_INPUT'),
       ),
     );
-    // Ordering observes admission; it does not invent completion correlation.
-    assert.equal((await rpc.idleSnapshot()).status, 'unconfirmed');
+    assert.equal(rpc.child.exitCode, 0);
+    assert.equal(rpc.child.signalCode, null);
+    await cancel(f);
   },
 );
 
@@ -753,69 +810,75 @@ test(
 );
 
 const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
-test('cancel during reservation validation never starts native switching and releases the reservation', async (t) => {
-  const f = await fixture(t),
-    priorConfig = process.env.PI_MCP_OWNER_CONFIG,
-    priorDir = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_OWNER_CONFIG = f.configFile;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const entered = Promise.withResolvers(),
-    release = Promise.withResolvers(),
-    open = fs.open,
-    file = claimFile(f.config.attachmentDir, f.session);
-  let gated = false,
-    switches = 0;
-  t.mock.method(fs, 'open', async function (target, ...args) {
-    if (target === file && !gated) {
-      let record;
-      try {
-        record = JSON.parse(readFileSync(file, 'utf8'));
-      } catch {}
-      // The first read after owner control publishes the reservation is the
-      // companion's asynchronous validation, after it received the response.
-      if (record?.phase === 'starting' && record.handoffId) {
-        gated = true;
-        entered.resolve();
-        await release.promise;
+for (const action of ['cancel', 'delete'])
+  test(`${action} during reservation validation never starts native switching or terminates the requester`, async (t) => {
+    const f = await fixture(t),
+      priorConfig = process.env.PI_MCP_OWNER_CONFIG,
+      priorDir = process.env.PI_MCP_ATTACH_DIR;
+    process.env.PI_MCP_OWNER_CONFIG = f.configFile;
+    process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+    const entered = Promise.withResolvers(),
+      release = Promise.withResolvers(),
+      open = fs.open,
+      file = claimFile(f.config.attachmentDir, f.session);
+    let gated = false,
+      switches = 0;
+    t.mock.method(fs, 'open', async function (target, ...args) {
+      if (target === file && !gated) {
+        let record;
+        try {
+          record = JSON.parse(readFileSync(file, 'utf8'));
+        } catch {}
+        // The first read after owner control publishes the reservation is the
+        // companion's asynchronous validation, after it received the response.
+        if (record?.phase === 'reserved' && record.handoffId) {
+          gated = true;
+          entered.resolve();
+          await release.promise;
+        }
       }
-    }
-    return open.call(this, target, ...args);
-  });
-  const commands = {},
-    shortcuts = {};
-  const ctx = {
-    mode: 'tui',
-    hasUI: true,
-    isIdle: () => true,
-    hasPendingMessages: () => false,
-    ui: { notify: () => {} },
-    switchSession: async () => {
-      switches++;
-      return { cancelled: true };
-    },
-  };
-  try {
-    joinExtension({
-      on: () => {},
-      registerShortcut: (name, value) => (shortcuts[name] = value.handler),
-      registerCommand: (name, value) => (commands[name] = value.handler),
+      return open.call(this, target, ...args);
     });
-    const joined = commands['bridge-join'](f.id, ctx);
-    await entered.promise;
-    await shortcuts['ctrl+alt+j'](ctx);
-    release.resolve();
-    await joined;
-    assert.equal(switches, 0);
-    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
-  } finally {
-    release.resolve();
-    t.mock.restoreAll();
-    if (priorConfig === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
-    else process.env.PI_MCP_OWNER_CONFIG = priorConfig;
-    if (priorDir === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = priorDir;
-  }
-});
+    const commands = {},
+      shortcuts = {};
+    const ctx = {
+      mode: 'tui',
+      hasUI: true,
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      ui: { notify: () => {} },
+      switchSession: async () => {
+        switches++;
+        return { cancelled: true };
+      },
+    };
+    try {
+      joinExtension({
+        on: () => {},
+        registerShortcut: (name, value) => (shortcuts[name] = value.handler),
+        registerCommand: (name, value) => (commands[name] = value.handler),
+      });
+      const joined = commands['bridge-join'](f.id, ctx);
+      await entered.promise;
+      if (action === 'delete') {
+        const deleted = await f.bridge.delete({ session_id: f.id });
+        assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+        assert.equal(await ownerAlive(f.request.requester), true);
+        await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
+      } else await shortcuts['ctrl+alt+j'](ctx);
+      release.resolve();
+      await joined;
+      assert.equal(switches, 0);
+      assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+    } finally {
+      release.resolve();
+      t.mock.restoreAll();
+      if (priorConfig === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
+      else process.env.PI_MCP_OWNER_CONFIG = priorConfig;
+      if (priorDir === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+      else process.env.PI_MCP_ATTACH_DIR = priorDir;
+    }
+  });
 
 test('an uncertain native switch exception retains its live reservation instead of allowing a second writer', async (t) => {
   const f = await fixture(t),
@@ -842,7 +905,8 @@ test('an uncertain native switch exception retains its live reservation instead 
       },
     });
     const held = await readClaim(f.config.attachmentDir, f.session);
-    assert.equal(held.phase, 'starting');
+    assert.equal(held.kind, 'handoff');
+    assert.equal(held.phase, 'opening');
     assert.equal(held.owner.pid, process.pid);
     assert.equal(held.noColdReacquire, undefined);
     assert.ok(notices.some((x) => x.includes('reservation is retained')));
@@ -867,16 +931,20 @@ for (const mode of [
   'one command during active work',
   'later switch veto and explicit retry',
   'cancel shortcut then explicit retry',
+  'delete during native switch',
+  'delete during cancelled switch',
 ])
   test(`ordinary native TUI joins with latest history (${mode})`, { timeout: 35000 }, async (t) => {
     const laterVeto = mode.startsWith('later'),
-      cancelWait = mode.startsWith('cancel');
+      cancelWait = mode.startsWith('cancel'),
+      deleting = mode.startsWith('delete'),
+      cancelDelete = mode === 'delete during cancelled switch';
     const f = await fixture(
       t,
       `pi.on('agent_before_settle',async()=>{await mark('settling');await wait('settle');});
     pi.on('session_shutdown',()=>{pi.appendEntry('final-owned-history',{latest:true});});`,
     );
-    f.cleanup.push(() => f.mark('settle'));
+    f.cleanup.push(() => Promise.all([f.mark('settle'), f.mark('open-go')]));
     const other = await savedSession(f.bridge),
       sessionB = await f.bridge.session(other.session_id);
     const tuiExtension = path.join(f.dir, 'tui.mjs');
@@ -886,7 +954,11 @@ for (const mode of [
     export default pi=>{pi.on('session_start',async(event,ctx)=>{if(event.reason==='resume')await fs.writeFile(dir+'/opened.json',JSON.stringify(ctx.sessionManager.getEntries()));});
       pi.registerCommand('fixture-switch-back',{handler:async(_args,ctx)=>{await ctx.switchSession(${JSON.stringify(sessionB.file)});await fs.writeFile(dir+'/switched-back','yes');}});
       pi.registerCommand('fixture-switch-conflict',{handler:async(_args,ctx)=>{const result=await ctx.switchSession(${JSON.stringify(f.session.file)});await fs.writeFile(dir+'/conflict.json',JSON.stringify({result,file:ctx.sessionManager.getSessionFile()}));}});
-      pi.on('session_before_switch',async event=>{if(event.targetSessionFile===${JSON.stringify(f.session.file)}&&veto){veto=false;return {cancel:true};}});};`,
+      pi.on('session_before_switch',async event=>{
+        if(event.targetSessionFile!==${JSON.stringify(f.session.file)})return;
+        if(veto){veto=false;return {cancel:true};}
+        if(${deleting}){await fs.writeFile(dir+'/opening','yes');while(!await fs.stat(dir+'/open-go').catch(()=>null))await new Promise(r=>setTimeout(r,10));if(${cancelDelete})return {cancel:true};}
+      });};`,
     );
     const args = [
       process.execPath,
@@ -955,7 +1027,7 @@ for (const mode of [
     await f.bridge.send({ session_id: f.id, text: 'NATIVE_JOIN_LATEST' });
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
-    if (!laterVeto && !cancelWait) {
+    if (!laterVeto && !cancelWait && !deleting) {
       tui.stdin.write('/fixture-switch-conflict\r');
       await until(() => exists(path.join(f.dir, 'conflict.json')), 'conflict cancellation');
       assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.dir, 'conflict.json'), 'utf8')), {
@@ -983,6 +1055,53 @@ for (const mode of [
       await until(() => f.bridge.handoffs.has(f.id), 'new explicit join');
     }
     await f.mark('settle');
+    if (deleting) {
+      await until(() => exists(path.join(f.dir, 'opening')), 'later asynchronous switch hook');
+      const deletion = f.bridge.delete({ session_id: f.id });
+      // The delete gate now excludes any new writer; this admitted native
+      // switch is the only operation allowed to finish registering its writer.
+      await until(async () => {
+        try {
+          await registryTransaction(f.config.attachmentDir, () =>
+            assertNoOtherLiveOwner(f.config.attachmentDir, f.session),
+          );
+          return false;
+        } catch (error) {
+          if (error.code !== 'LIVE_OWNER_UNREACHABLE') throw error;
+          return true;
+        }
+      }, 'delete authority');
+      await assert.rejects(
+        reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
+        /LIVE_OWNER_UNREACHABLE/,
+      );
+      assert.equal(await ownerAlive(owner.owner), true);
+      assert.equal(
+        (await readClaim(f.config.attachmentDir, sessionB)).generation,
+        owner.generation,
+      );
+      await f.mark('open-go');
+      const deleted = await deletion;
+      assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+      assert.equal(await ownerAlive(owner.owner), cancelDelete);
+      await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
+      assert.ok(await fs.stat(sessionB.file));
+      if (cancelDelete) {
+        assert.equal(
+          (await readClaim(f.config.attachmentDir, sessionB)).generation,
+          owner.generation,
+        );
+        assert.equal(await exists(path.join(f.dir, 'opened.json')), false);
+      } else assert.equal(await readClaim(f.config.attachmentDir, sessionB), null);
+      const manifest = JSON.parse(
+        await fs.readFile(
+          path.join(f.config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
+          'utf8',
+        ),
+      );
+      assert.match(await fs.readFile(manifest.trash_path, 'utf8'), /NATIVE_JOIN_LATEST/);
+      return;
+    }
     if (laterVeto) {
       await until(() => terminal.includes('Session switch cancelled'), 'later veto');
       await until(async () => {
@@ -1086,22 +1205,24 @@ test(
 );
 for (const timeout of [undefined, 100])
   test(
-    `shutdown UI cannot be confirmed complete after EOF (${timeout})`,
+    `shutdown UI warns without blocking normal handoff (${timeout})`,
     { timeout: 10000 },
     async (t) => {
       const f = await fixture(
         t,
         `pi.on('session_shutdown',async(_event,ctx)=>{await mark('shutdown-before');await ctx.ui.confirm('Shutdown','Continue?',${timeout === undefined ? 'undefined' : JSON.stringify({ timeout })});await mark('shutdown-after');});`,
       );
-      const rpc = await f.bridge.pool.resolve(f.session);
-      await assert.rejects(rpc.gracefulExit(), (error) => {
-        assert.equal(error.code, 'EXTENSION_UI_SHUTDOWN_UNAVAILABLE');
-        assert.deepEqual(error.ui.cancel_sent, []);
-        assert.deepEqual(error.ui.unavailable, [{ phase: 'shutdown', methods: ['confirm'] }]);
-        return true;
-      });
-      assert.equal(rpc.exited, true);
-      assert.equal(await exists(path.join(f.dir, 'shutdown-after')), timeout !== undefined);
+      const rpc = await f.bridge.pool.resolve(f.session),
+        owner = structuredClone(rpc.ownerRecord.owner),
+        result = await transfer(f);
+      assert.equal(result.status, 'reserved');
+      assert.deepEqual(result.ui.cancel_sent, []);
+      assert.deepEqual(result.ui.unavailable, [{ phase: 'shutdown', methods: ['confirm'] }]);
+      assert.equal(rpc.child.exitCode, 0);
+      assert.equal(await ownerAlive(owner), false);
+      assert.equal((await readClaim(f.config.attachmentDir, f.session)).kind, 'handoff');
+      if (timeout !== undefined)
+        assert.equal(await exists(path.join(f.dir, 'shutdown-after')), true);
     },
   );
 
@@ -1135,18 +1256,65 @@ test(
 );
 
 test(
-  'shutdown UI refuses a handoff reservation even when the native child exits zero',
+  'join displays shutdown warnings before starting the native switch',
   { timeout: 10000 },
   async (t) => {
     const f = await fixture(
       t,
-      `pi.on('session_shutdown',async(_event,ctx)=>{await ctx.ui.confirm('Shutdown','Continue?');await mark('unfinished-hook');});`,
+      `pi.on('session_shutdown',async(_event,ctx)=>{await ctx.ui.confirm('Shutdown','Continue?',{timeout:100});});`,
     );
-    const rpc = await f.bridge.pool.resolve(f.session);
-    await assert.rejects(transfer(f), /EXTENSION_UI_SHUTDOWN_UNAVAILABLE/);
+    const rpc = await f.bridge.pool.resolve(f.session),
+      notices = [],
+      commands = {};
+    let switched = false;
+    joinExtension(
+      {
+        on: () => {},
+        registerShortcut: () => {},
+        registerCommand: (name, value) => (commands[name] = value.handler),
+      },
+      { file: f.configFile, dir: f.config.attachmentDir },
+    );
+    await commands['bridge-join'](f.id, {
+      mode: 'tui',
+      hasUI: true,
+      isIdle: () => true,
+      hasPendingMessages: () => false,
+      ui: { notify: (text, severity) => notices.push({ text, severity }) },
+      switchSession: async (file) => {
+        assert.equal(file, f.session.file);
+        assert.equal(rpc.child.exitCode, 0);
+        assert.ok(
+          notices.some(
+            ({ text, severity }) => severity === 'warning' && text.includes('shutdown dialog'),
+          ),
+        );
+        switched = true;
+        return { cancelled: true };
+      },
+    });
+    assert.equal(switched, true);
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+  },
+);
+
+test(
+  'owner-local release reports shutdown UI warnings while retaining its explicit pause',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `pi.on('session_shutdown',async(_event,ctx)=>{await ctx.ui.confirm('Shutdown','Continue?',{timeout:100});await mark('shutdown-after');});`,
+    );
+    const rpc = await f.bridge.pool.resolve(f.session),
+      result = await f.bridge.releaseForLocal({ session_id: f.id });
+    assert.equal(result.status, 'released');
+    assert.equal(result.no_cold_reacquire, true);
+    assert.deepEqual(result.ui.unavailable, [{ phase: 'shutdown', methods: ['confirm'] }]);
     const claim = await readClaim(f.config.attachmentDir, f.session);
     assert.equal(rpc.child.exitCode, 0);
-    assert.equal(claim, null);
-    assert.equal(await exists(path.join(f.dir, 'unfinished-hook')), false);
+    assert.equal(claim.owner, null);
+    assert.equal(claim.noColdReacquire, true);
+    assert.equal(await exists(path.join(f.dir, 'shutdown-after')), true);
   },
 );

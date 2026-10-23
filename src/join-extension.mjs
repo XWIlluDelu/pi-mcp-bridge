@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { readOwnerConfig } from './owner-config.mjs';
 import { ownerRequest } from './owner-runtime.mjs';
-import { processIdentity, readClaim } from './attachments.mjs';
+import { processIdentity, readClaim, updateOwner } from './attachments.mjs';
 
 export default function joinExtension(
   pi,
@@ -27,7 +27,8 @@ export default function joinExtension(
         event.reason === 'resume' &&
         event.targetSessionFile === pending.result.session_file &&
         held?.generation === pending.result.generation &&
-        held.phase === 'starting' &&
+        held.kind === 'handoff' &&
+        held.phase === 'opening' &&
         held.handoffId === pending.request.handoff_id
       )
         return;
@@ -88,13 +89,27 @@ export default function joinExtension(
           signal: operation.controller.signal,
         });
         operation.controller.signal.throwIfAborted();
-        const held = await readClaim(dir, {
+        if (operation.result.ui?.unavailable?.some(({ phase }) => phase === 'shutdown'))
+          ctx.ui.notify(
+            'The previous Pi exited, but its shutdown dialog was unavailable. Extension cleanup may be incomplete.',
+            'warning',
+          );
+        const session = {
           file: operation.result.session_file,
           header: { id: operation.result.native_id },
-        });
+        };
+        const held = await readClaim(dir, session);
         operation.nativeId = operation.result.native_id;
-        if (held?.generation !== operation.result.generation)
+        if (
+          held?.kind !== 'handoff' ||
+          held.phase !== 'reserved' ||
+          held.generation !== operation.result.generation
+        )
           throw new Error('RUNTIME_SESSION_CHANGED');
+        // This registry transition serializes with deletion's revocation. Once
+        // native switch starts, a later async hook may still delay actual open.
+        // Do not claim that the public pre-switch hook closes that window.
+        await updateOwner(dir, session, held, { phase: 'opening' });
         if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new Error('LOCAL_SESSION_BUSY');
         operation.controller.signal.throwIfAborted();
         operation.switching = true;

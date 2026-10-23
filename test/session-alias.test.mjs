@@ -176,6 +176,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
       handlers[name] = fn;
     },
   });
+  let previousSessionFile;
   try {
     for (const timing of ['before-registration', 'after-registration']) {
       if (timing === 'after-registration') await handlers.session_shutdown({ reason: 'new' });
@@ -200,7 +201,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
       };
       if (timing === 'before-registration') await persist();
       await handlers.session_start(
-        {},
+        { reason: previousSessionFile ? 'new' : 'startup', previousSessionFile },
         {
           mode: 'tui',
           sessionManager: manager,
@@ -211,6 +212,7 @@ test('large persisted histories do not prevent TUI registration or first-persist
           },
         },
       );
+      previousSessionFile = file;
       if (timing === 'after-registration') {
         await persist();
         await handlers.agent_settled({ aborted: false });
@@ -230,65 +232,98 @@ test('large persisted histories do not prevent TUI registration or first-persist
   }
 });
 
-test('persisted paths retain protection against a different live native owner claim', async (t) => {
-  const f = await fixture(t),
-    original = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const a = {},
-    b = {};
-  await attachExtension({
-    getThinkingLevel: () => 'off',
-    on: (name, fn) => {
-      a[name] = fn;
-    },
-  });
-  await attachExtension({
-    getThinkingLevel: () => 'off',
-    on: (name, fn) => {
-      b[name] = fn;
-    },
-  });
-  const first = SessionManager.create(f.dir, f.config.sessionRoots[0]),
-    file = first.getSessionFile(),
-    second = SessionManager.open(file);
-  const sessionA = { file, header: first.getHeader() },
-    sessionB = { file, header: second.getHeader() };
-  let stopped = false;
-  try {
-    await a.session_start(
-      {},
-      { mode: 'tui', sessionManager: first, isIdle: () => true, shutdown: () => {} },
-    );
-    const claim = await readClaim(f.config.attachmentDir, sessionA);
-    second.appendMessage({
-      role: 'user',
-      content: 'second manager persisted first',
-      timestamp: Date.now(),
+for (const persisted of [false, true])
+  test(`independent managers at the same path stay distinct ${persisted ? 'after' : 'before'} first persistence`, async (t) => {
+    const f = await fixture(t),
+      original = process.env.PI_MCP_ATTACH_DIR;
+    process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+    const a = {},
+      b = {};
+    await attachExtension({
+      getThinkingLevel: () => 'off',
+      on: (name, fn) => {
+        a[name] = fn;
+      },
     });
-    await assert.rejects(
-      b.session_start(
+    await attachExtension({
+      getThinkingLevel: () => 'off',
+      on: (name, fn) => {
+        b[name] = fn;
+      },
+    });
+    const first = SessionManager.create(f.dir, f.config.sessionRoots[0]),
+      file = first.getSessionFile();
+    if (persisted)
+      first.appendMessage({
+        role: 'user',
+        content: 'first manager persisted',
+        timestamp: Date.now(),
+      });
+    const second = SessionManager.open(file);
+    assert.equal(first.getSessionId() === second.getSessionId(), persisted);
+    const sessionA = { file, header: first.getHeader() },
+      sessionB = { file, header: second.getHeader() };
+    let stopped = false;
+    try {
+      await a.session_start(
         {},
-        {
-          mode: 'tui',
-          sessionManager: second,
-          isIdle: () => true,
-          shutdown: () => {
-            stopped = true;
-          },
+        { mode: 'tui', sessionManager: first, isIdle: () => true, shutdown: () => {} },
+      );
+      const claim = await readClaim(f.config.attachmentDir, sessionA);
+      second.appendMessage({
+        role: 'user',
+        content: 'second manager persisted first',
+        timestamp: Date.now(),
+      });
+      const ctxB = {
+        mode: 'tui',
+        sessionManager: second,
+        isIdle: () => true,
+        shutdown: () => {
+          stopped = true;
         },
-      ),
-      /LIVE_OWNER_UNREACHABLE/,
-    );
-    assert.equal(stopped, true);
-    assert.equal(await readClaim(f.config.attachmentDir, sessionB), null);
-    assert.equal((await readClaim(f.config.attachmentDir, sessionA)).generation, claim.generation);
-  } finally {
-    await a.session_shutdown({});
-    await b.session_shutdown({});
-    if (original === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = original;
-  }
-});
+      };
+      for (const reason of ['startup', 'reload'])
+        await assert.rejects(b.session_start({ reason }, ctxB), /LIVE_OWNER_UNREACHABLE/);
+      assert.equal(stopped, true);
+      if (!persisted) assert.equal(await readClaim(f.config.attachmentDir, sessionB), null);
+      assert.equal(
+        (await readClaim(f.config.attachmentDir, sessionA)).generation,
+        claim.generation,
+      );
+      if (persisted) {
+        await a.session_shutdown({ reason: 'reload' });
+        await assert.rejects(b.session_start({ reason: 'reload' }, ctxB), /LIVE_OWNER_UNREACHABLE/);
+        await a.session_start(
+          { reason: 'reload' },
+          {
+            mode: 'tui',
+            sessionManager: first,
+            isIdle: () => true,
+            shutdown: () => {},
+          },
+        );
+        assert.notEqual(
+          (await readClaim(f.config.attachmentDir, sessionA)).generation,
+          claim.generation,
+        );
+      }
+      const third = SessionManager.create(f.dir, f.config.sessionRoots[0]);
+      const ctxC = { ...ctxB, sessionManager: third };
+      const preserved = await readClaim(f.config.attachmentDir, sessionA);
+      await b.session_start({ reason: 'startup' }, ctxC);
+      assert.deepEqual(await readClaim(f.config.attachmentDir, sessionA), preserved);
+      assert.deepEqual(
+        await b.session_before_switch({ reason: 'resume', targetSessionFile: file }, ctxC),
+        { cancel: true },
+      );
+    } finally {
+      await a.session_shutdown({});
+      await b.session_shutdown({});
+      if (original === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+      else process.env.PI_MCP_ATTACH_DIR = original;
+    }
+  });
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-alias-')),
@@ -420,13 +455,15 @@ test('native unflushed startup and /new reserve their paths and validate after p
       stopped = true;
     },
   });
+  let previousSessionFile;
   try {
     for (const reason of ['startup', 'new']) {
       if (reason === 'new') await handlers.session_shutdown({ reason: 'new' });
       const manager = SessionManager.create(f.dir, f.config.sessionRoots[0]),
         file = manager.getSessionFile();
       await assert.rejects(fs.stat(file), { code: 'ENOENT' });
-      await handlers.session_start({ reason }, context(manager));
+      await handlers.session_start({ reason, previousSessionFile }, context(manager));
+      previousSessionFile = file;
       assert.equal(stopped, false);
       const session = { file, header: manager.getHeader() },
         claim = await readClaim(f.config.attachmentDir, session);
@@ -580,6 +617,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
     },
   });
   const realLstat = fs.lstat;
+  let previousSessionFile;
   try {
     for (const mutation of ['valid', 'valid-name-event', 'hardlink', 'wrong-header', 'removed']) {
       if (mutation !== 'valid') await handlers.session_shutdown({ reason: 'new' });
@@ -587,7 +625,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
       const manager = SessionManager.create(f.dir, f.config.sessionRoots[0]),
         file = manager.getSessionFile();
       await handlers.session_start(
-        { reason: 'new' },
+        { reason: previousSessionFile ? 'new' : 'startup', previousSessionFile },
         {
           mode: 'tui',
           sessionManager: manager,
@@ -598,6 +636,7 @@ test('first persistence between missing lstat and memory snapshot is revalidated
           },
         },
       );
+      previousSessionFile = file;
       const session = { file, header: manager.getHeader() },
         claim = await readClaim(f.config.attachmentDir, session),
         runtime = new AttachedRuntime(f.config, session, claim);

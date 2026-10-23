@@ -6,9 +6,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
+import { scheduleAutoRelease } from '../src/auto-release.mjs';
 import { findHerdr, HerdrControl } from '../src/herdr-control.mjs';
 import { HerdrRpcTransport } from '../src/herdr-rpc-transport.mjs';
-import { ownerAlive, readClaim } from '../src/attachments.mjs';
+import { ownerAlive, readClaim, processIdentity } from '../src/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -69,6 +70,72 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
   await assert.rejects(fs.stat(rejected.child.directory), { code: 'ENOENT' });
 });
+
+test(
+  'delete completes when Herdr startup fails before reporting a Pi PID',
+  { timeout: 10000 },
+  async (t) => {
+    const dir = await fs.mkdtemp('/tmp/bridge-herdr-start-delete-'),
+      bin = path.join(dir, 'bin'),
+      entered = Promise.withResolvers(),
+      failStartup = Promise.withResolvers(),
+      environment = { PATH: process.env.PATH, HOME: process.env.HOME };
+    let bridge, sent;
+    t.after(async () => {
+      failStartup.resolve();
+      Object.assign(process.env, environment);
+      await sent;
+      await bridge?.close();
+      await fs.rm(dir, { recursive: true, force: true });
+    });
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(bin, 'herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+    process.env.PATH = bin;
+    process.env.HOME = dir;
+    const config = {
+      ...isolatedRuntime(dir),
+      herdr: true,
+      stateDir: path.join(dir, 'state'),
+      sessionRoots: [path.join(dir, 'sessions')],
+      folders: [{ path: dir }],
+      defaults: denyAllPermissions(),
+      grants: [{ folder: dir, send: true, delete: true }],
+    };
+    bridge = await new Bridge(config).init();
+    const session = await bridge.session((await savedSession(bridge)).session_id);
+    t.mock.method(HerdrControl, 'open', async () => {
+      entered.resolve();
+      await failStartup.promise;
+      throw new Error('HERDR_UNAVAILABLE');
+    });
+    sent = bridge.send({ session_id: session.id, text: 'MUST_NOT_REACH_PI' });
+    await entered.promise;
+    const start = bridge.pool.starting.get(session.id);
+    assert.equal(start.runtime.childIdentity, undefined);
+    // Delete arrives before startup can report a PID or finish failure cleanup.
+    const cancelled = new Promise((resolve) =>
+      start.controller.signal.addEventListener('abort', resolve, { once: true }),
+    );
+    const deleting = bridge.delete({ session_id: session.id });
+    await cancelled;
+    failStartup.resolve();
+    const result = await deleting;
+    assert.equal(result.status, 'deleted', JSON.stringify(result));
+    assert.equal((await sent).status, 'rejected');
+    assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
+    assert.equal(bridge.pool.starting.has(session.id), false);
+    await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
+    const manifest = JSON.parse(
+      await fs.readFile(
+        path.join(config.stateDir, 'trash', result.restore_token + '.restore.json'),
+        'utf8',
+      ),
+    );
+    assert.equal(manifest.native_session_id, session.header.id);
+    assert.equal(manifest.original_path, session.file);
+    assert.doesNotMatch(await fs.readFile(manifest.trash_path, 'utf8'), /MUST_NOT_REACH_PI/);
+  },
+);
 
 test(
   'real Herdr: cold start, hot placement changes, reuse, native EOF and explicit cleanup',
@@ -139,7 +206,8 @@ test(
       stateDir: path.join(dir, 'state'),
       sessionRoots: [path.join(dir, 'sessions')],
       folders: [{ path: dir }],
-      defaults: denyAllPermissions(),
+      defaults: { ...denyAllPermissions(), delete: true },
+      attachmentExitTimeoutMs: 100,
       herdr: false,
     };
     const configFile = path.join(dir, 'owner.json');
@@ -233,6 +301,40 @@ test(
     assert.equal(await ownerAlive(disconnected.childIdentity), false);
     assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
     await assert.rejects(fs.stat(lostDirectory), { code: 'ENOENT' });
+    // Delete must also reap a stubborn native tool descendant, without turning
+    // ordinary EOF or service shutdown into force-kill policies.
+    const deleting = await bridge.pool.resolve(session);
+    const marker = path.join(dir, 'stubborn-ready');
+    const script = `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(marker)},String(process.pid));setInterval(()=>{},1000)`;
+    await deleting.command({
+      type: 'bash',
+      command: `${JSON.stringify(process.execPath)} -e '${script.replaceAll("'", "'\\''")}' >/dev/null 2>&1 &`,
+    });
+    while (!(await fs.stat(marker).catch(() => null)))
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    const toolOwner = await processIdentity(Number(await fs.readFile(marker, 'utf8')));
+    assert.equal(await ownerAlive(toolOwner), true);
+    try {
+      // Pi's normal EOF has completed, but auto-release still holds the lane
+      // while the Herdr scope waits for its stubborn tool descendant.
+      deleting.autoReleaseWanted = true;
+      scheduleAutoRelease(bridge, deleting);
+      const deadline = Date.now() + 5000;
+      while (await ownerAlive(deleting.childIdentity)) {
+        assert.ok(Date.now() < deadline, 'native EOF did not finish');
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      assert.equal(bridge.handoffs.get(session.id)?.kind, 'auto_release');
+      assert.equal(await ownerAlive(toolOwner), true);
+      const deleted = await bridge.delete({ session_id: session.id });
+      assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+    } finally {
+      if (await ownerAlive(toolOwner)) process.kill(toolOwner.pid, 'SIGKILL');
+    }
+    assert.equal(await ownerAlive(toolOwner), false);
+    assert.equal(await ownerAlive(deleting.childIdentity), false);
+    assert.equal(await deleting.child.scopeActive(), false);
+    await assert.rejects(fs.stat(deleting.child.directory), { code: 'ENOENT' });
     // Final stdout/stderr can exceed socket buffers and arrive after the exit
     // record on another channel. close must mean both streams were drained.
     const bytes = 256 * 1024;

@@ -11,6 +11,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
+import { readClaim, reserveOwner } from '../src/attachments.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
 
 test('listing respects the latest native title including an explicit clear', async (t) => {
@@ -504,6 +505,9 @@ test('delete rename failure cleans intents while post-move sync failure preserve
   for (const phase of ['rename', 'sync']) {
     const f = await fixture(t),
       session = await f.bridge.session(f.id);
+    await f.bridge.releaseForLocal({ session_id: f.id });
+    const pause = await readClaim(f.bridge.pool.attachmentDir, session);
+    assert.equal(pause.noColdReacquire, true);
     let moved = false;
     const rename = fs.rename,
       open = fs.open;
@@ -535,9 +539,16 @@ test('delete rename failure cleans intents while post-move sync failure preserve
       assert.equal(result.status, 'rejected');
       assert.deepEqual(intents, []);
       assert.ok(await fs.stat(session.file));
+      assert.deepEqual(await readClaim(f.bridge.pool.attachmentDir, session), pause);
+      await assert.rejects(
+        reserveOwner(f.bridge.pool.attachmentDir, session, 'rpc'),
+        /COLD_REACQUIRE_BLOCKED/,
+      );
     } else {
       assert.equal(result.status, 'unknown');
-      assert.equal(intents.length, 1);
+      assert.deepEqual(intents, [result.restore_token + '.restore.json']);
+      assert.equal(result.recoverable, true);
+      assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
       const metadata = JSON.parse(
         await fs.readFile(path.join(f.config.stateDir, 'trash', intents[0]), 'utf8'),
       );

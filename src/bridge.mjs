@@ -65,7 +65,10 @@ export class Bridge {
     this.configFile = configFile;
     const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
     this.ownerSettings = structuredClone(settings);
-    this.pool = new RuntimePool(config, factory, { configFile });
+    this.pool = new RuntimePool(config, factory, {
+      configFile,
+      completionControl: { stateDir: config.stateDir, attachmentDir: config.attachmentDir },
+    });
     this.pendingMutations = new Set();
     this.locks = new Map();
     this.handoffs = new Map();
@@ -126,6 +129,7 @@ export class Bridge {
     const beforeDispatch = () => {
       this.assertOpen();
       if (input.stopped || this.locks.has(`stop:${sessionId}`)) throw new Error('STOP_IN_PROGRESS');
+      if (this.handoffs.get(sessionId)?.kind === 'delete') throw new Error('HANDOFF_PENDING');
     };
     try {
       return await fn(beforeDispatch);
@@ -960,36 +964,49 @@ export class Bridge {
         status: 'rejected',
         reason: 'NOT_FOUND_OR_DENIED',
       };
-    return this.mutationLock(args.session_id, 'delete', requestContext, async () => {
-      let trash, release;
+    // Delete has its own serialization lane: a normal EOF/handoff may hold
+    // the session lane indefinitely. Fence new work before interrupting that
+    // lifecycle, then drain the session lane before moving the saved history.
+    return this.locked(`delete:${args.session_id}`, async () => {
+      let trash, release, failure;
+      const marker = { kind: 'delete' };
       try {
         const s = await this.session(args.session_id, requestContext);
         this.check('delete', s, requestContext);
         trash = await prepareTrash(this.config, s);
-        release = await this.pool.stopForDelete(s); // Hold ownership through the move.
-        await trash.move();
-        return optionalResultFields(
-          {
-            status: 'deleted',
-            recoverable: true,
-            restore_token: trash.token,
-          },
-          { project: s.projectCwd ?? s.cwd },
-          resultBudget,
-        );
-      } catch (e) {
-        return optionalResultFields(
-          {
-            status: trash?.moved ? 'unknown' : 'rejected',
-            reason: safeReason(e),
-          },
-          { project: target?.projectCwd ?? target?.cwd ?? null },
-          resultBudget,
-        );
+        const prior = this.handoffs.get(s.id);
+        this.handoffs.set(s.id, marker);
+        prior?.controller?.abort();
+        // One session-wide deletion gate covers termination, lane drain and
+        // the trash move. Do not reselect a writer in a second termination pass.
+        release = await this.pool.stopForDelete(s);
+        await this.locked(s.id, async () => {
+          const current = await this.session(s.id, requestContext);
+          if (current.file !== s.file || current.header.cwd !== s.header.cwd)
+            throw new Error('RUNTIME_SESSION_CHANGED');
+          await trash.move();
+        });
+      } catch (error) {
+        failure = error;
       } finally {
-        await trash?.cancel().catch(() => {});
-        await release?.();
+        try {
+          await trash?.cancel().catch(() => {});
+          await release?.(trash?.moved === true);
+        } catch (error) {
+          failure ??= error;
+        } finally {
+          if (this.handoffs.get(args.session_id) === marker) this.handoffs.delete(args.session_id);
+        }
       }
+      return optionalResultFields(
+        {
+          status: failure ? (trash?.moved ? 'unknown' : 'rejected') : 'deleted',
+          ...(failure ? { reason: safeReason(failure) } : {}),
+          ...(trash?.moved ? { recoverable: true, restore_token: trash.token } : {}),
+        },
+        { project: target?.projectCwd ?? target?.cwd ?? null },
+        resultBudget,
+      );
     });
   }
   handoffForLocal(request, options) {
@@ -998,9 +1015,24 @@ export class Bridge {
   cancelHandoff(request) {
     return cancelHandoff(this, request);
   }
+  inputActivityForLocal(request) {
+    this.assertOpen();
+    const runtime =
+      this.pool.instances.get(request.session_id) ??
+      this.pool.starting.get(request.session_id)?.runtime;
+    if (
+      !(runtime instanceof PiRpc) ||
+      !runtime.alive ||
+      request.generation !== runtime.ownerRecord?.generation
+    )
+      throw new Error('INVALID_OWNER_COMMAND');
+    runtime.observeInputActivity(request);
+    return {};
+  }
   async releaseForLocal({ session_id, interrupt = false }) {
     this.assertOpen();
     if (typeof interrupt !== 'boolean') throw new Error('INVALID_OWNER_COMMAND');
+    if (this.handoffs.get(session_id)?.kind === 'delete') throw new Error('HANDOFF_PENDING');
     // EOF can be held indefinitely by a native shutdown hook. Interrupt must
     // reach that exact closing child without waiting behind its session lane.
     const closing = this.pool.instances.get(session_id);
@@ -1015,13 +1047,14 @@ export class Bridge {
     if (this.handoffs.get(session_id)?.kind === 'auto_release') await closing?.autoReleaseTask;
     if (this.handoffs.has(session_id)) throw new Error('HANDOFF_PENDING');
     const priorStop = this.locks.get(`stop:${session_id}`),
-      release = { kind: 'release' };
+      release = { kind: 'release', controller: new AbortController() };
     this.handoffs.set(session_id, release);
     try {
       return await this.locked(session_id, async () => {
         // An admitted stop finishes its receipt capture before owner shutdown.
         await priorStop?.catch(() => {});
         this.assertOpen();
+        release.controller.signal.throwIfAborted();
         const owned = this.pool.instances.get(session_id);
         let session;
         // Missing history must not strand a child we already own. Existing
@@ -1038,6 +1071,7 @@ export class Bridge {
         if (this.pool.starting.has(session_id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
         const runtime = await this.pool.forRead(session);
         if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
+        let exitDetails = {};
         if (runtime) {
           if (!(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
           runtime.handoffPending = true;
@@ -1048,10 +1082,11 @@ export class Bridge {
               await runtime.assertProcessIdentity();
             } else await runtime.assertReleasable();
             await runtime.drainAcks();
+            release.controller.signal.throwIfAborted();
             await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
             if (interrupt) await this.pool.stop(session_id);
             else {
-              await runtime.gracefulExit();
+              exitDetails = await runtime.gracefulExit(release.controller.signal);
               this.pool.instances.delete(session_id);
             }
           } catch (error) {
@@ -1074,6 +1109,7 @@ export class Bridge {
             const current = await readClaim(dir, session);
             if (current && (await ownerAlive(current.owner)))
               throw new Error('LIVE_OWNER_UNREACHABLE');
+            release.controller.signal.throwIfAborted();
             await atomicJson(claimFile(dir, session), {
               kind: 'rpc',
               file: session.file,
@@ -1084,7 +1120,7 @@ export class Bridge {
               noColdReacquire: true,
             });
           });
-        return { session_id, status: 'released', no_cold_reacquire: true };
+        return { session_id, status: 'released', no_cold_reacquire: true, ...exitDetails };
       });
     } finally {
       if (this.handoffs.get(session_id) === release) this.handoffs.delete(session_id);

@@ -21,6 +21,7 @@ import { requestRpcStop, withdrawalCollector } from './stop-execution.mjs';
 import { validatePiRuntime, validateLaunchArgs, readOwnerConfig } from './owner-config.mjs';
 import {
   reserveOwner,
+  acquireDeletion,
   updateOwner,
   releaseOwner,
   processIdentity,
@@ -59,7 +60,8 @@ export function launchProfile(config, hostEnv = process.env) {
   };
 }
 export class PiRpc {
-  constructor(config, session) {
+  constructor(config, session, { completionControl } = {}) {
+    this.completionControl = completionControl;
     this.config = config;
     this.session = session;
     this.pending = new Map();
@@ -72,6 +74,8 @@ export class PiRpc {
     this.generation = randomUUID();
     this.runtimeEvents = new RuntimeEvents(this.generation);
     this.promptAdmission = null;
+    this.pendingInputs = 0;
+    this.inputActivitySequence = 0;
     this.modelMutation = null;
     this.compactionMutation = null;
     this.settlement = {
@@ -81,14 +85,24 @@ export class PiRpc {
       aborted: null,
     };
     this.requiredSettlementSequence = 0;
+    this.launchSettled = Promise.withResolvers();
   }
-  async start() {
+  async start(signal) {
+    try {
+      return await this.startRuntime(signal);
+    } finally {
+      this.launchSettled.resolve();
+    }
+  }
+  async startRuntime(signal) {
+    signal?.throwIfAborted();
     validateLaunchArgs(this.config.piArgs);
     await assertSingleSessionFile(this.session.file);
     const { env, toolArgs } = launchProfile(this.config);
     if (this.config.piRuntime?.agentDir)
       await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
     const executable = await resolvePiInstallation(this.config, env);
+    signal?.throwIfAborted();
     try {
       if (this.config.attachmentDir) {
         this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
@@ -104,7 +118,7 @@ export class PiRpc {
         env.PI_MCP_RPC_OBSERVER = JSON.stringify({
           socket: this.ownerRecord.socket,
           generation: this.ownerRecord.generation,
-          sdkEntry: executable.sdkEntry,
+          ownerControl: this.completionControl,
         });
       }
       // Recheck at the actual launch boundary: content preflight and owner
@@ -128,8 +142,9 @@ export class PiRpc {
         env,
       };
       const herdr = this.config.herdr ? await findHerdr() : null;
+      signal?.throwIfAborted();
       this.child = herdr
-        ? new HerdrRpcTransport(herdr, launch)
+        ? new HerdrRpcTransport(herdr, launch, { signal })
         : spawn(launch.command, launch.args, {
             cwd: launch.cwd,
             env: launch.env,
@@ -193,10 +208,15 @@ export class PiRpc {
           readContract: READ_CONTRACT,
         });
       }
+      // Launch identity is now usable even if native readiness or its failure
+      // cleanup never finishes. Delete need not wait for the ready promise.
+      this.launchSettled.resolve();
+      signal?.throwIfAborted();
       await this.state(15000);
       this.phase = 'running';
       return this;
     } catch (error) {
+      this.launchSettled.resolve();
       if (this.child.abortStartup && !this.childIdentity) {
         await this.child.abortStartup();
         this.exited = true;
@@ -519,9 +539,24 @@ export class PiRpc {
   entries() {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
   }
-  hasUnsettledWork() {
+  observeInputActivity({ pendingInputs, sequence }) {
+    if (
+      !Number.isSafeInteger(pendingInputs) ||
+      pendingInputs < 0 ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 0
+    )
+      throw new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
+    if (sequence > this.inputActivitySequence) {
+      this.inputActivitySequence = sequence;
+      this.pendingInputs = pendingInputs;
+      if (!pendingInputs) this.onIdleCandidate?.();
+    }
+  }
+  hasUnsettledWork({ includeInputs = true } = {}) {
     return Boolean(
       this.activeBashes > 0 ||
+      (includeInputs && this.pendingInputs > 0) ||
       this.promptAdmission ||
       this.modelMutation ||
       this.compactionMutation ||
@@ -540,7 +575,7 @@ export class PiRpc {
   async idleSnapshot() {
     const state = await this.state();
     if (
-      this.hasUnsettledWork() ||
+      this.hasUnsettledWork({ includeInputs: false }) ||
       state.isStreaming === true ||
       state.isCompacting === true ||
       state.pendingMessageCount > 0
@@ -554,16 +589,16 @@ export class PiRpc {
     )
       return { state, status: 'unconfirmed' };
     const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
+    this.observeInputActivity(observed);
     if (
       observed.isIdle === false ||
       observed.hasPendingMessages === true ||
+      observed.pendingInputs > 0 ||
       this.hasUnsettledWork()
     )
       return { state, status: 'busy' };
-    // Native input events cannot correlate independent extension preflight with an RPC ACK.
-    // Historical RPC input counts are not evidence of unfinished work.
     if (
-      observed.nonRpcInputSeen !== false ||
+      observed.pendingInputs !== 0 ||
       observed.isIdle !== true ||
       observed.hasPendingMessages !== false
     )
@@ -762,12 +797,9 @@ export class PiRpc {
       this.lines?.close();
       await releaseOwner(this.config.attachmentDir, this.session, record);
       this.ownerRecord = null;
-      if (this.uiFacts.shutdown.size)
-        throw Object.assign(
-          new RpcFailure('EXTENSION_UI_SHUTDOWN_UNAVAILABLE', true),
-          uiSnapshot(this.uiFacts),
-        );
       if (result.code !== 0 || result.signal) throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
+      // UI availability is a shutdown diagnostic, not another writer claim.
+      return this.uiFacts.shutdown.size ? uiSnapshot(this.uiFacts) : {};
     })();
     return this.gracefulExitPromise;
   }
@@ -846,7 +878,7 @@ export class PiRpc {
   }
 }
 export class RuntimePool {
-  constructor(config, factory, { configFile } = {}) {
+  constructor(config, factory, { configFile, completionControl } = {}) {
     this.config = config;
     this.attachmentDir =
       config.attachmentDir ?? (config.stateDir ? path.join(config.stateDir, 'ipc') : undefined);
@@ -863,7 +895,14 @@ export class RuntimePool {
         // affects only acquisition, not reads or reuse of an existing owner.
         if (desiredRegistry !== this.attachmentDir) throw new RpcFailure('CONFIG_RESTART_REQUIRED');
         const herdr = desired.herdr;
-        return new PiRpc({ ...config, herdr, attachmentDir: this.attachmentDir }, session).start();
+        const start = this.starting.get(session.id);
+        start.controller.signal.throwIfAborted();
+        start.runtime = new PiRpc(
+          { ...config, herdr, attachmentDir: this.attachmentDir },
+          session,
+          { completionControl },
+        );
+        return start.runtime.start(start.controller.signal);
       });
     this.instances = new Map();
     // Keep the latest owned generation's bounded observations through normal
@@ -934,7 +973,7 @@ export class RuntimePool {
     return existing?.alive ? existing : null;
   }
   async resolve(session) {
-    if (this.starting.has(session.id)) return this.starting.get(session.id);
+    if (this.starting.has(session.id)) return this.starting.get(session.id).promise;
     const attached = await this.forRead(session);
     if (attached) {
       diagnostics.emit('runtime.reused', {
@@ -950,8 +989,10 @@ export class RuntimePool {
     const existing = this.instances.get(session.id);
     if (existing?.alive) return existing;
     if (existing) await existing.stop();
-    if (this.starting.has(session.id)) return this.starting.get(session.id);
-    const start = diagnostics
+    if (this.starting.has(session.id)) return this.starting.get(session.id).promise;
+    const start = { controller: new AbortController() };
+    this.starting.set(session.id, start);
+    start.promise = diagnostics
       .measure('runtime.start', { kind: 'rpc' }, () => this.factory(session))
       .then((runtime) => {
         this.watchRuntime(runtime);
@@ -959,8 +1000,7 @@ export class RuntimePool {
         return runtime;
       })
       .finally(() => this.starting.delete(session.id));
-    this.starting.set(session.id, start);
-    return start;
+    return start.promise;
   }
   get(id) {
     const r = this.instances.get(id);
@@ -968,28 +1008,52 @@ export class RuntimePool {
   }
   async stopForDelete(session) {
     const pending = this.starting.get(session.id);
-    if (pending) await pending.catch(() => {});
-    const runtime = await this.forRead(session);
-    if (runtime?.attached) {
-      await runtime.stopForDelete();
-      this.instances.delete(session.id);
-    } else await this.stop(session.id);
-    this.observations.delete(session.id);
-    if (this.attachmentDir) {
-      // Keep a cooperative owner claim across the filesystem move, including saved-session deletes.
-      const deletion = await reserveOwner(this.attachmentDir, session, 'delete');
-      return () => releaseOwner(this.attachmentDir, session, deletion);
+    pending?.controller.abort(new RpcFailure('RUNTIME_START_CANCELLED'));
+    // Stop before launch, or obtain the actual launched process identity. Never
+    // wait for native readiness/failure cleanup before exercising delete authority.
+    await pending?.runtime?.launchSettled.promise;
+    // Acquire once, before termination, not after the writer has released.
+    // Any owner admitted before this point is the target of this deletion;
+    // later acquisitions are blocked through the move and final cleanup.
+    const deletion = this.attachmentDir ? await acquireDeletion(this.attachmentDir, session) : null;
+    try {
+      const claim = await deletion?.writer(),
+        owned = this.instances.get(session.id) ?? pending?.runtime,
+        herdr =
+          owned instanceof PiRpc && owned.child instanceof HerdrRpcTransport ? owned.child : null;
+      // Before Herdr reports Pi's identity, this launch's claim names Bridge,
+      // not a writer to signal. A successor claim still belongs to this deletion.
+      const startingOwner =
+        herdr && !owned.childIdentity && claim?.generation === owned.ownerRecord?.generation;
+      if (claim && !startingOwner && (await ownerAlive(claim.owner))) {
+        const attached = new AttachedRuntime(
+          { ...this.config, attachmentDir: this.attachmentDir },
+          session,
+          claim,
+        );
+        await attached.stopForDelete();
+      }
+      // Close the owned scope once: either startup never reported a Pi identity,
+      // or the verified writer is now gone and only descendants may remain.
+      if (herdr && (!owned.childIdentity || !(await ownerAlive(owned.childIdentity))))
+        await herdr.terminateScope(this.config.attachmentExitTimeoutMs ?? 5000);
+      await this.stop(session.id);
+      this.observations.delete(session.id);
+      return deletion?.finish;
+    } catch (error) {
+      await deletion?.finish();
+      throw error;
     }
   }
   async stop(id) {
     const pending = this.starting.get(id);
-    if (pending) await pending.catch(() => {});
+    if (pending) await pending.promise.catch(() => {});
     const runtime = this.instances.get(id);
     await runtime?.stop();
     this.instances.delete(id);
   }
   async drainAcks() {
-    await Promise.all([...this.starting.values()].map((p) => p.catch(() => {})));
+    await Promise.all([...this.starting.values()].map((start) => start.promise.catch(() => {})));
     await Promise.all([...this.instances.values()].map((runtime) => runtime.drainAcks?.()));
   }
   prepareClose() {
