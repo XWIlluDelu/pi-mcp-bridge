@@ -14,6 +14,41 @@ async function populate(f) {
   await released(f);
 }
 
+test('too-small cold compact returns a safe native reason without changing history', async (t) => {
+  const f = await fixture(t);
+  const settings = JSON.parse(await fs.readFile(f.settings, 'utf8'));
+  settings.compaction.keepRecentTokens = 20000;
+  await fs.writeFile(f.settings, JSON.stringify(settings));
+  await f.bridge.send({ session_id: f.id, text: 'SMALL_COMPACT_MARKER' });
+  await released(f);
+  const before = await savedEntries(f.bridge, f.id);
+  assert.deepEqual(await f.bridge.compact({ session_id: f.id }), {
+    status: 'rejected',
+    reason: 'PI_REJECTED',
+    native_reason: 'Nothing to compact (session too small)',
+    native_effects: 'native_compact_attempted',
+  });
+  await released(f);
+  assert.deepEqual(await savedEntries(f.bridge, f.id), before);
+});
+
+test('native summarizer completes compact with isolated settings and an offline provider', async (t) => {
+  const f = await fixture(t);
+  await populate(f);
+  const result = await f.bridge.compact({
+    session_id: f.id,
+    instructions: 'NATIVE_COMPACT',
+  });
+  assert.equal(result.status, 'accepted', JSON.stringify(result));
+  assert.equal(result.completion, 'completed');
+  await released(f);
+  const entries = await savedEntries(f.bridge, f.id);
+  const compactions = entries.filter((entry) => entry.type === 'compaction');
+  assert.equal(compactions.length, 1);
+  assert.equal(compactions[0].fromHook, false);
+  assert.ok(compactions[0].summary.length > 0);
+});
+
 test(
   'cold compact needs send, hides its native summary and releases when complete',
   { timeout: 15000 },
@@ -143,6 +178,7 @@ test(
     const result = await f.bridge.compact({ session_id: f.id, instructions: 'CANCEL_COMPACT' });
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'PI_REJECTED');
+    assert.equal(result.native_reason, 'Compaction cancelled');
     await released(f);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,

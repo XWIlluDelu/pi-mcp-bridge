@@ -1,9 +1,8 @@
 import { batchSchema, publicOperationSchemas } from './tool-schemas.mjs';
 import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
+import { publicError } from './errors.mjs';
 
 export const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
-const code = (error) =>
-  /^[A-Z][A-Z_]{2,60}$/.test(error.message) ? error.message : 'OPERATION_FAILED';
 const envelope = (results) => ({
   status: 'processed',
   response_max_bytes: BATCH_RESPONSE_LIMIT,
@@ -104,7 +103,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
       try {
         sessionId = bridge.readCache.identity(args.cursor).session_id;
       } catch (error) {
-        results[index] = { index, op, error: { code: code(error) } };
+        results[index] = { index, op, error: { code: publicError(error) } };
         return Promise.resolve();
       }
     }
@@ -137,7 +136,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
             index,
             op,
             error: {
-              code: code(error),
+              code: publicError(error),
               ...(error.minimum_max_bytes ? { minimum_max_bytes: error.minimum_max_bytes } : {}),
               ...(error?.uncertain
                 ? {

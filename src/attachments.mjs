@@ -1,3 +1,4 @@
+import { knownErrorCode } from './errors.mjs';
 import {
   MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
@@ -399,35 +400,7 @@ export class AttachedRuntime {
           if (response.error)
             return finish(
               new AttachmentFailure(
-                [
-                  'MODEL_SELECTION_CHANGED',
-                  'MODEL_SELECTION_FAILED',
-                  'INVALID_MODEL_SELECTION',
-                  'THINKING_LEVEL_UNSUPPORTED',
-                  'THINKING_SUPPORT_UNKNOWN',
-                  'BASH_UNSUPPORTED',
-                  'INVALID_BASH_RESULT',
-                  'STOP_IN_PROGRESS',
-                  'STOP_UNSUPPORTED',
-                  'INVALID_STOP_RECEIPT',
-                  'RUNTIME_SESSION_CHANGED',
-                  'SESSION_TOO_LARGE',
-                  'ENTRY_NOT_FOUND',
-                  'STALE_CURSOR',
-                  'INVALID_CURSOR',
-                  'INVALID_READ_ARGUMENTS',
-                  'OWNER_READ_REFRESH_REQUIRED',
-                  'HOST_RELEASE_UNSUPPORTED',
-                  'HOST_RELEASE_FAILED',
-                  'HOST_NOT_READY',
-                  'HOST_SUBMIT_UNCERTAIN',
-                  'READ_BUDGET_TOO_SMALL',
-                  'READ_SNAPSHOT_TOO_LARGE',
-                  'INVALID_OWNER_READ',
-                  'INVALID_HOST_SNAPSHOT',
-                ].includes(response.error)
-                  ? response.error
-                  : 'ATTACHED_OPERATION_FAILED',
+                knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
                 written && mutating,
               ),
             );

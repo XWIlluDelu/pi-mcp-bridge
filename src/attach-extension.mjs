@@ -1,4 +1,5 @@
 // Load once through native Pi settings for ordinary TUI/RPC startup.
+import { publicError } from './errors.mjs';
 import fs from 'node:fs/promises';
 import { compactInputSchema, compactMetadata, requireInterruptCompaction } from './compact.mjs';
 import { modelState } from './models.mjs';
@@ -463,9 +464,7 @@ export default async function attachExtension(pi) {
             socket.end(
               JSON.stringify({
                 generation: record.generation,
-                error: /^[A-Z_]+$/.test(error.code ?? error.message)
-                  ? (error.code ?? error.message)
-                  : 'ATTACHED_OPERATION_FAILED',
+                error: publicError(error, 'ATTACHED_OPERATION_FAILED'),
               }) + '\n',
             );
           }

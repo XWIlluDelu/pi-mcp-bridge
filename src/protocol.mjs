@@ -3,6 +3,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import { publicSchemas } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
+import { publicError } from './errors.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
 export const SUPPORTED_VERSIONS = [
@@ -35,7 +36,7 @@ export const descriptions = {
   delete:
     'Recoverably move an authorized session to Bridge trash, stopping its owned live runtime. Project files are retained. Each call is a new deletion attempt; there is no result lookup.',
   batch:
-    'Wrap 1–10 operations (all tools except batch). Same-session operations execute serially through submission results; different sessions run concurrently. Each item keeps its own permissions. Every mutation item is a new operation, including in repeated batches; no outer replay or deduplication. Item failure does not cancel other items. Results share preallocated UTF-8/JSON/wire budgets: command/stop may return a smaller prefix than max_chars, with accurate completeness flags; auxiliary command.fullOutputPath/delete.project may be omitted. Captured query pages may shrink or explicitly refuse; mutation results are retained.',
+    'Wrap 1–10 operations (all tools except batch). Each item is {op,args}; for example: {"operations":[{"op":"list","args":{}}]}. Same-session operations execute serially through submission results; different sessions run concurrently. Each item keeps its own permissions. Every mutation item is a new operation, including in repeated batches; no outer replay or deduplication. Item failure does not cancel other items. Results share preallocated UTF-8/JSON/wire budgets: command/stop may return a smaller prefix than max_chars, with accurate completeness flags; auxiliary command.fullOutputPath/delete.project may be omitted. Captured query pages may shrink or explicitly refuse; mutation results are retained.',
   health:
     'Report noteworthy permission combinations and the relevant source rules, deduplicating inherited issues. Healthy configurations return a short ok result, not normal permission tables. Optional known session_id limits diagnosis to that session without exposing its metadata. Unscoped health also reports names of fixed settings awaiting restart, without blocking business requests or exposing their values. Takes no domain selector; does not change authorization.',
 };
@@ -64,13 +65,28 @@ export function toolDefinitions() {
     inputSchema: toJsonSchemaCompat(publicSchemas[name], { pipeStrategy: 'input' }),
   }));
 }
-export function publicError(error) {
-  return /^[A-Z][A-Z_]{2,60}$/.test(error?.message) ? error.message : 'OPERATION_FAILED';
-}
 export function toolError(code, extra = {}) {
+  const result = {
+    error: {
+      code,
+      ...(code === 'OWNER_READ_REFRESH_REQUIRED'
+        ? {
+            recovery:
+              'Update the session owner companion at an idle boundary (native /reload where supported), then retry read. Changing read arguments will not refresh the owner.',
+          }
+        : ['ATTACHMENT_PROTOCOL_MISMATCH', 'OWNER_COMPONENT_UPDATE_REQUIRED'].includes(code)
+          ? {
+              recovery:
+                'Update Bridge and the session owner component together; use a safe native reload at an idle boundary where supported. Do not delete a live claim or start a fallback writer.',
+            }
+          : {}),
+      ...extra,
+    },
+  };
   return {
     isError: true,
-    content: [{ type: 'text', text: JSON.stringify({ error: { code, ...extra } }) }],
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+    structuredContent: result,
   };
 }
 export async function callBridgeTool(
