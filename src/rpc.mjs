@@ -9,7 +9,6 @@ import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { RetainedObservations } from './context-observation.mjs';
 import { sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
-import { assertImageModel } from './prompt-input.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
@@ -576,14 +575,7 @@ export class PiRpc {
   // and submission, not the complete run or unrelated native extension work.
   async selectModel(
     model,
-    {
-      images,
-      thinkingLevel,
-      idle = false,
-      nativeThinking = false,
-      timeout = 5000,
-      beforeDispatch,
-    } = {},
+    { thinkingLevel, idle = false, nativeThinking = false, timeout = 5000, beforeDispatch } = {},
   ) {
     if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
     if (idle && this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
@@ -592,13 +584,11 @@ export class PiRpc {
     const initial = await this.state();
     let target = model ? models?.find((m) => sameModel(m, model)) : initial.model;
     if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
-    assertImageModel(images, target);
     if (!nativeThinking) await assertThinkingLevel(target, thinkingLevel, this.config);
     const state = idle ? await this.assertIdle() : await this.state();
     await beforeDispatch?.();
     if (!model) {
       target = state.model;
-      assertImageModel(images, target);
       if (!nativeThinking) await assertThinkingLevel(target, thinkingLevel, this.config);
     }
     if (model && !sameModel(state.model, target)) {
@@ -616,7 +606,6 @@ export class PiRpc {
     let selected = idle ? await this.assertIdle() : await this.state();
     if (model && !sameModel(selected.model, target))
       throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
-    assertImageModel(images, selected.model);
     if (!nativeThinking) await assertThinkingLevel(selected.model, thinkingLevel, this.config);
     if (thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel) {
       await this.command(

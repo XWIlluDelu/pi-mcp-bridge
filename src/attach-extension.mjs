@@ -16,7 +16,6 @@ import {
   SEND_MODES,
   attachedPromptInput,
   remotePromptRejection,
-  assertImageModel,
   hasPromptSettings,
 } from './prompt-input.mjs';
 import {
@@ -420,7 +419,6 @@ export default async function attachExtension(pi) {
                 throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
               if (!SEND_MODES.includes(args.mode))
                 throw new AttachmentFailure('INVALID_ATTACHED_SEND');
-              assertImageModel(input.images, ctx.model);
               const rejection = remotePromptRejection(input.text);
               if (rejection) data = rejection;
               else if (args.mode === 'idle_only' && (!ctx.isIdle() || ctx.hasPendingMessages()))

@@ -23,7 +23,7 @@ import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
-import { imageReply } from './fixtures/image-provider.mjs';
+import { imageReply, imageInputExtension } from './fixtures/image-provider.mjs';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(check) {
   const end = Date.now() + 10000;
@@ -155,6 +155,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
             noPromptTemplates: true,
             noThemes: true,
             systemPrompt: 'Image test.',
+            extensionFactories: [imageInputExtension],
           });
         await resourceLoader.reload();
         ({ session: sdk } = await createAgentSession({
@@ -168,6 +169,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
           sessionManager: SessionManager.open(saved.file),
           settingsManager,
         }));
+        await sdk.bindExtensions({ mode: 'rpc' });
         await controller.ready(createSdkHostBinding(sdk));
       } else {
         const pidFile = path.join(dir, 'pid'),
@@ -339,6 +341,50 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       assert.deepEqual((await readClaim(config.attachmentDir, saved)).owner, record.owner);
       assert.equal((await readClaim(config.attachmentDir, saved)).generation, record.generation);
       assert.equal(spawned, 0);
+      const small = pngImage(),
+        evidence = imageEvidence(small);
+      await call('set_model', {
+        session_id: saved.id,
+        model: { provider: selected.model.provider, id: 'text-only' },
+      });
+      const handled = await call('send', {
+        session_id: saved.id,
+        text: 'HANDLE_IMAGE_TEST ' + evidence.sha256,
+        images: [small],
+      });
+      assert.equal(handled.status, route === 'rpc-host' ? 'handled' : 'unknown');
+      const inputRecord = await until(async () => {
+        const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
+        return entries.findLast(
+          (e) => e.type === 'custom' && e.customType === 'image-input-fixture',
+        );
+      });
+      assert.deepEqual(inputRecord.data, [evidence]);
+      const transformed = await call('send', {
+        session_id: saved.id,
+        text: 'TRANSFORM_IMAGE_TEST',
+        images: [small],
+      });
+      assert.ok(['started', 'unknown'].includes(transformed.status));
+      await until(async () => {
+        const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
+        return entries
+          .findLast((e) => e.message?.role === 'user')
+          ?.message.content.some((c) => c.type === 'text' && c.text === 'IMAGE_TRANSFORMED');
+      });
+      await until(
+        async () =>
+          (sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText()) ===
+          'IMAGE_CONTEXT:[]',
+      );
+      assert.equal((await status()).model.id, 'text-only');
+      await call('send', { session_id: saved.id, text: 'SELECT_IMAGE_TEST', images: [small] });
+      await until(
+        async () =>
+          (sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText()) ===
+          'IMAGE_CONTEXT:' + JSON.stringify([evidence]),
+      );
+      assert.equal((await status()).model.id, 'vision');
       // Missing capability fails before transport dispatch, never text-only fallback.
       const unsupported = new AttachedRuntime(config, saved, { ...record, imagesSupported: false });
       assert.throws(

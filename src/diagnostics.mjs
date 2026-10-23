@@ -3,7 +3,6 @@ import { createHash, randomUUID } from 'node:crypto';
 
 const codes = new Set([
   'IMAGE_INPUT_UNSUPPORTED',
-  'MODEL_IMAGE_INPUT_UNSUPPORTED',
   'MODEL_SELECTION_UNSUPPORTED',
   'MODEL_SELECTION_PENDING',
   'MODEL_SELECTION_BUSY',

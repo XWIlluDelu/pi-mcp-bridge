@@ -53,7 +53,7 @@ export const imagesSchema = z
   .array(imageSchema)
   .min(1)
   .describe(
-    'Native Pi image blocks: PNG/JPEG/GIF/WebP, one or more images, at most 5 MiB decoded bytes in total. The selected model must support images.',
+    'Native Pi image blocks: PNG/JPEG/GIF/WebP, one or more images, at most 5 MiB decoded bytes in total. Native Pi extensions and the final provider handle image input.',
   )
   .superRefine((images, ctx) => {
     if (
@@ -102,13 +102,9 @@ export function attachedPromptInput(args) {
 export function assertPromptSelection(input, state) {
   if (input.model && !sameModel(input.model, state.model))
     throw new Error('MODEL_SELECTION_CHANGED');
-  assertImageModel(input.images, state.model);
   if (input.thinking_level !== undefined) {
     if (state.thinkingLevel !== input.thinking_level) throw new Error('MODEL_SELECTION_CHANGED');
   }
-}
-export function assertImageModel(images, model) {
-  if (images && !model?.input?.includes('image')) throw new Error('MODEL_IMAGE_INPUT_UNSUPPORTED');
 }
 
 // Public admission results are not completion tracking. Only a validated native
