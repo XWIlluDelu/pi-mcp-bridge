@@ -170,7 +170,7 @@ test('permission menu registers only a human TUI shortcut and aborts on lifecycl
     else process.env.PI_MCP_OWNER_CONFIG = prior;
   }
 });
-test('running bridge reloads only valid permission edits and fails closed on other changes', async (t) => {
+test('running bridge reloads valid permissions independently of pending fixed settings', async (t) => {
   const f = await fixture(t);
   const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
   try {
@@ -183,7 +183,12 @@ test('running bridge reloads only valid permission edits and fails closed on oth
     );
     await assert.rejects(bridge.read({ session_id: made.session_id }), /NOT_FOUND_OR_DENIED/);
     await fs.writeFile(f.file, JSON.stringify({ ...f.config, piArgs: ['--offline'] }));
-    await assert.rejects(bridge.list(), /CONFIG_RESTART_REQUIRED/);
+    assert.deepEqual(
+      (await bridge.list()).sessions.map((row) => row.session_id),
+      [made.session_id],
+    );
+    assert.equal((await bridge.read({ session_id: made.session_id })).session_id, made.session_id);
+    assert.deepEqual((await bridge.health()).restart_required, ['piArgs']);
     await fs.writeFile(f.file, 'broken');
     await assert.rejects(bridge.list(), /INVALID_OWNER_CONFIG/);
   } finally {

@@ -237,7 +237,15 @@ export async function discover(config) {
       }
     }
   }
-  for (const root of config.sessionRoots) await walk(root);
+  for (const root of config.sessionRoots) {
+    try {
+      await assertNativeDirectory(root);
+    } catch (error) {
+      if (error.code === 'ENOENT') continue; // An unused root need not exist yet.
+      throw error;
+    }
+    await walk(root);
+  }
   return found.sort((a, b) => a.id.localeCompare(b.id));
 }
 export const textBoundary = (text, offset) =>
