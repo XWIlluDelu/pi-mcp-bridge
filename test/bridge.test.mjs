@@ -404,7 +404,7 @@ test('changed native header identity produces a new opaque ID and cannot reuse o
   assert.equal(f.runtime.resumes, 2);
 });
 
-test('project symlink cannot borrow lexical parent permissions', async (t) => {
+test('recorded project history remains listed while a symlink cannot redirect cold execution', async (t) => {
   const f = await fixture(t);
   const outside = path.join(f.dir, 'outside');
   await fs.mkdir(outside);
@@ -413,8 +413,18 @@ test('project symlink cannot borrow lexical parent permissions', async (t) => {
   const [s] = await f.bridge.sessions();
   s.header.cwd = link;
   await fs.writeFile(s.file, JSON.stringify(s.header) + '\n');
-  assert.deepEqual((await f.bridge.list()).sessions, []);
-  assert.equal((await f.bridge.send({ session_id: f.id, text: 'hello' })).status, 'rejected');
+  const listed = (await f.bridge.list()).sessions;
+  assert.deepEqual(
+    listed.map(({ session_id, project }) => ({ session_id, project })),
+    [{ session_id: f.id, project: link }],
+  );
+  assert.equal((await f.bridge.session(f.id)).cwd, null);
+  assert.deepEqual(await f.bridge.send({ session_id: f.id, text: 'hello' }), {
+    status: 'rejected',
+    reason: 'EXECUTION_CWD_UNAVAILABLE',
+  });
+  assert.equal(f.runtime.resumes, 0);
+  assert.deepEqual(f.runtime.calls, []);
 });
 
 test('invalid transcript trees retain identity but content reads reject', async (t) => {
