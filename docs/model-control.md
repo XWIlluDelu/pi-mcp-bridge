@@ -21,7 +21,7 @@ A short-lived helper uses native `ModelRuntime.create({allowModelNetwork:false})
 
 **User Pi, read-only storage.** The helper loads `ModelRuntime`, thinking capabilities and native credential parsing from the same user installation selected for CLI execution. `model-catalog-storage.mjs` loads that installation's exported `ReadOnlyAuthStorage` from `./core/auth-storage.js` (not re-exported at the SDK root). A small read-only `ModelsStore` adapter passes existing JSON cache entries to native `ModelRuntime` without copying its model schema or pinning a provider-entry version. Both stores reject mutations: discovery never initializes auth/cache files, locks them, changes permissions or writes credentials. Missing native modules or loading failures report an unavailable catalog; Bridge never substitutes its own Pi.
 
-This catalog works even when there are no sessions. It excludes models registered only by extensions or a session at runtime; it is not a live owner's complete catalog. Native loading failures return `MODEL_CATALOG_UNAVAILABLE`, without underlying error text.
+This catalog works even when there are no sessions. It excludes models registered only by extensions or a session at runtime; it is not a live owner's complete catalog. Native loading failures return `MODEL_CATALOG_UNAVAILABLE`, without underlying error text. With `PI_MCP_LOG=1`, owner diagnostics retain a content-free `catalog_stage` and `catalog_reason` for module/storage/runtime/configuration/projection and subprocess/response failures. Native error messages, file contents and credentials are never forwarded or logged.
 
 The response contains only `models` and `next_offset` (null at the end). Offset defaults to 0; limit is 1–100, default 30. Models are sorted by provider/ID; pagination does not freeze the catalog across calls. Each item contains only `provider`, `id`, `name`, `input`, native `thinking_levels`, `context_window`, `max_output_tokens` and `input_limits`. Missing metadata is null. Credentials, endpoints, headers, provider configuration and raw provider errors are omitted.
 
@@ -170,6 +170,15 @@ UTF-16 units. `timeout_ms` is 50–30000 (default 5000), not an abort deadline.
 Late ACKs settle private state without repeating compaction. Attached operations continue after transport timeout and retain their input fence until the native callback/controller Promise settles. The ordinary RPC client exposes native rejection and lost ACK as plain Errors; that binding reports `HOST_COMPACT_UNCERTAIN` rather than guessing from error text. SDK and companion callbacks can report definitive native failure. There is no
 `recover` parameter or result lookup; use `list/read` after an unknown result.
 Native extension cancellation returns a refusal.
+
+For Bridge-owned RPC, a `PI_REJECTED` compact result can additionally include
+`native_reason`: exactly `Nothing to compact (session too small)`,
+`Already compacted`, or `Compaction cancelled`. Unknown native/provider/extension
+messages are omitted, not truncated or forwarded. This diagnostic does not change
+`status`, `reason`, or `native_effects`. A short multi-turn session can still be
+too small: native compaction keeps the configured recent-token window and needs
+older content to summarize. The refusal occurs before the compaction extension
+hook; it does not by itself indicate an extension failure.
 
 ## Native settings refresh
 

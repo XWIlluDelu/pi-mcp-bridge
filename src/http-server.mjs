@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { publicError } from './errors.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -21,8 +22,6 @@ import { readPrivateFile } from './storage.mjs';
 export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
 export const TOKEN_HEADER = 'x-pi-bridge-token';
 const digest = (value) => createHash('sha256').update(value).digest();
-const publicError = (error) =>
-  /^[A-Z][A-Z_]{2,60}$/.test(error.message) ? error.message : 'HTTP_SERVICE_FAILED';
 
 export async function loadHttpConfig(file) {
   const { config } = await readOwnerConfig(file);
@@ -327,12 +326,12 @@ async function main() {
     })();
     await initializing;
   } catch (error) {
-    console.error(publicError(error));
+    console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
     await close(1);
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   main().catch((error) => {
-    console.error(publicError(error));
+    console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
     process.exitCode = 1;
   });

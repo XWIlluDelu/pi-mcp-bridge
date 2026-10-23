@@ -13,6 +13,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { nativeCompactReason } from './compact.mjs';
 import { uiFacts, uiSnapshot } from './rpc-ui.mjs';
 import { RuntimeEvents } from './runtime-events.mjs';
 import { limitBashResult } from './bash-execution.mjs';
@@ -327,7 +328,14 @@ export class PiRpc {
     const ui = uiSnapshot(req.uiFacts);
     const result = event.success
       ? { ok: true, data: ui.ui ? { ...event.data, ...ui } : event.data }
-      : { ok: false, code: 'PI_REJECTED', ...ui };
+      : {
+          ok: false,
+          code: 'PI_REJECTED',
+          ...(req.commandType === 'compact'
+            ? { native_reason: nativeCompactReason(event.error) }
+            : {}),
+          ...ui,
+        };
     if (req.timedOut) {
       req.log?.('rpc.late_ack', {
         op: req.commandType,
@@ -340,7 +348,10 @@ export class PiRpc {
       return;
     }
     if (result.ok) req.resolve(result.data);
-    else req.reject(Object.assign(new RpcFailure(result.code), ui));
+    else
+      req.reject(
+        Object.assign(new RpcFailure(result.code), ui, { native_reason: result.native_reason }),
+      );
     notifyIdle();
   }
   trackAck(work) {

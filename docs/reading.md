@@ -333,6 +333,9 @@ snapshot, not unselected raw history. Attached fork still uses the raw `snapshot
 operation with its 32 MiB bound; owned fork uses native `get_entries`.
 
 Update the Bridge and companion/host components together. A missing or mismatched
-read contract returns `OWNER_READ_REFRESH_REQUIRED`; update the companion/host.
+read contract returns `OWNER_READ_REFRESH_REQUIRED`; update the companion/host
+at an idle boundary. Tool errors expose the same code in text and
+`structuredContent`, with refresh guidance for this error. Changing read
+selectors or refreshing the client's schema does not update a running owner.
 Read never falls back to the raw fork snapshot. Native Pi history still uses
 the current SDK projection without modifying historical records.

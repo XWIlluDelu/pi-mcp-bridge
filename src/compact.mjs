@@ -9,6 +9,18 @@ export const compactSchema = z
   .strict();
 export const compactInputSchema = compactSchema.omit({ session_id: true, timeout_ms: true });
 
+// Exact native messages only: never forward provider, extension or history text.
+export function nativeCompactReason(message) {
+  if (
+    [
+      'Nothing to compact (session too small)',
+      'Already compacted',
+      'Compaction cancelled',
+    ].includes(message)
+  )
+    return message;
+}
+
 // Native public APIs can interrupt but cannot attest unrelated input preflight.
 // A host with its own admission gate can implement idle compact separately.
 export function requireInterruptCompaction(input, state) {
