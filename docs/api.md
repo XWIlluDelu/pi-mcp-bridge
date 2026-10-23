@@ -277,8 +277,12 @@ including later work. Do not repeat stop merely to retrieve prior withdrawn text
 }
 ```
 
-`project` must exactly match a configured canonical project path. New sessions
-are stored under the first configured session root.
+`project` must exactly match a configured canonical project path. The child uses
+that project's native Pi session location and effective agent environment, not
+`sessionRoots[0]`. Native CLI/environment/settings overrides retain their normal
+precedence; see [storage configuration](configuration.md#storage-and-project-paths).
+If the native destination is outside the configured roots, creation rejects with
+`NATIVE_SESSION_OUTSIDE_ROOTS` before publishing a session or sending the prompt.
 `name` is optional, 1–200 code units. `fork_from` is optional and identifies
 the parent's **current committed native branch tail**, not an arbitrary
 position or an unfinished assistant preview. Pi's native fork preserves current

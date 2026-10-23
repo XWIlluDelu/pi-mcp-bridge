@@ -1,25 +1,34 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { SessionManager, CURRENT_SESSION_VERSION } from '@earendil-works/pi-coding-agent';
 import { opaqueId, syncDir, assertNativeDirectory } from './storage.mjs';
+import { launchProfile } from './rpc.mjs';
 import { sessionEntryIndex } from './data.mjs';
+const exec = promisify(execFile);
 
 // Fork committed native entries, never the Bridge read representation. An
 // in-memory manager forks the native branch and its current labels without opening a writer
 // on the parent's file or switching the parent's live runtime.
 export async function prepareSession(config, project, { name, parent, snapshot } = {}) {
-  const id = randomUUID(),
-    timestamp = new Date().toISOString();
-  const file = path.join(config.sessionRoots[0], `${timestamp.replace(/[:.]/g, '-')}_${id}.jsonl`);
-  const header = {
-    type: 'session',
-    version: CURRENT_SESSION_VERSION,
-    id,
-    timestamp,
-    cwd: project,
-    ...(parent ? { parentSession: parent.file } : {}),
-  };
+  const { stdout } = await exec(
+    process.execPath,
+    [
+      fileURLToPath(new URL('./native-create.mjs', import.meta.url)),
+      JSON.stringify({
+        roots: config.sessionRoots,
+        args: config.piArgs ?? [],
+        parentSession: parent?.file,
+      }),
+    ],
+    { cwd: project, env: launchProfile(config).env, timeout: 10000, maxBuffer: 65536 },
+  );
+  const { file, header, error } = JSON.parse(stdout);
+  if (error) throw new Error(error);
+  const { id, timestamp } = header;
   let entries = [];
   if (parent) {
     if (!Array.isArray(snapshot?.entries)) throw new Error('INVALID_RUNTIME_ENTRIES');
