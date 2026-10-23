@@ -66,7 +66,7 @@ test(
       attachmentDir: path.join(dir, 'ipc'),
     };
     const configFile = path.join(dir, 'owner.json');
-    await fs.writeFile(configFile, JSON.stringify(config));
+    await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     const setup = await new Bridge(config).init(),
       made = await savedSession(setup, { folder_id: 'project' }),
       saved = await setup.session(made.session_id);
@@ -213,7 +213,7 @@ test(
     });
     assert.equal(replacement.owner.pid, owner.owner.pid);
     config.grants.push({ session_id: saved.id, read: false, send: true });
-    await fs.writeFile(configFile, JSON.stringify(config));
+    await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     assert.equal((await call('read', { session_id: saved.id })).isError, true);
     const sendOnly = await ok('send', {
       session_id: saved.id,
@@ -224,7 +224,7 @@ test(
     assert.equal(JSON.stringify(sendOnly).includes('SEND_ONLY_NO_TRANSCRIPT'), false);
     await until(async () => !(await local.getState()).isStreaming);
     config.grants.push({ session_id: saved.id, read: true, send: true });
-    await fs.writeFile(configFile, JSON.stringify(config));
+    await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     await fs.rename(replacement.socket, replacement.socket + '.paused');
     try {
       assert.equal((await call('read', { session_id: saved.id })).isError, true);

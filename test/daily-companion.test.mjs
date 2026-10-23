@@ -42,7 +42,7 @@ for (const mode of ['tui', 'rpc'])
         outside = path.join(dir, 'outside', 'outside.jsonl');
       await Promise.all(
         [cwd, agent, root, path.dirname(outside), path.dirname(ownerFile)].map((p) =>
-          fs.mkdir(p, { recursive: true }),
+          fs.mkdir(p, { recursive: true, mode: 0o700 }),
         ),
       );
       const config = {

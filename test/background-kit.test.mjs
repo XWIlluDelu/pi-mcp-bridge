@@ -8,7 +8,6 @@ import os from 'node:os';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { checkOwner } from '../deploy/check-owner.mjs';
 const exec = promisify(execFile),
   base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture() {
@@ -28,62 +27,6 @@ async function fixture() {
   await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   return { dir, config, file };
 }
-test('service preflight is read-only and refuses unsafe config or existing locks without repairing them', async (t) => {
-  const f = await fixture();
-  t.after(() => fs.rm(f.dir, { recursive: true, force: true }));
-  assert.deepEqual(await checkOwner(f.file), {
-    owner_config_checked: true,
-    network_checked: false,
-    client_checked: false,
-    model_checked: false,
-  });
-  assert.deepEqual((await fs.readdir(f.dir)).sort(), ['owner.json', 'project']);
-  await fs.chmod(f.file, 0o644);
-  await assert.rejects(checkOwner(f.file), /OWNER_CONFIG_NOT_PRIVATE/);
-  await fs.chmod(f.file, 0o600);
-  await fs.mkdir(f.config.stateDir, { mode: 0o700 });
-  const lock = path.join(f.config.stateDir, 'bridge.lock');
-  await fs.writeFile(lock, 'public stale fixture');
-  await assert.rejects(checkOwner(f.file), /BRIDGE_LOCK_REQUIRES_OWNER_CHECK/);
-  assert.equal(await fs.readFile(lock, 'utf8'), 'public stale fixture');
-  await fs.unlink(lock);
-  for (const attachmentDir of [path.join(f.config.stateDir, 'ipc'), path.join(f.dir, 'ipc')]) {
-    await fs.mkdir(attachmentDir, { mode: 0o700 });
-    if (attachmentDir === path.join(f.dir, 'ipc')) f.config.attachmentDir = attachmentDir;
-    await fs.writeFile(f.file, JSON.stringify(f.config));
-    const registry = path.join(attachmentDir, 'registry.lock');
-    await fs.writeFile(registry, 'public fixture');
-    await assert.rejects(checkOwner(f.file), /REGISTRY_LOCK_REQUIRES_OWNER_CHECK/);
-    assert.equal(await fs.readFile(registry, 'utf8'), 'public fixture');
-    await fs.unlink(registry);
-  }
-});
-test('native session directories under umask 0022 need explicit owner privacy review', async (t) => {
-  const f = await fixture();
-  t.after(() => fs.rm(f.dir, { recursive: true, force: true }));
-  const { stdout } = await exec(
-    process.execPath,
-    [
-      '--input-type=module',
-      '-e',
-      "import { SessionManager } from '@earendil-works/pi-coding-agent'; process.umask(0o022); console.log(SessionManager.create(process.argv[1]).getSessionDir());",
-      f.cwd,
-    ],
-    {
-      cwd: base,
-      env: { PATH: process.env.PATH, HOME: f.dir, PI_CODING_AGENT_DIR: path.join(f.dir, 'agent') },
-    },
-  );
-  const root = stdout.trim();
-  assert.ok(root.startsWith(f.dir + path.sep));
-  assert.equal((await fs.stat(root)).mode & 0o777, 0o755);
-  f.config.sessionRoots = [root];
-  await fs.writeFile(f.file, JSON.stringify(f.config));
-  await assert.rejects(checkOwner(f.file), /STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY/);
-  // Explicit owner action on this fixture only, not an automatic preflight repair.
-  await fs.chmod(root, 0o700);
-  assert.equal((await checkOwner(f.file)).owner_config_checked, true);
-});
 test('user-service template parses with systemd without installing or starting a service', async (t) => {
   try {
     await exec('systemd-analyze', ['--version']);

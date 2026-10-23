@@ -694,7 +694,7 @@ test('Bridge independently authorizes known-ID reads and rechecks each continuat
   const cwd = path.join(dir, 'project'),
     root = path.join(dir, 'sessions');
   await fs.mkdir(cwd);
-  await fs.mkdir(root);
+  await fs.mkdir(root, { mode: 0o700 });
   const entries = [
     msg('u', null, 'user', 'private input'),
     msg('a', 'u', 'assistant', [text('private response'.repeat(1000))]),

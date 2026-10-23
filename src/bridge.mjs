@@ -13,7 +13,7 @@ import { prepareSession, persistSession } from './create-session.mjs';
 import { SEND_MODES, promptInput, assertImageModel } from './prompt-input.mjs';
 import { renderContextRead } from './context-read.mjs';
 import { discover, readSessionIdentity, loadSavedSession, validateExecutionCwd } from './data.mjs';
-import { hash, atomicJson } from './storage.mjs';
+import { hash, atomicJson, assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
 import { stopReceipt, recoveredWithdrawal, withdrawalPage } from './stop-execution.mjs';
 import { bashOutputPage, recoveredBash } from './bash-execution.mjs';
 import { PiRpc, RuntimePool } from './rpc.mjs';
@@ -47,15 +47,13 @@ export class Bridge {
   }
   async init() {
     validateOwnerConfig(this.config);
-    await privateDirectory(this.pool.attachmentDir);
     await fs.mkdir(this.config.stateDir, { recursive: true, mode: 0o700 });
-    if ((await fs.realpath(this.config.stateDir)) !== path.resolve(this.config.stateDir))
-      throw new Error('SYMLINK_STATE_NOT_ALLOWED');
+    await assertPrivateDirectory(this.config.stateDir);
     for (const root of this.config.sessionRoots) {
       await fs.mkdir(root, { recursive: true, mode: 0o700 });
-      if ((await fs.realpath(root)) !== path.resolve(root))
-        throw new Error('SYMLINK_ROOT_NOT_ALLOWED');
+      await assertNativeDirectory(root);
     }
+    await privateDirectory(this.pool.attachmentDir);
     // Configured execution directories may be offline while saved history is
     // still accessible. Create and cold resume validate their cwd on demand.
     // One bridge process per state directory. Do not automatically steal stale locks.

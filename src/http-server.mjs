@@ -1,6 +1,5 @@
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import path from 'node:path';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
@@ -16,7 +15,8 @@ import {
   boundMessage,
   rpcError,
 } from './protocol.mjs';
-import { validateOwnerConfig } from './owner-config.mjs';
+import { readOwnerConfig } from './owner-config.mjs';
+import { readPrivateFile } from './storage.mjs';
 
 export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
 export const TOKEN_HEADER = 'x-pi-bridge-token';
@@ -24,35 +24,11 @@ const digest = (value) => createHash('sha256').update(value).digest();
 const publicError = (error) =>
   /^[A-Z][A-Z_]{2,60}$/.test(error.message) ? error.message : 'HTTP_SERVICE_FAILED';
 
-async function privateFile(file, limit) {
-  if (typeof file !== 'string' || !path.isAbsolute(file) || (await fs.realpath(file)) !== file)
-    throw new Error('INVALID_PRIVATE_FILE');
-  const fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const stat = await fd.stat();
-    if (!stat.isFile() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.size > limit)
-      throw new Error('INVALID_PRIVATE_FILE');
-    const buffer = Buffer.alloc(limit + 1);
-    const { bytesRead } = await fd.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > limit) throw new Error('INVALID_PRIVATE_FILE');
-    return buffer.subarray(0, bytesRead).toString('utf8');
-  } finally {
-    await fd.close();
-  }
-}
-
 export async function loadHttpConfig(file) {
-  let config;
-  try {
-    config = JSON.parse(await privateFile(file, 1024 * 1024));
-  } catch (error) {
-    if (error instanceof SyntaxError) throw new Error('INVALID_OWNER_CONFIG');
-    throw error;
-  }
-  validateOwnerConfig(config);
+  const { config } = await readOwnerConfig(file);
   const settings = config.http;
   if (!settings) throw new Error('INVALID_HTTP_CONFIG');
-  const token = (await privateFile(settings.tokenFile, 257)).replace(/\n$/, '');
+  const token = (await readPrivateFile(settings.tokenFile, 257)).text.replace(/\n$/, '');
   if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
   return { config, token, port: settings.port };
 }

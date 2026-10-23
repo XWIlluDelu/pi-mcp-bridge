@@ -849,7 +849,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
     'off',
   );
   const filename = path.join(f.dir, 'config.json');
-  await fs.writeFile(filename, JSON.stringify(f.config));
+  await fs.writeFile(filename, JSON.stringify(f.config), { mode: 0o600 });
   const client = new Client({ name: 'attached-mcp-fixture', version: '1.0.0' });
   try {
     await client.connect(

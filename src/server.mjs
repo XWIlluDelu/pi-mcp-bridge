@@ -1,4 +1,3 @@
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -14,6 +13,7 @@ import {
   publicError,
 } from './protocol.mjs';
 import { diagnostics } from './diagnostics.mjs';
+import { readOwnerConfig } from './owner-config.mjs';
 export function makeServer(bridge, { execute = (run) => run() } = {}) {
   const server = new McpServer(SERVER_INFO);
   for (const name of toolNames)
@@ -33,7 +33,7 @@ async function main() {
   const configFile = process.argv[2];
   if (!configFile)
     throw new Error('Usage: node src/server.mjs /absolute/path/to/owner-config.json');
-  const config = JSON.parse(await fs.readFile(configFile, 'utf8'));
+  const { config } = await readOwnerConfig(path.resolve(configFile));
   const bridge = new Bridge(config, undefined, { configFile: path.resolve(configFile) });
   let server,
     transport,

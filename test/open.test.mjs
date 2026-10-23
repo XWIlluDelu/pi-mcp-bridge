@@ -27,7 +27,7 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
       folders: [{ id: 'p', path: cwd }],
       grants: [],
     };
-  await fs.writeFile(file, JSON.stringify(config));
+  await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   const binary = path.join(dir, 'pi'),
     explicit = path.join(dir, 'selected-pi');
   await fs.writeFile(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
@@ -55,7 +55,7 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   const selected = await openProfile(file, id, host);
   assert.equal(selected.command, explicit);
   assert.equal(selected.args[0], '-e');
-  await fs.writeFile(file, JSON.stringify(config));
+  await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   let observed;
   await openSession(file, id, {
     hostEnv: host,

@@ -241,7 +241,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       if (route.endsWith('companion')) {
         const remoteConfig = { ...config, stateDir: path.join(dir, 'remote-state') },
           file = path.join(dir, 'remote-owner.json');
-        await fs.writeFile(file, JSON.stringify(remoteConfig));
+        await fs.writeFile(file, JSON.stringify(remoteConfig), { mode: 0o600 });
         remote = new Client({ name: 'image-stdio', version: '1' });
         await remote.connect(
           new StdioClientTransport({

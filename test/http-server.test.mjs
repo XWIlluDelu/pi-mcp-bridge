@@ -572,7 +572,7 @@ test('HTTP owner configuration requires canonical private token and config files
   await assert.rejects(loadHttpConfig(file), /INVALID_PRIVATE_FILE/);
   await fs.chmod(tokenFile, 0o600);
   await fs.chmod(file, 0o644);
-  await assert.rejects(loadHttpConfig(file), /INVALID_PRIVATE_FILE/);
+  await assert.rejects(loadHttpConfig(file), /OWNER_CONFIG_NOT_PRIVATE/);
   await fs.chmod(file, 0o600);
   const link = path.join(f.dir, 'token-link');
   await fs.symlink(tokenFile, link);

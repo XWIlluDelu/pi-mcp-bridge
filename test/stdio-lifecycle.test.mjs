@@ -57,7 +57,7 @@ async function fixture(t) {
   const session = await bridge.session(made.session_id);
   await bridge.close();
   const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config));
+  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   t.after(() => fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }));
   return {
     dir,

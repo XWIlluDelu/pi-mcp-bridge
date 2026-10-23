@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
-import { hash, syncDir } from './storage.mjs';
+import { hash, syncDir, readPrivateFile } from './storage.mjs';
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
@@ -142,15 +142,10 @@ export function validateGrants(grants = []) {
 export async function readOwnerConfig(file) {
   if (typeof file !== 'string' || !path.isAbsolute(file))
     throw new Error('INVALID_OWNER_CONFIG_PATH');
-  const stat = await fs.lstat(file);
-  if (
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.size > 1024 * 1024 ||
-    (await fs.realpath(file)) !== file
-  )
-    throw new Error('INVALID_OWNER_CONFIG_PATH');
-  const raw = await fs.readFile(file, 'utf8');
+  const { text: raw, mode } = await readPrivateFile(file, 1024 * 1024, {
+    pathError: 'INVALID_OWNER_CONFIG_PATH',
+    privacyError: 'OWNER_CONFIG_NOT_PRIVATE',
+  });
   let config;
   try {
     config = JSON.parse(raw);
@@ -158,7 +153,7 @@ export async function readOwnerConfig(file) {
     throw new Error('INVALID_OWNER_CONFIG');
   }
   validateOwnerConfig(config);
-  return { config, revision: hash(raw), mode: stat.mode & 0o777 };
+  return { config, revision: hash(raw), mode };
 }
 export function permissionDetails(config, action, target) {
   const { allowed, explicit, sourceScope } = resolvePermission(config, action, target);

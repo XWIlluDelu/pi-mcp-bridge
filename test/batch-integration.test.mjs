@@ -36,7 +36,7 @@ test('mixed public MCP batches preserve native receipts across restart and isola
     ],
   };
   const filename = path.join(dir, 'config.json');
-  await fs.writeFile(filename, JSON.stringify(config));
+  await fs.writeFile(filename, JSON.stringify(config), { mode: 0o600 });
   let client;
   t.after(async () => {
     await client?.close();
@@ -158,7 +158,7 @@ test('mixed public MCP batches preserve native receipts across restart and isola
   assert.ok(JSON.stringify(multiple.results[1].result.items).includes('Created inside batch'));
 
   config.grants.push({ session_id: a, read: false, send: true, delete: false });
-  await fs.writeFile(filename, JSON.stringify(config));
+  await fs.writeFile(filename, JSON.stringify(config), { mode: 0o600 });
   const independent = await call('batch', {
     operations: [
       item('read', { session_id: a }),

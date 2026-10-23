@@ -19,7 +19,7 @@ test('late capture storage failure survives runtime removal and close reports it
     defaults: { ...denyAllPermissions() },
     grants: [],
   };
-  await fs.mkdir(config.sessionRoots[0]);
+  await fs.mkdir(config.sessionRoots[0], { mode: 0o700 });
   const bridge = await new Bridge(config).init();
   const failure = Object.assign(new Error('fixture storage failure'), { code: 'ENOSPC' });
   let stopped = false;

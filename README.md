@@ -26,13 +26,7 @@ chmod 600 /absolute/private/path/owner.json
 
 Replace every example path and add only the grants you intend. The example denies every operation until you grant it.
 
-Review existing `sessionRoots`, `stateDir` and `attachmentDir` directories: they must be owned by the service user, canonical (not symlink aliases), and private. Pi can create session directories as **0755** under a normal umask; Bridge requires no group/other access. After reviewing the selected existing directories, the owner can use `chmod 700 /absolute/path/to/selected/directory`. Apply it only to those directories, not recursively to all Pi data. See [storage requirements](docs/configuration.md#storage-and-project-paths).
-
-Then run the read-only preflight:
-
-```sh
-node deploy/check-owner.mjs /absolute/private/path/owner.json
-```
+Review the [storage requirements](docs/configuration.md#storage-and-project-paths). Bridge validates private control storage and native session path integrity at startup; it does not change existing permissions.
 
 For a single stdio MCP client:
 

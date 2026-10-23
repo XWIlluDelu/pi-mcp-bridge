@@ -216,7 +216,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
     'deterministic',
   ];
   const filename = path.join(f.dir, 'owner-config.json');
-  await fs.writeFile(filename, JSON.stringify(f.config));
+  await fs.writeFile(filename, JSON.stringify(f.config), { mode: 0o600 });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(base, 'src/server.mjs'), filename],
@@ -284,7 +284,7 @@ test('MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and c
     'deterministic',
   ];
   const filename = path.join(f.dir, 'owner-config.json');
-  await fs.writeFile(filename, JSON.stringify(f.config));
+  await fs.writeFile(filename, JSON.stringify(f.config), { mode: 0o600 });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [path.join(base, 'src/server.mjs'), filename],

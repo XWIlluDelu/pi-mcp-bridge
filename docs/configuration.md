@@ -1,6 +1,6 @@
 # Owner configuration and permissions
 
-Use a private canonical JSON file. [The example](../deploy/owner.example.json) denies every operation. Replace its paths with directories you explicitly intend the Bridge to access. When only some projects are authorized, configure those projects' session roots rather than a broad parent.
+Use a canonical JSON file owned by the service user with no group/other permissions. Both direct transports and permission refresh enforce this; permissions are never repaired automatically. [The example](../deploy/owner.example.json) denies every operation. Replace its paths with directories you explicitly intend the Bridge to access. When only some projects are authorized, configure those projects' session roots rather than a broad parent.
 
 ## Settings
 
@@ -24,7 +24,7 @@ Only the fields below are accepted. Unknown fields and incomplete baseline permi
 ### Storage and project paths
 
 - Storage roots and state must not overlap or resolve through directory aliases. Session-file symlinks and hardlink aliases are rejected.
-- Existing `sessionRoots`, `stateDir` and `attachmentDir` directories must belong to the service user and have no group/other permissions. Pi's default directory creation follows the process umask, so a native session directory can be 0755. Before using it, review its sharing requirements and, if appropriate, apply `chmod 700` to that selected directory. Preflight reports `STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY` for unsafe ownership, permissions or aliases; it does not repair them.
+- Existing `stateDir` and `attachmentDir` must belong to the service user and have no group/other permissions. Native session storage has a separate integrity rule, not a 0700 rule: Pi's ordinary 0755 directories and 0644 files are supported. An owned private ancestor protects descendants; otherwise the entire canonical directory chain and the actual file must not be writable by other users. Sticky temporary-directory ancestors are allowed. Unsafe storage is rejected without chmod.
 - The first configured session root receives new sessions.
 - Project cwd comes from the native session header and is validated independently of the storage path. Configure roots and project grants together; neither implies the other.
 - Saved history can remain readable when its cwd is unavailable, provided the remaining permission policy authorizes the read. Creating a session or cold-starting a writer requires a real, canonical project directory. Existing cooperating owners remain controllable if their original cwd disappears.
@@ -102,9 +102,9 @@ Load `src/owner-permissions-extension.mjs` into Pi with `PI_MCP_OWNER_CONFIG=/ab
 
 The menu is a human shortcut, not a model tool or slash command. It writes only the chosen field, preserves other settings, rejects concurrent edits and closes on native session lifecycle changes. A saved session outside the configured roots cannot be edited through this session's menu.
 
-## Local preflight and deployment
+## Deployment
 
-`node deploy/check-owner.mjs /absolute/path/owner.json` validates the configuration and its filesystem/privacy constraints. For HTTP, create a private random token file and add the `http` block described in [transports](transports.md).
+Bridge validates configuration and storage when initializing. For HTTP, create a private random token file and add the `http` block described in [transports](transports.md).
 
 `deploy/pi-mcp-bridge.service` is an optional user-systemd template. Review its installation paths, environment and stop budget before use. Autostart/linger, tunnel organization login and external authentication are owner deployment decisions.
 
