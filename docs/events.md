@@ -2,8 +2,7 @@
 
 Bridge implements the [OpenAI MCP Events integration](https://developers.openai.com/plugins/build/mcp-events)
 on MCP `2026-07-28`. ChatGPT Work chats (desktop: Cloud selected) and dots can
-subscribe and react in the subscribing chat. The transport is **outbound signed
-HTTPS webhooks**, not SSE, resource updates or a long-running tool call.
+subscribe and react in the subscribing chat through outbound signed HTTPS webhooks.
 
 ## Scope and completion meaning
 
@@ -13,20 +12,15 @@ Herdr. Subscription never starts Pi. An already attached external TUI, RPC or SD
 owner is rejected with `Unsupported / externalOwner`; execution after a handoff
 to an external owner is outside this event's scope.
 
-Pi's native `agent_settled` supplies the boundary after automatic continuations
-finish. It is not `agent_end`, process exit, a per-prompt receipt or a claim that
-the user's goal succeeded. Aborted runs also settle. A handled slash command
-that never starts an agent run does not produce this event.
+Pi's native `agent_settled` fires after automatic continuations finish, including
+aborted runs. Settlement describes the session run, not per-prompt success. A
+handled slash command that never starts a run produces no settlement.
 
-The owned observer captures the leaf synchronously in that native hook and sends
-it through the existing private owner-control socket, with the writer generation
-and monotonic occurrence sequence. Bridge checks the active owned runtime before
-accepting it. The observer waits only for bounded local acknowledgement, never
-HTTPS. No event is appended to native history; release and deletion protections
-are unchanged.
+The observer captures the leaf at that boundary. Bridge validates the owned
+writer generation and occurrence sequence before scheduling delivery. Pi waits
+only for bounded local acknowledgement, not HTTPS delivery.
 
-Subscribe **before** sending work. Subscriptions monitor future settlements until
-cancelled or expired; they are not implicitly one-shot.
+Subscribe **before** sending work. Monitoring continues until cancelled or expired.
 
 ## Protocol
 
@@ -54,10 +48,9 @@ Example subscribe params (include the protocol `_meta` from [transports](transpo
 }
 ```
 
-ChatGPT supplies the destination and secret; do not invent a callback or put
-credentials in prompts. Subscription identity is the fixed authenticated owner,
-exact callback URL, event name and canonical arguments. This deployment has one
-owner, not separate MCP-client accounts; `clientInfo` is not an identity.
+ChatGPT supplies the callback and secret. Subscription identity combines the
+deployment's authenticated owner, exact URL, event name and canonical arguments.
+`clientInfo` does not create a separate owner identity.
 
 Subscribe returns `id`, finite `refreshBefore`, `cursor: null` and
 `truncated: false`. Default lifetime is one hour. Positive `ttlMs` is honored up
@@ -82,44 +75,35 @@ Example delivery:
 }
 ```
 
-A null leaf denotes the empty branch. The caller reads
-`read({session_id, leaf_id, preset:"latest"})`. Explicit `leaf_id` prevents a
-later round from changing the selected result. Read can still fail if the
-session was subsequently deleted or access revoked. Event data carries no model
-instructions; the user decides the reaction in the subscribing chat.
+Read the result with `read({session_id,leaf_id,preset:"latest"})`; the leaf pins
+that round despite later work. Null denotes an empty branch. Deletion or revoked
+read access can make the result unavailable. The subscribing chat's user chooses
+the reaction; event payloads contain data only.
 
 ## Authorization, storage and delivery
 
-Event discovery and subscription use the request's receive-time permission
-snapshot, including waits in the executor or subscription queue. Subscription
-requires the session's `read` right. Each outbound delivery attempt takes a fresh
-snapshot of scope and read permission and rechecks identity; a detected
-revocation removes the subscription. Project authorization uses the native
-header's recorded project identity, so workspace cleanup alone does not revoke
-the subscription. The owner can unsubscribe after revocation.
+Discovery and subscription use the request's receive-time permission snapshot.
+Subscription requires `read`; each delivery attempt refreshes scope/read checks
+and validates session identity. Revocation removes the subscription. Project
+grants follow the recorded native project identity, including after workspace
+cleanup. The owner can always unsubscribe after revocation.
 
 Private `stateDir/event-subscriptions.json` stores subscriptions and secrets
 (mode 0600), protected by the existing service lock. Records survive restart.
-Expired records cannot deliver and are pruned on the next subscription change
-or in-memory load, before their endpoint metadata is validated. Occurrences and
-pending deliveries are held only in memory.
+Expired records cannot deliver and are pruned on load or subscription changes.
+Occurrences and pending deliveries are held only in memory; there is no replay.
 
-If the store is malformed, unreadable or nonprivate, Bridge starts with events
-unavailable rather than activating a partial store or stopping core operations.
-The original file is left intact; event methods cannot overwrite it and return
-HTTP 500 / JSON-RPC `-32603 EventSubscriptionsUnavailable` with a content-free
-`data.reason`. Unscoped `health({})` includes
-`events:{status:"unavailable",reason:"…"}`, and opt-in diagnostics emit
-`events.store_unavailable`. The owner repairs the file and its privacy, then
-restarts Bridge to load it. Occurrences during unavailability are not replayed.
+A malformed, unreadable or nonprivate store disables events while core operations
+remain available. Event methods leave the file intact and return HTTP 500 /
+JSON-RPC `-32603 EventSubscriptionsUnavailable` with a content-free `data.reason`.
+Health reports `events:{status:"unavailable",reason:"…"}`; diagnostics emit
+`events.store_unavailable`. Repair the file/privacy and restart to reload it.
 
-Callback consent is verified with a fresh signed challenge before activation,
-and cached by owner and exact URL for five minutes. Successful verification
-requires a matching challenge in a response body bounded to 4096 bytes. Ordinary
-deliveries use the HTTP status only and close the unused response stream.
-Secrets must decode to 24–64 bytes. Requests use Standard Webhooks headers and signatures over the
-exact serialized body. Callback errors use OpenAI's documented `-32015`
-`CallbackEndpointError`, with a content-free `data.reason`.
+Callback verification sends a signed challenge and requires a matching response
+of at most 4096 bytes. Verification is cached by owner/URL for five minutes. Secrets decode to
+24–64 bytes. Standard Webhooks signatures cover the exact serialized body.
+Delivery acknowledges HTTP status only. Verification failures return `-32015 CallbackEndpointError` with a content-free
+`data.reason`.
 
 Each connection resolves DNS anew, rejects nonpublic addresses, pins the validated
 address, and retains hostname-based TLS verification. No redirects are followed.
@@ -130,16 +114,15 @@ this outbound request for it.
 
 Delivery is bounded to ten attempts, with 1/2/4/8/16/30/60/120/120-second
 backoff (361 seconds in total) and ten-second network deadlines per attempt.
-This keeps retry opportunities open across a brief callback outage, provided
-Bridge remains running and the subscription remains authorized and unexpired.
-Retries keep the event ID and exact body and refresh the signature timestamp.
+Retries require Bridge to remain running and the subscription authorized and
+unexpired. They keep the event ID and body, refreshing the signature timestamp.
 Only transport failures, 408, 429 and 5xx retry; 410, 413 and redirects do not.
 At most 32 active subscriptions and 64 pending deliveries are retained. Overflow
-or exhausted delivery attempts are dropped, not replayed. Incoming Tunnel
-reconnection neither pauses nor restarts this independent outbound retry loop.
+or exhausted delivery attempts are dropped. Incoming Tunnel reconnection does
+not affect the outbound retry loop.
 
-There is **no replay**, polling, streaming, `gap` or `terminated` notification.
-An interruption can lose occurrences or pending deliveries. `PI_MCP_LOG=1`
+Polling, streaming, `gap` and `terminated` notifications are unsupported.
+Interruption can lose occurrences or pending deliveries. `PI_MCP_LOG=1`
 enables content-free delivery success/failure/drop diagnostics. For network
 troubleshooting, `PI_MCP_LOG_CALLBACK_HOST=1` additionally records the parsed
 callback hostname before verification. Neither setting logs full callback URLs,

@@ -1,18 +1,16 @@
 # Reading a Pi session
 
-`read` automatically uses a matching configured session reader, based on the
-target session's live or persisted extension evidence; otherwise it reads Pi's
-persisted native projection. Only explicit `view:"native"` forces native reading.
-Selection parameters go to the selected reader rather than changing the source.
-[Module management and routing](compatibility.md#session-specific-read-routing)
-define this boundary.
-Pi's native `buildSessionProjection` determines branch ancestry,
-compaction checkpoints and context edits. The Bridge pairs tools and applies
-selectors **before** sanitizing and segmenting selected records.
+`read` uses a matching configured session reader based on the target's live or
+persisted extension evidence, otherwise Pi's native projection. Only explicit
+`view:"native"` forces native reading; selection parameters go to the selected
+reader. [Module routing](compatibility.md#session-specific-read-routing) defines
+that contract.
 
-This is a reading view, not the final provider payload or a lossless native
-export. It does not rerun context hooks, scan abandoned branches or generate
-another summary.
+Native `buildSessionProjection` determines branch ancestry, compaction checkpoints
+and context edits. Bridge pairs tools and applies selectors before sanitizing and
+segmenting records. Reading never starts Pi, calls a model, reruns context hooks
+or writes history. The result is a readable view, not a lossless export or final
+provider payload.
 
 ## Request
 
@@ -20,36 +18,34 @@ another summary.
 { "session_id": "ps_...", "max_bytes": 4096 }
 ```
 
-To continue, pass the returned cursor alone; the byte budget may change:
+Continue with the returned cursor; the byte budget may change:
 
 ```json
 { "cursor": "<next_cursor>", "max_bytes": 12000 }
 ```
 
-| Argument     | Meaning                                                                                                                        |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `session_id` | Required for the first read; optional with a cursor. Knowing an ID is not permission.                                          |
-| `view`       | Omit for automatic routing; `native` forces projection, `observed` reads a capture. Continuations inherit the captured source. |
-| `preset`     | Initial default `latest`; alternatives `recent` and `full`. Omitted on continuation: inherit.                                  |
-| `select`     | Overrides for the eight selectors below. Omitted continuation fields inherit.                                                  |
-| `max_bytes`  | UTF-8 limit for the entire structured page: default 24000, range 4096–65536.                                                   |
-| `cursor`     | Opaque backward continuation of one captured snapshot.                                                                         |
-| `leaf_id`    | Optional native leaf. Explicit `null` means the empty root, not the last file entry.                                           |
+| Argument     | Meaning                                                                                                               |
+| ------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `session_id` | Required initially; optional with a cursor.                                                                           |
+| `view`       | Omit for automatic routing; `native` forces projection, `observed` reads a capture. Continuations inherit the source. |
+| `preset`     | Native default `latest`; alternatives `recent` and `full`. Omitted continuation fields inherit.                       |
+| `select`     | Overrides for the eight selectors below.                                                                              |
+| `max_bytes`  | UTF-8 limit for the whole structured page: default 24000, range 4096–65536.                                           |
+| `cursor`     | Opaque backward continuation of a captured snapshot.                                                                  |
+| `leaf_id`    | Optional native leaf; explicit `null` means the empty root.                                                           |
 
-An explicit continuation preset, merged with its explicit selectors, must match
-all eight captured values. Without a preset, only explicitly supplied selector
-fields are checked. An explicit session or leaf must also match; mismatches
-return `STALE_CURSOR`. Defaults are not applied before deciding what to inherit.
+A continuation's explicit preset plus selectors must match all eight captured
+values. Without a preset, only explicitly supplied selectors are compared.
+Explicit view/session/leaf values must also match; conflicts return `STALE_CURSOR`.
+Defaults are applied only after deciding what to inherit.
 
-Every read, including a cursor-only read, uses its own receive-time permission
-snapshot and validates the current canonical file/native session identity.
-A cursor is not authorization. It cannot be reused across Bridge instances.
+Every page uses a new [permission snapshot](configuration.md#request-permission-snapshots)
+and validates current canonical file/native identity. A cursor grants no access
+and cannot cross Bridge instances.
 
-Adapted reads return `view:"adapted"`, `reader.id`, and synthetic
-`source.reader_index` locators. They use the same cleaning, byte budgets and
-frozen pagination; native selector counts are null. Their contents come from the
-selected module. The result identifies the chosen source; the call needs no
-plugin-specific arguments.
+Adapted results use `view:"adapted"`, `reader.id` and `source.reader_index` locators.
+Their native selection counts are null. They share sanitization, byte budgets and
+frozen pagination with other views.
 
 ## Observed request context
 
@@ -57,341 +53,234 @@ plugin-specific arguments.
 { "session_id": "ps_...", "view": "observed", "max_bytes": 24000 }
 ```
 
-This view reads the latest passively captured `context_with_system` event,
-including request-local memory transforms. Every `context` handler runs before
-this phase, so Magic Context's tags, drops and injected Historian summaries are
-observed even when MC loads after the Bridge observer. Later
-`context_with_system` handlers, Pi projections and provider conversion may still
-change the request. This is a request-stage observation, not final provider
-payload or confirmation that dispatch succeeded.
+This reads the latest passively captured `context_with_system` event. All
+`context` handlers have run, including request-local memory transforms such as
+Magic Context's. Later full-context handlers, projections and provider conversion
+may still change the request; capture does not establish successful dispatch.
 
-The entire captured array is eligible for paging, without native
-`preset`, `select` or `leaf_id` overrides. These arguments reject rather than
-misidentifying synthetic history as native prompts. `selection` and
-`omissions.selection` are null. Items use `source.observation_index`, with
-content/part positions where split; no native entry or prompt IDs are invented.
-The same sanitization, Unicode-safe semantic paging, byte and batch budgets apply
-to all views. Cursor-only continuation inherits the view and freezes all
-observation metadata; conflicting view or native-selector overrides reject.
+The whole captured message array is pageable. Native `preset`, `select` and
+`leaf_id` arguments reject; `selection` and `omissions.selection` are null.
+Items use `source.observation_index` and split content/part positions instead of
+native entry/prompt IDs. Cursor pages freeze the view and observation metadata.
 
-`observation.available:true` carries:
+Available observations contain:
 
-- `id`, `observed_at`, `owner_generation` and
-  `phase:"context_with_system_observer"`.
-- `input_leaf_id` (also the page's `leaf_id`): the native leaf at capture.
-- `current_leaf_id`, `later_committed_entries` and `checked_at`: branch ancestry
-  and intervening native commits checked at the first read.
-- `owner_active`: whether the capture came from the current live observer, rather
-  than retained data. `false` does not mean that no process currently owns the session.
+| Field                                                      | Meaning                                                                                                                |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `id`, `observed_at`, `owner_generation`                    | Identity, time and owner of the capture.                                                                               |
+| `phase`                                                    | `context_with_system_observer`.                                                                                        |
+| `input_leaf_id`                                            | Native leaf at capture; also the page's `leaf_id`.                                                                     |
+| `current_leaf_id`, `later_committed_entries`, `checked_at` | Active ancestry and intervening commits checked on the first read.                                                     |
+| `owner_active`                                             | Whether the capture came from the current live observer. Retained captures report false even if another owner is live. |
 
-An answer generated after capture is not part of that observation. Read the
-native view for subsequent committed answers. An observation remains a dated
-request snapshot even when no new native entries appeared; idle memory changes
-are not recomputed by reading.
+Subsequent answers belong to the native view. Idle memory changes are not
+recomputed by reading, even when no new native entries exist.
 
-Updated companions and Bridge-owned RPCs capture one bounded cleaned snapshot
-per runtime. Before normal owned RPC exit, Bridge retains the snapshot when
-available, without needing a prior external read. Bridge keeps at most 16 sessions and
-approximately 32 MiB of accounted observation data, latest per session, in
-addition to the existing frozen-page cache. The observer also has a 32 MiB
-accounted capture limit. Retention does not keep the writer alive or persist observations to disk. A successful observed read from a companion is also retained
-for later switch-away/exit. A new live owner is queried first. If it has not
-captured a request yet, an existing successful capture remains readable as
-`source:"retained"`, with its original ID, time, owner generation and input leaf,
-and `owner_active:false`. The current leaf and intervening commits are checked
-against the new owner's reported active branch, not merely the saved file's tail.
-No-prompt operations such as model changes or a rejected compact do not erase a
-capture when their cold-started owner exits.
+Owned RPCs and companions keep one bounded cleaned capture per runtime. Bridge
+retains available owned captures before normal RPC exit without a prior read;
+a successful companion observed read is also retained. The observer has a 32 MiB
+accounted capture limit. The separate Bridge retention cache holds the latest
+successful capture for at most 16 sessions and approximately 32 MiB. Retention
+is memory-only and does not keep writers alive.
 
-Only a successful capture replaces retained content. Failed live captures remain
-explicitly unavailable in that read; an unavailable reply or transport failure
-does not erase an older retained capture. Publication ordering still fences delayed
-reads from an older capture or a retired owner. Without a live owner, saved reads
-check the captured input leaf still belongs to the saved branch.
+Bridge queries a live owner first. If it has no capture yet, a retained success
+remains readable as `source:"retained"`, preserving its original ID, time,
+generation and input leaf. It is checked against the new owner's active branch,
+or the saved branch when no owner exists. No-prompt cold starts therefore leave
+previous captures available.
 
-No available capture, a failed/oversized live capture or a changed branch returns
-`observation.available:false` with a reason and empty items. Retained observations
-are lost on eviction or Bridge restart; an available live observer can still
-supply its snapshot. A host without an observer returns
-`host_observer_unavailable`; its native view remains available. Reads never start Pi, call a model, rerun context hooks,
-write session history or access MC's database. Normal agent work creates the
-observations; an already-running old companion must be updated with the Bridge.
+Only successful captures replace retained content. Failed live captures report
+unavailable for that read; transport failures or unavailable replies do not erase
+an older success. Publication ordering fences delayed captures and retired owners.
+Missing, oversized or failed captures and changed branches report
+`observation.available:false`, a reason and empty items. Hosts without observers
+report `host_observer_unavailable`. Eviction or Bridge restart loses retained
+captures; a live observer can still supply its own.
 
 ## Native selection
 
-| Selector           | Counting and selection                                                                                                             |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `system`           | `0` omits native system instructions/sections; `-1` includes them in native order. Tool declarations also require nonzero `tools`. |
-| `summary`          | `0` omits summaries; `1` or `-1` includes all active summaries at their native positions.                                          |
-| `recent_prompts`   | Last N inputs (native users and explicitly adapted custom messages), or all with `-1`.                                             |
-| `earliest_prompts` | First N inputs, or all with `-1`.                                                                                                  |
-| `text`             | Per selected prompt, first N **and** last N assistant text blocks; union by source position.                                       |
-| `thinking`         | Per selected prompt, first N **and** last N native thinking blocks.                                                                |
-| `tools`            | Per selected prompt, first N **and** last N logical tool units (a call with its result, or an unresolved/orphan unit).             |
-| `commands`         | Last N native `bashExecution` messages, independently of prompt selection.                                                         |
+| Selector           | Counting and selection                                                                                                      |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `system`           | `0` omits native instructions/sections; `-1` includes them in native order. Tool declarations also require nonzero `tools`. |
+| `summary`          | `0` omits; `1` or `-1` includes all active summaries at native positions.                                                   |
+| `recent_prompts`   | Last N inputs (native users or explicitly mapped custom messages), or all with `-1`.                                        |
+| `earliest_prompts` | First N inputs, or all with `-1`.                                                                                           |
+| `text`             | Per selected prompt, first N and last N assistant text blocks.                                                              |
+| `thinking`         | Per selected prompt, first N and last N thinking blocks.                                                                    |
+| `tools`            | Per selected prompt, first N and last N logical units: call with paired result, unresolved call or orphan result.           |
+| `commands`         | Last N native `bashExecution` messages, independently of prompts.                                                           |
 
-For all count selectors, `0` means none and `-1` means all. Counts are
-nonnegative safe integers or `-1`; `summary` only accepts `-1`, `0` or `1`, and
-`system` only accepts `-1` or `0`.
-First/last overlap is included once, so a bidirectional count N selects at most
-2N units per prompt. Text that happens to be identical is not deduplicated.
+Counts accept nonnegative safe integers or `-1` for all; `0` selects none.
+`system` accepts only `0/-1` and `summary` only `0/1/-1`. First/last overlap is
+included once, selecting at most 2N units per prompt. Identical content at
+different source positions remains distinct.
 
-For a native read, omitting `preset` is equivalent to `preset:"latest"`:
+Presets supply defaults; explicit `select` fields replace individual values:
 
-```json
-{
-  "system": 0,
-  "summary": 0,
-  "recent_prompts": 1,
-  "earliest_prompts": 0,
-  "text": -1,
-  "thinking": 2,
-  "tools": 0,
-  "commands": 0
-}
-```
+| Selector           | `latest` (default) | `recent` | `full` |
+| ------------------ | ------------------ | -------- | ------ |
+| `system`           | 0                  | 0        | -1     |
+| `summary`          | 0                  | 1        | -1     |
+| `recent_prompts`   | 1                  | 3        | -1     |
+| `earliest_prompts` | 0                  | 0        | -1     |
+| `text`             | -1                 | -1       | -1     |
+| `thinking`         | 2                  | 3        | -1     |
+| `tools`            | 0                  | 0        | -1     |
+| `commands`         | 0                  | 0        | -1     |
 
-This selects the last prompt with all assistant text and the first/last two
-thinking blocks. It omits system instructions, summaries, extra earliest prompts,
-tool units and direct shell commands. Native system records can be large repeated
-background, so they do not consume the default conversation page. Their omission
-is counted in `omissions.selection.system`, not silently truncated. Use
-`select:{system:-1}` to include them, or `preset:"full"` for all effective context.
-Omitting system does not hide custom messages or affect the observed view.
-Active summaries remain controlled by `summary`.
+`latest` focuses on the last input and assistant text/thinking; `recent` adds
+active summaries and more prompts. Omitted system records count in
+`omissions.selection.system`. Use `select:{system:-1}` to include them without
+switching to full. This selector does not hide custom messages or affect observed
+captures.
 
-Explicit `preset:"recent"` uses:
+When system records are selected, `tools:0` removes `toolsAdded`/`toolsRemoved`
+declarations and declaration-only records, preserving instructions and section
+updates/removals. Declarations are global, not counted as per-prompt tool units.
 
-```json
-{
-  "system": 0,
-  "summary": 1,
-  "recent_prompts": 3,
-  "earliest_prompts": 0,
-  "text": -1,
-  "thinking": 3,
-  "tools": 0,
-  "commands": 0
-}
-```
-
-This includes active summaries and the last three prompts with all assistant
-text and the first/last three thinking blocks per prompt. It adds no earliest
-prompts and omits system instructions, tool units and direct shell commands.
-
-To extend the default `latest` with the first/last two tool units and the earliest
-prompt as well:
+For the latest prompt plus the earliest input and first/last two tool units:
 
 ```json
 { "session_id": "ps_...", "select": { "tools": 2, "earliest_prompts": 1 } }
 ```
 
-Each tool unit includes its call arguments and paired result output; unresolved
-calls and orphan results retain their pairing status. Selected records remain
-subject to capacity paging. Set `select.tools:-1` for all tools in the selected
-prompts.
+Overrides leave other preset values intact. With `full`, `recent_prompts:1`
+still selects every prompt because `earliest_prompts` remains `-1`; set it to `0`
+for recent-only selection. With `latest`, changing only `recent_prompts:3` retains
+its summary and thinking defaults rather than selecting `recent`.
 
-When system records are included, `tools:0` omits their
-`toolsAdded`/`toolsRemoved` declarations and records containing nothing else;
-instruction text and section updates/removals remain. Nonzero `tools` includes
-those declarations only when `system:-1`; tool calls/results remain independently
-selectable. Declarations do not count as per-prompt tool units. Custom messages
-still follow their prompt windows.
-
-Explicit `preset:"full"` selects everything:
-
-```json
-{
-  "system": -1,
-  "summary": -1,
-  "recent_prompts": -1,
-  "earliest_prompts": -1,
-  "text": -1,
-  "thinking": -1,
-  "tools": -1,
-  "commands": -1
-}
-```
-
-Overrides replace individual preset fields; they do not reset the other fields.
-For example, with the full preset, setting only `recent_prompts:1` still includes
-all prompts because `earliest_prompts` defaults to `-1`. Use `latest` or `recent`,
-or set `earliest_prompts:0`, for recent-only selection. With `latest`, overriding
-only `recent_prompts:3` keeps summaries omitted and thinking at first/last two;
-it does not switch to `recent`.
-
-Saved v1/v2 histories are normalized in memory with native pure parsing/migration. Malformed records are skipped as in Pi. Optional `history` reports `skipped_malformed_lines` and `unterminated_tail`; reads never modify file bytes. Native writer open alone performs disk repair/migration. Native v1 entry IDs are assigned in memory and need not match between fresh reads; cursor pages retain their captured IDs.
+Saved v1/v2 histories are normalized in memory by native parsing/migration.
+Malformed lines are skipped as in Pi; optional `history` reports
+`skipped_malformed_lines` and `unterminated_tail`. Only native writer open repairs
+or migrates disk data. Native v1 IDs assigned in memory may differ between fresh
+reads; cursor pages retain captured IDs.
 
 ## Readable content
 
-A page contains `session_id`, `view`, acquisition `source`, captured `leaf_id`,
-resolved `selection`, chronological `items`, `omissions`, `live` and
-`next_cursor`. Runtime extension observations may appear in `runtime_events`.
+Pages contain `session_id`, `view`, acquisition `source`, captured `leaf_id`,
+resolved `selection`, chronological `items`, `omissions`, `live` and `next_cursor`.
+The MCP envelope represents the same result in JSON text `content` and
+`structuredContent`; consume either. `max_bytes` bounds the structured page;
+the wire budget accounts for both copies.
 
-The MCP envelope carries this same result as JSON text in `content` and as
-`structuredContent`, for text-consuming and structured clients respectively.
-Consume either representation, not both as separate history. `max_bytes` bounds
-the structured page; the separate wire budget includes both copies.
+Native units retain entry/message/block positions and `prompt_id`. Message data
+uses `message`, assistant blocks use `block`, and large shared fields use linked
+`message_metadata` units. Types include prompt, text, thinking, tool call/result,
+command, system, custom, native and summary.
 
-Units retain their native source entry/message/block positions and `prompt_id`.
-Ordinary message data is in `message`; assistant blocks are in `block`, with
-a small allowlist of time/model/thinking/stop/error metadata. Types include
-prompt, text, thinking, tool call/result, command, system, custom, native and summary.
-Large message/block fields use source-linked `message_metadata` units rather
-than being copied into every text segment.
+- Images become `{type:"image",mime_type:"image/png",data_omitted:true}` without
+  base64 or invented links.
+- Assistant text/thinking retains `stopReason` on every part. Large error details
+  live in shared metadata. Native signatures, response IDs, replay metadata,
+  usage/cost and diagnostics are excluded; business arguments/details are not
+  recursively stripped by property name.
+- Tools retain name, namespace, arguments/errors, paired output and error state.
+  Indivisible metadata stays whole or is explicitly marked omitted.
+- Saved `nestedCalls` follow their parent tool selection. Small snapshots stay
+  whole; larger ones become source-linked `nested_call` units.
+  `nested_calls_complete` preserves recorder completeness independently of paging.
+  Native `argumentsBytes`, error and unfinished state remain available; missing
+  child result bodies are not synthesized.
+- Commands retain output and execution state. Every output part repeats
+  `exitCode`, `cancelled`, native `truncated` and command/path strings up to 256
+  encoded JSON bytes each. Larger fields occur once in linked metadata. Native
+  truncation differs from capacity omissions; `!!` records carry
+  `in_model_context:false`.
+- System sections are segmented before arbitrary-object limits. Summary provenance
+  and global/context-prefix content remain available. Later custom/unknown records
+  follow their prompt window; custom payloads retain `content`, `customType`,
+  `display` and business `details` under the same capacity limits.
 
-- Native image blocks become
-  `{type:"image",mime_type:"image/png",data_omitted:true}`.
-  No base64, image decoding or invented image link is returned.
-- Assistant text/thinking parts retain `stopReason` in all views, so an error or
-  cancellation remains visible on the latest page. Large error details stay in
-  shared metadata instead of repeating with each part.
-- Native text/thinking signatures, response IDs, replay metadata, usage/cost
-  and diagnostics are excluded. Tool arguments and business `details` are not
-  recursively stripped because a key happens to be called `signature`.
-- Tool calls retain name, namespace, arguments/errors and pairing. Results retain
-  tool identity, output and error state. Retained arguments/details stay whole;
-  oversized metadata fields are named explicitly when omitted.
-- Saved `nestedCalls` stay with their parent tool selection. Small snapshots remain
-  whole; larger ones use complete `nested_call` items with parent/source links.
-  `nested_calls_complete` preserves the native recorder's completeness independently
-  of `next_cursor`. Native `argumentsBytes`, error and unfinished status remain
-  native observations; child result bodies that were not saved are not invented.
-- Commands keep command/output and exit/cancellation state. Each paged output
-  chunk repeats `exitCode`, `cancelled` and native `truncated` when present, plus
-  command/path strings of at most 256 encoded JSON bytes each. Larger command/path
-  fields stay in one metadata item linked by `source.entry_id`; a small page can
-  explicitly omit those indivisible fields. Native truncation is separate from
-  pagination capacity omissions. `!!` records expose `in_model_context:false`,
-  not a claim that Pi included them in a provider call.
-- System sections remain readable; tool declarations follow the `tools`
-  selection above. Large known section text is segmented before arbitrary-object
-  limits are applied.
-- Active summary provenance and global/context-prefix native content remain available. Custom and unknown native records attributable to a prompt follow that prompt window; `full` retains all of them, subject to explicit capacity limits.
-- Custom messages retain their native `content`, `customType`, `display` and
-  business `details`, subject to the same explicit capacity limits as other
-  messages. The core does not interpret plugin-private objects or remove text
-  merely because it repeats across fields.
-
-Prompt ownership and tool pairing do not change. A context-hidden user creates
-an empty synthetic boundary without leaking its hidden text. A retained suffix
-without its user gets a `context_prefix` boundary. Calls/results are paired
-before sampling, even across a steering prompt. `pairing` distinguishes paired,
-unresolved and orphan units; reused call IDs resolve to the latest preceding
-unresolved call. Identical text from different source positions is not deduplicated.
+A context-hidden user creates an empty boundary; a retained assistant suffix
+without its input gets `context_prefix`. Tools are paired before sampling, even
+across steering inputs. `pairing` distinguishes paired, unresolved and orphan
+units; reused call IDs resolve to the latest preceding unresolved call. Text is
+not deduplicated across source positions or custom payload fields.
 
 ## Optional input mappings
 
-By default, custom messages remain custom context and follow the existing prompt
-window; native `custom` state entries are not conversation messages. Owners can
-enable exact custom-message input mappings through the
-[compatibility module manager](compatibility.md#owner-configuration).
+By default, custom messages follow their existing prompt window; native `custom`
+state entries are not conversation messages. Owners can enable exact custom-input
+mappings through [module configuration](compatibility.md#owner-configuration).
 
-After Pi's native projection, matching `role:"custom"` messages establish input
-boundaries before the existing `latest`, `recent`, earliest/recent prompt,
-assistant-block and tool selectors run. An adapted input has `type:"prompt"`,
-its native entry ID as `prompt_id`, and `source.read_adapter` naming the mapping.
-It retains its original `message.role:"custom"`, custom type, content and details.
-Context-hidden adapted inputs keep an empty `hidden_input` boundary without
-exposing hidden content. Other custom messages and state entries do not become
-inputs.
+After native projection, matching `role:"custom"` messages establish input
+boundaries before prompt/block/tool selection. They become `type:"prompt"` with
+their native entry ID as `prompt_id` and `source.read_adapter` identifying the
+mapping. Their custom role, type, content and details remain intact. Hidden mapped
+inputs use an empty `hidden_input` boundary. Other custom messages/state do not
+become inputs. Observed captures do not apply these mappings.
 
-The supplied [Intercom module](compatibility.md#input-mapping) maps
-`intercom_message`. Its sender/routing information, delivery metadata and
-attachments remain in the native payload, subject to the usual sanitization and
-capacity bounds. Disabling the module and restarting restores ordinary
-custom-message reading.
-
-Mappings affect only native input selection; observed request-stage captures do
-not apply them.
+The [Intercom module](compatibility.md#input-mapping) maps `intercom_message`;
+disabling it and restarting restores ordinary custom-message reading.
 
 ## Capacity and continuation
 
-The first page contains the newest selected units that fit, in chronological
-order. Following `next_cursor` moves toward earlier units.
-`omissions.selection` counts native logical records excluded by selectors;
-`omissions.capacity.earlier_units` and `later_units` locate the page within its
-captured selected units. Later units on an older page are already-covered newer
-content, not a forward-page request.
+The first page holds the newest selected units that fit, in chronological order;
+`next_cursor` moves backward. `omissions.selection` counts excluded native logical
+records. `omissions.capacity.earlier_units` and `later_units` locate a page within
+the capture; later units are already-covered newer content.
 
-Small blocks remain whole. Long prose prefers paragraphs and complete lines. Long single lines split at whitespace or Unicode code point boundaries, repeating necessary source/tool context. Segments can carry a `part`
-ordinal within their original block; message parts retain its native `content_index`. Each item is independently readable:
-**do not concatenate JSON slices or parse reconstructed records**.
-Selector counts still refer to native prompts/blocks/tool units, never paragraphs.
+Small blocks stay whole. Long prose splits at paragraphs/lines, then whitespace
+or Unicode code-point boundaries. Parts retain source/tool links and may carry
+`part`; message parts preserve `content_index`. Items are independently readable
+objects, not JSON fragments. Selectors count native prompts/blocks/tools, not
+paragraphs.
 
-If shared metadata or an individual nested-call field cannot fit the page,
-`omitted_fields` names the omitted indivisible fields while retaining body text,
-parent identity and native error state. Other indivisible content that fits a
-maximum page but not the requested budget raises
-`READ_BUDGET_TOO_SMALL`, with `minimum_max_bytes` when known. Increase the budget;
-a small request does not permanently discard ordinary content. Other content that
-cannot fit even a 65536-byte page becomes an explicit
-`complete:false,reason:"oversized_indivisible_content"` omission. Earlier and
-later history remains pageable.
+If shared metadata or nested-call fields cannot fit, `omitted_fields` names them
+while preserving body text, parent identity and native error state. Other
+indivisible content that fits a maximum page but exceeds the requested budget
+returns `READ_BUDGET_TOO_SMALL` with `minimum_max_bytes` when known. Content too
+large for any 65536-byte page becomes an explicit
+`complete:false,reason:"oversized_indivisible_content"` omission; other history
+remains pageable.
 
-Batch gives read its internal structured and duplicated-wire budget **before
-the first render**. It pages the same captured snapshot, without reacquiring
-history after a later mutation. An indivisible unit that exceeds the shared wire
-budget returns an explicit item budget error; read it separately with more room.
+Batch assigns structured and duplicated-wire budgets before rendering the captured
+snapshot. It never reacquires history after a later mutation. An indivisible unit
+exceeding the shared budget returns an item budget error; read it separately.
 
 ## Frozen bounded snapshots
 
-Snapshots retain detached sanitized units only: not raw native entries, base64,
-or a second set of complete JSON encodings. The cache holds at most 16 snapshots
-and approximately 32 MiB of accounted memory. Selected data exceeding this bound
-returns `READ_SNAPSHOT_TOO_LARGE`; selectors are not silently narrowed.
+The cache retains detached sanitized units, at most 16 snapshots and approximately
+32 MiB of accounted memory. Excess selected data returns `READ_SNAPSHOT_TOO_LARGE`
+without narrowing selectors. Cursors are issued only after successful caching;
+a complete one-page result needs no cache entry. Batch pins needed snapshots
+through assembly; temporary pressure returns `READ_CACHE_BUSY`.
 
-A continuation cursor is returned only after its snapshot was successfully cached.
-Batch pins its still-needed cursor snapshots until response assembly; temporary
-capacity pressure returns `READ_CACHE_BUSY` rather than evicting another active
-batch result. A page containing everything needs no cached snapshot.
-
-Snapshots have no inactivity timeout. LRU/capacity eviction or Bridge restart returns `STALE_CURSOR`; start a fresh read. The Bridge
-does not recreate an old cursor from mutable history. Once captured, normal
-appends, owner exit, automatic release or a new owner generation do not change
-the frozen history. Each continuation rechecks read permission and native identity,
-including the header cwd; changing that identity invalidates the cursor.
+There is no inactivity expiry. LRU/capacity eviction or Bridge restart produces
+`STALE_CURSOR`; start a fresh read. Appends, owner exit, release and replacement
+otherwise leave the frozen capture intact. Every continuation rechecks permission
+and native identity, including header cwd; identity changes invalidate the cursor.
 
 ## Live output and runtime extension events
 
-`live` is a separately bounded, transient and incomplete observation, outside
-historical cursor paging. It uses the same signature/image sanitization and
-readable units. Capacity omissions are explicit; no half-JSON preview is returned.
-The observer and renderer retain the newest tail, trimming oversized text/thinking blocks at Unicode-safe boundaries with explicit truncation. The observer's 65,536 UTF-16-unit budget includes a per-block overhead charge, so short or empty blocks cannot grow it without bound. A larger byte budget can expose more of that tail. Historical cursors and explicit-leaf reads do not return a moving preview.
+`live` is a separate bounded, transient and incomplete observation, outside cursor
+history. It uses the same image/signature sanitization and readable units. Native
+text/thinking deltas and cumulative message events feed it; tool-result streams
+and bash chunks are not assistant text. Owned projection and preview are captured
+together, keeping later-prompt output out of an earlier capture.
 
-`available:false` and a reason describe unavailable/invalid observations.
-An empty observed live item list means no unfinished assistant text was observed,
-not that all agent/tool work is idle. Invalid native observations are explicitly
-unavailable. Native observer truncation remains visible. Final committed history
-is authoritative.
+The observer keeps the newest tail under 65,536 UTF-16 units, including per-block
+overhead. Oversized text/thinking trims at Unicode boundaries and reports truncation;
+a larger byte budget can expose more of that tail. Cursors and explicit-leaf reads
+have no moving preview. `available:false` carries a reason; an empty item list means
+no unfinished assistant text was observed, not that all work is idle. Final commits
+remain authoritative.
 
 `runtime_events` contains bounded, generation-scoped transient extension errors
-and notifications where the owned RPC exposes them. It is neither historical
-context nor a receipt/completion tracker.
+and notifications from owned RPCs. It is separate from history and completion
+notifications.
 
 ## Read costs and current components
 
-Saved first reads parse native history and drop image content bytes per record
-before building the projection; raw fork loads preserve those bytes. Unrelated
-dangling parents do not disqualify a usable current branch. Duplicate IDs, invalid
-entry shapes and cycles encountered during branch traversal still reject; reads
-do not repair the source. Owned RPC
-selects and sanitizes inside its Pi observer, transferring the same cleaned read
-contract as companions/hosts rather than the entire raw history. Its live preview
-and committed projection are captured together. No extra history index is kept.
+Saved first reads parse history and discard image bytes per record before
+projection. Unrelated dangling parents do not invalidate a usable branch;
+duplicate IDs, invalid entries and traversed cycles reject. Owners select and
+sanitize before transfer, so read IPC limits apply to cleaned snapshots rather
+than unselected history. Continuations use only the cache, without fetching
+entries or computing history fingerprints.
 
-Continuations read only the captured snapshot: they do not fetch entries or
-compute full-history fingerprints.
-
-Owner `op:read` replies contain only selected native or observed sanitized snapshots;
-Bridge paginates them uniformly. Their read IPC ceiling applies to the cleaned
-snapshot, not unselected raw history. Attached fork still uses the raw `snapshot`
-operation with its 32 MiB bound; owned fork uses native `get_entries`.
-
-Update the Bridge and companion/host components together. A missing or mismatched
-read contract returns `OWNER_READ_REFRESH_REQUIRED`; update the companion/host
-at an idle boundary. Tool errors expose the same code in text and
-`structuredContent`, with refresh guidance for this error. Changing read
-selectors or refreshing the client's schema does not update a running owner.
-Read never falls back to the raw fork snapshot. Native Pi history still uses
-the current SDK projection without modifying historical records.
+Fork uses a separate [raw snapshot contract](runtime.md#read-and-fork-boundaries).
+Read never falls back to it. Bridge and companion/host read contracts must match;
+missing/mismatched contracts return `OWNER_READ_REFRESH_REQUIRED` with refresh
+guidance. Update the running components at a safe boundary; changing selectors
+or refreshing the client's schema cannot update an owner.

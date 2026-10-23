@@ -1,13 +1,10 @@
 # MCP transports
 
-Both transports expose the same [public tools](api.md) and enforce the same
-[independent permissions](configuration.md#seven-independent-rights).
+Both transports expose the same [public tools](api.md) and [permissions](configuration.md#seven-independent-rights).
 
 ## Choose a process topology
 
 ### One client: direct stdio
-
-Configure a standard MCP command:
 
 ```json
 {
@@ -16,55 +13,25 @@ Configure a standard MCP command:
 }
 ```
 
-The client owns this Bridge process. Closing stdin, SIGINT, or SIGTERM stops new
-business dispatch, drains already-dispatched requests, closes owned RPC processes
-and releases the Bridge lock. Queued mutations, including later same-session
-batch items, may return `BRIDGE_CLOSING` before native dispatch.
-Attached external Pi instances are disconnected, not terminated. Startup and
-shutdown share one cleanup path, including a signal arriving while the owner
-lock is being acquired. The kernel releases the service mutex on process death;
-surviving Pi writers retain their separate identity-checked claims.
+The client owns this Bridge process. Stdin EOF, SIGINT or SIGTERM stops new dispatch, drains dispatched requests, closes owned RPCs and releases the service lock. Waiting mutations may return `BRIDGE_CLOSING`. External Pi owners are disconnected and retain their writer claims; see [runtime lifecycle](runtime.md#shutdown-and-in-flight-acks).
 
-Each line is one UTF-8 JSON-RPC message. Protocol stdout contains no logs.
-Input lines are bounded at 8 MiB; an oversized line is rejected and discarded
-through its next newline without growing an unbounded buffer.
+Each line is one UTF-8 JSON-RPC message; stdout contains no logs. Oversized input is rejected and discarded through its next newline. The owned Pi RPC stream is also LF-delimited: fragmented UTF-8, CRLF and Unicode line/paragraph separators are preserved, and unfinished EOF frames are discarded.
 
 ### Multiple clients: one HTTP Bridge
-
-Start one independent service:
 
 ```sh
 node /absolute/path/to/pi-mcp-bridge/src/http-server.mjs /absolute/path/to/owner-config.json
 ```
 
-The configuration's `http` object contains `port` and `tokenFile`. The server
-binds **127.0.0.1 only** and exposes **POST /mcp only**. GET, DELETE and OPTIONS
-return 405; there is no session endpoint or SSE notification stream.
+Configure `http:{port,tokenFile}`. The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config and token must be canonical absolute paths to regular files owned by the service user, with no group/other access; symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
 
-The owner configuration and token file must be canonical absolute paths,
-regular files owned by the service user, and inaccessible to group/others
-(mode 0600 is appropriate). Symlink token/config paths are rejected. The token
-contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`; one final newline is
-permitted in the file.
+Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend accepts only `Host: 127.0.0.1:PORT` and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
 
-Every request must carry `x-pi-bridge-token: TOKEN`. Credential validation uses
-a fixed-length digest comparison and happens before parsing the request body.
-The backend accepts only its exact `Host: 127.0.0.1:PORT` and rejects every
-`Origin` header. Keep these checks behind a tunnel: the tunnel must rewrite
-the upstream Host, remove browser Origin rather than expose a browser API, and
-inject the private backend token after authenticating its public caller. Do not
-expose the loopback service directly or share this token with untrusted callers.
-This owner-local token boundary is not an implementation of MCP OAuth.
-
-HTTP clients and tunnel gateways must accept `application/json` and
-`text/event-stream` in their Accept header; this backend returns ordinary JSON.
-There is no `Mcp-Session-Id`, CORS access or GET/SSE replay endpoint. A service
-shutdown drains admitted operations before releasing the runtime and owner lock.
-A disconnected client never owns the service lifecycle.
+Clients/gateways must accept `application/json` and `text/event-stream`; the backend returns ordinary JSON with `Cache-Control: no-store`. There is no MCP session ID, CORS browser access or GET/SSE endpoint. A disconnected client does not stop the shared service.
 
 ### Multiple stdio-only clients: thin shared proxy
 
-Each MCP client may launch:
+Start the HTTP service, then configure each client with:
 
 ```json
 {
@@ -76,33 +43,15 @@ Each MCP client may launch:
 }
 ```
 
-Start the HTTP service first. The proxy reads the same private HTTP/token
-configuration and forwards to its loopback endpoint. It does **not** acquire a
-Bridge lock, spawn Pi, retain a work queue or retry requests. All proxies share
-the service's single RuntimePool. Closing a proxy aborts its network waits, not
-the backend or another client. Network failures return
-`BRIDGE_CONNECTION_LOST` with outcome-unknown guidance. Each proxy
-permits at most 16 concurrent forwards, matching the backend's request cap;
-excess requests return `PROXY_BUSY` with `NOT_FORWARDED` and are not queued.
-Notifications never receive JSON-RPC responses.
+The proxy reads the same HTTP/token configuration and forwards requests without spawning Pi, holding a Bridge lock or retrying work. Closing it ends its network waits while the backend and other clients continue. Network failure returns `BRIDGE_CONNECTION_LOST` with outcome-unknown guidance. Each proxy allows 16 concurrent forwards; excess requests return `PROXY_BUSY` / `NOT_FORWARDED` without queueing. Notifications receive no JSON-RPC response.
 
-Starting several direct stdio Bridge processes with the same state directory
-instead remains an owner-lock conflict; changing state directories is not a
-shared-runtime proxy.
+Multiple direct stdio services using the same state directory conflict on the service lock. Use proxies to share one runtime pool.
 
 ## Protocol versions
 
 ### MCP 2026-07-28
 
-This is an MCP protocol revision, separate from the Bridge's release number
-and owner-configuration format. Its [versioning contract](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
-and [message schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2026-07-28/schema.ts)
-define per-request metadata. Transport requirements are specified for
-[stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
-and [Streamable HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
-
-Modern requests have **no initialize handshake**. Every request includes
-`params._meta`:
+This protocol uses [per-request metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) rather than an initialize handshake:
 
 ```json
 {
@@ -122,104 +71,43 @@ Modern requests have **no initialize handshake**. Every request includes
 }
 ```
 
-The protocol version and capabilities are required on every request.
-`clientInfo` is recommended, not required. No capability is inferred from a
-previous request. `server/discover` returns supported versions and capabilities.
-Results carry `resultType: "complete"` and server identity metadata; discovery
-and `tools/list` also carry `ttlMs: 0` and `cacheScope: "private"`.
-The fixed tool list is deterministic. Modern discovery also advertises
-[completion events](events.md): events/list, events/subscribe and events/unsubscribe
-use the same endpoint and authentication. Delivery uses outbound signed HTTPS
-webhooks, not SSE. No elicitation, MRTR input or logging stream is advertised.
+Version and capabilities are required on every request; clientInfo is optional. `server/discover` returns supported versions and capabilities. Results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same authenticated endpoint and outbound HTTPS delivery.
 
-Modern HTTP also requires:
+HTTP requests also require:
 
-| Header                 | Value                                                                                    |
-| ---------------------- | ---------------------------------------------------------------------------------------- |
-| `MCP-Protocol-Version` | Same as the body's protocol metadata                                                     |
-| `Mcp-Method`           | Same as `method`                                                                         |
-| `Mcp-Name`             | Same as `params.name` for tools/call and prompts/get, or `params.uri` for resources/read |
+| Header                 | Value                                                                         |
+| ---------------------- | ----------------------------------------------------------------------------- |
+| `MCP-Protocol-Version` | The body's protocol version                                                   |
+| `Mcp-Method`           | The body's method                                                             |
+| `Mcp-Name`             | `params.name` for tools/call and prompts/get; `params.uri` for resources/read |
 
-Header names are case-insensitive; values are case-sensitive. Duplicate,
-missing or inconsistent required headers produce HTTP 400, JSON-RPC
-`-32020` (HeaderMismatch). `Mcp-Name` supports the specified UTF-8 Base64
-sentinel encoding. No tool parameters advertise `x-mcp-header`.
+Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020 HeaderMismatch`.
 
-An unsupported version produces HTTP 400 / JSON-RPC `-32022`, with
-`data.supported` and `data.requested`. The client selects a supported version;
-the server never silently substitutes a modern version. Missing required
-metadata produces HTTP 400 / `-32602`. An unknown modern method produces HTTP
-404 / `-32601`. These errors identify a modern server for dual-era clients.
+Unsupported versions return HTTP 400 / `-32022` with `data.supported` and `data.requested`; missing metadata returns 400 / `-32602`; unknown methods return 404 / `-32601`. See the [message schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2026-07-28/schema.ts) and [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) / [HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) bindings.
 
 ### MCP SDK clients
 
-The pinned MCP SDK uses initialization-based protocol revisions
-`2025-11-25`, `2025-06-18`, `2025-03-26`, and `2024-11-05` on stdio,
-and its supported Streamable HTTP bindings. HTTP+SSE is not implemented.
-SDK clients initialize before their tool requests; per-request protocol clients
-carry the metadata described above. On HTTP, header handling follows the SDK's
-standard negotiation, including its specified behavior when a version header is
-absent.
-
-These are MCP transport bindings for current clients, not old Bridge business
-contracts. Both paths use the same strict current tool schemas and dispatcher;
-neither accepts retired Bridge arguments or translates old tool results.
+The pinned SDK supports initialization-based revisions `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` over stdio, plus its Streamable HTTP bindings. SDK clients initialize first and follow SDK header negotiation. HTTP+SSE is not implemented. Both protocol paths use the same current tool schemas and dispatcher.
 
 ## Timeouts and disconnects
 
-A JSON-RPC `id` identifies **one communication exchange**, not a mutation.
-Reusing it does not make work idempotent. Public tools accept no mutation
-identifier, result handle or lookup/replay parameters.
+JSON-RPC IDs identify communication exchanges; reusing one does not deduplicate a mutation. After a lost/unknown result, follow the [API outcome guidance](api.md#sessions-and-mutations). Reconnection neither recovers a lost result nor replays work.
 
-Once a tool is admitted, a lost response does not replay or roll back it.
-Every new call is an independent operation, even with identical input.
-Batch disconnects do not cancel later admitted items. A partial create result
-includes its chosen child session and initial-send status when available.
-If that response is lost, there is no safe automatic retry or result lookup:
-inspect `list` for sessions/activity and authorized `read` for native
-history before deciding whether to submit again. Coarse activity is not
-per-prompt completion tracking.
+| Budget              | Limit                                | Effect                                                            |
+| ------------------- | ------------------------------------ | ----------------------------------------------------------------- |
+| HTTP headers/upload | 10 / 15 seconds                      | Bounds incoming request handling.                                 |
+| HTTP response wait  | 35 seconds after parsing             | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues. |
+| Tool `timeout_ms`   | Tool-specific acknowledgement budget | Does not bound model execution or kill a shell command.           |
+| Proxy network wait  | 40 seconds                           | Exceeds the backend response wait.                                |
 
-There are distinct time budgets:
-
-- HTTP headers: 10 seconds; request upload: 15 seconds.
-- HTTP response wait: 35 seconds after a complete parsed request. Exceeding it
-  returns HTTP 504 / `REQUEST_WAIT_EXPIRED`; already-admitted Pi work continues.
-- Tool `timeout_ms`: a bounded native acknowledgement wait, not model completion
-  or a shell kill deadline.
-- Proxy network wait: 40 seconds, exceeding the backend response wait.
-
-A tunnel/client can impose a shorter deadline. Reconnecting does not recover a
-lost result or replay work. No SSE Last-Event-ID recovery is implemented.
-While the service remains running, protocol cancellation, HTTP disconnect or a
-proxy's exit suppresses reply delivery without cancelling admitted calls or
-batch items. Direct stdio EOF instead shuts down the owned service: dispatched
-calls finish ACK/result capture, but not-yet-dispatched operations may return
-`BRIDGE_CLOSING`.
-There is no public business-operation AbortSignal. Use `stop` for Pi execution
-and queue cancellation.
-On modern stdio, `notifications/cancelled` suppresses subsequent messages for
-that request. This server uses JSON HTTP responses, not SSE response streams.
+A client or tunnel may impose a shorter deadline. While the service runs, protocol cancellation, HTTP disconnect and proxy exit suppress replies without cancelling admitted calls or later admitted batch items. On modern stdio, `notifications/cancelled` suppresses that request's subsequent messages. Direct stdio EOF instead shuts down the owned service as described above. Use `stop` to cancel Pi execution and queues.
 
 ## Bounds and errors
 
-HTTP bodies and stdio input messages are bounded at 8 MiB. JSON-RPC arrays,
-invalid UTF-8, unsupported HTTP content types/encodings, malformed IDs, duplicate
-credentials and oversized uploads are rejected before dispatch. HTTP allows at
-most 16 concurrent requests/admitted waiters and 32 connections. Responses use
-`Cache-Control: no-store`.
+HTTP bodies and MCP stdio messages are limited to **8 MiB**. JSON-RPC arrays, invalid UTF-8, unsupported HTTP content types/encodings, malformed IDs, duplicate credentials and oversized uploads are rejected before dispatch. HTTP allows 16 concurrent requests/admitted waiters and 32 connections.
 
-The global response limit is **256 KiB UTF-8 for the entire JSON-RPC envelope**,
-including metadata, request ID, text encoding/escaping and structured content.
-The server never cuts JSON or splits a Unicode sequence. Oversized exceptional
-results become an explicit `RESPONSE_TOO_LARGE` tool error with outcome-unknown
-guidance, rather than silently dropping a mutation's status or replaying work.
-Read selection and continuations handle normal history pagination. Read's
-`max_bytes` counts its complete structured JSON result (default 24,000 bytes,
-allowed 4,096–65,536), including read metadata; it is distinct from the global
-MCP envelope cap. The envelope cap includes both representations if present.
+The response limit is **256 KiB UTF-8 for the complete JSON-RPC envelope**, including metadata, IDs, escaping and both text/structured representations. Exceptional oversized results become `RESPONSE_TOO_LARGE` with outcome-unknown guidance. JSON and Unicode sequences are never cut to fit.
 
-HTTP authentication/routing/upload failures use clear status codes (401, 403,
-404, 405, 413, 415, 503). Modern protocol failures use the specified JSON-RPC
-error codes; tool validation and business failures are returned as tool errors.
-Error bodies never include private token/config contents.
+Read's `max_bytes` instead bounds its complete structured result: default 24000, range 4096–65536. Use [read pagination](reading.md#capacity-and-continuation) for normal history and [batch budgeting](api.md#batch) for combined calls.
+
+HTTP authentication/routing/upload failures use status codes 401, 403, 404, 405, 413, 415 or 503. Protocol failures use JSON-RPC errors; tool validation and business failures use tool errors. Error bodies omit private token/config contents.
