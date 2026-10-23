@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { readSchema } from './read-schema.mjs';
 import { stopSchema, bashSchema } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
-import { permitted, permissionWarnings } from './permissions.mjs';
+import { permitted, permissionsHealth } from './permissions.mjs';
 import { sessionMetadata, runtimeStatus } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
 import { SEND_MODES, promptInput, assertImageModel } from './prompt-input.mjs';
@@ -506,47 +506,12 @@ export class Bridge {
     this.assertOpen();
     if (domain !== 'permissions') throw new Error('UNSUPPORTED_HEALTH_DOMAIN');
     if (this.configFile) await this.refreshPermissions();
-    // A supplied known ID can be diagnosed without disclosing its metadata or
-    // enumerating hidden sessions. Sources name the tier, never a hidden path.
-    let session;
+    // Diagnose only the requested session, without its metadata or source paths.
     if (session_id) {
       const target = await this.session(session_id).catch(() => ({ id: session_id, cwd: null }));
-      const report = permissionWarnings(this.config, { session_id, cwd: target.cwd });
-      session = {
-        session_id,
-        ...report,
-        effective: Object.fromEntries(
-          Object.entries(report.effective)
-            .filter(([action]) => action !== 'create')
-            .map(([action, value]) => [
-              action,
-              {
-                allowed: value.allowed,
-                explicit: value.explicit,
-                source: value.sourceScope?.session_id
-                  ? 'session'
-                  : value.sourceScope?.folder
-                    ? 'project'
-                    : 'default',
-              },
-            ]),
-        ),
-      };
+      return permissionsHealth(this.config, { session_id, cwd: target.cwd });
     }
-    return {
-      domain,
-      status: 'ok',
-      ...(session ? { session } : {}),
-      defaults: permissionWarnings(this.config),
-      projects: this.config.folders.map((folder) => ({
-        project: folder.path,
-        ...permissionWarnings(this.config, { folder: folder.path }),
-      })),
-      session_override_count: new Set(
-        (this.config.grants ?? []).filter((rule) => rule.session_id).map((rule) => rule.session_id),
-      ).size,
-      note: 'Warnings are advisory. Permissions remain independent. Supply session_id to diagnose one known session; create is evaluated at project/default scope.',
-    };
+    return permissionsHealth(this.config);
   }
   async read(args) {
     this.assertOpen();

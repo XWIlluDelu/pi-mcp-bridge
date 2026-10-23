@@ -92,7 +92,7 @@ Backend checks apply to batch items, receipt recovery and read continuations. Pe
 
 ### Diagnose combinations
 
-`health({})` returns default/project effective rights, their sources, advisory warnings and the number of session overrides. Add a known `session_id` to get that session's effective rights; its project and name are not disclosed, and source labels give only the default/project/session tier. `health` never lists hidden session IDs and never changes permissions.
+`health({})` reports only noteworthy permission combinations. A healthy configuration returns `{"domain":"permissions","status":"ok"}`. Issues include their relevant allowed/blocked conditions and source rules; the same inherited issue is reported once, without normal permission tables or repeated project configuration. Add a known `session_id` to diagnose only that session; source labels show the tier without disclosing its project or name. `health` never changes permissions.
 
 Warnings cover known-ID-only access, work without progress reading, work without stop, restricted access to newly created sessions, and the difference between direct shell permission and model tools. These are valid configurations, not validation errors or implicit permission dependencies.
 

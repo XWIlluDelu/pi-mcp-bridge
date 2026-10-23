@@ -307,8 +307,10 @@ the same batch waits for that command's ordinary return/timeout.
 { "session_id": "ps_KNOWN_OPTIONAL" }
 ```
 
-Reports defaults/projects, effective rights and advisory combinations. `{}`
-queries defaults/projects alone. The sole domain is `permissions`; explicit
-`domain:"permissions"` remains accepted.
-An optional known session ID adds a source-tier-only session report without
-listing hidden identifiers or native metadata. See [configuration](configuration.md).
+Reports only noteworthy permission combinations and their relevant source rules,
+deduplicating inherited issues. Healthy configurations return
+`{"domain":"permissions","status":"ok"}` without normal permission tables.
+`{}` diagnoses defaults and configured projects; an optional known `session_id`
+limits diagnosis to that session, labeling source tiers without exposing native
+metadata. The sole domain is `permissions`; explicit `domain:"permissions"`
+remains accepted. See [configuration](configuration.md).
