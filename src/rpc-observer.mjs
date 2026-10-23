@@ -1,6 +1,10 @@
 // Public Pi context observation for a Bridge-owned child. Never owns a claim.
 import net from 'node:net';
-import { loadPiSdk } from './pi-installation.mjs';
+import { ownerRequest } from './owner-runtime.mjs';
+import { opaqueId } from './storage.mjs';
+// Pi's extension loader supplies the CLI's own public SDK exports.
+import * as sdk from '@earendil-works/pi-coding-agent';
+import { observeRpcInputs } from './rpc-input-activity.mjs';
 import fs from 'node:fs/promises';
 import { prepareContextRead } from './context-read.mjs';
 import { ContextObservation } from './context-observation.mjs';
@@ -9,8 +13,22 @@ import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
 export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
   if (!value) return;
-  const { socket, generation, sdkEntry } = JSON.parse(value);
-  const sdk = await loadPiSdk({ sdkEntry });
+  const { socket, generation, ownerControl } = JSON.parse(value);
+  // Reuse owner-local IPC; Pi reserves stdout for its own RPC records.
+  // Sequence numbers preserve ordering across concurrent notifications/reload.
+  const inputActivity = observeRpcInputs(sdk.AgentSession, (manager, activity) => {
+    if (ownerControl)
+      void ownerRequest(
+        ownerControl,
+        {
+          op: 'input_activity',
+          session_id: opaqueId(manager.getSessionFile() + '\0' + manager.getSessionId()),
+          generation,
+          ...activity,
+        },
+        { signal: AbortSignal.timeout(2000) },
+      ).catch(() => {}); // A later idle check can read authoritative child state.
+  });
   let server, context;
   const connections = new Set();
   const live = new LiveMessageObserver('rpc_message_events');
@@ -22,27 +40,20 @@ export default async function rpcObserver(pi) {
     'message_end',
   ])
     pi.on(name, (event) => live.update(event));
-  // Keep uncertainty across factory replacement in the same owned process.
-  const key = Symbol.for('pi-mcp-bridge.rpc-observer.preflight');
-  const preflight =
+  // Preserve observation ordering across native extension reload.
+  const key = Symbol.for('pi-mcp-bridge.rpc-observer.lifecycle');
+  const lifecycle =
     globalThis[key]?.generation === generation
       ? globalThis[key]
       : (globalThis[key] = {
           generation,
-          nonRpcInputSeen: false,
           captureSequence: 0,
         });
   // Preserve capture ordering across reload within this same owner generation.
-  const observation = new ContextObservation(generation, preflight);
+  const observation = new ContextObservation(generation, lifecycle);
   // Pi dispatches every context handler (including MC) before this phase,
   // irrespective of extension load order. Later full-context hooks can still change it.
   pi.on('context_with_system', (event, ctx) => observation.capture(event, ctx));
-  // ctx.isIdle() omits prompt preflight. Only the pipe owner has RPC ACKs;
-  // independent extension inputs need an explicit interrupting owner release
-  // if their completion cannot be established through the native interface.
-  pi.on('input', (event) => {
-    if (event.source !== 'rpc') preflight.nonRpcInputSeen = true;
-  });
   // An owned RPC is one file-bound writer. Veto before Pi opens another file;
   // session_shutdown is too late. Native TUI/host owners use their own lifecycle.
   pi.on('session_before_switch', (event, ctx) => {
@@ -88,7 +99,7 @@ export default async function rpcObserver(pi) {
                 ? {
                     isIdle: context.isIdle(),
                     hasPendingMessages: context.hasPendingMessages(),
-                    nonRpcInputSeen: preflight.nonRpcInputSeen,
+                    ...inputActivity(context.sessionManager),
                   }
                 : {
                     sessionFile: request.file,

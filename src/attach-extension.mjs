@@ -1,6 +1,6 @@
 // Load once through native Pi settings for ordinary TUI/RPC startup.
-import { publicError } from './errors.mjs';
 import fs from 'node:fs/promises';
+import { publicError } from './errors.mjs';
 import { compactInputSchema, compactMetadata, requireInterruptCompaction } from './compact.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
@@ -37,18 +37,22 @@ import {
   ownerAlive,
   registryTransaction,
   readClaim,
-  readOwnerRecord,
   claimFile,
   updateOwner,
   assertNoOtherLiveOwner,
   AttachmentFailure,
 } from './attachments.mjs';
 
+// A completed native shutdown authorizes only its paired successor. Keep this
+// short-lived evidence across factory reloads, not a process-wide writer waiver.
+const replacements = (globalThis[Symbol.for('pi-mcp-bridge.companion-replacements')] ??= new Map());
+const replacementKey = (dir, file) => `${dir}\0${file}`;
+
 export default async function attachExtension(pi) {
   const profile = await companionProfile();
   if (!profile) return;
   const { dir, file } = profile;
-  let active;
+  let active, ownership;
   joinExtension(pi, { dir, file });
   pi.on('session_before_switch', async (event, ctx) => {
     if (
@@ -81,7 +85,15 @@ export default async function attachExtension(pi) {
       // Refuse an already-owned target before SessionManager.open can switch us.
       // This is a read-only admission check, not an atomic open reservation.
       await registryTransaction(dir, () =>
-        assertNoOtherLiveOwner(dir, { file: targetFile }, { allowSameProcess: true }),
+        assertNoOtherLiveOwner(
+          dir,
+          { file: targetFile },
+          {
+            allowSameProcess:
+              active?.session.file === targetFile && active.manager === ctx.sessionManager,
+            completeHandoff: true,
+          },
+        ),
       );
     } catch {
       try {
@@ -93,38 +105,54 @@ export default async function attachExtension(pi) {
       return { cancel: true }; // Pi reports hook errors without cancelling.
     }
   });
-  async function retirePreviousClaims(currentFile, owner) {
-    // Replacement/reload can reconstruct this extension, so use native identity
-    // rather than closure state. Never retire a controller or a different process.
+  function replacementFor(event, manager) {
+    const file = manager.getSessionFile();
+    const previous = event.reason === 'reload' ? file : event.previousSessionFile;
+    const replacement = replacements.get(replacementKey(dir, previous));
     if (
-      !(await fs.stat(dir).catch((error) => {
-        if (error.code === 'ENOENT') return null;
-        throw error;
-      }))
+      replacement &&
+      replacement.reason === event.reason &&
+      (event.reason !== 'reload' || replacement.manager === manager) &&
+      (!replacement.target || replacement.target === file)
+    )
+      return replacement;
+  }
+  function consumeReplacement(replacement) {
+    if (
+      replacement &&
+      replacements.get(replacementKey(dir, replacement.session.file)) === replacement
+    )
+      replacements.delete(replacementKey(dir, replacement.session.file));
+  }
+  // Called under the registry mutex. Retire only the native context that
+  // actually shut down, never other managers which happen to share its PID.
+  async function retirePreviousClaim(replacement, currentSession) {
+    if (
+      !replacement ||
+      (replacement.session.file === currentSession?.file &&
+        replacement.session.header.id === currentSession.header.id)
     )
       return;
-    await registryTransaction(dir, async () => {
-      for (const name of await fs.readdir(dir)) {
-        if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
-        const file = path.join(dir, name);
-        const other = await readOwnerRecord(dir, file, undefined, { owner });
-        if (
-          other?.file !== currentFile &&
-          ['tui', 'extension'].includes(other?.kind) &&
-          other.owner?.pid === owner.pid &&
-          other.owner.start === owner.start &&
-          other.owner.boot === owner.boot
-        ) {
-          await fs.unlink(file);
-        }
-      }
-    });
+    const other = await readClaim(dir, replacement.session);
+    const owner = replacement.record.owner;
+    if (
+      other &&
+      !['rpc', 'host', 'handoff'].includes(other.kind) &&
+      other.owner?.pid === owner.pid &&
+      other.owner.start === owner.start &&
+      other.owner.boot === owner.boot
+    ) {
+      const file = claimFile(dir, replacement.session);
+      if (other.noColdReacquire)
+        await atomicJson(file, { ...other, phase: 'released', owner: null });
+      else await fs.unlink(file);
+    }
   }
   async function closeServer(runtime) {
     if (!runtime) return;
     runtime.ready = false;
     for (const socket of runtime.connections) socket.destroy();
-    await new Promise((resolve) => runtime.server.close(resolve));
+    if (runtime.server) await new Promise((resolve) => runtime.server.close(resolve));
   }
   async function validateStorage(runtime) {
     try {
@@ -180,30 +208,49 @@ export default async function attachExtension(pi) {
       if (active?.ready) await validateStorage(active);
     });
   pi.on('session_shutdown', async (event) => {
-    const runtime = active;
-    active = undefined;
-    if (!runtime) return;
-    runtime.ready = false; // Retire captured callbacks before the first asynchronous lifecycle step.
-    runtime.observation.reset();
+    const runtime = active,
+      current = ownership;
+    active = ownership = undefined;
+    if (!current) return;
+    if (runtime) {
+      runtime.ready = false; // Fence captured callbacks before the first await.
+      runtime.observation.reset();
+    }
     try {
-      await updateOwner(dir, runtime.session, runtime.record, { phase: 'transitioning' });
+      await updateOwner(dir, current.session, current.record, { phase: 'transitioning' });
     } finally {
       await closeServer(runtime);
       // IPC disconnect is not completion: keep the old claim and native
       // context until admitted setters/compaction can no longer append.
-      await Promise.allSettled([...runtime.mutations]);
+      await Promise.allSettled(runtime ? [...runtime.mutations] : []);
+      if (['reload', 'new', 'resume', 'fork'].includes(event.reason))
+        replacements.set(replacementKey(dir, current.session.file), {
+          ...current,
+          reason: event.reason,
+          target: event.targetSessionFile,
+        });
     }
     // The identified claim blocks until exact death or successful switch-away.
     // Keep the claim through quit/reload/replacement until exact process death or a fresh session_start.
   });
-  pi.on('session_start', async (_event, ctx) => {
+  pi.on('session_start', async (event, ctx) => {
     if (!['tui', 'rpc'].includes(ctx.mode)) return;
     try {
-      const file = ctx.sessionManager.getSessionFile();
+      const manager = ctx.sessionManager;
+      const file = manager.getSessionFile();
       // Check only path metadata before inspecting entries or publishing IPC.
       // No-session runs and sessions outside the owner's roots remain ordinary Pi.
       if (!companionIncludes(await currentCompanionScope(profile), file)) {
-        await retirePreviousClaims(file, await processIdentity());
+        if (replacementFor(event, manager))
+          await registryTransaction(dir, async () => {
+            const replacement = replacementFor(event, manager);
+            if (replacement?.session.file === file) {
+              // Scope removal disables control, not the still-live native writer.
+              // Carry only its ownership forward without inspecting excluded data.
+              ownership = { session: replacement.session, record: replacement.record, manager };
+            } else await retirePreviousClaim(replacement);
+            consumeReplacement(replacement);
+          });
         return;
       }
       await privateDirectory(dir);
@@ -227,24 +274,46 @@ export default async function attachExtension(pi) {
         const observation = { session, ctx, fileObserved: false };
         await validateStorage(observation);
         fileObserved = observation.fileObserved;
+        const replacement = replacementFor(event, manager);
         // The same path cannot be reserved under another live native identity,
         // whether first persistence has happened yet or not.
-        await assertNoOtherLiveOwner(dir, session);
+        await assertNoOtherLiveOwner(dir, session, {
+          allowSameProcess: replacement?.session.file === file,
+          completeHandoff: true,
+        });
         const old = await readClaim(dir, session);
         const sameProcess =
           old?.owner &&
           old.owner.pid === owner.pid &&
           old.owner.start === owner.start &&
           old.owner.boot === owner.boot;
-        if (old && (await ownerAlive(old.owner)) && !sameProcess) {
-          if (ctx.mode === 'tui') ctx.shutdown();
-          throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-        }
+        // Rebinding UI/actions emits session_start again in the same native
+        // extension runtime. Keep its existing endpoint instead of replacing it.
+        if (
+          active?.ready &&
+          active.manager === manager &&
+          old?.generation === active.record.generation
+        )
+          return false;
         // An installed companion must not replace this writer's existing RPC/host
         // controller. Its endpoint and lifecycle remain with that controller.
-        if (sameProcess && ['rpc', 'host'].includes(old.kind)) return false;
+        if (sameProcess && ['rpc', 'host'].includes(old.kind)) {
+          await retirePreviousClaim(replacement, session);
+          consumeReplacement(replacement);
+          return false;
+        }
+        const opening = sameProcess && old.kind === 'handoff' && old.phase === 'opening';
+        if (
+          old &&
+          (await ownerAlive(old.owner)) &&
+          !(sameProcess && (opening || replacement?.session.file === file))
+        )
+          throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
         if (old?.noColdReacquire) record.noColdReacquire = true;
+        await retirePreviousClaim(replacement, session);
         await atomicJson(claimFile(dir, session), record);
+        ownership = { session, record, manager };
+        consumeReplacement(replacement);
         return true;
       });
       if (!registered) return;
@@ -261,10 +330,12 @@ export default async function attachExtension(pi) {
         mutations: new Set(),
         server: null,
         ctx,
+        manager,
         fileObserved,
         liveMessage: new LiveMessageObserver('extension_message_events'),
         observation: new ContextObservation(record.generation),
       };
+      active = runtime;
       const activity = () => ({
         idle: ctx.isIdle() && runtime.mutations.size === 0,
         pending_messages: ctx.hasPendingMessages(),
@@ -471,7 +542,6 @@ export default async function attachExtension(pi) {
         });
       });
       runtime.server = server;
-      active = runtime;
       await new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(record.socket, resolve);
@@ -483,8 +553,6 @@ export default async function attachExtension(pi) {
         imagesSupported: true,
         readContract: READ_CONTRACT,
       });
-      // A successful replacement lifecycle conclusively releases this process's previous native identity.
-      await retirePreviousClaims(file, owner);
     } catch (error) {
       // Pi catches hook errors. A TUI can request graceful exit; an externally
       // owned RPC host must remain under its owner's lifecycle control.

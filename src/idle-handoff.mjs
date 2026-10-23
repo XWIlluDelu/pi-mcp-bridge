@@ -34,7 +34,8 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
   const controller = new AbortController();
   signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   const priorStop = bridge.locks.get(`stop:${session_id}`);
-  bridge.handoffs.set(session_id, { handoff_id, requester, controller });
+  const marker = { handoff_id, requester, controller };
+  bridge.handoffs.set(session_id, marker);
   try {
     return await bridge.locked(session_id, async () => {
       // Fence new stops immediately, but let an admitted stop finish its queue
@@ -49,6 +50,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
       const runtime = await bridge.pool.forRead(session);
       if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
       if (runtime && !(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
+      let exitDetails = {};
       if (runtime) {
         runtime.handoffPending = true;
         try {
@@ -57,7 +59,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
           if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
           // Cancellation after EOF cannot undo shutdown. Finish observing the
           // exact child's normal exit, but never open a cancelled destination.
-          await runtime.gracefulExit(signal);
+          exitDetails = await runtime.gracefulExit(signal);
           bridge.pool.instances.delete(session_id);
         } finally {
           if (!runtime.gracefulExitPromise) runtime.handoffPending = false;
@@ -70,18 +72,18 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
         const current = await readClaim(dir, session);
         if (current && (await ownerAlive(current.owner))) throw new Error('LIVE_OWNER_UNREACHABLE');
         if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
-        // Reserve the future TUI BEFORE it calls switchSession/opens the file.
-        // session_start replaces this same-process reservation with its endpoint.
+        // A future requester is not yet a writer. The companion marks opening
+        // before invoking native switch; session_start publishes the real TUI.
         const record = {
-          kind: 'tui',
+          kind: 'handoff',
           file: session.file,
           sessionId: session.header.id,
           generation: randomUUID(),
           owner: requester,
-          phase: 'starting',
+          phase: 'reserved',
           handoffId: handoff_id,
-          socket: dir + `/${requester.pid}-${handoff_id.slice(0, 8)}.sock`,
         };
+        signal?.throwIfAborted();
         await atomicJson(claimFile(dir, session), record);
         return record;
       });
@@ -96,13 +98,14 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
         native_id: session.header.id,
         generation: reservation.generation,
         no_cold_reacquire: false,
+        ...exitDetails,
       };
     });
   } catch (error) {
     if (signal.aborted) throw new Error('HANDOFF_CANCELLED');
     throw error;
   } finally {
-    bridge.handoffs.delete(session_id);
+    if (bridge.handoffs.get(session_id) === marker) bridge.handoffs.delete(session_id);
   }
 }
 export async function cancelHandoff(bridge, request) {
@@ -113,19 +116,22 @@ export async function cancelHandoff(bridge, request) {
     sameRequester(pending.requester, request.requester)
   )
     pending.controller.abort();
-  const session = await bridge.session(request.session_id),
-    dir = bridge.pool.attachmentDir;
-  await registryTransaction(dir, async () => {
-    const current = await readClaim(dir, session),
-      owner = request.requester;
-    if (
-      current?.handoffId !== request.handoff_id ||
-      current.kind !== 'tui' ||
-      current.phase !== 'starting' ||
-      !sameRequester(current.owner, owner)
-    )
-      return;
-    await fs.unlink(claimFile(dir, session));
+  const session = await bridge.session(request.session_id).catch((error) => {
+    if (error.message === 'NOT_FOUND_OR_DENIED') return null; // Already deleted.
+    throw error;
   });
+  const dir = bridge.pool.attachmentDir;
+  if (session)
+    await registryTransaction(dir, async () => {
+      const current = await readClaim(dir, session),
+        owner = request.requester;
+      if (
+        current?.handoffId !== request.handoff_id ||
+        current.kind !== 'handoff' ||
+        !sameRequester(current.owner, owner)
+      )
+        return;
+      await fs.unlink(claimFile(dir, session));
+    });
   return { session_id: request.session_id, status: 'cancelled' };
 }

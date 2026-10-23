@@ -2,9 +2,11 @@
 
 The Bridge reuses a cooperating live Pi instance. It starts an RPC child only
 when no live registered writer owns the saved session. Ownership includes the
-native session ID, canonical file, generation and exact Linux process identity
-(PID, process start time and boot ID). A live but unreachable owner blocks
-control and cold startup; it never authorizes a fallback writer.
+canonical file and exact Linux process identity (PID, process start time and boot
+ID). Native session ID, generation and socket metadata bind the current control
+endpoint; they are not prerequisites for recognizing a live path owner. A live
+but unreachable owner blocks control and cold startup; it never authorizes a
+fallback writer.
 
 Registry transactions use one Linux abstract Unix socket derived from the
 canonical private IPC directory. The kernel releases this short mutex on process
@@ -12,10 +14,33 @@ death; contention has a bounded wait and no lockfile recovery/migration path.
 All cooperating processes must share the registry and Linux PID/network
 namespaces. Releasing this mutex does not release a session's writer claim:
 those claims still require exact process identity and appropriate exit evidence.
-Registry scans isolate protocol mismatches to the target path or exact process
-identity after validating bounded private storage and unambiguous scope. Direct
-access reports `ATTACHMENT_PROTOCOL_MISMATCH`; update the Bridge and companion
-together. No mismatched record is translated or used to attach a runtime.
+Registry scans validate ownership separately from control-interface metadata,
+after bounded private reads. Endpoint metadata is checked when accessing live
+control, not when recognizing ownership or publishing a native replacement.
+A known different target path does not inherit damaged owner fields; ambiguous scope still blocks admission. Old control
+metadata cannot turn an exited process into a live writer. Native reload and
+replacement publish fresh endpoints using their completed shutdown/start evidence,
+not the old control format. Cold startup replaces a dead claim
+under the registry mutex, but preserves an explicit local pause.
+
+Using an unsupported live control endpoint reports
+`ATTACHMENT_PROTOCOL_MISMATCH`; update the Bridge and companion together at a
+safe native reload boundary. Ownership remains blocking while that process is
+alive, until exact exit or native replacement ends that claim. A fresh native
+registration preserves explicit pauses and existing RPC/host controllers. The
+companion records replacement evidence only after closing its listener and draining
+admitted mutations. The successor must match the shutdown reason, previous file
+and known destination; reload also requires the same native `SessionManager`
+instance. A matching successor consumes this process-local evidence once and
+retires only that prior context, not other sessions sharing its PID. Without this
+evidence, neither PID equality nor a `transitioning` phase ends a live claim;
+confirmed process exit remains the other registration boundary. Independent
+managers remain distinct writers even when their path and native session ID match.
+Rebinding the same active extension runtime retains its endpoint. A same-file
+reload outside current scope retains ownership without control or excluded-content
+reads; a later paired switch retires that exact claim. Switching away retains a
+pause as a released owner record. No old endpoint is translated or
+used as a fallback.
 
 This is a cooperative registry, not a global lock imposed on every Pi process.
 An unregistered RPC process has no generic attach-by-PID API. Its original host
@@ -30,7 +55,9 @@ host that manages their ownership. Identity observation rejects mismatches and
 invalidates scoped events without stopping the process.
 
 For an ordinary companion, scoped native resume checks existing target-path
-claims before Pi opens the target and cancels another process's live ownership.
+claims before Pi opens the target and cancels another live writer, including an
+independent manager in the same process. Resuming the current native context and
+completing this requester's admitted handoff remain allowed.
 The current session remains usable; use `/bridge-join` or host coordination for
 a managed handoff. This read-only check creates no reservation. It does not make
 simultaneous opens atomic or protect initial startup before extension loading;
@@ -71,7 +98,11 @@ On native shutdown/switch, the companion fences admissions and drains its
 admitted model setters and manual compaction before allowing a fresh
 session_start to retire the old claim. Socket loss does not settle those calls.
 
-Missing ACKs and observed independent extension preflight without completion correlation keep the owner alive. Automatic release promises to drain observable top-level calls, runs, queues, received ACK checks and native capture, not arbitrary detached extension jobs. A handled slash or ordinary input does not by itself hold the generation forever; nested asynchronous commands may outlive that top-level return and be interrupted by EOF. Extensions needing a longer lifetime must finish it within the observable lifecycle or use an externally managed owner. No quiet-time heuristic can establish detached-job completion.
+Missing ACKs and unfinished native input calls keep the owner alive. Automatic
+release drains input preparation, nested native commands, runs, queues, received
+ACK checks and native capture. Completed extension input leaves no lasting
+uncertainty marker. [Handoff behavior](#handoff-behavior) describes the observation
+boundary.
 
 A cold `command` is also eligible for safe release after bash completion; timeout retains the native pending ACK and late completion reevaluates release. A runtime cold-started for `set_model` uses the same safe idle release. Compaction also enables safe release on completion or refusal; a timed-out compaction keeps its native fence until settlement. Catalog queries do not acquire a session owner.
 
@@ -273,32 +304,38 @@ manually. Owner-local join is not a remotely callable prompt command.
    Lifecycle UI failures prevent destination reservation. Handoff does not
    escalate to process signals.
 4. Reserve the target for the requesting TUI **before** `switchSession()`.
-5. Recheck the reservation in Pi's cancellable pre-open hook and switch to the
-   latest saved history.
+   This `handoff` record identifies a future requester, not an actual writer.
+5. Change the reservation from `reserved` to `opening` under the registry mutex,
+   then invoke native switching. Recheck it in Pi's cancellable pre-open hook.
+   Successful `session_start` publishes the real writer and retires its old
+   session claims in one registry transaction.
 
 Owner automation should call the handoff protocol directly. Idle-gated controls
 and local release share its ACK, queue and settlement checks; completed queued RPC
 input does not leave a lasting preflight barrier. New mutations are fenced during
 handoff; reads remain available while it waits.
 
-The owned RPC observer is loaded before explicit `piArgs` extensions so it sees
-independent inputs before their asynchronous input handlers. This establishes
-observation order, not completion correlation for those inputs.
+The owned RPC observer counts outstanding calls to Pi's public `prompt`,
+`steer`, `followUp` and `sendCustomMessage` methods by native session manager.
+It wraps these methods only inside the Bridge-owned child and preserves native
+dispatch, results and errors. The observer imports Pi's public package through
+the extension loader, which supplies the CLI's own SDK exports even in bundled
+installations; a separate SDK-path import would refer to another class.
 
-Native Pi reports `before_agent_start` as busy. Earlier `input` hooks still precede
-that busy state, and independent extension-origin input has no completion
-correlation ID. An instance that has received such input can remain unconfirmed
-even after a settlement event. Ordinary prompts remain available, but combined
-prompt settings still require proven idle. If lossless release cannot be established, use the explicit interrupting
-maintenance path below rather than inferring completion from a quiet stream.
+This covers input hooks before native busy state and nested asynchronous slash
+commands started through `sendUserMessage(...,{expandPromptTemplates:true})`,
+even after the parent command returns. Each call stops counting when its native
+Promise settles, including handled or rejected input. Unrelated run settlement
+cannot clear another unfinished call. Counts and sequence numbers survive
+extension reload. Private owner-control IPC carries activity notifications;
+idle checks also read the child's current counts. Notifications cannot reorder
+the counts or permanently substitute a stale state. RPC ACKs, queues and native
+run settlement remain separate completion evidence.
 
-Registered slash commands run before Pi's `input` event. An extension that
-starts another command with `sendUserMessage(...,{expandPromptTemplates:true})`
-and returns before that command finishes can leave work outside both input
-observation and native run state. The Bridge has no native completion
-notification for such detached commands. Ordinary handoff remains available, but does not promise to
-preserve such unregistered background work. Finish that extension's work before
-joining; repeated idle state reads cannot prove it completed.
+The observer does not treat timers or arbitrary extension background jobs as
+native input calls. It does not edit Pi's installation or intercept private
+dispatch methods. Companions and external hosts retain their own admission and
+lifecycle contracts.
 
 While waiting, the fresh TUI does not mirror the old RPC's live output.
 Notifications explain waiting/failure; Ctrl+Alt+J cancels. A startup extension
@@ -332,7 +369,8 @@ unregistered manual writer. This pause is separate from ordinary join:
 
 3. Retry safe join or send a new authorized prompt to resume saved history.
 
-Reset checks registered owner identity and refuses a live owner. It cannot
+Reset checks registered owner identity and refuses a live owner, independently
+of that claim's control metadata. It cannot
 discover every unregistered Pi process; the caller confirms that local closure.
 Do not delete claims to bypass a surviving writer.
 
@@ -394,12 +432,14 @@ Notifications need no response and are exposed through
 Before the first RPC readiness ACK, Bridge treats interactive UI as unavailable
 and fails with `EXTENSION_UI_STARTUP_UNAVAILABLE`. In particular, an awaited
 `session_start` dialog runs before Pi installs its stdin reader and cannot
-consume a response; it no longer waits for the general ACK timeout. After EOF, shutdown UI cannot consume a
-response. Its methods appear in `ui.unavailable`, and normal process exit still
-returns `EXTENSION_UI_SHUTDOWN_UNAVAILABLE` to the handoff/reopen caller. A hook
-may finish through its own timeout, or exit before its continuation runs; exit
-code zero alone does not prove that every shutdown promise completed. These
-lifecycle requests are never labelled as cancellation frames sent.
+consume a response; it no longer waits for the general ACK timeout. After EOF,
+shutdown UI cannot consume a response. On normal process exit, handoff and
+owner-local release return its methods in `ui.unavailable` as a warning, without
+blocking the next reservation or failing the completed release. Native join
+displays the warning before switching. A hook may finish through its own timeout
+or leave extension cleanup incomplete; the UI diagnostic is separate from writer
+ownership. Abnormal exit, identity mismatch and a surviving writer still prevent
+handoff. These lifecycle requests are never labelled as cancellation frames sent.
 
 Prompt ACKs establish started/queued/handled admission, not model completion.
 A timeout after dispatch means `unknown`. There is no public result lookup or
@@ -422,22 +462,89 @@ create a queryable result. Incomplete bodies are marked honestly, and an unknown
 execution outcome remains unknown even when some output is available.
 Components must be updated together; no capture-file fallback is supported.
 
-For cooperative host deletion, reserve ownership before opening the writer and
+## Explicit deletion
+
+Delete is interrupting authority, separate from normal idle release and Bridge
+shutdown. It resolves the registry binding directly rather than requiring a
+successful read/state attachment. It validates the session header and owner
+generation/PID/start/boot before each signal, sends SIGTERM, and escalates to
+SIGKILL after `attachmentExitTimeoutMs` (default 5 seconds). The registry mutex
+covers each identity check and signal, not the exit wait. Other sessions sharing
+that PID prevent process-wide termination; process groups, external parents and
+daemons are not inferred termination targets. A changed binding prevents escalation.
+
+Deletion is serialized separately from the ordinary session lane. After preparing
+recovery records and fencing new input, it cancels a pending handoff/release.
+Under the registry mutex it acquires a session-file deletion gate and observes
+the current owner. A transfer completed before this acquisition is included in
+the deletion; subsequent writer reservations and handoffs cannot enter. Deletion
+then closes that writer without waiting behind the normal lifecycle's exit wait,
+drains the session lane, and moves the history while still holding the gate.
+There is one termination path, not a second lookup after releasing ownership.
+An unopened handoff reservation is revoked without signalling its requester.
+For an already-started native switch, deletion keeps the gate and waits for that
+one admitted switch to publish its real writer, cancel, or its requester to exit.
+Only that exact requester's completion can pass the gate; new acquisitions cannot.
+The same delete call then closes the writer and moves the history. Pi's public
+switch hook is not an atomic cancel/open boundary: if switching hangs permanently
+or throws without confirming cancellation or publishing a writer, deletion may
+remain waiting until the requester exits. There is no timeout-based permission
+to kill a process that may still be using another session.
+
+Pending RPC startup is cancellable before launch. Once launched, its exact
+identity is available before native readiness, so deletion can terminate it even
+when startup failure cleanup is waiting for an unresponsive Pi. Startup promises
+are drained only after deletion has exercised its termination authority.
+
+The gate uses the existing process-owned kernel lock mechanism. It does not
+replace the writer claim, hold the registry mutex during exit, or create a
+persistent deletion record. Other sessions continue independently, existing
+owners can finish their release, and Bridge death releases the gate.
+A failed move leaves the prior cold-resume pause intact. Once the file has moved,
+cleanup removes that pause before releasing the gate, even if a later directory
+sync reports an uncertain durability result.
+
+For a Bridge-created Herdr scope, explicit delete also terminates its remaining
+worker/tool descendants, escalating after the same grace period. Ordinary EOF,
+handoff and service shutdown retain their non-escalating behavior.
+
+Only confirmed writer exit or a successful session-local host release permits
+the trash move. While the deletion gate excludes new acquisitions, removal of
+the writer claim or its same-generation released state confirms closure even
+when the release ACK is lost; the shared host PID need not exit. An unexpected
+binding change is not authority to signal an unverified process. Recovery records
+are prepared before interruption, and the original file identity is checked again
+before rename.
+
+For session-local host deletion, reserve ownership before opening the writer and
 publish callbacks only after it is ready. Release follows three phases:
 
-- Close admission and retire the endpoint.
+- Close business admission and mark the owner as transitioning. Matching
+  release controls remain reachable.
 - Invoke optional `cancel()` to cancel host-owned work, then drain every admitted
   operation, including asynchronous preparation and inline result delivery.
-  For an active bash callback without `cancel`, the adapter uses its required
-  native `stop` callback before draining.
+  An active bash uses `stop` only when no `cancel` callback exists. Command
+  support therefore requires bash and either cancellation callback, not the
+  complete remote stop interface.
 - Invoke `release()` to close the actual writer and confirm `{released:true}`,
   then release ownership and permit the filesystem move.
+
+A failed cancel or release keeps business admission closed and ownership intact.
+Concurrent release calls share the pending attempt; an explicit local release or
+later authorized delete can retry unfinished close steps. Once the host confirms
+writer closure, a retry only finishes registry cleanup. Host callbacks must be
+able to resume or confirm closure on an explicit retry after a failure. There is
+no automatic retry, business replay or reopening of admission.
 
 A host whose preparation needs cancellation must implement `cancel` rather
 than waiting for the final writer-close callback. The host must also fence and
 drain its own non-Bridge admissions; adapter tracking alone cannot certify
 those. Controller disconnect merely retires its endpoint and retains the live
-writer claim. It never kills a shared host.
+writer claim. It never kills a shared host. Unsupported, failed or unreachable
+release does not veto deletion of a dedicated writer: Bridge terminates its
+verified process instead. A shared host without a working session-local close
+path reports `DELETE_SHARED_OWNER`; forcibly killing it would also destroy its
+neighbor sessions.
 
 ## Read and fork boundaries
 

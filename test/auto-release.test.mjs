@@ -241,7 +241,7 @@ test(
 );
 for (const slash of [false, true])
   test(
-    `handled ${slash ? 'slash' : 'input'} releases observable work without promising detached nested command lifetime`,
+    `handled ${slash ? 'slash' : 'input'} waits for a nested native command and then releases`,
     { timeout: 10000 },
     async (t) => {
       const f = await fixture(
@@ -260,9 +260,13 @@ for (const slash of [false, true])
         'handled',
       );
       const rpc = f.runtimes[0];
+      await until(() => exists(f.dir + '/slash-held'));
+      assert.equal((await rpc.idleSnapshot()).status, 'busy');
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      assert.equal(await exists(f.dir + '/shutdown'), false);
+      await f.mark('slash-go');
       await until(() => exists(f.dir + '/shutdown'));
-      assert.equal(rpc.child.stdin.writableEnded, true);
-      assert.equal(await exists(f.dir + '/slash-finished'), false);
+      assert.equal(await exists(f.dir + '/slash-finished'), true);
       await f.mark('shutdown-go');
       await released(f, rpc);
     },
@@ -606,7 +610,7 @@ test(
   },
 );
 
-for (const method of ['interrupt', 'stop'])
+for (const method of ['interrupt', 'stop', 'delete'])
   test(
     `explicit ${method} reaches a native shutdown hook held after EOF`,
     { timeout: 10000 },
@@ -625,19 +629,40 @@ for (const method of ['interrupt', 'stop'])
         reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
         /LIVE_OWNER_UNREACHABLE/,
       );
-      rpc.child.kill = (signal) => {
-        signals.push(signal);
-        return kill(signal);
-      };
+      if (method !== 'delete')
+        rpc.child.kill = (signal) => {
+          signals.push(signal);
+          return kill(signal);
+        };
       if (method === 'interrupt')
         assert.equal(
           (await f.bridge.releaseForLocal({ session_id: f.id, interrupt: true })).status,
           'released',
         );
-      else await rpc.stop();
-      assert.deepEqual(signals, ['SIGTERM']);
+      else if (method === 'delete') {
+        assert.equal((await f.bridge.delete({ session_id: f.id })).reason, 'NOT_FOUND_OR_DENIED');
+        assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+        const queued = f.bridge.send({ session_id: f.id, text: 'NEVER_RESTART_DURING_DELETE' });
+        f.config.grants[0].delete = true;
+        const deleted = await f.bridge.delete({ session_id: f.id });
+        assert.equal((await queued).status, 'rejected');
+        assert.equal(f.runtimes.length, 1);
+        assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
+        const manifest = JSON.parse(
+          await fs.readFile(
+            path.join(f.config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
+            'utf8',
+          ),
+        );
+        assert.ok(await fs.stat(manifest.trash_path));
+        await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
+      } else await rpc.stop();
+      if (method !== 'delete') {
+        assert.deepEqual(signals, ['SIGTERM']);
+        assert.equal(rpc.child.signalCode, 'SIGTERM');
+      }
       assert.equal(rpc.exited, true);
-      assert.equal(rpc.child.signalCode, 'SIGTERM');
+      assert.equal(await ownerAlive(rpc.childIdentity), false);
       await rpc.autoReleaseTask;
       const claim = await readClaim(f.config.attachmentDir, f.session);
       assert.equal(claim?.noColdReacquire ?? false, method === 'interrupt');
@@ -883,7 +908,7 @@ const independentWorkSource =
   ').then(module=>module.default(pi));';
 for (const window of ['ack', 'identity'])
   test(
-    'normal release rechecks observed native work after the final ' + window + ' await',
+    'normal release rechecks native input preflight after the final ' + window + ' await',
     { timeout: 15000 },
     async (t) => {
       const f = await fixture(t, independentWorkSource),
@@ -913,24 +938,22 @@ for (const window of ['ack', 'identity'])
         await f.bridge.send({ session_id: f.id, text: 'FIRST' });
         await observed.promise;
         await f.mark('new-run');
-        await until(
-          () =>
-            exists(f.dir + '/second-provider') &&
-            rpc.settlement.sequence < rpc.requiredSettlementSequence,
-        );
-        assert.equal((await rpc.state()).isStreaming, true);
+        await until(async () => (await exists(f.dir + '/second-input')) && rpc.pendingInputs > 0);
+        assert.equal((await rpc.state()).isStreaming, false);
         go.resolve();
         await until(() => !f.bridge.autoReleases.size);
         assert.equal(rpc.child.stdin.writableEnded, false);
         assert.equal(f.bridge.handoffs.has(f.id), false);
         assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+        await f.mark('input-go');
+        await until(() => exists(f.dir + '/second-provider'));
         await f.mark('finish');
         await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
         assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
-        // Independent extension preflight retains its existing uncertainty fence;
-        // observing this run must not authorize discarding some other detached input.
+        await released(f, rpc);
       } finally {
         go.resolve();
+        await f.mark('input-go');
         await f.mark('finish');
       }
     },
@@ -941,6 +964,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t, independentWorkSource);
+    await f.mark('input-go'); // This case observes the later native run boundary.
     const rpc = await f.bridge.pool.resolve(f.session);
     await rpc.command({ type: 'prompt', message: 'FIRST' });
     await until(() => rpc.settlement.sequence === 1);

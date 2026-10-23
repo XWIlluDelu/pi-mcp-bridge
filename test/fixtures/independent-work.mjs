@@ -28,6 +28,13 @@ export default function independentWork(pi) {
     },
   ]);
   pi.registerProvider(faux.provider);
+  pi.on('input', async (event) => {
+    if (event.text === 'SECOND_REAL_RUN') {
+      await mark('second-input');
+      await wait('input-go');
+    }
+    return { action: 'continue' };
+  });
   pi.on('session_start', async () => {
     await pi.setModel(faux.getModel());
     void wait('new-run').then(() => pi.sendUserMessage('SECOND_REAL_RUN'));

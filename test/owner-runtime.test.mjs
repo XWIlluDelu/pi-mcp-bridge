@@ -330,7 +330,7 @@ test('release refuses busy, unknown state and admission ambiguity without signal
 for (const overlap of [false, true])
   test(
     overlap
-      ? 'observed overlapping extension inputs remain unconfirmed after unrelated settlement'
+      ? 'overlapping extension inputs stay busy through unrelated settlement and reload, then release'
       : 'independent extension startup reports busy before agent_start',
     { timeout: 20000 },
     async (t) => {
@@ -365,6 +365,7 @@ for (const overlap of [false, true])
         ),
       );
       const owned = f.bridge.pool.get(f.id);
+      owned.autoReleaseWanted = false; // Exercise explicit release after completion.
       if (overlap) await until(() => owned.settlement.sequence === 1);
       const state = await owned.state();
       assert.equal(state.isStreaming, !overlap); // input hooks precede busy; before_agent_start no longer does.
@@ -378,7 +379,7 @@ for (const overlap of [false, true])
       assert.deepEqual(
         { release, ownerAlive: await ownerAlive(owner) },
         {
-          release: { reason: overlap ? 'RUNTIME_IDLE_UNCONFIRMED' : 'RUNTIME_BUSY' },
+          release: { reason: 'RUNTIME_BUSY' },
           ownerAlive: true,
         },
       );
@@ -386,40 +387,30 @@ for (const overlap of [false, true])
         (await readClaim(f.bridge.pool.attachmentDir, f.session)).noColdReacquire,
         true,
       );
-      await fs.writeFile(gate, 'continue');
-      await until(() => owned.settlement.sequence === (overlap ? 2 : 1));
       if (overlap) {
-        await assert.rejects(
-          ownerRequest(f.config, { op: 'release', session_id: f.id }),
-          /RUNTIME_IDLE_UNCONFIRMED/,
-        );
-        assert.equal(await ownerAlive(owner), true);
         assert.equal(
           (await owned.command({ type: 'prompt', message: '/preflight-reload' })).disposition,
           'handled',
         );
         await assert.rejects(
           ownerRequest(f.config, { op: 'release', session_id: f.id }),
-          /RUNTIME_IDLE_UNCONFIRMED/,
+          /RUNTIME_BUSY/,
         );
         assert.equal(await ownerAlive(owner), true);
       }
-      // Settlement has no correlation ID for independent extension preflight.
-      // A deliberate owner interruption gives this generation a recovery exit.
-      await assert.rejects(
-        ownerRequest(f.config, { op: 'release', session_id: f.id }),
-        /RUNTIME_IDLE_UNCONFIRMED/,
-      );
+      await fs.writeFile(gate, 'continue');
+      await until(() => owned.settlement.sequence === (overlap ? 2 : 1));
+      await until(async () => (await owned.idleSnapshot()).status === 'idle');
       const released = await exec(process.execPath, [
         path.join(base, 'src/owner-runtime.mjs'),
         f.file,
         'release',
         f.id,
-        '--interrupt',
       ]);
       assert.equal(JSON.parse(released.stdout).status, 'released');
       assert.equal(await ownerAlive(owner), false);
-      assert.notEqual(owned.child.signalCode, 'SIGKILL');
+      assert.equal(owned.child.signalCode, null);
+      assert.equal(owned.child.exitCode, 0);
       await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
       assert.ok(
         ['started', 'queued', 'handled'].includes(
@@ -444,7 +435,7 @@ for (const overlap of [false, true])
   );
 test('release of saved session and reset serialize with sends; pending startup is not aborted', async (t) => {
   const f = await fixture(t);
-  f.bridge.pool.starting.set(f.id, new Promise(() => {}));
+  f.bridge.pool.starting.set(f.id, { promise: new Promise(() => {}) });
   await assert.rejects(
     ownerRequest(f.config, { op: 'release', session_id: f.id }),
     /RUNTIME_IDLE_UNCONFIRMED/,

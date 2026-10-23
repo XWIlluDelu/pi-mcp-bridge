@@ -1,7 +1,7 @@
 // Cooperative host integration. Reserve the actual writer before it opens the
-import { publicError } from './errors.mjs';
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import fs from 'node:fs/promises';
+import { publicError } from './errors.mjs';
 import net from 'node:net';
 import { nativeSdk } from './pi-installation.mjs';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
@@ -67,6 +67,8 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
     bashing = false,
     settingModel = false,
     compacting = false,
+    releasing = false,
+    writerReleased = false,
     releasePromise,
     closePromise;
   const sockets = new Set(),
@@ -102,39 +104,46 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
   async function release() {
     if (!callbacks?.release) fail('HOST_RELEASE_UNSUPPORTED');
     if (releasePromise) return releasePromise;
-    ready = false; // Fence admissions before the first awaited lifecycle step.
+    releasing = true;
+    ready = false; // A failed close never reopens business admission.
     releasePromise = (async () => {
-      await retire();
-      // Cancellation must precede the operation drain: an active native bash
-      // may only settle after the host aborts it. Writer close still happens
-      // AFTER every admitted preparation/capture has settled.
-      await assertIdentity();
-      if (callbacks.cancel) await callbacks.cancel();
-      else if (bashing && !stopping)
-        await callbacks.stop({
-          sessionFile: target.file,
-          sessionId: target.header.id,
-          onWithdraw: async () => {},
-        });
-      await Promise.allSettled([...operations]);
-      await assertIdentity();
-      const result = await callbacks.release();
-      if (result?.released !== true) fail('HOST_RELEASE_FAILED');
-      // A shared host may remain alive. The explicit host callback attests the
-      // target writer, including non-bridge work, has been drained and closed.
+      if (!writerReleased) {
+        await retire();
+        // Cancel before draining: admitted work may depend on cancellation to
+        // finish. An explicit retry resumes close, never the original business.
+        await assertIdentity();
+        if (callbacks.cancel) await callbacks.cancel();
+        else if (bashing && !stopping)
+          await callbacks.stop({
+            sessionFile: target.file,
+            sessionId: target.header.id,
+            onWithdraw: async () => {},
+          });
+        await Promise.allSettled([...operations]);
+        await assertIdentity();
+        const result = await callbacks.release();
+        if (result?.released !== true) fail('HOST_RELEASE_FAILED');
+        // Keep this attestation if registry cleanup fails. Retrying cleanup
+        // must not close the native writer a second time.
+        writerReleased = true;
+      }
       const current = await readClaim(attachmentDir, target);
-      if (current?.generation !== record.generation) fail('RUNTIME_SESSION_CHANGED');
-      await releaseOwner(attachmentDir, target, record);
-      // Stop accepting immediately, but let the current release socket flush
-      // its acknowledgment before the listener's close callback can complete.
+      if (current && current.generation !== record.generation) fail('RUNTIME_SESSION_CHANGED');
+      if (current && !isReleasedOwner(current)) await releaseOwner(attachmentDir, target, record);
+      // Let the current release socket flush its acknowledgment.
       server?.close(() => {});
       return { released: true, generation: record.generation };
     })();
-    return releasePromise;
+    try {
+      return await releasePromise;
+    } catch (error) {
+      releasePromise = undefined;
+      throw error;
+    }
   }
   function validateRequest(request) {
     if (
-      !ready ||
+      (!ready && !(releasing && request?.op === 'release')) ||
       closed ||
       request?.generation !== record.generation ||
       request.file !== target.file ||
@@ -142,6 +151,9 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
     )
       fail('RUNTIME_SESSION_CHANGED');
   }
+  const supportsBash = () =>
+    typeof callbacks.bash === 'function' &&
+    (typeof callbacks.cancel === 'function' || typeof callbacks.stop === 'function');
   async function operate(request, partial) {
     const entryStopSequence = stopSequence,
       stoppingAtEntry = stopping;
@@ -194,7 +206,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
         ...modelState(observed),
         capabilities: {
           send: true,
-          command: typeof callbacks.bash === 'function' && typeof callbacks.stop === 'function',
+          command: supportsBash(),
           stop: typeof callbacks.stop === 'function',
         },
       };
@@ -315,8 +327,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
         remotePromptRejection(input.text) ??
         receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
     } else if (request.op === 'bash') {
-      if (typeof callbacks.bash !== 'function' || typeof callbacks.stop !== 'function')
-        fail('BASH_UNSUPPORTED');
+      if (!supportsBash()) fail('BASH_UNSUPPORTED');
       if (typeof args.command !== 'string' || !args.command.length || args.command.length > 100000)
         fail('INVALID_ATTACHED_BASH');
       beforeDispatch();
@@ -409,7 +420,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
     callbacks = value;
     try {
       await state();
-      if (closed || releasePromise) fail('RUNTIME_SESSION_CHANGED');
+      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
       server = net.createServer((socket) => {
         if (sockets.size >= 16) {
           socket.destroy();
@@ -477,14 +488,13 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       });
       await fs.chmod(record.socket, 0o600);
       await state();
-      if (closed || releasePromise) fail('RUNTIME_SESSION_CHANGED');
+      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
-        releaseSupported: Boolean(callbacks.release),
         imagesSupported: callbacks.supportsImages === true,
         readContract: READ_CONTRACT,
       });
-      if (closed || releasePromise) {
+      if (closed || releasing) {
         await retire();
         fail('RUNTIME_SESSION_CHANGED');
       }
