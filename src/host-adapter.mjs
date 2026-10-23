@@ -1,4 +1,5 @@
 // Cooperative host integration. Reserve the actual writer before it opens the
+import { publicError } from './errors.mjs';
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import fs from 'node:fs/promises';
 import net from 'node:net';
@@ -462,9 +463,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
               socket.end(
                 JSON.stringify({
                   generation: record.generation,
-                  error: /^[A-Z_]{3,64}$/.test(error.code ?? error.message)
-                    ? (error.code ?? error.message)
-                    : 'HOST_OPERATION_FAILED',
+                  error: publicError(error, 'HOST_OPERATION_FAILED'),
                 }) + '\n',
               );
             }

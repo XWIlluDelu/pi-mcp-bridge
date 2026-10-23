@@ -73,6 +73,31 @@ async function fixture(t) {
   return { bridge, runtime, calls, project, id: made.session_id, config };
 }
 
+test('launch failures preserve public codes through MCP and batch without exposing native error text', async (t) => {
+  const f = await fixture(t);
+  for (const code of [
+    'HERDR_PROTOCOL_MISMATCH',
+    'PI_INSTALLATION_UNAVAILABLE',
+    'PRIVATE_PROVIDER_ERROR',
+  ]) {
+    f.bridge.pool.factory = async () => {
+      throw Object.assign(new Error('private provider credentials'), { code });
+    };
+    const args = { session_id: f.id, text: 'NEVER_DISPATCHED' },
+      expected = code === 'PRIVATE_PROVIDER_ERROR' ? 'OPERATION_FAILED' : code;
+    assert.equal((await callBridgeTool(f.bridge, 'send', args)).structuredContent.reason, expected);
+    assert.equal(
+      (
+        await executeBatch(f.bridge, {
+          operations: [{ op: 'send', args }],
+        })
+      ).results[0].result.reason,
+      expected,
+    );
+  }
+  assert.deepEqual(f.calls, { prompt: 0, command: 0, stop: 0 });
+});
+
 test('invalid list filters and missing mutation payloads do not dispatch', async (t) => {
   const f = await fixture(t);
   for (const args of [{ limit: 0 }, { offset: -1 }, { active_after: 'not-a-date' }, { project: 1 }])

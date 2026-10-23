@@ -66,6 +66,7 @@ export default function (pi) {
     if (await exists(gate + '.hold-selection')) while (!(await exists(gate))) await pause(10);
   });
   pi.on('session_before_compact', async (event) => {
+    if (event.customInstructions === 'NATIVE_COMPACT') return;
     if (event.customInstructions === 'CANCEL_COMPACT') return { cancel: true };
     if (event.customInstructions === 'HOLD_COMPACT') {
       await fs.writeFile(process.env.PI_MODEL_GATE + '.compact-start', 'started');

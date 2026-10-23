@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
+import { publicError } from './errors.mjs';
 import path from 'node:path';
-import { compactReceipt } from './compact.mjs';
+import { compactReceipt, nativeCompactReason } from './compact.mjs';
 import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
@@ -335,9 +336,12 @@ export class Bridge {
               );
           return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
         } catch (error) {
+          const nativeReason =
+            error.code === 'PI_REJECTED' ? nativeCompactReason(error.native_reason) : undefined;
           return {
             status: error.uncertain ? 'unknown' : 'rejected',
             reason: safeReason(error),
+            ...(nativeReason ? { native_reason: nativeReason } : {}),
             native_effects:
               error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
           };
@@ -1157,75 +1161,7 @@ async function beforePromptDispatch(runtime, input, selection, authorize) {
   await authorize();
 }
 function safeReason(error) {
-  const code = error.code ?? error.message;
+  const code = publicError(error);
   diagnostics.emit('operation.failure', { code, uncertain: error.uncertain === true });
-  return [
-    'IMAGE_INPUT_UNSUPPORTED',
-    'MODEL_IMAGE_INPUT_UNSUPPORTED',
-    'MODEL_SELECTION_UNSUPPORTED',
-    'MODEL_SELECTION_PENDING',
-    'MODEL_SELECTION_BUSY',
-    'MODEL_SELECTION_IDLE_UNCONFIRMED',
-    'MODEL_SELECTION_FAILED',
-    'MODEL_SELECTION_CHANGED',
-    'MODEL_UNAVAILABLE',
-    'THINKING_LEVEL_UNSUPPORTED',
-    'THINKING_SUPPORT_UNKNOWN',
-    'MODEL_REQUIRES_PROMPT',
-    'COMPACT_UNSUPPORTED',
-    'HOST_COMPACT_UNCERTAIN',
-    'COMPACTION_PENDING',
-    'INVALID_COMPACT_RESULT',
-    'COMPACT_BUSY',
-    'COMPACT_IDLE_UNCONFIRMED',
-    'RUNTIME_EXIT_ABNORMAL',
-    'RUNTIME_EXIT_BEFORE_EOF',
-    'EXTENSION_UI_STARTUP_UNAVAILABLE',
-    'EXTENSION_UI_SHUTDOWN_UNAVAILABLE',
-    'BRIDGE_CLOSING',
-    'CONFIG_RESTART_REQUIRED',
-    'INVALID_PROMPT_INPUT',
-    'INVALID_PROMPT_RESULT',
-    'SNAPSHOT_UNSUPPORTED',
-    'SESSION_TOO_LARGE',
-    'INVALID_HOST_SNAPSHOT',
-    'HANDOFF_PENDING',
-    'BASH_IN_PROGRESS',
-    'BASH_UNSUPPORTED',
-    'INVALID_BASH_RESULT',
-    'STOP_IN_PROGRESS',
-    'STOP_UNSUPPORTED',
-    'INVALID_STOP_RECEIPT',
-    'ATTACHED_OPERATION_FAILED',
-    'COLD_REACQUIRE_BLOCKED',
-    'HOST_RELEASE_UNSUPPORTED',
-    'HOST_RELEASE_FAILED',
-    'HOST_NOT_READY',
-    'HOST_SUBMIT_UNCERTAIN',
-    'EXECUTION_CWD_UNAVAILABLE',
-    'NATIVE_SESSION_OUTSIDE_ROOTS',
-    'STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY',
-    'UNSAFE_NATIVE_SESSION_STORAGE',
-    'INVALID_SESSION',
-    'INVALID_SESSION_TREE',
-    'NOT_FOUND_OR_DENIED',
-    'ATTACHMENT_REQUEST_TOO_LARGE',
-    'ATTACHMENT_PROTOCOL_MISMATCH',
-    'PROMPT_ADMISSION_PENDING',
-    'PI_REJECTED',
-    'ACK_TIMEOUT',
-    'WRITE_UNKNOWN',
-    'RUNTIME_DISCONNECTED',
-    'RUNTIME_START_FAILED',
-    'PI_EXECUTABLE_NOT_FOUND',
-    'PI_EXECUTABLE_NOT_EXECUTABLE',
-    'RUNTIME_STOP_FAILED',
-    'RUNTIME_SESSION_CHANGED',
-    'LIVE_OWNER_UNREACHABLE',
-    'OWNER_STILL_ALIVE',
-    'ATTACHMENT_REGISTRY_BUSY',
-    'PI_ACCEPTANCE_UNOBSERVABLE',
-  ].includes(code)
-    ? code
-    : 'OPERATION_FAILED';
+  return code;
 }
