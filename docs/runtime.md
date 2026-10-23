@@ -433,19 +433,17 @@ writer claim. It never kills a shared host.
 
 ## Read and fork boundaries
 
-Attached reads select and sanitize at the owner, then transfer a bounded clean
-snapshot for Bridge pagination. Owned RPC reads acquire native history before
-selection and sanitization. Saved reads use the selected Pi SDK without starting
-a writer. Read and fork use separate representations:
+Owned RPC and attached reads select and sanitize at the owner, then transfer a
+bounded clean snapshot for Bridge pagination. Saved reads use the selected Pi
+SDK without starting a writer. Read and fork use separate representations:
 image bytes are omitted from reads but preserved in raw fork snapshots.
 See [reading](reading.md) for native/observed views, live previews, frozen
 cursors and component-mismatch errors.
 
 Live observers accept native text/thinking deltas or cumulative message events.
 Tool-result streams and independent bash chunks are not exposed as assistant
-text. If native message boundaries change while history is being acquired, the
-read omits the preview with `context_changed_during_read`; a fresh read can
-observe the new prompt.
+text. The owned observer captures the native projection and live preview
+together, so a later prompt cannot donate its live output to an earlier capture.
 
 Fork uses the cooperative `runtime.snapshot()` operation:
 `{sessionFile,sessionId,entries,leafId}`. It contains raw native records, not

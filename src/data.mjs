@@ -111,7 +111,7 @@ export async function validateExecutionCwd(cwd) {
   }
   return cwd;
 }
-export async function loadSession(file) {
+export async function loadSession(file, { omitImageData = false } = {}) {
   const expected = await assertSingleSessionFile(file),
     fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
     records = [];
@@ -122,7 +122,22 @@ export async function loadSession(file) {
     if (!line.trim()) return;
     const parsed = parseSessionEntries(line);
     if (!parsed.length) skipped++;
-    else records.push(...parsed);
+    else
+      for (const entry of parsed) {
+        if (omitImageData) {
+          // Rendering never uses native image bytes. Drop only content-block data,
+          // not business details/arguments; raw fork snapshots keep their default.
+          const content =
+            entry.type === 'message'
+              ? entry.message?.content
+              : entry.type === 'custom_message'
+                ? entry.content
+                : null;
+          for (const block of Array.isArray(content) ? content : [])
+            if (block?.type === 'image') delete block.data;
+        }
+        records.push(entry);
+      }
   };
   try {
     const opened = await fd.stat();
@@ -199,8 +214,8 @@ export function sessionEntryIndex(entries, leafId, byId) {
   }
   return byId;
 }
-export async function loadSavedSession(session) {
-  const data = await loadSession(session.file);
+export async function loadSavedSession(session, options) {
+  const data = await loadSession(session.file, options);
   if (data.header.id !== session.header.id || data.header.cwd !== session.header.cwd)
     throw new Error('RUNTIME_SESSION_CHANGED');
   return { ...session, ...data };

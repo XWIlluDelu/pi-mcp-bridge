@@ -102,46 +102,51 @@ test(
 );
 
 test(
-  'a second native prompt cannot donate its preview to an earlier captured history',
+  'a captured native projection keeps its matching preview when a later prompt runs',
   { timeout: 15000 },
   async (t) => {
     const { bridge, session, finish } = await fixture(t);
+    const read = () => bridge.read({ session_id: session.id, max_bytes: 4096 });
+    const preview = async () => {
+      const result = await read();
+      return result.live?.items?.some((u) => u.block?.text) ? result : null;
+    };
     await bridge.send({ session_id: session.id, text: 'PROMPT_A' });
-    const rpc = bridge.pool.get(session.id);
-    await until(() => rpc.liveMessage.snapshot().message?.content.some((b) => b.text));
-    const dispatch = rpc.dispatch,
+    await until(preview);
+    const rpc = bridge.pool.get(session.id),
+      observing = rpc.observeRead.bind(rpc),
       captured = Promise.withResolvers(),
       resume = Promise.withResolvers();
-    let capture = false,
-      holding = false;
+    let holding = false,
+      first;
     t.after(() => resume.resolve());
-    t.mock.method(rpc, 'dispatch', async function (command, ...args) {
-      if (capture && !holding && command.type === 'get_state') {
-        holding = true;
-        captured.resolve();
-        await resume.promise;
-      }
-      const result = await dispatch.call(this, command, ...args);
-      if (command.type === 'get_entries') capture = true;
-      return result;
-    });
-    const reading = bridge.read({ session_id: session.id, max_bytes: 4096 });
+    t.mock.method(rpc, 'observeRead', (work) =>
+      observing(async () => {
+        const result = await work();
+        if (!holding) {
+          holding = true;
+          first = structuredClone(result);
+          captured.resolve();
+          await resume.promise;
+        }
+        return result;
+      }),
+    );
+    const reading = read();
     await captured.promise;
     await finish(1);
     await until(() => rpc.settlement.sequence > 0);
     await bridge.send({ session_id: session.id, text: 'PROMPT_B' });
-    await until(() => rpc.liveMessage.snapshot().message?.content.some((b) => b.text));
+    const current = await until(preview);
     resume.resolve();
     const earlier = await reading;
-    assert.equal(
-      earlier.items.filter((i) => i.type === 'prompt').at(-1).message.content[0].text,
-      'PROMPT_A',
-    );
-    assert.equal(earlier.live.available, false);
-    assert.equal(earlier.live.reason, 'context_changed_during_read');
-    const current = await bridge.read({ session_id: session.id, max_bytes: 4096 });
-    const lastPrompt = current.items.filter((i) => i.type === 'prompt').at(-1);
-    assert.equal(lastPrompt.message.content[0].text, 'PROMPT_B');
-    assert.equal(current.live.prompt_id, lastPrompt.prompt_id);
+    const oldPrompt = earlier.items.findLast((i) => i.type === 'prompt'),
+      newPrompt = current.items.findLast((i) => i.type === 'prompt');
+    assert.equal(oldPrompt.message.content[0].text, 'PROMPT_A');
+    assert.deepEqual(earlier.live, first.live);
+    assert.equal(earlier.live.prompt_id, oldPrompt.prompt_id);
+    assert.equal(newPrompt.message.content[0].text, 'PROMPT_B');
+    assert.equal(current.live.prompt_id, newPrompt.prompt_id);
+    assert.notEqual(current.live.prompt_id, earlier.live.prompt_id);
   },
 );

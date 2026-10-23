@@ -245,16 +245,19 @@ context nor a receipt/completion tracker.
 
 ## Read costs and current components
 
-Saved and owned-RPC first reads acquire native history, select it, sanitize it,
-then materialize the bounded snapshot. Unrelated dangling parents do not
-disqualify a usable current branch. Duplicate IDs, invalid entry shapes and
-cycles encountered during branch traversal still reject; reads do not repair
-the source.
+Saved first reads parse native history and drop image content bytes per record
+before building the projection; raw fork loads preserve those bytes. Unrelated
+dangling parents do not disqualify a usable current branch. Duplicate IDs, invalid
+entry shapes and cycles encountered during branch traversal still reject; reads
+do not repair the source. Owned RPC
+selects and sanitizes inside its Pi observer, transferring the same cleaned read
+contract as companions/hosts rather than the entire raw history. Its live preview
+and committed projection are captured together. No extra history index is kept.
 
 Continuations read only the captured snapshot: they do not fetch entries or
 compute full-history fingerprints.
 
-Companion/host `op:read` replies contain only selected, sanitized snapshots;
+Owner `op:read` replies contain only selected, sanitized snapshots;
 Bridge paginates them uniformly. Their read IPC ceiling applies to the cleaned
 snapshot, not unselected raw history. Attached fork still uses the raw `snapshot`
 operation with its 32 MiB bound; owned fork uses native `get_entries`.
