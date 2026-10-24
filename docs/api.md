@@ -6,18 +6,19 @@ Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are 
 
 A `session_id` is an opaque Bridge ID derived from the canonical native file path and native session identity. It survives restart but can change when that identity moves or is replaced. List permission controls discovery; a known ID remains usable with the permission for the requested operation.
 
-Every mutation call is a new operation, including identical calls. There is no mutation-ID deduplication or result lookup. If a result is lost or unknown, inspect `list` for session activity and `read` for native history before deciding whether to submit again. Retain a returned child `session_id` even if create's initial send failed.
+Every mutation call is a new operation, including identical calls. There is no deduplication or replay. Send/create return a `submission_id` once a target submission is tracked; `submission` can retrieve its admission receipt, including a late native ACK. This ID is not a Pi turn ID or a retry key. If the response itself is lost, or its receipt has expired, inspect `list/read` before deciding whether to submit again. Retain a returned child `session_id` even if create's initial send failed.
 
-| Status     | Meaning                                                                        |
-| ---------- | ------------------------------------------------------------------------------ |
-| `started`  | Pi started a send/create prompt; model execution may still be running.         |
-| `queued`   | Pi queued a send/create prompt.                                                |
-| `handled`  | Native input handling completed, such as an extension command.                 |
-| `accepted` | A command, stop or compact operation returned its native result.               |
-| `rejected` | Definite refusal, explained by `reason`.                                       |
-| `skipped`  | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
-| `unknown`  | Dispatch or outcome is uncertain.                                              |
-| `deleted`  | The session moved to recoverable Bridge trash.                                 |
+| Status       | Meaning                                                                        |
+| ------------ | ------------------------------------------------------------------------------ |
+| `started`    | Pi started a send/create prompt; model execution may still be running.         |
+| `queued`     | Pi queued a send/create prompt.                                                |
+| `handled`    | Native input handling completed, such as an extension command.                 |
+| `dispatched` | An external owner invoked Pi; its public API cannot report native admission.   |
+| `accepted`   | A command, stop or compact operation returned its native result.               |
+| `rejected`   | Definite refusal, explained by `reason`.                                       |
+| `skipped`    | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
+| `unknown`    | Dispatch or outcome is uncertain.                                              |
+| `deleted`    | The session moved to recoverable Bridge trash.                                 |
 
 Tool errors return `isError:true` with `{error:{code:…}}` in text and structured content. An operation may instead return `rejected` or `unknown`. Batch retains each item's result or error independently.
 
@@ -118,11 +119,23 @@ Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 - `steer`: use the native steering queue.
 - `follow_up`: use the native follow-up queue.
 
-Bridge waits for native input admission, not model completion. The result contains `status` (`started`, `queued`, `handled`, `skipped`, `rejected` or `unknown`) and a `reason` when needed. An owner unable to prove admission reports `unknown`; a handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
+Bridge waits for native input admission where observable, not model completion. A tracked submission returns `submission_id` and `status`. Native ACKs establish `started`, `queued` or `handled`; `skipped` and `rejected` mean input was not submitted. An external companion/SDK owner that successfully invokes Pi returns `dispatched, admission:"unobservable"`: delivery to the Pi API is confirmed, but input hooks may still transform, handle or reject it. It is unnecessary to read history merely to confirm that dispatch, and it is unsafe to resend it automatically. A synchronous exception or transport uncertainty remains `unknown`. A handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
 
 Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
 
 Admission that cancelled an unsupported native dialog carries `reason:"EXTENSION_UI_CANCEL_SENT"`. [Runtime lifecycle](runtime.md#shutdown-and-in-flight-acks) describes dialog handling and automatic release.
+
+### Submission receipt
+
+```json
+{ "session_id": "ps_…", "submission_id": "<ID returned by send/create>" }
+```
+
+`submission` returns `{session_id,submission_id,operation,receipt,submitted_at,updated_at,expires_at}`. The receipt contains `status` and optional `reason`/`admission`; it never contains prompt text or model output. After an owned RPC `unknown / ACK_TIMEOUT`, a later matching, identity-validated native ACK updates the same receipt to `started`, `queued`, `handled` or `rejected`. Querying neither resends input nor starts or contacts Pi.
+
+Records are held in Bridge memory for at most one hour, with a limit of 256 newest submissions. Restart or eviction returns `SUBMISSION_UNAVAILABLE`, which says nothing about execution. A retained `unknown` is still uncertain; an external `dispatched` does not later turn into native admission evidence. Query requires current `read` or `send` permission, or current `create` permission for that initial-create receipt, and revalidates the saved session identity. It cannot recover an ID lost with the original response.
+
+Use `list({session_id})` for current activity and `read({session_id})` for current useful content. A submission is not a work unit: several steering/follow-up inputs can share a run, and queued input can be withdrawn. Completion events remain session-wide; read their supplied `leaf_id` to retain that result boundary despite later input. See [collaboration design](collaboration.md).
 
 ### Image input (send and create)
 

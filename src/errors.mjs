@@ -1,6 +1,7 @@
 // Content-free Bridge error codes shared by public results, owner IPC and diagnostics.
 // Arbitrary native/provider exception messages (even uppercase ones) are not codes.
 const codes = new Set([
+  'SUBMISSION_UNAVAILABLE',
   'ACK_TIMEOUT',
   'ATTACHED_OPERATION_FAILED',
   'ATTACHMENT_PROTOCOL_MISMATCH',

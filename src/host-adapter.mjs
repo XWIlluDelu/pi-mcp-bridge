@@ -38,6 +38,8 @@ const fail = (code) => {
   throw new AttachmentFailure(code);
 };
 function receipt(value) {
+  if (value?.status === 'dispatched' && value.admission === 'unobservable')
+    return { status: 'dispatched', admission: 'unobservable' };
   if (value?.status === 'accepted' && ['started', 'queued', 'handled'].includes(value.disposition))
     return { status: 'accepted', disposition: value.disposition };
   if (value?.status === 'skipped' && value.reason === 'busy')
