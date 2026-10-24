@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -46,10 +47,10 @@ for (const operation of ['send', 'create'])
     async (t) => {
       const f = await fixture(t),
         { bridge, id } = f;
+      ackTimeout(t, ['set_model']);
       await fs.writeFile(f.gate + '.hold-selection', 'hold');
       const args = {
         model: choice('vision'),
-        timeout_ms: 50,
         ...(operation === 'create'
           ? { project: f.cwd, text: 'NEVER_SENT' }
           : { session_id: id, text: 'NEVER_SENT' }),

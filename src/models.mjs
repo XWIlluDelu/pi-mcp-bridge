@@ -65,14 +65,8 @@ export function modelInfo(model, getSupportedThinkingLevels) {
     name: textOrNull(model.name),
     input,
     context_window: numberOrNull(model.contextWindow),
-    max_output_tokens: numberOrNull(model.maxTokens),
     // This is the same native helper used by AgentSession, not a Bridge guess.
-    thinking_levels: reasoning === null ? null : getSupportedThinkingLevels(model),
-    input_limits: {
-      max_request_bytes: numberOrNull(model.inputLimits?.maxRequestBytes),
-      images_per_message: numberOrNull(model.inputLimits?.images?.maxPerMessage),
-      images_per_request: numberOrNull(model.inputLimits?.images?.maxPerRequest),
-    },
+    effort: reasoning === null ? null : getSupportedThinkingLevels(model),
   };
 }
 export function catalogPage(models, args = {}, getSupportedThinkingLevels) {

@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -101,6 +102,15 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
       extension,
     ],
   });
+  const agentDir = path.join(f.dir, 'agent');
+  await fs.mkdir(agentDir, { recursive: true });
+  await fs.writeFile(
+    path.join(agentDir, 'settings.json'),
+    JSON.stringify({
+      defaultThinkingLevel: 'low',
+      modelThinkingLevels: { 'model-fixture/reasoner': 'medium' },
+    }),
+  );
   f.cleanups.push(() => client.stop());
   await client.start();
   await client.getState();
@@ -138,6 +148,13 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   assert.deepEqual(
     await f.bridge.set_model({
       session_id: saved.id,
+      model: { provider: 'model-fixture', id: 'reasoner' },
+    }),
+    { model: { provider: 'model-fixture', id: 'reasoner' }, thinking_level: 'high' },
+  );
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: saved.id,
       model: { provider: 'bridge-fixture', id: 'deterministic' },
     }),
     { model: { provider: 'bridge-fixture', id: 'deterministic' }, thinking_level: 'off' },
@@ -154,11 +171,11 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   assert.match(JSON.stringify(raw), /PUBLIC_RPC_INPUT/);
   assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, pid);
   assert.equal(f.spawned(), 0);
+  ackTimeout(t, ['send']);
   const delayedArgs = {
     session_id: saved.id,
 
     text: 'PUBLIC_DELAYED_REPLY',
-    timeout_ms: 50,
   };
   const delayed = await f.bridge.send(delayedArgs);
   assert.equal(delayed.status, 'unknown');
@@ -206,6 +223,7 @@ test('two official SDK sessions in one host PID release independently without sh
     models: [
       { id: 'a', reasoning: false, input: ['text'] },
       { id: 'b', reasoning: true, input: ['text'] },
+      { id: 'c', reasoning: true, input: ['text'] },
     ],
   });
   faux.setResponses([
@@ -228,6 +246,8 @@ test('two official SDK sessions in one host PID release independently without sh
     f.controllers.push(controller);
     const agentDir = path.join(f.dir, saved === savedA ? 'agent-a' : 'agent-b'),
       settings = SettingsManager.inMemory({
+        defaultThinkingLevel: 'low',
+        modelThinkingLevels: { 'host-sdk-fixture/c': 'medium' },
         cacheWarming: 'off',
         retry: { enabled: false },
         compaction: { enabled: false },
@@ -292,6 +312,20 @@ test('two official SDK sessions in one host PID release independently without sh
       model: { provider: hosts[0].session.model.provider, id: hosts[0].session.model.id },
       thinking_level: 'high',
     },
+  );
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: savedA.id,
+      model: { provider: 'host-sdk-fixture', id: 'c' },
+    }),
+    { model: { provider: 'host-sdk-fixture', id: 'c' }, thinking_level: 'high' },
+  );
+  assert.deepEqual(
+    await f.bridge.set_model({
+      session_id: savedA.id,
+      model: { provider: 'host-sdk-fixture', id: 'a' },
+    }),
+    { model: { provider: 'host-sdk-fixture', id: 'a' }, thinking_level: 'off' },
   );
   assert.equal(hosts[1].session.model, neighbor.model);
   assert.equal(hosts[1].session.thinkingLevel, neighbor.level);

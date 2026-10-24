@@ -109,9 +109,10 @@ setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})
   -> Promise<{model:{provider,id}, thinking_level}>
 ```
 
-Await the native setters, retain expected session identity and return the actual
-selection. `beforeDispatch()` checks adapter admission; Stop does not block this
-input-free control. The adapter checks the result against `state()`, drains an
+For model-only changes, preserve the effort current before switching and use the
+native thinking setter for compatible fallback. Await the native setters, retain
+expected session identity and return the actual selection. `beforeDispatch()`
+checks adapter admission; Stop does not block this input-free control. The adapter checks the result against `state()`, drains an
 admitted setter during close/release, and fences overlapping settings/send until
 settlement. Missing support reports `MODEL_SELECTION_UNSUPPORTED`.
 

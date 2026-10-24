@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -112,10 +113,10 @@ test(
   async (t) => {
     const f = await fixture(t);
     await populate(f);
+    ackTimeout(t, ['compact']);
     const result = await f.bridge.compact({
       session_id: f.id,
       instructions: 'HOLD_COMPACT',
-      timeout_ms: 50,
     });
     const runtime = f.bridge.pool.get(f.id);
     assert.equal(result.status, 'unknown');

@@ -93,12 +93,12 @@ The pinned SDK supports initialization-based revisions `2025-11-25`, `2025-06-18
 
 JSON-RPC IDs identify communication exchanges; reusing one does not deduplicate a mutation. After a lost/unknown result, follow the [API outcome guidance](api.md#sessions-and-mutations). Reconnection neither recovers a lost result nor replays work.
 
-| Budget              | Limit                                | Effect                                                            |
-| ------------------- | ------------------------------------ | ----------------------------------------------------------------- |
-| HTTP headers/upload | 10 / 15 seconds                      | Bounds incoming request handling.                                 |
-| HTTP response wait  | 35 seconds after parsing             | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues. |
-| Tool `timeout_ms`   | Tool-specific acknowledgement budget | Does not bound model execution or kill a shell command.           |
-| Proxy network wait  | 40 seconds                           | Exceeds the backend response wait.                                |
+| Budget              | Limit                          | Effect                                                              |
+| ------------------- | ------------------------------ | ------------------------------------------------------------------- |
+| HTTP headers/upload | 10 / 15 seconds                | Bounds incoming request handling.                                   |
+| HTTP response wait  | 35 seconds after parsing       | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues.   |
+| Native/owner ACK    | Internal 5 seconds per request | Does not bound execution or abort admitted work. No tool parameter. |
+| Proxy network wait  | 40 seconds                     | Exceeds the backend response wait.                                  |
 
 A client or tunnel may impose a shorter deadline. While the service runs, protocol cancellation, HTTP disconnect and proxy exit suppress replies without cancelling admitted calls or later admitted batch items. On modern stdio, `notifications/cancelled` suppresses that request's subsequent messages. Direct stdio EOF instead shuts down the owned service as described above. Use `stop` to cancel Pi execution and queues.
 

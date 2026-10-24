@@ -1,4 +1,4 @@
-import { batchSchema, publicOperationSchemas } from './tool-schemas.mjs';
+import { batchSchema, batchOperationSchema, publicOperationSchemas } from './tool-schemas.mjs';
 import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
 import { publicError } from './errors.mjs';
 
@@ -23,15 +23,9 @@ function planBatch(operations) {
     wireShare = Math.floor((TOOL_RESULT_LIMIT - toolResultBytes(frame)) / count);
   return operations.map((item, index) => {
     const op = item?.op,
-      schema = Object.hasOwn(publicOperationSchemas, op) ? publicOperationSchemas[op] : null,
+      schema = batchOperationSchema.safeParse(item).success ? publicOperationSchemas[op] : null,
       parsed = schema?.safeParse(item?.args);
-    if (
-      !item ||
-      typeof item !== 'object' ||
-      Array.isArray(item) ||
-      Object.keys(item).some((key) => !['op', 'args'].includes(key)) ||
-      !parsed?.success
-    )
+    if (!parsed?.success)
       return {
         index,
         op: typeof op === 'string' ? op.slice(0, 64) : null,
