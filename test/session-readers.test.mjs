@@ -292,6 +292,11 @@ test('one read entry routes live and saved session evidence, pages frozen contex
     assert.ok(JSON.stringify(adapted).includes('NATIVE_ANSWER'));
     for (const [key, value] of Object.entries(args)) assert.deepEqual(requests.at(-1)[key], value);
   }
+  const emptyBranch = await f.call({ session_id: withMemory.id, leaf_id: null });
+  assert.equal(emptyBranch.leaf_id, null);
+  assert.equal(requests.at(-1).leaf_id, null);
+  assert.ok(JSON.stringify(emptyBranch.items).includes('PERSISTED_MEMORY'));
+  assert.ok(!JSON.stringify(emptyBranch.items).includes('NATIVE_'));
   await runtime.gracefulExit();
   const persisted = await f.call({ session_id: withMemory.id });
   assert.equal(persisted.reader.id, 'fixture-memory');

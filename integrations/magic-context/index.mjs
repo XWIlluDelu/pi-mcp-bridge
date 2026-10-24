@@ -21,6 +21,7 @@ const COLUMNS = {
     'p1',
     'p2',
     'p3',
+    'p4',
     'start_message_id',
     'end_message_id',
     'start_block_index',
@@ -289,7 +290,10 @@ export function createMagicContextReader(options) {
           .prepare(
             `SELECT id, sequence, title, content, p1, p2, p3, start_message_id, end_message_id,
              start_block_index, end_block_index, rebase_status, created_at
-           FROM compartments WHERE session_id = ? AND harness = 'pi' ORDER BY sequence ASC, id ASC`,
+           FROM compartments WHERE session_id = ? AND harness = 'pi'
+             AND (title <> '' OR content <> '' OR COALESCE(p1, '') <> ''
+               OR COALESCE(p2, '') <> '' OR COALESCE(p3, '') <> '' OR COALESCE(p4, '') <> '')
+           ORDER BY sequence ASC, id ASC`,
           )
           .all(context.session.native_id);
         const memories = db

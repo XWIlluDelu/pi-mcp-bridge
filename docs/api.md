@@ -55,7 +55,7 @@ Connected runtimes also expose `capabilities:{send,command,stop}`. Values are tr
 ```
 
 `read` defaults to a brief task/result overview, active summaries and compact tool
-activity with references. `preset:"recent"` adds the last three prompts;
+activity with references. `preset:"recent"` selects the last three prompts;
 `preset:"full"` selects the full effective source. `detail:"full"` returns selected
 source units directly. `select` adjusts Session Context content; `types` filters
 brief item kinds. Full effective context includes active compaction summaries and

@@ -19,7 +19,7 @@ const schema = `
   CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, harness TEXT, counter INTEGER, cached_m0_bytes BLOB);
   CREATE TABLE compartments(
     id INTEGER PRIMARY KEY, session_id TEXT, harness TEXT, sequence INTEGER,
-    title TEXT, content TEXT, p1 TEXT, p2 TEXT, p3 TEXT,
+    title TEXT, content TEXT, p1 TEXT, p2 TEXT, p3 TEXT, p4 TEXT,
     start_message_id TEXT, end_message_id TEXT, start_block_index INTEGER, end_block_index INTEGER,
     rebase_status TEXT DEFAULT 'ok', created_at INTEGER
   );
@@ -62,6 +62,7 @@ async function fixture(t) {
       p1: 'Detailed summary',
       p2: 'Brief with anchors',
       p3: 'Decision',
+      p4: null,
       start_message_id: 'entry-start',
       end_message_id: 'entry-end',
       start_block_index: null,
@@ -277,13 +278,16 @@ test('stored content uses brief/detail tiers and honest source relationships wit
   );
 });
 
-test('presets bound current summaries and eligible memories independently of detail', async (t) => {
+test('presets select real summaries and eligible memories, excluding empty boundary markers', async (t) => {
   const f = await fixture(t);
   for (let id = 1; id <= 6; id++) f.compartment({ id, sequence: id });
   for (let id = 1; id <= 8; id++) {
     f.memory({ id, importance: id === 2 ? 95 : 50, updated_at: id * 1000 });
   }
   f.compartment({ id: 7, session_id: 'other-session' });
+  // MC keeps all-empty compartments to track excluded raw rows, not as summaries.
+  for (const id of [8, 9])
+    f.compartment({ id, sequence: id, title: '', content: '', p1: null, p2: null, p3: null });
   f.memory({ id: 9, status: 'archived' });
   f.memory({ id: 10, project_path: 'other-project' });
   const reader = createMagicContextReader({ database: f.database });
