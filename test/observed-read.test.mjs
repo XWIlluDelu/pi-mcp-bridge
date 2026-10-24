@@ -95,11 +95,11 @@ async function pages(bridge, first) {
 }
 
 test(
-  'observed capture survives no-prompt cold starts and release, then updates on the next prompt',
+  'runtime capture survives no-prompt cold starts and release, then updates on the next prompt',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t),
-      read = () => f.bridge.read({ session_id: f.id, view: 'observed', max_bytes: 4096 });
+      read = () => f.bridge.read({ session_id: f.id, view: 'runtime', max_bytes: 4096 });
     assert.equal((await read()).observation.reason, 'no_retained_observation');
     assert.equal(f.runtimes.length, 0);
     await f.bridge.send({ session_id: f.id, text: 'DROP_FROM_REQUEST' });
@@ -117,7 +117,7 @@ test(
     assert.ok(!JSON.stringify(units).includes('LATER_FULL_CONTEXT_HOOK'));
     assert.ok(!JSON.stringify(units).includes('Synthetic response 1.'));
     const native = await f.bridge.read({ session_id: f.id, preset: 'full' });
-    assert.equal(native.view, 'native');
+    assert.equal(native.view, 'session');
     assert.ok(JSON.stringify(native).includes('DROP_FROM_REQUEST'));
     assert.ok(JSON.stringify(native).includes('Synthetic response 1.'));
     assert.equal(await fs.readFile(f.session.file, 'utf8'), before);
@@ -128,13 +128,13 @@ test(
       method: 'tools/call',
       params: {
         name: 'read',
-        arguments: { session_id: f.id, view: 'observed', max_bytes: 4096 },
+        arguments: { session_id: f.id, view: 'runtime', max_bytes: 4096 },
         _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
       },
     });
     assert.equal(mcp.message.result.structuredContent.observation.id, first.observation.id);
     const batch = await executeBatch(f.bridge, {
-      operations: [{ op: 'read', args: { session_id: f.id, view: 'observed', max_bytes: 4096 } }],
+      operations: [{ op: 'read', args: { session_id: f.id, view: 'runtime', max_bytes: 4096 } }],
     });
     assert.equal(batch.results[0].result.observation.id, first.observation.id);
     f.config.grants[0].read = false;
@@ -158,7 +158,10 @@ test(
       assert.equal(saved.observation.available, true);
       for (const key of ['id', 'observed_at', 'owner_generation', 'input_leaf_id'])
         assert.equal(saved.observation[key], first.observation[key], key);
-      assert.deepEqual(await pages(f.bridge, saved), units);
+      assert.deepEqual(
+        (await pages(f.bridge, saved)).map(({ ref, ...item }) => item),
+        units.map(({ ref, ...item }) => item),
+      );
     }
     await f.bridge.send({ session_id: f.id, text: 'KEPT_TAIL' });
     await f.released();
@@ -188,7 +191,7 @@ test('an uncaptured live owner validates retained context against its active bra
       getEntries: () => entries,
     },
   };
-  const args = { session_id: f.id, view: 'observed' };
+  const args = { session_id: f.id, view: 'runtime' };
   const previous = new ContextObservation('previous');
   previous.capture({ messages: [{ role: 'user', content: 'RETAINED_CONTEXT' }] }, ctx);
   f.bridge.pool.observations.put(f.session, previous.read(args, ctx), {});
@@ -216,7 +219,7 @@ test('an uncaptured live owner validates retained context against its active bra
   assert.equal(same.observation.owner_active, false);
   assert.equal(same.observation.current_leaf_id, 'tail');
   assert.equal(same.observation.later_committed_entries, 1);
-  assert.equal(same.items[0].message.content, 'RETAINED_CONTEXT');
+  assert.equal(same.items[0].text, 'RETAINED_CONTEXT');
 });
 
 const gate = () => {
@@ -274,7 +277,7 @@ for (const change of ['newer_capture', 'failed_capture', 'new_owner']) {
       }
       return value;
     });
-    const read = () => f.bridge.read({ session_id: f.id, view: 'observed' });
+    const read = () => f.bridge.read({ session_id: f.id, view: 'runtime' });
     const older = read();
     t.after(() => proceed.resolve());
     await held.promise;

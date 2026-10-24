@@ -93,6 +93,7 @@ test('history larger than 32 MiB remains locatable, readable, sendable and delet
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
   const context = await f.bridge.read({
     session_id: f.session.id,
+    detail: 'full',
     preset: 'full',
     max_bytes: 4096,
   });
@@ -159,7 +160,10 @@ test('missing cwd retains project history and deletion rights without permitting
   assert.equal(identity.projectCwd, f.cwd);
   assert.equal(identity.header.cwd, f.cwd);
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
-  assert.deepEqual((await f.bridge.read({ session_id: f.session.id })).items, previous.items);
+  assert.deepEqual(
+    (await f.bridge.read({ session_id: f.session.id })).items.map(({ ref, ...item }) => item),
+    previous.items.map(({ ref, ...item }) => item),
+  );
   assert.equal(
     (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
