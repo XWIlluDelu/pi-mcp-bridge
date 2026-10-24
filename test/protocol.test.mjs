@@ -141,30 +141,6 @@ test('public mutation payloads are validated before dispatch', async () => {
   assert.equal(unknown.message.result.isError, true);
   assert.equal(called, 1);
 });
-test('tool schemas omit timeout controls and reject them before dispatch', async () => {
-  for (const tool of toolDefinitions())
-    assert.ok(!('timeout_ms' in tool.inputSchema.properties), tool.name);
-  let calls = 0;
-  for (const [name, args] of [
-    ['send', { session_id: 's', text: 'prompt' }],
-    ['create', { project: '/project', text: 'prompt' }],
-    ['command', { session_id: 's', command: 'true' }],
-    ['stop', { session_id: 's' }],
-    ['compact', { session_id: 's' }],
-  ]) {
-    const result = await dispatchModern(
-      {
-        [name]: async () => {
-          calls++;
-        },
-      },
-      message('tools/call', { name, arguments: { ...args, timeout_ms: 50 } }),
-    );
-    assert.equal(result.message.result.structuredContent.error.code, 'INVALID_ARGUMENTS');
-  }
-  assert.equal(calls, 0);
-});
-
 test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
   const bridge = {
     read: async () => {

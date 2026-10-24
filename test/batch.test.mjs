@@ -82,7 +82,7 @@ test('MCP discovery describes batch items and both protocol paths retain per-ite
       { op: 'health', args: {}, extra: true },
       { op: 'send', args: { session_id: 'a', text: '' } },
       { op: 'set_model', args: { session_id: 'a' } },
-      { op: 'command', args: { session_id: 'a', command: 'true', timeout_ms: 50 } },
+      { op: 'command', args: { session_id: 'a', command: 'true', unexpected: true } },
       { op: 'health', args: {} },
     ],
   };

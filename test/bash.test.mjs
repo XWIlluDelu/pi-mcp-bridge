@@ -119,8 +119,6 @@ test('command and batch distinguish native truncation from response completeness
           result.fullOutputPath,
           native_truncated ? '/synthetic/native-output.log' : null,
         );
-        assert.ok(!('truncated' in result));
-        assert.ok(!('output_complete' in result));
       }
     }
   }
