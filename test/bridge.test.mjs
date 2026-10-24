@@ -441,9 +441,12 @@ test('recorded project history remains listed while a symlink cannot redirect co
     [{ session_id: f.id, project: link }],
   );
   assert.equal((await f.bridge.session(f.id)).cwd, null);
-  assert.deepEqual(await f.bridge.send({ session_id: f.id, text: 'hello' }), {
+  const rejected = await f.bridge.send({ session_id: f.id, text: 'hello' });
+  assert.match(rejected.submission_id, /^[a-f0-9-]{36}$/);
+  assert.deepEqual(rejected, {
     status: 'rejected',
     reason: 'EXECUTION_CWD_UNAVAILABLE',
+    submission_id: rejected.submission_id,
   });
   assert.equal(f.runtime.resumes, 0);
   assert.deepEqual(f.runtime.calls, []);
@@ -505,7 +508,9 @@ test('shutdown rejects new work and drains an admitted send before closing its r
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(closed, false);
   release.resolve();
-  assert.deepEqual(await sending, { status: 'started' });
+  const sent = await sending;
+  assert.match(sent.submission_id, /^[a-f0-9-]{36}$/);
+  assert.deepEqual(sent, { status: 'started', submission_id: sent.submission_id });
   await closing;
   assert.equal(f.runtime.alive, false);
 });

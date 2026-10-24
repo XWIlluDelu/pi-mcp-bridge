@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import { EventSubscriptions } from './events.mjs';
+import { Submissions } from './submissions.mjs';
 import { publicError } from './errors.mjs';
 import path from 'node:path';
 import { compactReceipt, nativeCompactReason } from './compact.mjs';
@@ -89,6 +90,7 @@ export class Bridge {
     this.readCache = new ContextReadCache();
     this.autoReleases = new Set();
     this.events = new EventSubscriptions(this);
+    this.submissions = new Submissions();
     this.pool.onIdleCandidate = (runtime) => scheduleAutoRelease(this, runtime);
   }
   async init() {
@@ -275,6 +277,26 @@ export class Bridge {
   }
   send(args, options) {
     return this.#mutation('send', args, options, this.#send);
+  }
+  async submission(args, { requestContext } = {}) {
+    if (!publicOperationSchemas.submission.safeParse(args).success)
+      throw new Error('INVALID_ARGUMENTS');
+    requestContext = await (requestContext ?? this.captureRequestContext());
+    this.assertOpen();
+    const session = await this.session(args.session_id, requestContext);
+    if (
+      !['read', 'send', 'create'].some((action) =>
+        permitted(requestContext.permissions, action, session),
+      )
+    )
+      throw new Error('NOT_FOUND_OR_DENIED');
+    const record = this.submissions.get(session.id, args.submission_id);
+    if (
+      !['read', 'send'].some((action) => permitted(requestContext.permissions, action, session)) &&
+      !(record.operation === 'create' && permitted(requestContext.permissions, 'create', session))
+    )
+      throw new Error('NOT_FOUND_OR_DENIED');
+    return record;
   }
   create(args, options) {
     return this.#mutation('create', args, options, this.#create);
@@ -770,6 +792,12 @@ export class Bridge {
         };
       return this.mutationLock(args.session_id, 'send', requestContext, async () => {
         const selection = {};
+        const submissionId = this.submissions.start(target.id, 'send');
+        const outcome = (receipt) => ({
+          ...selection,
+          ...(this.submissions.update(submissionId, receipt) ?? receipt),
+          submission_id: submissionId,
+        });
         let runtime;
         try {
           beforeDispatch();
@@ -788,12 +816,15 @@ export class Bridge {
           const authorized = beforeDispatch;
           await authorized();
           if (runtime.attached)
-            return attachedPromptResult(
-              await runtime.send({ ...args, ...body, beforeDispatch: authorized }),
+            return outcome(
+              attachedPromptResult(
+                await runtime.send({ ...args, ...body, beforeDispatch: authorized }),
+              ),
             );
           if (hasPromptSettings(body) && body.mode === 'idle_only') {
             const idle = await runtime.idleSnapshot();
-            if (idle.status === 'busy') return { ...selection, status: 'skipped', reason: 'busy' };
+            if (idle.status === 'busy')
+              return outcome({ ...selection, status: 'skipped', reason: 'busy' });
             if (idle.status !== 'idle') throw new Error('MODEL_SELECTION_IDLE_UNCONFIRMED');
           }
           if (hasPromptSettings(body)) {
@@ -817,32 +848,33 @@ export class Bridge {
               state.isIdle === false ||
               state.pendingMessageCount > 0
             )
-              return { ...selection, status: 'skipped', reason: 'busy' };
+              return outcome({ ...selection, status: 'skipped', reason: 'busy' });
           }
           await authorized();
           const command = {
+            id: submissionId,
             type: 'prompt',
             message: body.text,
             ...(body.images ? { images: body.images } : {}),
             // Native admission must also refuse a hook that turns busy after selection.
             ...promptOptions(hasPromptSettings(body) ? 'idle_only' : body.mode),
           };
-          const late = () => {}; // Keep native late-ACK identity validation.
+          const late = (result) => this.submissions.update(submissionId, promptResult(result));
           if (!runtime.modelMutation && !runtime.compactionMutation && !runtime.promptAdmission)
             markForAutoRelease(runtime);
           const result = await runtime.command(command, undefined, late, () =>
             beforePromptDispatch(runtime, body, selection, authorized),
           );
-          return { ...selection, ...promptResult({ ok: true, data: result }) };
+          return outcome({ ...selection, ...promptResult({ ok: true, data: result }) });
         } catch (e) {
-          return {
+          return outcome({
             ...selection,
             ...promptResult({
               ok: false,
               code: safeReason(e),
               uncertain: e.uncertain,
             }),
-          };
+          });
         }
       });
     });
@@ -949,14 +981,19 @@ export class Bridge {
       };
     const input = promptInput(args);
     let child,
+      submissionId,
       created = false;
     const selection = {};
-    const outcome = (send) => ({
-      status: send.status,
-      created,
-      session_id: child?.id,
-      send: { ...selection, ...send },
-    });
+    const outcome = (send) => {
+      if (submissionId) send = this.submissions.update(submissionId, send) ?? send;
+      return {
+        status: send.status,
+        created,
+        session_id: child?.id,
+        ...(submissionId ? { submission_id: submissionId } : {}),
+        send: { ...selection, ...send },
+      };
+    };
     try {
       await validateExecutionCwd(folder.path);
       let parent, snapshot;
@@ -996,6 +1033,7 @@ export class Bridge {
           await beforeDispatch();
           await persistSession(child);
           created = true;
+          submissionId = this.submissions.start(child.id, 'create');
 
           const runtime = await this.pool.resolve(child);
           markForAutoRelease(runtime);
@@ -1013,9 +1051,10 @@ export class Bridge {
             };
             await beforeDispatch();
           }
-          const onLate = () => {}; // No public late-result lookup.
+          const onLate = (result) => this.submissions.update(submissionId, promptResult(result));
           const result = await runtime.command(
             {
+              id: submissionId,
               type: 'prompt',
               message: input.text,
               ...(input.images ? { images: input.images } : {}),

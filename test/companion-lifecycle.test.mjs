@@ -486,7 +486,7 @@ for (const outcome of ['handled', 'rejected'])
       f.finishers.push(() => finish.resolve());
       assert.equal(
         (await f.bridge.send({ session_id: f.a.id, text: 'FIRST_PREFLIGHT' })).status,
-        'unknown',
+        'dispatched',
       );
       await entered.promise;
       const session = f.runtime.session;
@@ -499,7 +499,12 @@ for (const outcome of ['handled', 'rejected'])
         text: 'SECOND_IDLE_ONLY',
         mode: 'idle_only',
       });
-      assert.deepEqual(skipped, { status: 'skipped', reason: 'busy' });
+      assert.match(skipped.submission_id, /^[a-f0-9-]{36}$/);
+      assert.deepEqual(skipped, {
+        status: 'skipped',
+        reason: 'busy',
+        submission_id: skipped.submission_id,
+      });
       assert.deepEqual(session.sessionManager.getEntries(), entries);
       assert.equal(f.faux.state.callCount, calls);
       finish.resolve();
@@ -512,7 +517,7 @@ for (const outcome of ['handled', 'rejected'])
             mode: 'idle_only',
           })
         ).status,
-        'unknown',
+        'dispatched',
       );
       await until(() => f.faux.state.callCount > calls && session.isIdle);
       const current = await f.bridge.read({ session_id: f.a.id, preset: 'full' });

@@ -136,7 +136,7 @@ test('native setter identity changes block the second step and overlapping sette
   assert.equal(thinkingCalls, 0);
 });
 
-test('SDK dispatch reports unknown without waiting for completion and tracks drain', async () => {
+test('SDK dispatch confirms invocation without claiming admission or waiting for completion', async () => {
   const completion = Promise.withResolvers(),
     calls = [];
   let released = false;
@@ -154,8 +154,8 @@ test('SDK dispatch reports unknown without waiting for completion and tracks dra
     },
   );
   assert.deepEqual(await binding.submit({ text: 'public', mode: 'steer' }), {
-    status: 'unknown',
-    reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
+    status: 'dispatched',
+    admission: 'unobservable',
   });
   assert.deepEqual(calls, [['public', { streamingBehavior: 'steer' }]]);
   assert.equal(released, false);
@@ -163,7 +163,7 @@ test('SDK dispatch reports unknown without waiting for completion and tracks dra
   assert.equal(released, true);
 });
 
-test('SDK completion failure stays unknown and raw failures remain host-local', async () => {
+test('SDK later failure does not rewrite dispatch evidence and synchronous failure remains unknown', async () => {
   const completion = Promise.withResolvers(),
     errors = [];
   const binding = createSdkHostBinding(
@@ -173,7 +173,7 @@ test('SDK completion failure stays unknown and raw failures remain host-local', 
   const receipt = await binding.submit({ text: 'public', mode: 'follow_up' });
   completion.reject(new Error('PRIVATE_PROVIDER_ERROR'));
   await tick();
-  assert.equal(receipt.status, 'unknown');
+  assert.deepEqual(receipt, { status: 'dispatched', admission: 'unobservable' });
   assert.equal(errors.length, 1);
   assert.equal(JSON.stringify(receipt).includes('PRIVATE'), false);
   const sync = createSdkHostBinding(

@@ -459,8 +459,10 @@ export class PiRpc {
       return Promise.reject(new RpcFailure('MODEL_SELECTION_PENDING'));
     if (['prompt', 'compact'].includes(command.type) && this.promptAdmission)
       return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
-    const id = randomUUID(),
+    const id = command.id ?? randomUUID(),
       generation = this.generation;
+    if (typeof id !== 'string' || !id.length || id.length > 128 || this.pending.has(id))
+      return Promise.reject(new RpcFailure('INVALID_ARGUMENTS'));
     const serialized = `${JSON.stringify({ ...command, id })}\n`;
     if (command.type === 'prompt') this.promptAdmission = { id, generation };
     if (['set_model', 'set_thinking_level'].includes(command.type))

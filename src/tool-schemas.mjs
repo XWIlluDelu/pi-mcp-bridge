@@ -40,6 +40,7 @@ export const publicOperationSchemas = {
       { message: 'active_after must not exceed active_before' },
     ),
   models: modelsSchema,
+  submission: z.object({ session_id: id, submission_id: z.string().uuid() }).strict(),
   set_model: z
     .object({ session_id: id, ...modelSettingsSchema.innerType().shape })
     .strict()
@@ -137,7 +138,38 @@ const readableResult = z
 const readableEnvelope = readableResult.partial().extend({
   error: z.object({ code: z.string() }).passthrough().optional(),
 });
-export const publicOutputSchemas = { read: readableEnvelope, search: readableEnvelope };
+export const publicOutputSchemas = {
+  read: readableEnvelope,
+  search: readableEnvelope,
+  submission: z.object({
+    session_id: z.string().optional(),
+    submission_id: z.string().optional(),
+    operation: z.enum(['send', 'create']).optional(),
+    receipt: z
+      .object({
+        status: z.enum([
+          'pending',
+          'started',
+          'queued',
+          'handled',
+          'dispatched',
+          'skipped',
+          'rejected',
+          'unknown',
+        ]),
+        reason: z.string().optional(),
+        admission: z.literal('unobservable').optional(),
+      })
+      .optional(),
+    submitted_at: z.string().optional(),
+    updated_at: z.string().optional(),
+    expires_at: z.string().optional(),
+    error: z.object({ code: z.string() }).passthrough().optional(),
+  }),
+};
 export const publicAnnotations = Object.fromEntries(
-  ['read', 'search'].map((name) => [name, { readOnlyHint: true, destructiveHint: false }]),
+  ['read', 'search', 'submission'].map((name) => [
+    name,
+    { readOnlyHint: true, destructiveHint: false },
+  ]),
 );
