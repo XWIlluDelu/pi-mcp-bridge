@@ -76,7 +76,7 @@ amount of content per selected item; `preset:"full"` controls the selected range
 | `detail`      | Default `brief` returns excerpts and refs; `full` returns selected source units.                     |
 | `types`       | Optional content kinds from item `type` values; applies to brief browsing.                           |
 | `refs`        | One to eight references from one capture. Only optional `session_id` and `max_bytes` accompany refs. |
-| `cursor`      | Opaque backward continuation of a captured result.                                                   |
+| `cursor`      | Opaque continuation of a captured result.                                                            |
 | `max_bytes`   | UTF-8 limit for the whole structured page: default 24000, range 4096–65536.                          |
 | `leaf_id`     | Optional native leaf; explicit `null` means the empty root.                                          |
 
@@ -98,10 +98,17 @@ They cannot cross Bridge instances.
 ## Brief content
 
 Brief items have `type`, `text`, `ref`, source locators and optional `title` and
-`related` references. Search results include `matches`; supplied `types` filters
-are echoed in the result. Pagination counts distinguish earlier content
-still available from newer content already covered. Text excerpts can be shorter
-than their source; expanding the ref retrieves its captured content.
+`related` references. Session and adapted browsing put the latest selected input
+and its latest assistant reply first, followed by summaries and memories, then
+remaining activity from newest to oldest. These are selected source excerpts;
+the reader does not generate a new task summary. Large previews share the page
+budget so a long input can appear alongside its answer.
+
+All selected text blocks from one assistant message share one brief item and ref.
+Explicit text selectors still count blocks; grouping does not restore unselected
+content. Search results include `matches`; supplied `types` filters are echoed in
+the result. Text excerpts can be shorter than their source; expanding the ref
+retrieves its captured content.
 
 Logical tool calls and results are grouped before previewing. Tool previews name
 the tool and common target fields, indicate recorded result/error status, and show
@@ -114,8 +121,10 @@ longer text for search and expansion. Current native task/progress content can b
 included alongside extension memories through the shared reader contract.
 
 A reader may return `reader.coverage` rows such as
-`{type:"memory",selected:3,total:12}`. These count its captured versus eligible
-items within its documented scope, before pagination or search-result filtering.
+`{type:"memory",selected:3,total:12}`. `total` counts items in its declared source
+scope before branch or preset selection; `selected` counts captured items before
+pagination or search-result filtering. Optional `excluded` counts items from that
+total removed by selection rules, such as other-branch summaries.
 They explain a small default overview without implying that every stored extension
 record was read. Cursor pages and refs cannot recover unselected items: request
 `recent`, `full`, or use search to locate evidence in the reader's full supported
@@ -296,10 +305,13 @@ disabling it and restarting restores ordinary custom-message reading.
 
 ## Capacity and continuation
 
-The first page holds the newest selected items or units that fit, in source order;
-`next_cursor` moves backward. `omissions.selection` counts excluded native logical
-records. `omissions.capacity.earlier_units` and `later_units` locate a page within
-the capture; later units are already-covered newer content.
+Brief Session/adapted pages follow the task-first navigation order above.
+Full-content, Runtime and search pages start with the newest selected source
+items or units that fit, in source order, then move backward. In either case,
+`next_cursor` continues the same frozen capture. `omissions.selection` counts
+excluded native logical records. `omissions.capacity.remaining_units` counts
+items available through continuation; `previous_units` counts items on preceding
+pages. Neither count means that the source contains no other unselected content.
 
 Small blocks stay whole. Long prose splits at paragraphs/lines, then whitespace
 or Unicode code-point boundaries. Parts retain source/tool links and may carry

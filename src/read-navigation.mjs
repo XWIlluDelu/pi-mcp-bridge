@@ -41,6 +41,7 @@ export function fitNavigationRow(row, fits) {
 function messageText(message, { metadata = false } = {}) {
   if (!message) return '';
   const texts = [];
+  if (metadata && message.toolName) texts.push(message.toolName);
   if (typeof message.command === 'string') texts.push(`command: ${message.command}`);
   if (message.role === 'bashExecution')
     texts.push(
@@ -104,20 +105,32 @@ const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot
 export const documentUnits = docUnits;
 export function documentText(snapshot, doc) {
   const units = docUnits(snapshot, doc);
+  let body = '',
+    previousBlock;
+  for (const unit of units) {
+    const text = unitBodyText(unit, true);
+    if (!text) continue;
+    const block = unit.source?.block_index ?? unit.source?.content_index;
+    if (block !== undefined && previousBlock !== undefined && block !== previousBlock) body += '\n';
+    body += text;
+    previousBlock = block;
+  }
   // Split bodies repeat their stop reason, while the error detail lives once
   // in shared metadata. Keep each failure fact once beside the complete text.
-  return [assistantFailure(units), units.map((unit) => unitBodyText(unit, true)).join('')]
-    .filter(Boolean)
-    .join('\n');
+  return [assistantFailure(units), body].filter(Boolean).join('\n');
 }
 
-function key(unit, index) {
+const blockKey = (source) =>
+  `${source.entry_id}:${source.message_index ?? ''}:${source.block_index ?? ''}`;
+function key(unit, index, textBlocks) {
   if (unit.tool_id) return `tool:${unit.tool_id}`;
   const s = unit.source ?? {};
   if (s.reader_item !== undefined) return `item:${s.reader_item}`;
   if (s.observation_index !== undefined) return `runtime:${s.observation_index}`;
-  if (s.entry_id !== undefined)
+  if (s.entry_id !== undefined) {
+    if (textBlocks.has(blockKey(s))) return `session:${s.entry_id}:${s.message_index ?? ''}:text`;
     return `session:${s.entry_id}:${s.message_index ?? ''}:${s.block_index ?? ''}`;
+  }
   return `unit:${index}`;
 }
 
@@ -164,8 +177,15 @@ function toolPreview(units) {
 
 export function navigationDocuments(snapshot) {
   const grouped = new Map();
+  // Selectors still count blocks. The brief/ref unit is the selected text of a
+  // whole assistant message, including metadata split away from those blocks.
+  const textBlocks = new Set(
+    snapshot.units
+      .filter((u) => u.type === 'text' && u.source?.entry_id !== undefined)
+      .map((u) => blockKey(u.source)),
+  );
   snapshot.units.forEach((u, i) => {
-    const id = key(u, i);
+    const id = key(u, i, textBlocks);
     if (!grouped.has(id))
       grouped.set(id, {
         id,
@@ -189,6 +209,13 @@ export function navigationDocuments(snapshot) {
     doc.title = body.title;
     doc.preview = body.preview;
     doc.related = body.related;
+    doc.assistant =
+      (doc.kind === 'text' && body.source?.entry_id !== undefined) ||
+      (doc.kind === 'native' && body.message?.role === 'assistant');
+    if (doc.kind === 'text' && doc.source?.entry_id !== undefined) {
+      const { block_index, ...messageSource } = doc.source;
+      doc.source = messageSource;
+    }
     if (body.provenance) doc.source = { ...doc.source, ...body.provenance };
     if (
       typeof body.provenance?.source_entry_id === 'string' &&
@@ -238,7 +265,12 @@ export function navigationDocuments(snapshot) {
   return docs;
 }
 
-export function navigationRows(snapshot, documents, ref, { query, types } = {}) {
+export function navigationRows(
+  snapshot,
+  documents,
+  ref,
+  { query, types, task_order = false } = {},
+) {
   const matching = documents
     .map((doc, index) => ({ doc, index }))
     .filter(
@@ -251,36 +283,51 @@ export function navigationRows(snapshot, documents, ref, { query, types } = {}) 
           : doc.parent === undefined),
     );
   const parents = new Set(matching.map(({ doc }) => doc.parent).filter((x) => x !== undefined));
-  return matching
-    .filter(({ index }) => !query || !parents.has(index))
-    .map(({ doc, index }) => {
-      const related = (doc.related ?? [])
-        .map((link) => {
-          const target = documents.findIndex((d) => d.id === `item:${link.id}`);
-          return target >= 0 ? { relation: link.relation, ref: ref(target) } : null;
-        })
-        .filter(Boolean);
-      if (doc.parent !== undefined) related.push({ relation: 'parent', ref: ref(doc.parent) });
-      if (doc.sourceIndex !== undefined)
-        related.push({ relation: 'source_context', ref: ref(doc.sourceIndex) });
-      const children = doc.children ?? [];
-      const salient = children.filter((i) =>
-        documentText(snapshot, documents[i]).includes('"status":"error"'),
-      );
-      for (const i of [...new Set([...salient.slice(0, 3), ...children.slice(-2)])])
-        related.push({ relation: 'operation', ref: ref(i) });
-      return {
-        type: doc.kind,
-        ref: ref(index),
-        ...(doc.title ? { title: doc.title } : {}),
-        text: query
-          ? excerpt(documentText(snapshot, doc), 640, query)
-          : excerpt(
-              doc.preview ?? documentText(snapshot, doc),
-              doc.kind === 'prompt' || doc.kind === 'text' ? 1600 : 900,
-            ),
-        ...(doc.source ? { source: doc.source } : {}),
-        ...(related.length ? { related } : {}),
-      };
-    });
+  let selected = matching.filter(({ index }) => !query || !parents.has(index));
+  if (task_order) {
+    const prompt = selected.findLast(({ doc }) => doc.kind === 'prompt');
+    const answer = selected.findLast(
+      ({ doc, index }) => doc.assistant && (!prompt || index > prompt.index),
+    );
+    const priority = new Set([prompt?.index, answer?.index].filter((index) => index !== undefined));
+    const background = selected
+      .filter(({ doc, index }) => !priority.has(index) && ['summary', 'memory'].includes(doc.kind))
+      .reverse();
+    for (const { index } of background) priority.add(index);
+    selected = [
+      ...[prompt, answer].filter(Boolean),
+      ...background,
+      ...selected.filter(({ index }) => !priority.has(index)).reverse(),
+    ];
+  }
+  return selected.map(({ doc, index }) => {
+    const related = (doc.related ?? [])
+      .map((link) => {
+        const target = documents.findIndex((d) => d.id === `item:${link.id}`);
+        return target >= 0 ? { relation: link.relation, ref: ref(target) } : null;
+      })
+      .filter(Boolean);
+    if (doc.parent !== undefined) related.push({ relation: 'parent', ref: ref(doc.parent) });
+    if (doc.sourceIndex !== undefined)
+      related.push({ relation: 'source_context', ref: ref(doc.sourceIndex) });
+    const children = doc.children ?? [];
+    const salient = children.filter((i) =>
+      documentText(snapshot, documents[i]).includes('"status":"error"'),
+    );
+    for (const i of [...new Set([...salient.slice(0, 3), ...children.slice(-2)])])
+      related.push({ relation: 'operation', ref: ref(i) });
+    return {
+      type: doc.kind,
+      ref: ref(index),
+      ...(doc.title ? { title: doc.title } : {}),
+      text: query
+        ? excerpt(documentText(snapshot, doc), 640, query)
+        : excerpt(
+            doc.preview ?? documentText(snapshot, doc),
+            doc.kind === 'prompt' || doc.kind === 'text' ? 1600 : 900,
+          ),
+      ...(doc.source ? { source: doc.source } : {}),
+      ...(related.length ? { related } : {}),
+    };
+  });
 }

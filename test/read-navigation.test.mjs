@@ -37,6 +37,144 @@ const snapshot = (units, extra = {}) => ({
 });
 const rows = (snap, options) => navigationRows(snap, navigationDocuments(snap), (i) => i, options);
 
+function taskHistory({
+  task = 'CURRENT TASK: correct rollback and preserve unrelated changes.',
+  answer,
+  loops = 25,
+} = {}) {
+  const entries = [];
+  const add = (role, content, fields = {}) => {
+    entries.push({
+      type: 'message',
+      id: `entry-${entries.length}`,
+      parentId: entries.at(-1)?.id ?? null,
+      message: { role, content, ...fields },
+    });
+  };
+  add('user', task);
+  for (let i = 0; i < loops; i++) {
+    add('assistant', [
+      { type: 'text', text: `Progress ${i}: ` + 'investigation details '.repeat(100) },
+      { type: 'toolCall', id: `call-${i}`, name: 'bash', arguments: { command: `test step ${i}` } },
+    ]);
+    add('toolResult', [{ type: 'text', text: 'Step completed.' }], {
+      toolCallId: `call-${i}`,
+      toolName: 'bash',
+      isError: false,
+    });
+  }
+  add(
+    'assistant',
+    answer ?? [
+      { type: 'text', text: 'FINAL CONCLUSION: rollback corrected.' },
+      { type: 'text', text: 'VALIDATION: transaction tests passed.' },
+      { type: 'text', text: 'NEXT STEP: review the retained changes.' },
+    ],
+  );
+  return { entries, leafId: entries.at(-1).id };
+}
+
+test('long-task brief prioritizes its input and complete selected answer, then pages one frozen index', () => {
+  const data = taskHistory();
+  for (const max_bytes of [24000, 4096]) {
+    const request = { session_id: 'fixture', max_bytes };
+    const captured = prepareContextRead(data, request, { buildSessionProjection });
+    const cache = new ContextReadCache();
+    let page = cache.navigate(captured, request, { identity });
+    assert.equal(page.items[0].type, 'prompt');
+    assert.match(page.items[0].text, /CURRENT TASK/);
+    assert.equal(page.items[1].type, 'text');
+    assert.match(page.items[1].text, /FINAL CONCLUSION.*VALIDATION.*NEXT STEP/);
+    const answer = cache.expand([page.items[1].ref], identity);
+    assert.equal(answer.units.length, 3);
+    assert.deepEqual(
+      answer.units.map((unit) => unit.source.block_index),
+      [0, 1, 2],
+    );
+    assert.equal(page.omissions.capacity.previous_units, 0);
+    const refs = [];
+    for (let count = 0; ; count++) {
+      assert.ok(count < 40, 'pagination terminates');
+      assert.ok(jsonBytes(page) <= max_bytes);
+      refs.push(...page.items.map((item) => item.ref));
+      assert.equal(Boolean(page.next_cursor), page.omissions.capacity.remaining_units > 0);
+      if (!page.next_cursor) break;
+      const next = cache.get({ cursor: page.next_cursor }, identity);
+      page = cache.render(next.snapshot, { max_bytes }, { ...next, identity });
+      assert.equal(page.omissions.capacity.previous_units, refs.length);
+    }
+    assert.equal(new Set(refs).size, refs.length, 'no duplicated rows across task-order pages');
+    assert.equal(
+      refs.length,
+      navigationDocuments(captured).filter((doc) => doc.parent === undefined).length,
+    );
+    // Brief presentation never changes the selected native units or their order.
+    const full = cache.render(
+      captured,
+      { ...request, detail: 'full', max_bytes: 65536 },
+      { identity },
+    );
+    assert.equal(full.items.at(-1).source.entry_id, data.leafId);
+    assert.equal(full.items.at(-1).source.block_index, 2);
+  }
+});
+
+test('small UTF-8 brief pages share space between a long input and answer and retain their source refs', () => {
+  const data = taskHistory({
+    task: '当前输入：' + '约束与需求🔎'.repeat(700),
+    answer: [{ type: 'text', text: '最新结论：' + '进展与证据🔎'.repeat(700) }],
+    loops: 1,
+  });
+  const request = { session_id: 'fixture', max_bytes: 4096 };
+  const captured = prepareContextRead(data, request, { buildSessionProjection });
+  const cache = new ContextReadCache();
+  const page = cache.navigate(captured, request, { identity });
+  assert.ok(jsonBytes(page) <= 4096);
+  assert.equal(page.items[0].type, 'prompt');
+  assert.match(page.items[0].text, /当前输入/);
+  assert.equal(page.items[1].type, 'text');
+  assert.match(page.items[1].text, /最新结论/);
+  for (const item of page.items.slice(0, 2)) {
+    assert.ok(
+      !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(item.text),
+    );
+    assert.ok(jsonBytes(cache.expand([item.ref], identity).units) > 4096);
+  }
+});
+
+test('orphan tool result names visible in brief are searchable during native acquisition', () => {
+  const entries = [
+    {
+      type: 'message',
+      id: 'u',
+      parentId: null,
+      message: { role: 'user', content: 'Inspect the failure' },
+    },
+    {
+      type: 'message',
+      id: 'result',
+      parentId: 'u',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'missing-call',
+        toolName: 'special_tool',
+        isError: true,
+        content: [{ type: 'text', text: 'permission denied' }],
+      },
+    },
+  ];
+  const data = { entries, leafId: 'result' };
+  const request = { session_id: 'fixture', preset: 'full' };
+  const sdk = { buildSessionProjection };
+  const brief = rows(prepareContextRead(data, request, sdk));
+  assert.equal(brief.find((item) => item.type === 'tool').title, 'special_tool');
+  const found = prepareContextRead(data, { ...request, search_query: 'special_tool' }, sdk);
+  const hits = rows(found, { query: 'special_tool' });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].title, 'special_tool');
+  assert.match(hits[0].text, /permission denied/);
+});
+
 test('navigation groups split source parts, separates source namespaces and never deduplicates equal text', () => {
   const snap = snapshot([
     textUnit('a', 'first ', { part: 1 }),

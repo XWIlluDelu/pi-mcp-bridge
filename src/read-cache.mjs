@@ -88,7 +88,7 @@ export class ContextReadCache {
       units,
       navigation: undefined,
       detail: 'full',
-      request: { detail: 'full' },
+      request: { ...snapshot.request, detail: 'full' },
       expanded_refs: refs,
       selection: snapshot.selection,
     };
@@ -205,6 +205,7 @@ export class ContextReadCache {
       request: { ...args, detail: 'brief' },
       navigation: {
         documents: navigationDocuments(snapshot),
+        task_order: !query && snapshot.view !== 'runtime',
         ...(query ? { query } : {}),
         ...(args.types ? { types: args.types } : {}),
       },

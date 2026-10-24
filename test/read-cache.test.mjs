@@ -197,3 +197,44 @@ test('native cwd replacement invalidates frozen cursors even under the same nati
   await assert.rejects(f.bridge.read({ cursor: first.next_cursor }), /STALE_CURSOR/);
   assert.equal(f.acquisitions(), 1);
 });
+
+test('expanded adapted references retain their original scope for cursor validation', async (t) => {
+  const f = await fixture(t);
+  for (const native of [false, true]) {
+    const unregister = f.bridge.compatibilityServices.sessionReaders.register('scope-fixture', {
+      matches: () => true,
+      read: () => ({
+        native,
+        items: [{ id: 'memory', kind: 'memory', text: 'Stored memory details.\n\n'.repeat(600) }],
+      }),
+    });
+    try {
+      for (const scope of [{ preset: 'recent' }, { preset: 'full', select: { tools: 0 } }]) {
+        const overview = await f.bridge.read({ session_id: f.id, ...scope });
+        const ref = overview.items.find((item) => item.type === 'memory').ref;
+        const expanded = await f.bridge.read({ refs: [ref], max_bytes: 4096 });
+        assert.ok(expanded.next_cursor);
+        assert.equal(expanded.detail, 'full');
+        assert.deepEqual(expanded.selection, overview.selection);
+        if (!native) assert.equal(expanded.selection, null);
+        const next = await f.bridge.read({ cursor: expanded.next_cursor });
+        const explicit = await f.bridge.read({
+          cursor: expanded.next_cursor,
+          ...scope,
+          detail: 'full',
+        });
+        assert.deepEqual(explicit.items, next.items);
+        await assert.rejects(
+          f.bridge.read({ cursor: expanded.next_cursor, preset: 'latest' }),
+          /STALE_CURSOR/,
+        );
+        await assert.rejects(
+          f.bridge.read({ cursor: expanded.next_cursor, select: { recent_prompts: 1 } }),
+          /STALE_CURSOR/,
+        );
+      }
+    } finally {
+      unregister();
+    }
+  }
+});
