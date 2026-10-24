@@ -133,6 +133,53 @@ test('search examines full split documents and returns a match outside the norma
   assert.equal(rows(snap, { query: 'needle', types: ['tool'] }).length, 0);
 });
 
+test('brief and search retain assistant failure facts once across native and runtime split content', () => {
+  for (const [stopReason, errorMessage, text] of [
+    ['error', 'Upstream authentication failed', 'Partial response'],
+    ['error', 'Upstream authentication failed', 'Partial response '.repeat(700)],
+    ['aborted', undefined, 'Partial response '.repeat(700)],
+  ]) {
+    const message = {
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+      stopReason,
+      ...(errorMessage ? { errorMessage } : {}),
+    };
+    const entries = [
+      {
+        type: 'message',
+        id: 'task',
+        parentId: null,
+        message: { role: 'user', content: 'Inspect the deployment' },
+      },
+      { type: 'message', id: 'answer', parentId: 'task', message },
+    ];
+    const request = { session_id: 'fixture' };
+    const native = prepareContextRead({ entries, leafId: 'answer' }, request, {
+      buildSessionProjection,
+    });
+    const runtime = { units: [], accountedBytes: 0 };
+    appendUnits(runtime, { type: 'assistant', source: { observation_index: 0 }, message });
+    const query = errorMessage ?? 'assistant aborted';
+    const found = prepareContextRead(
+      { entries, leafId: 'answer' },
+      { ...request, search_query: query },
+      { buildSessionProjection },
+    );
+    assert.equal(rows(found, { query }).length, 1, 'Native acquisition retains failure evidence');
+    for (const source of [native, runtime]) {
+      const overview = rows(source).at(-1);
+      assert.ok(overview.text.includes(`assistant ${stopReason}`));
+      assert.equal(overview.text.split(`assistant ${stopReason}`).length - 1, 1);
+      assert.match(overview.text, /Partial response/);
+      if (errorMessage) assert.ok(overview.text.includes(errorMessage));
+      const hits = rows(source, { query });
+      assert.equal(hits.length, 1);
+      assert.ok(hits[0].text.includes(query));
+    }
+  }
+});
+
 test('brief preserves image presence and shell commands remain searchable without output', () => {
   const target = { units: [], accountedBytes: 0 };
   appendUnits(target, {
@@ -478,7 +525,6 @@ test('read/search schemas and MCP discovery describe a usable navigation path', 
   assert.ok(readSchema.safeParse({ refs: ['opaque-ref'] }).success);
   assert.ok(!readSchema.safeParse({ refs: ['opaque-ref'], detail: 'full' }).success);
   assert.ok(!readSchema.safeParse({ session_id: 's', view: 'runtime', preset: 'full' }).success);
-  assert.ok(!readSchema.safeParse({ session_id: 's', view: 'native' }).success);
   assert.ok(!searchSchema.safeParse({ session_id: 's', query: ' ' }).success);
   assert.ok(
     searchSchema.safeParse({ session_id: 's', view: 'runtime', query: 'failure', types: ['tool'] })

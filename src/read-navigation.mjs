@@ -46,7 +46,8 @@ function messageText(message, { metadata = false } = {}) {
     texts.push(
       `exit: ${message.exitCode ?? 'unknown'}${message.cancelled ? '; cancelled' : ''}${message.truncated ? '; native output truncated' : ''}`,
     );
-  if (message.errorMessage) texts.push(`error: ${message.errorMessage}`);
+  if (message.errorMessage && message.role !== 'assistant')
+    texts.push(`error: ${message.errorMessage}`);
   for (const key of ['summary', 'output'])
     if (typeof message[key] === 'string') texts.push(message[key]);
   if (typeof message.content === 'string') texts.push(message.content);
@@ -67,7 +68,7 @@ function messageText(message, { metadata = false } = {}) {
   if (metadata && message.nestedCalls) texts.push(JSON.stringify(message.nestedCalls));
   return texts.join('\n');
 }
-export function unitText(unit, metadata = false) {
+function unitBodyText(unit, metadata = false) {
   if (unit.text !== undefined) return String(unit.text);
   if (unit.nested_call) return JSON.stringify(unit.nested_call);
   if (unit.block) {
@@ -79,12 +80,36 @@ export function unitText(unit, metadata = false) {
     ...(unit.parts ?? []).map((p) => messageText(p.message, { metadata })),
   ].join('\n');
 }
+function assistantFailure(units) {
+  const messages = units
+    .flatMap((unit) => [
+      ...(unit.metadata ? [{ ...unit.metadata, role: 'assistant' }] : []),
+      unit.message,
+      ...(unit.parts ?? []).map((part) => part.message),
+    ])
+    .filter(
+      (message) =>
+        message?.role === 'assistant' &&
+        (['error', 'aborted'].includes(message.stopReason) || message.errorMessage),
+    );
+  const message = messages.find((value) => value.errorMessage) ?? messages[0];
+  return message
+    ? `assistant ${message.stopReason ?? 'error'}${message.errorMessage ? ': ' + message.errorMessage : ''}`
+    : '';
+}
+export function unitText(unit, metadata = false) {
+  return [assistantFailure([unit]), unitBodyText(unit, metadata)].filter(Boolean).join('\n');
+}
 const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot.units[i]);
 export const documentUnits = docUnits;
-export const documentText = (snapshot, doc) =>
-  docUnits(snapshot, doc)
-    .map((u) => unitText(u, true))
-    .join('');
+export function documentText(snapshot, doc) {
+  const units = docUnits(snapshot, doc);
+  // Split bodies repeat their stop reason, while the error detail lives once
+  // in shared metadata. Keep each failure fact once beside the complete text.
+  return [assistantFailure(units), units.map((unit) => unitBodyText(unit, true)).join('')]
+    .filter(Boolean)
+    .join('\n');
+}
 
 function key(unit, index) {
   if (unit.tool_id) return `tool:${unit.tool_id}`;

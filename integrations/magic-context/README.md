@@ -51,8 +51,9 @@ Counts are upper limits; `detail` changes presentation, never this selection.
 Bridge uses `full` for search, allowing older summaries and lower-priority
 memories to be found without first expanding the read preset. `coverage` reports
 `{ type, selected, total }` for `summary` and `memory` before Bridge's type filters
-and page budget. Totals count only this session's compartments and the own-project
-memories eligible below, not everything in the database. Use `recent` or `full`
+and page budget. Totals count only this session's compartments with content and
+the own-project memories eligible below. MC's empty boundary markers do not
+consume summary slots. Use `recent` or `full`
 to widen the selected set; pagination traverses only the acquired selection.
 
 - Compartments contain their P1/full stored summary as `text`, P2 (or P3) as
@@ -72,7 +73,7 @@ to widen the selected set; pagination traverses only the acquired selection.
   It does not invent an exact source message from a session-level relationship.
 - Returned data is the current **stored** extension snapshot, marked in `source`.
   It does not claim to be present in the most recently captured `runtime` context.
-- Explicit historical `leaf_id` requests reject. Use Bridge's native/session view
+- Explicit historical `leaf_id` requests reject. Use Bridge's Session Context view
   for a particular historical branch; this module never reads or forks raw history.
 
 Every operation opens `DatabaseSync` with `readOnly:true`, enables `query_only`,

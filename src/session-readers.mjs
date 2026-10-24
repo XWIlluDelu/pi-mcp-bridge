@@ -126,7 +126,7 @@ export async function captureSessionRead(reader, context, args) {
       ...(result.coverage ? { coverage: structuredClone(result.coverage) } : {}),
     },
     session_id: args.session_id,
-    leaf_id: native?.leaf_id ?? context.owner.leaf_id,
+    leaf_id: native ? native.leaf_id : context.owner.leaf_id,
     selection: native?.selection ?? null,
     omissions: native?.omissions ?? null,
     units: target.units,
