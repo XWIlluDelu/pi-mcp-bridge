@@ -16,9 +16,12 @@ Pi's native `agent_settled` fires after automatic continuations finish, includin
 aborted runs. Settlement describes the session run, not per-prompt success. A
 handled slash command that never starts a run produces no settlement.
 
-The observer captures the leaf at that boundary. Bridge validates the owned
-writer generation and occurrence sequence before scheduling delivery. Pi waits
-only for bounded local acknowledgement, not HTTPS delivery.
+The observer captures the leaf and a bounded last assistant response at that
+boundary, before awaiting IPC. The response comes from the same native projection
+as Session Context, restricted to entries after this observed run started.
+Bridge validates the owned writer generation and occurrence sequence before
+scheduling delivery. Pi waits only for bounded local acknowledgement, not HTTPS
+delivery.
 
 Subscribe **before** sending work. Monitoring continues until cancelled or expired.
 
@@ -69,16 +72,42 @@ Example delivery:
   "data": {
     "session_id": "ps_0123456789abcdef0123456789abcdef",
     "leaf_id": "native-entry-id",
-    "aborted": false
+    "aborted": false,
+    "result": {
+      "entry_id": "native-assistant-entry",
+      "text": "Report saved to reports/check.md.",
+      "stop_reason": "stop",
+      "truncated": false
+    },
+    "read": {
+      "session_id": "ps_0123456789abcdef0123456789abcdef",
+      "view": "session",
+      "leaf_id": "native-entry-id",
+      "preset": "latest"
+    }
   },
   "cursor": null
 }
 ```
 
-Read the result with `read({session_id,leaf_id,preset:"latest"})`; the leaf pins
-that round despite later work. Null denotes an empty branch. Deletion or revoked
-read access can make the result unavailable. The subscribing chat's user chooses
-the reaction; event payloads contain data only.
+The excerpt can be enough to report a short outcome without another tool call.
+`result` is null when no current-run assistant remains in the native projection
+or the observer did not see the run start. It never substitutes an earlier run's
+answer. Only the last assistant's text blocks are included; an empty/error final
+response does not fall back to earlier prose. `stop_reason` is that message's
+native termination reason, not a claim that the user's task succeeded.
+
+Text preserves its formatting and written links, up to 2048 UTF-16 units and a
+4096-byte JSON result object. Longer text retains its beginning and end with
+`truncated:true`. No model generates a summary; no files are discovered, opened,
+uploaded or verified from paths in the text.
+
+When more detail is useful, pass `data.read` directly as the `read` tool arguments.
+Its explicit `view:"session"` reads the native boundary even when an enabled
+memory reader handles default reads; MC does not reconstruct historical leaves.
+The leaf pins that round despite later work. A null leaf denotes an empty branch.
+Deletion or revoked read access can make deeper reading unavailable. The
+subscribing chat's user chooses the reaction; event payloads contain data only.
 
 ## Authorization, storage and delivery
 
@@ -158,8 +187,9 @@ interruption of in-flight work.
    ChatGPT to read the settlement's result and report in that chat. Confirm
    subscription and callback verification succeed before sending work.
 3. Send a harmless Pi task with a distinct result. Verify native settlement,
-   webhook receipt and the event-triggered read/report in the original chat,
-   without polling or prompting the chat again. A webhook `2xx` acknowledges
+   webhook receipt and the event-triggered report in the original chat, using
+   the excerpt or `data.read` when more context is needed, without polling or
+   prompting the chat again. A webhook `2xx` acknowledges
    receipt; the chat reaction is asynchronous.
 4. Cancel monitoring and confirm unsubscribe. Remove temporary probes and
    diagnostic settings.

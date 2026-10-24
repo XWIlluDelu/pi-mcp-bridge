@@ -11,6 +11,7 @@ import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { ContextObservation } from './context-observation.mjs';
 import { nativeReadFeatures } from './read-features.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
+import { captureSettledResult } from './settled-result.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
 export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
@@ -52,12 +53,19 @@ export default async function rpcObserver(pi) {
           captureSequence: 0,
           completionSequence: 0,
         });
+  pi.on('agent_start', (_event, ctx) => {
+    // Automatic continuations can start another loop before one run settles.
+    if (lifecycle.runStartLeaf === undefined)
+      lifecycle.runStartLeaf = ctx.sessionManager.getLeafId();
+  });
   // Capture the native boundary before the first await. Only local IPC is
   // acknowledged here; HTTPS delivery never blocks Pi or keeps its writer alive.
   if (ownerControl)
     pi.on('agent_settled', async (event, ctx) => {
       const file = ctx.sessionManager.getSessionFile(),
         id = ctx.sessionManager.getSessionId();
+      const result = captureSettledResult(ctx.sessionManager, lifecycle.runStartLeaf);
+      lifecycle.runStartLeaf = undefined;
       await ownerRequest(
         ownerControl,
         {
@@ -67,6 +75,7 @@ export default async function rpcObserver(pi) {
           sequence: ++lifecycle.completionSequence,
           leafId: ctx.sessionManager.getLeafId(),
           aborted: event.aborted,
+          result,
           timestamp: new Date().toISOString(),
         },
         { signal: AbortSignal.timeout(2000) },

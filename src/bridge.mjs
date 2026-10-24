@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import { EventSubscriptions } from './events.mjs';
 import { Submissions } from './submissions.mjs';
+import { settledResultSchema } from './settled-result.mjs';
 import { publicError } from './errors.mjs';
 import path from 'node:path';
 import { compactReceipt, nativeCompactReason } from './compact.mjs';
@@ -1156,6 +1157,7 @@ export class Bridge {
           request.leafId.length <= 128)
       ) ||
       typeof request.aborted !== 'boolean' ||
+      !settledResultSchema.safeParse(request.result).success ||
       typeof request.timestamp !== 'string' ||
       !Number.isFinite(Date.parse(request.timestamp))
     )

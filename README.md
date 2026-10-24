@@ -8,10 +8,10 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 - Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
 - Send text and images, run native shell commands, select model/thinking settings, compact context and stop work.
 - Create or fork sessions, and move deleted sessions to recoverable trash while retaining project files.
-- Notify ChatGPT Work chats and dots when a Bridge-owned session settles, with a leaf ID for reading that result.
+- Notify ChatGPT Work chats and dots when a Bridge-owned session settles, with a short result excerpt and pinned native reading arguments.
 - Batch independent operations and apply seven separate permissions at default, project and session tiers.
 
-Every mutation call performs a new operation. Send/create return a `submission_id` for querying admission receipts, including late native ACKs. External owners report confirmed dispatch separately from unobservable native admission. These receipts are not model completion or retry keys; automatic retries can duplicate work. Use `list/read` for activity and results. See the [public API](docs/api.md) and [collaboration design](docs/collaboration.md).
+See [working with a session](docs/collaboration.md) for the dispatch, observation and continuation workflow, and the [public API](docs/api.md) for tool arguments and outcomes.
 
 ## Start locally
 
@@ -55,6 +55,7 @@ The launcher negotiates ownership before opening the session. See [runtime integ
 
 - [Configuration and permissions](docs/configuration.md)
 - [Public tool API](docs/api.md)
+- [Working with a session](docs/collaboration.md)
 - [Model catalog, thinking and compaction](docs/model-control.md)
 - [Reading, search and reference expansion](docs/reading.md)
 - [Optional compatibility modules](docs/compatibility.md)
