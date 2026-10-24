@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -103,11 +104,11 @@ for (const route of ['companion', 'binding']) {
     { timeout: 15000 },
     async (t) => {
       const f = await attached(t, route);
+      ackTimeout(t, ['compact']);
       const result = await f.bridge.compact({
         session_id: f.id,
         interrupt: true,
         instructions: 'HOLD_COMPACT',
-        timeout_ms: 50,
       });
       assert.equal(result.status, 'unknown', JSON.stringify(result));
       await until(() => exists(f.gate + '.compact-start'));

@@ -108,18 +108,9 @@ test('native catalog is offline, session-free, paged and sanitized in the owner 
   assert.deepEqual(first.models[0].input, ['text', 'image']);
   assert.deepEqual(
     Object.keys(first.models[0]).sort(),
-    [
-      'provider',
-      'id',
-      'name',
-      'input',
-      'thinking_levels',
-      'context_window',
-      'max_output_tokens',
-      'input_limits',
-    ].sort(),
+    ['provider', 'id', 'name', 'input', 'context_window', 'effort'].sort(),
   );
-  assert.ok(first.models[0].thinking_levels.includes('high'));
+  assert.ok(first.models[0].effort.includes('high'));
   assert.ok(!/SECRET|PRIVATE_ENDPOINT|apiKey|headers|baseUrl/.test(JSON.stringify(first)));
   assert.deepEqual(Object.keys(process.env), Object.keys(env));
   for (const name of Object.keys(env))

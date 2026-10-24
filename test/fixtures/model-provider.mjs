@@ -29,6 +29,14 @@ export default function (pi) {
         contextWindow: 32000,
         maxTokens: 4096,
       },
+      {
+        id: 'reasoner',
+        name: 'Reasoner',
+        input: ['text'],
+        reasoning: true,
+        contextWindow: 32000,
+        maxTokens: 4096,
+      },
     ],
     tokensPerSecond: 10000,
   });

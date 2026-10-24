@@ -4,10 +4,9 @@ export const compactSchema = z
     session_id: z.string().min(1).max(128),
     instructions: z.string().max(100000).optional(),
     interrupt: z.boolean().optional(),
-    timeout_ms: z.number().int().min(50).max(30000).optional(),
   })
   .strict();
-export const compactInputSchema = compactSchema.omit({ session_id: true, timeout_ms: true });
+export const compactInputSchema = compactSchema.omit({ session_id: true });
 
 // Exact native messages only: never forward provider, extension or history text.
 export function nativeCompactReason(message) {

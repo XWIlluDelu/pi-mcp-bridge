@@ -213,9 +213,9 @@ async function exerciseBash(f, native) {
     max_chars: 512,
   });
   assert.equal(first.status, 'accepted');
-  assert.equal(first.truncated, false);
+  assert.equal(first.native_truncated, false);
   assert.equal(first.exitCode, 0);
-  assert.equal(first.output_complete, false);
+  assert.equal(first.response_complete, false);
   assert.ok(text.startsWith(first.output));
   assert.ok(JSON.stringify({ output: first.output }).length <= 512);
   assert.equal(first.next_cursor, undefined);
@@ -251,7 +251,6 @@ async function exerciseBash(f, native) {
     session_id: id,
 
     command: "printf started > '" + started + "'; sleep 30",
-    timeout_ms: 10000,
   });
   await until(async () => {
     try {
@@ -378,7 +377,6 @@ test(
       session_id: id,
 
       command: "printf started > '" + marker + "'; sleep 30",
-      timeout_ms: 10000,
     });
     await until(() =>
       fs.stat(marker).then(

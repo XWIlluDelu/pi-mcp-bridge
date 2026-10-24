@@ -652,7 +652,7 @@ export class AttachedRuntime {
         ...(args.images ? { images: args.images } : {}),
         mode: args.mode ?? 'default',
       },
-      args.timeout_ms ?? 5000,
+      undefined,
       args.beforeDispatch,
     );
   }
