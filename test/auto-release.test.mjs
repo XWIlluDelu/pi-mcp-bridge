@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -224,11 +225,11 @@ test(
       t,
       `pi.on('input',async()=>{await mark('input-held');await wait('input-go');return {action:'continue'};});`,
     );
+    ackTimeout(t, ['prompt']);
     const first = await f.bridge.send({
       session_id: f.id,
 
       text: 'LATE',
-      timeout_ms: 50,
     });
     assert.equal(first.status, 'unknown');
     const rpc = f.runtimes[0];
@@ -361,11 +362,11 @@ test(
       }
       return receive(event, generation);
     });
+    ackTimeout(t, ['prompt']);
     const receipt = await f.bridge.send({
       session_id: f.id,
 
       text: 'SETTLED',
-      timeout_ms: 50,
     });
     assert.equal(receipt.status, 'unknown');
     await until(() => rpc.settlement.sequence > 0);
@@ -681,10 +682,10 @@ for (const slow of [false, true])
           : '',
       );
       f.config.grants[0].command = true;
+      if (slow) ackTimeout(t, ['bash']);
       const result = await f.bridge.command({
         session_id: f.id,
         command: 'printf audit-ok',
-        timeout_ms: slow ? 50 : 5000,
       });
       const rpc = f.runtimes[0];
       if (slow) {

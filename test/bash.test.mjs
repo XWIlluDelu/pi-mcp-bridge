@@ -78,8 +78,8 @@ test('MCP command permission is independent and output is bounded without contin
   assert.ok(!response.isError);
   const result = response.structuredContent;
   assert.equal(result.exitCode, 0);
-  assert.equal(result.truncated, false);
-  assert.equal(result.output_complete, false);
+  assert.equal(result.native_truncated, false);
+  assert.equal(result.response_complete, false);
   assert.ok(f.output.startsWith(result.output));
   assert.ok(JSON.stringify({ output: result.output }).length <= 512);
   assert.equal((await f.call({})).isError, true);
@@ -91,6 +91,41 @@ test('MCP command permission is independent and output is bounded without contin
   assert.equal((await f.call({ command: 'native command', max_chars: 32768 })).isError, undefined);
   assert.equal(f.calls(), 2);
 });
+test('command and batch distinguish native truncation from response completeness', async (t) => {
+  const f = await fixture(t);
+  f.rule.command = true;
+  const output = 'native output line\n'.repeat(100);
+  for (const native_truncated of [false, true]) {
+    f.callbacks.bash = async () => ({
+      output,
+      exitCode: 0,
+      cancelled: false,
+      truncated: native_truncated,
+      fullOutputPath: native_truncated ? '/synthetic/native-output.log' : null,
+    });
+    for (const max_chars of [256, 32768]) {
+      const args = { session_id: f.saved.id, command: 'native fixture', max_chars };
+      const direct = await f.client.callTool({ name: 'command', arguments: args });
+      const batch = await f.client.callTool({
+        name: 'batch',
+        arguments: { operations: [{ op: 'command', args }] },
+      });
+      for (const result of [direct.structuredContent, batch.structuredContent.results[0].result]) {
+        assert.equal(result.status, 'accepted');
+        assert.equal(result.native_truncated, native_truncated);
+        assert.equal(result.response_complete, max_chars === 32768);
+        assert.equal(result.output, output.slice(0, result.output.length));
+        assert.equal(
+          result.fullOutputPath,
+          native_truncated ? '/synthetic/native-output.log' : null,
+        );
+        assert.ok(!('truncated' in result));
+        assert.ok(!('output_complete' in result));
+      }
+    }
+  }
+});
+
 test('connection loss after received native bash output retains it without repeating execution', async (t) => {
   const f = await fixture(t),
     finish = Promise.withResolvers(),
@@ -125,7 +160,7 @@ test('connection loss after received native bash output retains it without repea
     assert.equal(result.status, 'unknown');
     assert.equal(result.output, 'result before lost ACK');
     assert.equal(
-      result.output_complete,
+      result.response_complete,
       true,
       'Known output coverage is distinct from an uncertain final ACK',
     );

@@ -43,17 +43,22 @@ export function createModelSetter({ state, models, setModel, setThinkingLevel })
       if (model && !target) throw new Error('MODEL_UNAVAILABLE');
       let selected = await checked();
       if (!selected.model) throw new Error('MODEL_UNAVAILABLE');
+      let level = thinking_level;
       if (target && !sameModel(selected.model, target)) {
+        // Model-only changes keep current effort; the native setter owns clamping.
+        level ??= selected.thinkingLevel;
+        if (!thinkingLevelSchema.safeParse(level).success)
+          throw new Error('INVALID_MODEL_SELECTION');
         await beforeDispatch?.();
         dispatched = true;
         if ((await setModel(target)) === false) throw new Error('MODEL_UNAVAILABLE');
         selected = await checked();
       }
       if (target && !sameModel(selected.model, target)) throw new Error('MODEL_SELECTION_CHANGED');
-      if (thinking_level !== undefined && selected.thinkingLevel !== thinking_level) {
+      if (level !== undefined && selected.thinkingLevel !== level) {
         await beforeDispatch?.();
         dispatched = true;
-        await setThinkingLevel(thinking_level);
+        await setThinkingLevel(level);
         selected = await checked();
       }
       if (target && !sameModel(selected.model, target)) throw new Error('MODEL_SELECTION_CHANGED');

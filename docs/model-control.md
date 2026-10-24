@@ -19,7 +19,7 @@ The catalog uses the same user Pi installation as CLI execution. A short-lived n
 
 Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Failures return `MODEL_CATALOG_UNAVAILABLE`; `PI_MCP_LOG=1` records content-free `catalog_stage` and `catalog_reason` diagnostics.
 
-The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain `provider`, `id`, `name`, `input`, `thinking_levels`, `context_window`, `max_output_tokens` and `input_limits`. Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
+The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain only `provider`, `id`, `name`, `input`, `context_window` and `effort`. `effort` lists Pi's supported thinking levels (`["off"]` for a model without reasoning). Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
 
 For a live session's actual selection, use [list status](api.md#list): `status.model` and `status.thinking_level` come from its owner and are null when unobserved.
 
@@ -42,7 +42,7 @@ Requires `send` and at least one setting. Success returns the actual selection:
 }
 ```
 
-Pi applies model-switch preferences and clamps explicit thinking to native capabilities. Thinking-only calls act on the model current at execution. Selection changes session state without sending input, aborting work or changing global defaults.
+A model-only change preserves the effort current immediately before the switch, overriding target-model and global switch defaults. Pi's native thinking setter applies its compatible fallback if the new model does not support that effort. Explicit thinking also uses native clamping. Thinking-only calls act on the model current at execution. Selection changes session state without sending input, aborting work or changing global defaults.
 
 Busy selection is supported. Issued provider requests keep their captured settings; later provider calls, including continuations and queued input, use the current selection. Bridge serializes its own same-session mutations while independent native actions remain possible. Prompt preflight and concurrent Stop do not block selection. An unresolved setter blocks overlapping settings/input until it settles. Partial changes are not rolled back.
 
@@ -67,7 +67,7 @@ In tested Pi 1.3.0 and 1.4.0, startup restores saved model/thinking only when th
 
 Send and create accept either setting, including create's first prompt, together with required text or images:
 
-- Model only: Pi selects it and preserves or adjusts thinking natively.
+- Model only: preserve current effort, using Pi's native compatible fallback if unsupported by the new model.
 - Thinking only: validate and set the level on the current model.
 - Both: validate thinking against the target model before either change.
 - Neither: follow native selection, including cold-start restoration, launch overrides, availability and the [empty-context limitation](#empty-context-resume-limitation).
@@ -82,7 +82,7 @@ Explicit settings add `model_selection:{model:{provider,id},thinking_level}` onl
 
 ## Prompt settings timeout
 
-`timeout_ms` is 50–30000, default 5000, and bounds native acknowledgements. A timed-out setter blocks further input until its acknowledgement arrives and identity is validated. It never causes the pending prompt or another setting to be dispatched later.
+Native requests retain their internal five-second acknowledgement budget; there is no tool timeout parameter. A timed-out setter blocks further input until its acknowledgement arrives and identity is validated. It never causes the pending prompt or another setting to be dispatched later.
 
 A model step can succeed while thinking remains unapplied. The result stays unknown; inspect `list.status` and native history before another call. Create retains its chosen child ID and nested send result when available. Every new call can submit input or create another child.
 
@@ -99,7 +99,7 @@ Default compaction requires `send` and proven idle. Owned RPCs can establish idl
 
 Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
 
-An accepted result means compaction completed. It returns `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. `timeout_ms` is 50–30000, default 5000, and does not abort the operation. Attached operations retain their input fence until the native callback or controller Promise settles.
+An accepted result means compaction completed. It returns `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. The internal five-second acknowledgement budget does not abort compaction; an expired wait returns an unknown outcome, and native history can show a later completed summary. Attached operations retain their input fence until the native callback or controller Promise settles.
 
 The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect list/read; a new call performs another compaction.
 

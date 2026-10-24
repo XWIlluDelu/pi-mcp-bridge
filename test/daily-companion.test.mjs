@@ -72,7 +72,7 @@ for (const mode of ['tui', 'rpc'])
         `import fs from 'node:fs/promises';
 import {fauxProvider} from ${JSON.stringify(aiEntry)};
 export default pi=>{
- pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']}]}).provider);
+ pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']},{id:'next',reasoning:true,input:['text']}]}).provider);
  pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile)},JSON.stringify({
   pid:process.pid,file:ctx.sessionManager.getSessionFile(),header:ctx.sessionManager.getHeader(),
   joinCommands:pi.getCommands().filter(c=>c.name==='bridge-join').length
@@ -86,6 +86,8 @@ export default pi=>{
         JSON.stringify({
           defaultProvider: 'bridge-fixture',
           defaultModel: 'deterministic',
+          defaultThinkingLevel: 'low',
+          modelThinkingLevels: { 'selection-fixture/next': 'medium' },
           compaction: { enabled: false },
           retry: { enabled: false },
           extensions: [path.resolve('test/fixtures/faux-extension.mjs'), companion, probe],
@@ -197,6 +199,13 @@ export default pi=>{
         model: { provider: 'selection-fixture', id: 'other' },
         thinking_level: 'high',
       });
+      assert.deepEqual(
+        await bridge.set_model({
+          session_id: saved.id,
+          model: { provider: 'selection-fixture', id: 'next' },
+        }),
+        { model: { provider: 'selection-fixture', id: 'next' }, thinking_level: 'high' },
+      );
       assert.deepEqual(
         await bridge.set_model({
           session_id: saved.id,

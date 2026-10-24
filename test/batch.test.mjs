@@ -2,6 +2,10 @@ import { Bridge } from '../src/bridge.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { executeBatch, preflightBatch } from '../src/batch.mjs';
+import { toolDefinitions, dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
+import { makeServer } from '../src/server.mjs';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 const mockBridge = (methods) => ({
   inputs: new Set(),
   locks: new Map(),
@@ -44,6 +48,66 @@ test('batch is a transparent wrapper with per-item validation and original-order
   assert.equal(result.results[3].error.code, 'INVALID_OPERATION');
   assert.equal(result.results[4].result.ok, true);
 });
+test('MCP discovery describes batch items and both protocol paths retain per-item validation', async (t) => {
+  const bridge = mockBridge({ health: async () => ({ ok: true }) }),
+    server = makeServer(bridge),
+    client = new Client({ name: 'batch-schema-test', version: '1' }),
+    [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  t.after(async () => {
+    await client.close();
+    await server.close();
+  });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  const tools = (await client.listTools()).tools,
+    batch = tools.find((tool) => tool.name === 'batch').inputSchema,
+    items = batch.properties.operations.items;
+  assert.deepEqual(batch, toolDefinitions().find((tool) => tool.name === 'batch').inputSchema);
+  assert.equal(items.type, 'object');
+  assert.deepEqual(items.required, ['op', 'args']);
+  assert.equal(items.additionalProperties, false);
+  assert.equal(items.properties.args.type, 'object');
+  assert.deepEqual(
+    items.properties.op.enum.slice().sort(),
+    tools
+      .filter((tool) => tool.name !== 'batch')
+      .map((tool) => tool.name)
+      .sort(),
+  );
+  const args = {
+    operations: [
+      null,
+      { op: 'batch', args: {} },
+      { op: 'constructor', args: {} },
+      { op: 'health', args: {}, extra: true },
+      { op: 'send', args: { session_id: 'a', text: '' } },
+      { op: 'set_model', args: { session_id: 'a' } },
+      { op: 'command', args: { session_id: 'a', command: 'true', timeout_ms: 50 } },
+      { op: 'health', args: {} },
+    ],
+  };
+  const modern = await dispatchModern(bridge, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: {
+      name: 'batch',
+      arguments: args,
+      _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
+    },
+  });
+  for (const result of [
+    modern.message.result,
+    await client.callTool({ name: 'batch', arguments: args }),
+  ]) {
+    assert.ok(!result.isError, JSON.stringify(result));
+    const { status, results } = result.structuredContent;
+    assert.equal(status, 'processed');
+    assert.ok(results.slice(0, -1).every((item) => item.error.code === 'INVALID_OPERATION'));
+    assert.deepEqual(results.at(-1).result, { ok: true });
+  }
+});
+
 test('different sessions progress independently while each session retains input order', async () => {
   const entered = Promise.withResolvers(),
     release = Promise.withResolvers(),

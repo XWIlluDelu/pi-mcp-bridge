@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -374,12 +375,13 @@ export default function(pi){
   try {
     const made = await savedSession(bridge),
       session_id = made.session_id;
+    const restoreTimeout = ackTimeout(t, ['prompt']);
     const first = await bridge.send({
       session_id,
 
       text: 'HOLD first',
-      timeout_ms: 50,
     });
+    restoreTimeout();
     assert.equal(first.status, 'unknown');
     assert.equal(first.reason, 'ACK_TIMEOUT');
     const runtime = bridge.pool.get(session_id);
@@ -422,12 +424,13 @@ export default function(pi){
     assert.equal(runtime.exited, true);
     // A separate held admission ends with exact child death, not a late ACK.
     await fs.unlink(release);
+    const restoreHeldTimeout = ackTimeout(t, ['prompt']);
     const held = await bridge.send({
       session_id,
 
       text: 'HOLD until exit',
-      timeout_ms: 50,
     });
+    restoreHeldTimeout();
     assert.equal(held.status, 'unknown');
     const old = bridge.pool.get(session_id),
       oldGeneration = old.generation;
@@ -441,7 +444,6 @@ export default function(pi){
       session_id,
 
       text: 'fresh runtime',
-      timeout_ms: 5000,
     });
     assert.ok(['started', 'queued', 'handled'].includes(next.status), JSON.stringify(next));
     assert.equal(next.status, 'started');

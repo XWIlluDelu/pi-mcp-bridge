@@ -344,10 +344,10 @@ export class Bridge {
           await authorized();
           const late = () => {}; // Keep native late-ACK identity validation.
           const result = runtime.attached
-            ? await runtime.compact(body, args.timeout_ms ?? 5000, authorized)
+            ? await runtime.compact(body, undefined, authorized)
             : await runtime.command(
                 { type: 'compact', customInstructions: body.instructions },
-                args.timeout_ms ?? 5000,
+                undefined,
                 late,
                 authorized,
               );
@@ -757,7 +757,6 @@ export class Bridge {
             const actual = await runtime.selectModel(body.model, {
               thinkingLevel: body.thinking_level,
               idle: true,
-              timeout: args.timeout_ms ?? 5000,
               beforeDispatch: authorized,
             });
             selection.model_selection = {
@@ -788,7 +787,7 @@ export class Bridge {
           const late = () => {}; // Keep native late-ACK identity validation.
           if (!runtime.modelMutation && !runtime.compactionMutation && !runtime.promptAdmission)
             markForAutoRelease(runtime);
-          const result = await runtime.command(command, args.timeout_ms ?? 5000, late, () =>
+          const result = await runtime.command(command, undefined, late, () =>
             beforePromptDispatch(runtime, body, selection, authorized),
           );
           return { ...selection, ...promptResult({ ok: true, data: result }) };
@@ -963,7 +962,6 @@ export class Bridge {
             const actual = await runtime.selectModel(input.model, {
               thinkingLevel: input.thinking_level,
               idle: true,
-              timeout: args.timeout_ms ?? 5000,
               beforeDispatch,
             });
             selection.model_selection = {
@@ -980,7 +978,7 @@ export class Bridge {
               ...(input.images ? { images: input.images } : {}),
               ...promptOptions(hasPromptSettings(input) ? 'idle_only' : 'default'),
             },
-            args.timeout_ms ?? 5000,
+            undefined,
             onLate,
             () => beforePromptDispatch(runtime, input, selection, beforeDispatch),
           );

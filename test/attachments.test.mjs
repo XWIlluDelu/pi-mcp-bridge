@@ -880,7 +880,6 @@ test('official TUI session replacement registers a fresh identity and socket los
     session_id: replacement.id,
 
     text: 'do not start a second process',
-    timeout_ms: 100,
   });
   assert.equal(result.status, 'rejected');
   assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
