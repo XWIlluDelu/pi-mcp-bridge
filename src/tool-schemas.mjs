@@ -112,6 +112,7 @@ const readableResult = z
               type: z.string(),
               selected: z.number().int().nonnegative(),
               total: z.number().int().nonnegative(),
+              excluded: z.number().int().nonnegative().optional(),
             }),
           )
           .optional(),
@@ -129,6 +130,7 @@ const readableResult = z
           title: z.string().optional(),
           text: z.string().optional(),
           source: z.record(z.unknown()).optional(),
+          branch_relation: z.enum(['on_branch', 'off_branch', 'unknown']).optional(),
           related: z.array(z.object({ relation: z.string(), ref: z.string() })).optional(),
         })
         .passthrough(),

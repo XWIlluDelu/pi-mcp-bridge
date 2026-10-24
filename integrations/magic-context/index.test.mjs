@@ -11,6 +11,8 @@ import { captureSessionRead } from '../../src/session-readers.mjs';
 import { ContextReadCache } from '../../src/read-cache.mjs';
 import { prepareContextRead } from '../../src/context-read.mjs';
 import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
+import { toolDefinitions } from '../../src/protocol.mjs';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 // The reader's current contract is checked against MC 0.49.20 schema 95.
 // Only the tables and columns it queries are needed in these isolated fixtures.
@@ -431,6 +433,19 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   assert.equal(historical.provenance.source_entry_id, 'old-answer');
   assert.equal(full.leaf_id, 'latest-answer');
   const cache = new ContextReadCache();
+  const brief = cache.navigate(
+    recent,
+    { session_id: f.context.session.id, preset: 'recent' },
+    { identity: f.context.session },
+  );
+  const validator = new AjvJsonSchemaValidator();
+  for (const name of ['read', 'search']) {
+    const validate = validator.getValidator(
+      toolDefinitions().find((tool) => tool.name === name).outputSchema,
+    );
+    const checked = validate(brief);
+    assert.equal(checked.valid, true, checked.errorMessage);
+  }
   const found = cache.navigate(
     full,
     { session_id: f.context.session.id, preset: 'full', max_bytes: 4096 },
