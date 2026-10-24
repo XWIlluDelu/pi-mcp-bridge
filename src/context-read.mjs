@@ -3,8 +3,10 @@ import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
+import { fitNavigationRow, unitText } from './read-navigation.mjs';
+import packageInfo from '../package.json' with { type: 'json' };
 
-export const READ_CONTRACT = 'semantic_units_v7';
+export const READ_CONTRACT = packageInfo.version;
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 export const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;
@@ -329,7 +331,7 @@ function cleanRecord(record) {
     'message_index',
     'block_index',
     'observation_index',
-    'reader_index',
+    'reader_item',
     'read_adapter',
   ];
   if (record.source) result.source = pick(record.source, sourceFields);
@@ -611,10 +613,18 @@ export function appendUnits(target, record) {
   }
 }
 export function prepareContextRead(data, rawArgs, { buildSessionProjection, readAdapters = [] }) {
-  const parsed = readSchema.safeParse(rawArgs);
+  // Internal owner acquisition predicate. Public search supplies it only after
+  // validating its own schema; public read does not accept this field.
+  const { search_query, ...readArgs } = rawArgs;
+  if (
+    search_query !== undefined &&
+    (typeof search_query !== 'string' || !search_query.trim() || search_query.length > 2048)
+  )
+    throw new Error('INVALID_READ_ARGUMENTS');
+  const parsed = readSchema.safeParse(readArgs);
   if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
   const args = parsed.data;
-  if (args.cursor !== undefined || args.view === 'observed')
+  if (args.cursor !== undefined || args.view === 'runtime')
     throw new Error('INVALID_READ_ARGUMENTS');
   const selection = contextSelection(args),
     leaf =
@@ -632,14 +642,37 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
       validateReadAdapters(readAdapters),
     ),
     target = { units: [], accountedBytes: 0 };
-  for (const record of selected.records) appendUnits(target, record);
+  let records = selected.records;
+  if (search_query !== undefined) {
+    const query = search_query.toLocaleLowerCase(),
+      matches = new Set(),
+      tools = new Set();
+    for (const record of records) {
+      const kind = record.tool_id ? 'tool' : record.type;
+      if (
+        args.types?.length &&
+        !args.types.includes(kind) &&
+        !(kind === 'tool' && args.types.includes('nested_call'))
+      )
+        continue;
+      if (unitText(cleanRecord(record), true).toLocaleLowerCase().includes(query)) {
+        matches.add(record);
+        if (record.tool_id) tools.add(record.tool_id);
+      }
+    }
+    records = records.filter(
+      (record) => matches.has(record) || (record.tool_id && tools.has(record.tool_id)),
+    );
+  }
+  for (const record of records) appendUnits(target, record);
   return {
     contract: READ_CONTRACT,
-    view: 'native',
+    view: 'session',
     session_id: args.session_id,
     leaf_id: leaf,
     selection,
     omissions: selected.omissions,
+    ...(search_query !== undefined ? { search_query } : {}),
     units: target.units,
     ...(data.history ? { history: data.history } : {}),
     live: args.leaf_id === undefined ? cleanLive(data.live, selection, selected) : null,
@@ -748,16 +781,21 @@ export function renderPreparedContextRead(
   if (end < 0 || end > snapshot.units.length) throw new Error('INVALID_CURSOR');
   const base = {
     session_id: snapshot.session_id,
-    view: snapshot.view ?? 'native',
+    view: snapshot.view ?? 'session',
     ...(snapshot.observation ? { observation: snapshot.observation } : {}),
     ...(snapshot.reader ? { reader: snapshot.reader } : {}),
     source: snapshot.source ?? 'session_projection',
     leaf_id: snapshot.leaf_id,
     selection: snapshot.selection,
+    ...(snapshot.detail ? { detail: snapshot.detail } : {}),
+    ...(snapshot.query ? { query: snapshot.query } : {}),
+    ...(snapshot.matches !== undefined ? { matches: snapshot.matches } : {}),
+    ...(snapshot.types ? { types: snapshot.types } : {}),
+    ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
     omissions: { selection: snapshot.omissions },
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
-    ...(snapshot.view !== 'observed' &&
+    ...(snapshot.view !== 'runtime' &&
     snapshot.view !== 'adapted' &&
     !cursor &&
     args.leaf_id === undefined &&
@@ -788,6 +826,13 @@ export function renderPreparedContextRead(
     }
     if (metadataUnit(unit) && !items.length && !fits(page([unit], before - 1)))
       unit = fitMetadata(unit, (candidate) => fits(page([candidate], before - 1)));
+    if (
+      unit.ref &&
+      typeof unit.text === 'string' &&
+      !items.length &&
+      !fits(page([unit], before - 1))
+    )
+      unit = fitNavigationRow(unit, (candidate) => fits(page([candidate], before - 1)));
     const maximum = { ...page([unit], before - 1), live: null };
     delete maximum.runtime_events;
     if (jsonBytes(maximum) > READ_PAGE_LIMIT)
@@ -815,7 +860,8 @@ export function renderPreparedContextRead(
 }
 export function assertReadSnapshot(value, args) {
   if (value?.contract !== READ_CONTRACT) throw new Error('OWNER_READ_REFRESH_REQUIRED');
-  const observed = args.view === 'observed';
+  if (value.search_query !== args.search_query) throw new Error('INVALID_OWNER_READ');
+  const observed = args.view === 'runtime';
   if (
     observed &&
     (!Number.isSafeInteger(value.capture_sequence) ||
@@ -847,7 +893,7 @@ export function assertReadSnapshot(value, args) {
     throw new Error('INVALID_OWNER_READ');
   if (
     value.session_id !== args.session_id ||
-    value.view !== (observed ? 'observed' : 'native') ||
+    value.view !== (observed ? 'runtime' : 'session') ||
     !Array.isArray(value.units) ||
     (observed
       ? value.selection !== null || value.omissions !== null

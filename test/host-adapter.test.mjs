@@ -205,7 +205,7 @@ test('two-phase host reservation blocks another writer before ready and exposes 
   const read = await request(f, 'read', { session_id: 'fixture' });
   assert.ok(JSON.stringify(read.data).includes('PUBLIC_FIXTURE'));
   assert.equal(read.data.contract, READ_CONTRACT);
-  const observed = await request(f, 'read', { session_id: 'fixture', view: 'observed' });
+  const observed = await request(f, 'read', { session_id: 'fixture', view: 'runtime' });
   assert.equal(observed.data.observation.reason, 'host_observer_unavailable');
   assert.deepEqual(observed.data.units, []);
   assert.equal((await request(f, 'state')).data.sessionId, f.session.header.id);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { prepareContextRead } from '../src/context-read.mjs';
 import { validateReadAdapters } from '../src/read-adapters.mjs';
 import { CompatibilityServices } from '../src/compatibility-services.mjs';
-import intercomModule from '../src/compatibility/intercom.mjs';
+import intercomModule from '../integrations/intercom/index.mjs';
 import { sdk } from './fixtures/pi.mjs';
 
 const services = new CompatibilityServices();

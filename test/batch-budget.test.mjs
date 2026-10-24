@@ -306,7 +306,7 @@ test('batch reads with large shared tool metadata retain complete pageable body 
   const response = await callBridgeTool(bridge, 'batch', {
     operations: Array.from({ length: 10 }, () => ({
       op: 'read',
-      args: { session_id: made.session_id, preset: 'full', max_bytes: 65536 },
+      args: { session_id: made.session_id, detail: 'full', preset: 'full', max_bytes: 65536 },
     })),
   });
   assert.ok(!response.isError, JSON.stringify(response));

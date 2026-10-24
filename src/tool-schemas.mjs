@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { readSchema as publicReadSchema } from './read-schema.mjs';
+import { readSchema as publicReadSchema, searchSchema } from './read-schema.mjs';
 import { compactSchema } from './compact.mjs';
 import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
 import { modelSelectionSchema, thinkingLevelSchema, modelsSchema } from './models.mjs';
@@ -48,6 +48,7 @@ export const publicOperationSchemas = {
     }),
   compact: compactSchema,
   read: publicReadSchema,
+  search: searchSchema,
   send: z
     .object({
       session_id: id,
@@ -93,3 +94,50 @@ export const batchSchema = z
   })
   .strict();
 export const publicSchemas = { ...publicOperationSchemas, batch: batchSchema };
+
+const readableResult = z
+  .object({
+    session_id: z.string(),
+    view: z.enum(['session', 'runtime', 'adapted']),
+    reader: z
+      .object({
+        id: z.string(),
+        coverage: z
+          .array(
+            z.object({
+              type: z.string(),
+              selected: z.number().int().nonnegative(),
+              total: z.number().int().nonnegative(),
+            }),
+          )
+          .optional(),
+      })
+      .optional(),
+    detail: z.enum(['brief', 'full']).optional(),
+    query: z.string().optional(),
+    matches: z.number().int().nonnegative().optional(),
+    types: z.array(z.string()).optional(),
+    items: z.array(
+      z
+        .object({
+          type: z.string(),
+          ref: z.string().optional(),
+          title: z.string().optional(),
+          text: z.string().optional(),
+          source: z.record(z.unknown()).optional(),
+          related: z.array(z.object({ relation: z.string(), ref: z.string() })).optional(),
+        })
+        .passthrough(),
+    ),
+    next_cursor: z.string().nullable(),
+  })
+  .passthrough();
+// MCP clients also validate structured error results against the advertised
+// schema. Success fields remain discoverable alongside the shared error shape.
+const readableEnvelope = readableResult.partial().extend({
+  error: z.object({ code: z.string() }).passthrough().optional(),
+});
+export const publicOutputSchemas = { read: readableEnvelope, search: readableEnvelope };
+export const publicAnnotations = Object.fromEntries(
+  ['read', 'search'].map((name) => [name, { readOnlyHint: true, destructiveHint: false }]),
+);

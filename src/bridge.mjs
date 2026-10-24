@@ -7,7 +7,7 @@ import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema } from './read-schema.mjs';
+import { readSchema, searchSchema } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
@@ -503,7 +503,16 @@ export class Bridge {
       ...(this.events.storeError ? { events: this.events.health() } : {}),
     };
   }
-  async read(args, { requestContext, resultBudget, readPins } = {}) {
+  async search(input, options = {}) {
+    const parsed = searchSchema.safeParse(input);
+    if (!parsed.success) throw new Error('INVALID_SEARCH_ARGUMENTS');
+    const { query, ...args } = parsed.data;
+    return this.read(
+      { ...args, detail: 'brief', ...(args.view !== 'runtime' ? { preset: 'full' } : {}) },
+      { ...options, searchQuery: query },
+    );
+  }
+  async read(args, { requestContext, resultBudget, readPins, searchQuery } = {}) {
     const parsed = readSchema.safeParse(args);
     if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
     args = parsed.data;
@@ -511,7 +520,11 @@ export class Bridge {
     this.assertOpen();
     // Routing metadata only. Cached content is accessed after authorization and
     // today's canonical path/native identity check; a cursor is never a grant.
-    const id = args.session_id ?? this.readCache.identity(args.cursor).session_id;
+    const id =
+      args.session_id ??
+      (args.refs
+        ? this.readCache.referenceIdentity(args.refs[0]).session_id
+        : this.readCache.identity(args.cursor).session_id);
     let s = await this.session(id, requestContext);
     this.check('read', s, requestContext);
     const identity = {
@@ -520,6 +533,24 @@ export class Bridge {
       native_id: s.header.id,
       native_cwd: s.header.cwd,
     };
+    if (args.refs) {
+      const references = args.refs.map((ref) => this.readCache.reference(ref));
+      if (references.some((r) => JSON.stringify(r.entry.identity) !== JSON.stringify(identity)))
+        throw new Error('INVALID_READ_REFERENCE');
+      if (references.some((r) => r.document.request)) {
+        if (references.length !== 1) throw new Error('INVALID_READ_REFERENCE');
+        return this.read(
+          { ...references[0].document.request, max_bytes: args.max_bytes },
+          { requestContext, resultBudget, readPins },
+        );
+      }
+      const snapshot = this.readCache.expand(args.refs, identity);
+      return this.readCache.render(
+        snapshot,
+        { max_bytes: args.max_bytes },
+        { identity, resultBudget, readPins },
+      );
+    }
     if (args.cursor) {
       const captured = this.readCache.get(args, identity);
       return this.readCache.render(captured.snapshot, args, {
@@ -529,7 +560,7 @@ export class Bridge {
         readPins,
       });
     }
-    args = { ...args, session_id: id };
+    args = { ...args, session_id: id, detail: args.detail ?? 'brief' };
     let runtime = await this.pool.forRead(s);
     while (runtime && this.handoffs.get(id)?.runtime === runtime) {
       await runtime.autoReleaseTask;
@@ -543,7 +574,7 @@ export class Bridge {
     });
     let captured,
       retained = false;
-    if (args.view === 'observed') {
+    if (args.view === 'runtime') {
       captured =
         runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord)
           ? await runtime.read(args)
@@ -552,11 +583,16 @@ export class Bridge {
             : this.pool.observations.get(s);
       retained = !runtime;
     } else {
-      const nativeRead = () => this.acquireNativeRead(s, runtime, { ...args, view: 'native' });
+      const nativeRead = () =>
+        this.acquireNativeRead(s, runtime, {
+          ...args,
+          view: 'session',
+          ...(searchQuery ? { search_query: searchQuery } : {}),
+        });
       const acquire = async () => {
         // Only an explicit view selects a source. Modules assess session-local
         // evidence even without a live owner; reading never starts Pi.
-        if (this.compatibilityServices.sessionReaders.readers.size && args.view !== 'native') {
+        if (this.compatibilityServices.sessionReaders.readers.size && args.view !== 'session') {
           const context = {
             session: Object.freeze({
               id,
@@ -585,7 +621,7 @@ export class Bridge {
       };
       captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
     }
-    const runtimeObservation = runtime && captured.view === 'observed' ? captured : null;
+    const runtimeObservation = runtime && captured.view === 'runtime' ? captured : null;
     let currentLeaf;
     if (runtimeObservation?.observation.reason === 'no_observation') {
       const previous = this.pool.observations.get(s);
@@ -616,12 +652,14 @@ export class Bridge {
       this.pool.instances.get(id) === runtime
     )
       this.pool.observations.put(current, runtimeObservation, runtime);
-    const live = captured.live,
+    const live = searchQuery ? null : captured.live,
       snapshot = {
         session_id: id,
         view: captured.view,
         ...(captured.observation ? { observation: captured.observation } : {}),
-        ...(captured.reader ? { reader: captured.reader, request: args } : {}),
+        ...(captured.reader ? { reader: captured.reader } : {}),
+        request: args,
+        detail: args.detail,
         leaf_id: captured.leaf_id,
         selection: captured.selection,
         omissions: captured.omissions,
@@ -635,16 +673,21 @@ export class Bridge {
               : 'rpc'
             : 'saved',
       };
-    const events = (runtime?.runtimeEvents ?? this.pool.runtimeEvents.get(id))?.snapshot(
-      Math.min(4096, Math.floor((args.max_bytes ?? 24000) / 4)),
-    );
-    return this.readCache.render(snapshot, args, {
+    const events =
+      !searchQuery &&
+      (runtime?.runtimeEvents ?? this.pool.runtimeEvents.get(id))?.snapshot(
+        Math.min(4096, Math.floor((args.max_bytes ?? 24000) / 4)),
+      );
+    const renderOptions = {
       identity,
       resultBudget,
       live,
       runtimeEvents: events,
       readPins,
-    });
+    };
+    return args.detail === 'brief'
+      ? this.readCache.navigate(snapshot, args, renderOptions, searchQuery)
+      : this.readCache.render(snapshot, args, renderOptions);
   }
   async acquireNativeRead(session, runtime, args) {
     if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))

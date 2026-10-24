@@ -76,7 +76,7 @@ async function fixture(t) {
 
 test('frozen cache stores only detached clean units and never reacquires changed native entries', async (t) => {
   const f = await fixture(t),
-    first = await f.bridge.read({ session_id: f.id, max_bytes: 4096 });
+    first = await f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 });
   assert.ok(first.next_cursor);
   const stored = [...f.bridge.readCache.entries.values()][0];
   assert.ok(!JSON.stringify(stored).includes('AAAAAAA'));
@@ -97,10 +97,15 @@ test('frozen cache stores only detached clean units and never reacquires changed
 test('eviction and a new Bridge return STALE_CURSOR without reconstructing old snapshots', async (t) => {
   const f = await fixture(t);
   f.bridge.readCache = new ContextReadCache({ maxEntries: 1 });
-  const first = await f.bridge.read({ session_id: f.id, max_bytes: 4096 });
-  await f.bridge.read({ session_id: f.id, max_bytes: 4096, select: { thinking: 0 } });
+  const first = await f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 });
+  await f.bridge.read({
+    session_id: f.id,
+    detail: 'full',
+    max_bytes: 4096,
+    select: { thinking: 0 },
+  });
   await assert.rejects(f.bridge.read({ cursor: first.next_cursor }), /STALE_CURSOR/);
-  const fresh = await f.bridge.read({ session_id: f.id, max_bytes: 4096 });
+  const fresh = await f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 });
   await f.bridge.close();
   const restarted = await new Bridge(f.config, () => assert.fail('No writer')).init();
   try {
@@ -114,17 +119,21 @@ test('snapshot admission failure never issues an unusable cursor or silently nar
   const f = await fixture(t);
   f.bridge.readCache = new ContextReadCache({ maxBytes: 4096 });
   await assert.rejects(
-    f.bridge.read({ session_id: f.id, max_bytes: 4096 }),
+    f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 }),
     /READ_SNAPSHOT_TOO_LARGE/,
   );
   assert.equal(f.bridge.readCache.entries.size, 0);
   assert.equal(f.bridge.readCache.accountedBytes, 0);
-  const denied = await callBridgeTool(f.bridge, 'read', { session_id: f.id, max_bytes: 4096 });
+  const denied = await callBridgeTool(f.bridge, 'read', {
+    session_id: f.id,
+    detail: 'full',
+    max_bytes: 4096,
+  });
   assert.equal(JSON.parse(denied.content[0].text).error.code, 'READ_SNAPSHOT_TOO_LARGE');
   f.bridge.readCache = new ContextReadCache();
   f.entries[1].message.content[0].text = ('x'.repeat(1000) + '\n\n').repeat(9000);
   await assert.rejects(
-    f.bridge.read({ session_id: f.id, max_bytes: 4096 }),
+    f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 }),
     /READ_SNAPSHOT_TOO_LARGE/,
   );
   assert.equal(f.bridge.readCache.entries.size, 0);
@@ -136,8 +145,8 @@ test('batch cursor snapshots are pinned until assembly and temporary cache press
   f.bridge.readCache = new ContextReadCache({ maxEntries: 1 });
   const response = await callBridgeTool(f.bridge, 'batch', {
     operations: [
-      { op: 'read', args: { session_id: f.id, max_bytes: 4096 } },
-      { op: 'read', args: { session_id: f.id, max_bytes: 4096 } },
+      { op: 'read', args: { session_id: f.id, detail: 'full', max_bytes: 4096 } },
+      { op: 'read', args: { session_id: f.id, detail: 'full', max_bytes: 4096 } },
     ],
   });
   const [first, second] = response.structuredContent.results;
@@ -152,6 +161,7 @@ test('cursor overrides validate explicit values only, and canonical native ident
   const f = await fixture(t),
     first = await f.bridge.read({
       session_id: f.id,
+      detail: 'full',
       max_bytes: 4096,
       preset: 'full',
       select: { text: 1, tools: 0, thinking: 0, commands: 0 },
@@ -174,7 +184,7 @@ test('cursor overrides validate explicit values only, and canonical native ident
 
 test('native cwd replacement invalidates frozen cursors even under the same native ID', async (t) => {
   const f = await fixture(t),
-    first = await f.bridge.read({ session_id: f.id, max_bytes: 4096 });
+    first = await f.bridge.read({ session_id: f.id, detail: 'full', max_bytes: 4096 });
   assert.ok(first.next_cursor);
   const text = await fs.readFile(f.session.file, 'utf8'),
     lines = text.trimEnd().split('\n'),

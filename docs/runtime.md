@@ -52,7 +52,7 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 
 | Capability              | Bridge-owned RPC                    | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings            |
 | ----------------------- | ----------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
-| Read context            | Native + observed                   | Native + observed                                     | Native snapshot; observed unavailable     |
+| Read context            | Session + runtime                   | Session + runtime                                     | Session projection; runtime unavailable   |
 | Live text/thinking      | Native delta events                 | Public extension events                               | When supplied by the host                 |
 | Send text/images        | Native ACK                          | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
 | Standalone `set_model`  | Native setters; busy supported      | Public setters; busy supported                        | Native setters; busy supported            |
@@ -62,7 +62,7 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 | TUI handoff             | Drain, normal EOF, reserved join    | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                   |
 
 Saved reads need no writer. Send, command, compact and `set_model` may cold-start
-an RPC; stop, read and list do not. Model catalogs are independent of session
+an RPC; stop, read, search and list do not. Model catalogs are independent of session
 owners. See [native controls](model-control.md) and [read formats](reading.md).
 
 After prompt/control work, an owned RPC normally exits by EOF once ACKs, native
@@ -398,7 +398,7 @@ close path returns `DELETE_SHARED_OWNER` to protect its other sessions.
 ## Read and fork boundaries
 
 Owner reads transfer selected, sanitized snapshots; saved reads need no writer.
-[Reading](reading.md) defines selection, capture and cursor behavior.
+[Reading](reading.md) defines brief/full selection, search, references and frozen capture behavior.
 
 Fork uses `{sessionFile,sessionId,entries,leafId}` from the cooperating owner's
 `snapshot()` while leaving its writer in place. These raw native records retain

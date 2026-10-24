@@ -58,6 +58,7 @@ const enums = {
     'health',
     'list',
     'read',
+    'search',
     'send',
     'stop',
     'bash',

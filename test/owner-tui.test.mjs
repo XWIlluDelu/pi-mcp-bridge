@@ -194,6 +194,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       'list',
       'models',
       'read',
+      'search',
       'send',
       'set_model',
       'stop',

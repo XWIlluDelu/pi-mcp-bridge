@@ -3,7 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
 import { Bridge } from './bridge.mjs';
-import { publicSchemas } from './tool-schemas.mjs';
+import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { toolNames, descriptions, objectSchema, callBridgeTool, SERVER_INFO } from './protocol.mjs';
 import { publicError } from './errors.mjs';
 import { diagnostics } from './diagnostics.mjs';
@@ -13,7 +13,13 @@ export function makeServer(bridge, { execute = (run) => run() } = {}) {
   for (const name of toolNames)
     server.registerTool(
       name,
-      { description: descriptions[name], inputSchema: objectSchema(publicSchemas[name]) },
+      {
+        description: descriptions[name],
+        inputSchema: objectSchema(publicSchemas[name]),
+        ...(publicOutputSchemas[name]
+          ? { outputSchema: publicOutputSchemas[name], annotations: publicAnnotations[name] }
+          : {}),
+      },
       (args, extra) =>
         callBridgeTool(bridge, name, args, {
           execute,

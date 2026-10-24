@@ -403,7 +403,7 @@ export class AttachedRuntime {
       JSON.stringify({
         op,
         body,
-        ...(op === 'read' && body.view !== 'observed'
+        ...(op === 'read' && body.view !== 'runtime'
           ? { readAdapters: this.compatibility?.readInputs.snapshot() ?? [] }
           : {}),
         generation: this.record.generation,

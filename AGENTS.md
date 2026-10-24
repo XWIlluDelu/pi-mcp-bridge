@@ -7,6 +7,12 @@ and their dedicated tests, fixtures and documentation; do not translate or migra
 old control formats. Report a clear mismatch when using an unsupported live
 endpoint and require the components to be updated together.
 
+Use `package.json` as the single Bridge version source, including owner read
+compatibility. Main releases use a plain semantic version and a matching Git tag.
+Auto-dev iterations use the next intended release's prerelease suffix, starting
+at `-dev.1` for each release cycle. Remove that suffix when publishing main;
+do not maintain a separate protocol iteration counter.
+
 Ownership evidence is separate from control-interface compatibility. Scope
 checks to the target path or exact process, preserve live writers and explicit
 local pauses, and allow native replacement or confirmed process exit to end

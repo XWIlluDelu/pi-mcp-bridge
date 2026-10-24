@@ -208,6 +208,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
       'list',
       'models',
       'read',
+      'search',
       'send',
       'set_model',
       'stop',
@@ -463,12 +464,12 @@ test('official Pi RPC preserves Unicode line separators in native session messag
       content = 'Before\u2028between\u2029after 😀 汉字';
     manager.appendMessage({ role: 'user', content, timestamp: Date.now() });
     assert.equal(
-      (await bridge.read({ session_id: made.session_id })).items[0].message.content,
+      (await bridge.read({ session_id: made.session_id, detail: 'full' })).items[0].message.content,
       content,
     );
     const runtime = await bridge.pool.resolve(await bridge.session(made.session_id));
     assert.equal((await runtime.state()).sessionId, saved.header.id);
-    const live = await bridge.read({ session_id: made.session_id });
+    const live = await bridge.read({ session_id: made.session_id, detail: 'full' });
     assert.equal(live.items[0].message.content, content);
   } finally {
     await bridge.close();

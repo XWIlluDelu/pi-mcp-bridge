@@ -940,7 +940,7 @@ export class RuntimePool {
       runtime.retainObservation = async () => {
         let snapshot;
         try {
-          snapshot = await runtime.read({ session_id: runtime.session.id, view: 'observed' });
+          snapshot = await runtime.read({ session_id: runtime.session.id, view: 'runtime' });
         } catch {
           // An unavailable observer does not erase a dated request snapshot.
           // Late public reads remain fenced by handoff and the runtime identity.

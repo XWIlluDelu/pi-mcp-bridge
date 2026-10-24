@@ -45,7 +45,7 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   const config = {
     ...isolatedRuntime(dir),
     compatibilityModules: [
-      { module: fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url)) },
+      { module: fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url)) },
     ],
     herdr: true,
     stateDir: path.join(dir, 'state'),

@@ -4,7 +4,8 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 
 ## What it does
 
-- List authorized sessions and read native history, configured extension views or captured request context.
+- List authorized sessions, read useful task overviews, search effective context and expand referenced evidence.
+- Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
 - Send text and images, run native shell commands, select model/thinking settings, compact context and stop work.
 - Create or fork sessions, and move deleted sessions to recoverable trash while retaining project files.
 - Notify ChatGPT Work chats and dots when a Bridge-owned session settles, with a leaf ID for reading that result.
@@ -55,7 +56,8 @@ The launcher negotiates ownership before opening the session. See [runtime integ
 - [Configuration and permissions](docs/configuration.md)
 - [Public tool API](docs/api.md)
 - [Model catalog, thinking and compaction](docs/model-control.md)
-- [Reading and pagination](docs/reading.md)
+- [Reading, search and reference expansion](docs/reading.md)
+- [Optional compatibility modules](docs/compatibility.md)
 - [Runtime ownership and host interfaces](docs/runtime.md)
 - [MCP protocols and transports](docs/transports.md)
 - [Completion events](docs/events.md)
@@ -69,4 +71,4 @@ npm run format:check
 npm audit
 ```
 
-Tests use synthetic providers, temporary session stores and isolated Pi profiles. Native subprocess/PTY tests require Linux utilities including `script`; the service-unit check needs `systemd-analyze`. See [verification](docs/architecture.md#verification) for external Pi selection and optional Herdr tests.
+Tests include independent modules under `integrations/` and use synthetic providers, temporary session stores and isolated Pi profiles. Native subprocess/PTY tests require Linux utilities including `script`; the service-unit check needs `systemd-analyze`. See [verification](docs/architecture.md#verification) for external Pi selection and optional Herdr tests.
