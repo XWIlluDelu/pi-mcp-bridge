@@ -612,10 +612,40 @@ export function appendUnits(target, record) {
     target.units.push(detached);
   }
 }
+export function validateReadEntryIds(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length > 10000 ||
+    value.some((id) => typeof id !== 'string' || !id || id.length > 128)
+  )
+    throw new Error('INVALID_READ_ARGUMENTS');
+  return [...new Set(value)].sort();
+}
+
+function entryRelations(byId, leaf, ids) {
+  const ancestry = new Set();
+  let current = leaf;
+  while (current !== null) {
+    const entry = byId.get(current);
+    if (!entry) break;
+    ancestry.add(current);
+    current = entry.parentId;
+  }
+  // The raw parent chain includes ancestors omitted by compaction. A missing
+  // parent prevents negative claims; entries reached on the chain are known.
+  return Object.fromEntries(
+    ids.map((id) => [
+      id,
+      ancestry.has(id) ? 'on_branch' : current === null && byId.has(id) ? 'off_branch' : 'unknown',
+    ]),
+  );
+}
+
 export function prepareContextRead(data, rawArgs, { buildSessionProjection, readAdapters = [] }) {
   // Internal owner acquisition predicate. Public search supplies it only after
   // validating its own schema; public read does not accept this field.
-  const { search_query, ...readArgs } = rawArgs;
+  const { search_query, entry_ids, ...readArgs } = rawArgs;
+  const requestedEntries = entry_ids === undefined ? undefined : validateReadEntryIds(entry_ids);
   if (
     search_query !== undefined &&
     (typeof search_query !== 'string' || !search_query.trim() || search_query.length > 2048)
@@ -672,6 +702,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
     leaf_id: leaf,
     selection,
     omissions: selected.omissions,
+    ...(requestedEntries ? { entry_relations: entryRelations(byId, leaf, requestedEntries) } : {}),
     ...(search_query !== undefined ? { search_query } : {}),
     units: target.units,
     ...(data.history ? { history: data.history } : {}),
@@ -871,6 +902,21 @@ export function renderPreparedContextRead(
 export function assertReadSnapshot(value, args) {
   if (value?.contract !== READ_CONTRACT) throw new Error('OWNER_READ_REFRESH_REQUIRED');
   if (value.search_query !== args.search_query) throw new Error('INVALID_OWNER_READ');
+  if (args.entry_ids !== undefined) {
+    const ids = validateReadEntryIds(args.entry_ids);
+    if (
+      !value.entry_relations ||
+      typeof value.entry_relations !== 'object' ||
+      Array.isArray(value.entry_relations) ||
+      Object.keys(value.entry_relations).length !== ids.length ||
+      ids.some(
+        (id) =>
+          !Object.hasOwn(value.entry_relations, id) ||
+          !['on_branch', 'off_branch', 'unknown'].includes(value.entry_relations[id]),
+      )
+    )
+      throw new Error('INVALID_OWNER_READ');
+  }
   const observed = args.view === 'runtime';
   if (
     observed &&

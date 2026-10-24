@@ -209,6 +209,7 @@ export function navigationDocuments(snapshot) {
     doc.title = body.title;
     doc.preview = body.preview;
     doc.related = body.related;
+    doc.branch_relation = body.branch_relation;
     doc.assistant =
       (doc.kind === 'text' && body.source?.entry_id !== undefined) ||
       (doc.kind === 'native' && body.message?.role === 'assistant');
@@ -327,6 +328,7 @@ export function navigationRows(
             doc.kind === 'prompt' || doc.kind === 'text' ? 1600 : 900,
           ),
       ...(doc.source ? { source: doc.source } : {}),
+      ...(doc.branch_relation ? { branch_relation: doc.branch_relation } : {}),
       ...(related.length ? { related } : {}),
     };
   });

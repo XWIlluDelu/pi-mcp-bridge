@@ -8,7 +8,10 @@ import { PiRpc } from '../src/rpc.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/host-bindings.mjs';
 import { processIdentity } from '../src/attachments.mjs';
-import { RpcClient } from './fixtures/pi.mjs';
+import { RpcClient, buildSessionProjection } from './fixtures/pi.mjs';
+import { prepareContextRead, assertReadSnapshot } from '../src/context-read.mjs';
+import { readSchema } from '../src/read-schema.mjs';
+import { captureSessionRead } from '../src/session-readers.mjs';
 import { makeServer } from '../src/server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -34,8 +37,11 @@ async function fixture(t) {
           : fs.stat(path.join(options.store,session.native_id+'.json')).then(()=>true,e=>{
               if(e.code==='ENOENT')return false;throw e;
             }),
-        read: async ({session}) => {
+        read: async ({session,nativeRead}) => {
           const stored = JSON.parse(await fs.readFile(path.join(options.store,session.native_id+'.json'),'utf8'));
+          const native = await nativeRead({entry_ids:['a','u','missing']});
+          if (!Object.hasOwn(native.entry_relations,'u') || native.entry_relations.missing !== 'unknown')
+            throw new Error('MISSING_NATIVE_BRANCH_EVIDENCE');
           return {native:true,items:stored};
         },
       }));
@@ -171,6 +177,112 @@ test('RPC host read routing sees the target session extension through public com
   const page = await f.call({ session_id: target.id, max_bytes: 4096 });
   assert.equal(page.reader.id, 'fixture-memory');
   assert.equal((await f.call({ session_id: plain.id })).view, 'session');
+});
+
+test('native branch evidence uses the requested raw chain and treats incomplete ancestry as unknown', () => {
+  const args = { session_id: 'branch-fixture', entry_ids: ['root', 'current', 'other', 'missing'] };
+  const entries = [
+    {
+      type: 'message',
+      id: 'root',
+      parentId: null,
+      message: { role: 'user', content: 'Shared input' },
+    },
+    {
+      type: 'message',
+      id: 'current',
+      parentId: 'root',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Current answer' }] },
+    },
+    {
+      type: 'message',
+      id: 'other',
+      parentId: 'root',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Other answer' }] },
+    },
+  ];
+  const capture = (rows, options = {}) =>
+    prepareContextRead(
+      { entries: rows, leafId: 'current' },
+      { ...args, ...options },
+      { buildSessionProjection },
+    );
+  assert.equal(
+    readSchema.safeParse(args).success,
+    false,
+    'entry_ids is not a public read argument',
+  );
+  const native = capture(entries);
+  assert.deepEqual(native.entry_relations, {
+    current: 'on_branch',
+    missing: 'unknown',
+    other: 'off_branch',
+    root: 'on_branch',
+  });
+  assert.equal(assertReadSnapshot(native, args), native);
+  assert.throws(
+    () => assertReadSnapshot({ ...native, entry_relations: undefined }, args),
+    /INVALID_OWNER_READ/,
+  );
+  const broken = capture(entries.filter((entry) => entry.id !== 'root'));
+  assert.deepEqual(broken.entry_relations, {
+    current: 'on_branch',
+    missing: 'unknown',
+    other: 'unknown',
+    root: 'unknown',
+  });
+  assert.equal(capture(entries, { leaf_id: 'other' }).entry_relations.current, 'off_branch');
+  assert.throws(() => capture(entries, { entry_ids: [null] }), /INVALID_READ_ARGUMENTS/);
+});
+
+test('readers reuse one native capture for branch selection and may omit its content', async () => {
+  let acquired = 0;
+  const args = { session_id: 'reader-fixture' };
+  const native = {
+    leaf_id: 'captured',
+    units: [{ type: 'text', source: { entry_id: 'captured' } }],
+    entry_relations: { captured: 'on_branch' },
+  };
+  const context = {
+    owner: { leaf_id: 'older' },
+    nativeRead: async () => {
+      acquired++;
+      return native;
+    },
+  };
+  for (const includeNative of [true, false]) {
+    const result = await captureSessionRead(
+      {
+        id: 'fixture',
+        read: async ({ nativeRead }) => {
+          assert.equal(await nativeRead({ entry_ids: ['captured', 'captured'] }), native);
+          assert.equal(await nativeRead({ entry_ids: ['captured'] }), native);
+          assert.equal(await nativeRead(), native);
+          return { native: includeNative, items: [] };
+        },
+      },
+      context,
+      args,
+    );
+    assert.equal(result.leaf_id, 'captured');
+    assert.equal(result.units.length, includeNative ? 1 : 0);
+  }
+  assert.equal(acquired, 2);
+  await assert.rejects(
+    captureSessionRead(
+      {
+        id: 'fixture',
+        read: async ({ nativeRead }) => {
+          await nativeRead({ entry_ids: ['captured'] });
+          await nativeRead({ entry_ids: ['another'] });
+        },
+      },
+      context,
+      args,
+    ),
+    /SESSION_READER_FAILED/,
+  );
+  assert.equal(acquired, 3, 'changing the requested facts must not silently reacquire');
 });
 
 test('one read entry routes live and saved session evidence, pages frozen context, and keeps explicit session view', async (t) => {
