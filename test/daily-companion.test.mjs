@@ -73,10 +73,10 @@ for (const mode of ['tui', 'rpc'])
 import {fauxProvider} from ${JSON.stringify(aiEntry)};
 export default pi=>{
  pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']},{id:'next',reasoning:true,input:['text']}]}).provider);
- pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile)},JSON.stringify({
+ pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile + '.pending')},JSON.stringify({
   pid:process.pid,file:ctx.sessionManager.getSessionFile(),header:ctx.sessionManager.getHeader(),
   joinCommands:pi.getCommands().filter(c=>c.name==='bridge-join').length
- }));});
+ }));await fs.rename(${JSON.stringify(metaFile + '.pending')},${JSON.stringify(metaFile)});});
  pi.registerCommand('fixture-reload',{handler:async(_,ctx)=>ctx.reload()});
  pi.registerCommand('fixture-switch-outside',{handler:async(_,ctx)=>ctx.switchSession(${JSON.stringify(outside)})});
 };`,
