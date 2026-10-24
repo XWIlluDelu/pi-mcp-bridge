@@ -61,6 +61,12 @@ export async function fixture(t) {
   config.piRuntime.inheritEnv = ['PI_MODEL_GATE'];
   process.env.PI_MODEL_GATE = gate;
   await fs.mkdir(config.piRuntime.agentDir);
+  // Cold model restoration reads configured auth before the extension's async
+  // availability refresh; make the offline provider available at that boundary.
+  await fs.writeFile(
+    path.join(config.piRuntime.agentDir, 'auth.json'),
+    JSON.stringify({ 'model-fixture': { type: 'api_key', key: 'synthetic-only' } }),
+  );
   const settings = path.join(config.piRuntime.agentDir, 'settings.json');
   await fs.writeFile(
     settings,
