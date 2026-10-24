@@ -18,6 +18,7 @@ Every mutation call is a new operation, including identical calls. There is no d
 | `rejected`   | Definite refusal, explained by `reason`.                                       |
 | `skipped`    | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
 | `unknown`    | Dispatch or outcome is uncertain.                                              |
+| `created`    | The session was saved without submitting an initial prompt.                    |
 | `deleted`    | The session moved to recoverable Bridge trash.                                 |
 
 Tool errors return `isError:true` with `{error:{code:…}}` in text and structured content. An operation may instead return `rejected` or `unknown`. Batch retains each item's result or error independently.
@@ -185,7 +186,19 @@ Stop never cold-starts Pi. It invalidates pending Bridge inputs, including batch
 
 A completed owned runtime may release normally; external owners stay open. Each stop acts on current work, so repeating it to retrieve old withdrawn text can interrupt a later run.
 
-### Create and send
+### Create
+
+```json
+{ "project": "/home/example/project", "name": "Review" }
+```
+
+Omit `text` and `images` to save a session without starting a writer or model run.
+This returns `{status:"created",created:true,session_id}` with no `send` or
+`submission_id`. The saved session can be listed, read and subscribed to before
+its first `send`. Model and thinking settings require an initial prompt; set them
+on that later send when preparing an empty session.
+
+To create and submit the first prompt together:
 
 ```json
 {
@@ -196,11 +209,15 @@ A completed owned runtime may release normally; external owners stay open. Each 
 }
 ```
 
-`project` must exactly match a configured canonical path. The child uses the project's [native session destination](configuration.md#storage-and-project-paths); a destination outside configured roots returns `NATIVE_SESSION_OUTSIDE_ROOTS` before publication or input. `name` is optional, 1–200 code units. Text or images are required, with the same image and model/thinking rules as send.
+`project` must exactly match a configured canonical path. The child uses the project's [native session destination](configuration.md#storage-and-project-paths); a destination outside configured roots returns `NATIVE_SESSION_OUTSIDE_ROOTS` before publication or input. `name` is optional, 1–200 code units. Supplied text, images and model/thinking settings follow the same rules as send.
 
-Target `create` permission authorizes the first prompt; later sends need `send`. Optional `fork_from` additionally requires source `read` and copies the parent's current committed native branch, preserving native bookmarks. A live parent's native snapshot is authoritative; unsupported snapshot capability fails. The fork leaves its owner in place and waits if that owner is already releasing. See [read/fork boundaries](runtime.md#read-and-fork-boundaries).
+Target `create` permission authorizes creation and its optional first prompt; later sends need `send`. Listing requires `list`; reading and subscribing require `read`. Optional `fork_from` additionally requires source `read` and copies the parent's current committed native branch, preserving native bookmarks. It also works without a prompt, so the copied context can be inspected before continuing. A live parent's native snapshot is authoritative; unsupported snapshot capability fails. The fork leaves its owner in place and waits if that owner is already releasing. See [read/fork boundaries](runtime.md#read-and-fork-boundaries).
 
-The result contains `created`, the chosen child `session_id` when available, and nested `send` status/details. A failure after creation retains the child ID. The initial prompt holds the child's admission lane so later input cannot overtake it. Another create call creates another child.
+The result contains `created` and the chosen child `session_id` when available.
+When an initial prompt is supplied, it also contains nested `send` status/details
+and a `submission_id` once tracked. A failure after creation retains the child ID.
+The initial prompt holds the child's admission lane so later input cannot
+overtake it. Another create call creates another child.
 
 ### Delete
 

@@ -210,6 +210,31 @@ test('create-and-send uses only create permission and returns its child identity
   );
 });
 
+test('empty creation needs only create permission and does not start a writer or submission', async (t) => {
+  const f = await fixture(t, { send: false, read: false, list: false });
+  f.bridge.pool.factory = async () => assert.fail('Empty creation must not start a writer');
+  const result = await f.bridge.create({ project: f.project, name: 'Awaiting task' });
+  assert.deepEqual(result, {
+    status: 'created',
+    created: true,
+    session_id: result.session_id,
+  });
+  assert.match(result.session_id, /^ps_[a-f0-9]{32}$/);
+  assert.equal((await f.bridge.sessions()).length, 1);
+  assert.equal(f.bridge.pool.instances.size, 0);
+  assert.deepEqual((await f.bridge.list()).sessions, []);
+  await assert.rejects(f.bridge.read({ session_id: result.session_id }), /NOT_FOUND_OR_DENIED/);
+  assert.equal(
+    (await f.bridge.send({ session_id: result.session_id, text: 'later' })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
+  for (const settings of [{ model: { provider: 'test', id: 'model' } }, { thinking_level: 'high' }])
+    await assert.rejects(f.bridge.create({ project: f.project, ...settings }), /INVALID_ARGUMENTS/);
+  f.config.defaults.create = false;
+  assert.equal((await f.bridge.create({ project: f.project })).reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal((await f.bridge.sessions()).length, 1);
+});
+
 test('fork copies committed native branch, keeps parent owner, and uses target permissions', async (t) => {
   const f = await fixture(t);
   const parent = await f.bridge.create({
@@ -220,6 +245,22 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   const before = await fs.readFile(source.file, 'utf8'),
     runtime = f.bridge.pool.get(source.id);
   f.config.defaults.send = false;
+  const prepared = await f.bridge.create({ project: f.project, fork_from: source.id });
+  assert.equal(prepared.status, 'created');
+  assert.equal(prepared.submission_id, undefined);
+  assert.equal(f.bridge.pool.get(prepared.session_id), null);
+  const preparedRead = await f.bridge.read({
+    session_id: prepared.session_id,
+    detail: 'full',
+  });
+  assert.ok(JSON.stringify(preparedRead.items).includes('parent'));
+  const preparedHistory = await loadSavedSession(await f.bridge.session(prepared.session_id));
+  assert.equal(preparedHistory.header.parentSession, source.file);
+  assert.deepEqual(
+    preparedHistory.entries.filter((e) => e.type === 'message').map((e) => e.message.content),
+    ['parent'],
+  );
+  assert.equal(f.calls.length, 1, 'Preparing a fork must not send another prompt');
   const child = await f.bridge.create({
     project: f.project,
     text: 'child prompt',
@@ -239,16 +280,11 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
     source.id,
   );
   f.config.grants = [{ session_id: source.id, read: false }];
-  assert.equal(
-    (
-      await f.bridge.create({
-        project: f.project,
-        text: 'denied',
-        fork_from: source.id,
-      })
-    ).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
+  for (const prompt of [{}, { text: 'denied' }])
+    assert.equal(
+      (await f.bridge.create({ project: f.project, fork_from: source.id, ...prompt })).reason,
+      'NOT_FOUND_OR_DENIED',
+    );
 });
 
 test('failed first send preserves its created identity', async (t) => {

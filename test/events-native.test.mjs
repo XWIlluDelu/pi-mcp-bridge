@@ -9,7 +9,6 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 async function until(fn) {
@@ -35,7 +34,14 @@ test(
       stateDir: dir + '/state',
       sessionRoots: [dir + '/sessions'],
       folders: [{ path: dir }],
-      defaults: { ...denyAllPermissions(), read: true, send: true },
+      defaults: {
+        ...denyAllPermissions(),
+        list: true,
+        read: true,
+        send: true,
+        create: true,
+        delete: true,
+      },
     };
     const extension = dir + '/shutdown-gate.mjs';
     await fs.writeFile(
@@ -102,8 +108,7 @@ test(
       await service.close();
       await fs.rm(dir, { recursive: true, force: true });
     });
-    const made = await savedSession(bridge),
-      events = [],
+    const events = [],
       verification = [];
     const secret = 'whsec_' + Buffer.alloc(32, 4).toString('base64');
     bridge.events.post = async (_url, body, headers) => {
@@ -142,6 +147,24 @@ test(
       });
       return { status: response.status, body: await response.json() };
     }
+    const creation = await call('tools/call', {
+      name: 'create',
+      arguments: { project: dir, name: 'Awaiting notification subscription' },
+    });
+    const made = creation.body.result.structuredContent;
+    assert.deepEqual(made, { status: 'created', created: true, session_id: made.session_id });
+    const listed = await call('tools/call', {
+      name: 'list',
+      arguments: { session_id: made.session_id },
+    });
+    assert.equal(listed.body.result.structuredContent.sessions[0].status.state, 'saved');
+    const emptyRead = await call('tools/call', {
+      name: 'read',
+      arguments: { session_id: made.session_id },
+    });
+    assert.deepEqual(emptyRead.body.result.structuredContent.items, []);
+    assert.equal(bridge.pool.instances.size, 0);
+    assert.equal(events.length, 0);
     const input = {
       name: 'session.settled',
       arguments: { session_id: made.session_id },
@@ -183,7 +206,7 @@ test(
       op: 'settled',
       session_id: made.session_id,
       generation: runtime.ownerRecord.generation,
-      sequence: runtime.completionSequence,
+      sequence: 1,
       leafId: first.data.leaf_id,
       aborted: false,
       result: first.data.result,
@@ -241,5 +264,12 @@ test(
       200,
     );
     assert.equal(bridge.events.records.size, 0);
+    const deleted = await call('tools/call', {
+      name: 'delete',
+      arguments: { session_id: made.session_id },
+    });
+    assert.equal(deleted.body.result.structuredContent.status, 'deleted');
+    assert.equal(typeof deleted.body.result.structuredContent.restore_token, 'string');
+    assert.deepEqual((await bridge.list({ session_id: made.session_id })).sessions, []);
   },
 );

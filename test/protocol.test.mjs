@@ -130,7 +130,15 @@ test('public mutation payloads are validated before dispatch', async () => {
       arguments: { project: '/tmp/p' },
     }),
   );
-  assert.equal(empty.message.result.isError, true);
+  assert.equal(empty.message.result.isError, undefined);
+  const settingsOnly = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'create',
+      arguments: { project: '/tmp/p', thinking_level: 'high' },
+    }),
+  );
+  assert.equal(settingsOnly.message.result.isError, true);
   const unknown = await dispatchModern(
     bridge,
     message('tools/call', {
@@ -139,7 +147,7 @@ test('public mutation payloads are validated before dispatch', async () => {
     }),
   );
   assert.equal(unknown.message.result.isError, true);
-  assert.equal(called, 1);
+  assert.equal(called, 2);
 });
 test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
   const bridge = {

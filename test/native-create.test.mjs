@@ -41,10 +41,18 @@ for (const persistent of [false, true])
         throw Object.assign(new Error('synthetic cleanup failure'), { code: 'EACCES' });
       return unlink(file);
     });
-    const result = await bridge.create({ project: dir, text: 'NEVER_DISPATCH' });
+    const result = await bridge.create({
+      project: dir,
+      ...(persistent ? { text: 'NEVER_DISPATCH' } : {}),
+    });
     assert.equal(result.created, true, JSON.stringify(result));
     assert.equal(result.status, 'unknown');
-    assert.equal(result.send.status, 'unknown');
+    if (persistent) assert.equal(result.send.status, 'unknown');
+    else {
+      assert.equal(result.send, undefined);
+      assert.equal(typeof result.reason, 'string');
+      assert.equal(result.submission_id, undefined);
+    }
     assert.match(result.session_id, /^ps_/);
     const files = await fs.readdir(root),
       published = files.find((file) => file.endsWith('.jsonl')),

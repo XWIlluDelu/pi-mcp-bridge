@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { opaqueId } from '../../src/storage.mjs';
 
 // Seed persisted history without starting Pi or exercising create-and-send.
-// Tests of create itself must call Bridge.create with an initial prompt.
+// Tests of public creation must call Bridge.create.
 export async function savedSession(bridge, { project = bridge.config.folders[0]?.path } = {}) {
   const id = randomUUID(),
     timestamp = new Date().toISOString();
