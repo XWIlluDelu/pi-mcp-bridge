@@ -9,6 +9,8 @@ import { test } from 'node:test';
 import module, { createMagicContextReader } from './index.mjs';
 import { captureSessionRead } from '../../src/session-readers.mjs';
 import { ContextReadCache } from '../../src/read-cache.mjs';
+import { prepareContextRead } from '../../src/context-read.mjs';
+import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
 
 // The reader's current contract is checked against MC 0.49.20 schema 95.
 // Only the tables and columns it queries are needed in these isolated fixtures.
@@ -42,9 +44,11 @@ async function fixture(t) {
     session: { id: 'ps_public', native_id: 'native-public', cwd },
     owner: { available: false, commands: [], tools: [] },
     request: {},
-    nativeRead: () => {
-      throw new Error('Only the core may invoke nativeRead');
-    },
+    nativeRead: async ({ entry_ids } = {}) => ({
+      units: [],
+      leaf_id: null,
+      entry_relations: Object.fromEntries((entry_ids ?? []).map((id) => [id, 'unknown'])),
+    }),
   };
   db.prepare('INSERT INTO session_projects VALUES(?,?,?)').run('native-public', 'pi', identity);
   t.after(async () => {
@@ -315,6 +319,150 @@ test('presets select real summaries and eligible memories, excluding empty bound
   }
 });
 
+test('default MC reads exclude known other-branch summaries before limiting, while full retains their sources', async (t) => {
+  const f = await fixture(t);
+  const message = (id, parentId, role, text) => ({
+    type: 'message',
+    id,
+    parentId,
+    timestamp: '2026-01-01T00:00:00Z',
+    message: { role, content: [{ type: 'text', text }], timestamp: 0 },
+  });
+  const entries = [
+    message('root', null, 'user', 'Choose the storage design'),
+    message('common', 'root', 'assistant', 'Common design constraints'),
+    message('current-input', 'common', 'user', 'Use PostgreSQL'),
+    message('current-answer', 'current-input', 'assistant', 'PostgreSQL is selected'),
+    {
+      type: 'compaction',
+      id: 'compact',
+      parentId: 'current-answer',
+      timestamp: '2026-01-01T00:00:00Z',
+      firstKeptEntryId: 'current-input',
+      summary: 'Shared design constraints',
+      tokensBefore: 2000,
+    },
+    message('latest-input', 'compact', 'user', 'Continue the PostgreSQL implementation'),
+    message('latest-answer', 'latest-input', 'assistant', 'Implementing PostgreSQL'),
+    message('old-input', 'common', 'user', 'Use MongoDB'),
+    message('old-answer', 'old-input', 'assistant', 'MongoDB is selected'),
+  ];
+  for (const [id, end, status] of [
+    [1, 'common', 'ok'],
+    [2, 'current-answer', 'ok'],
+    [3, 'missing', 'ok'],
+    [4, 'old-answer', 'unresolved'],
+    [5, 'old-input', 'ok'],
+    [6, 'old-answer', 'ok'],
+  ])
+    f.compartment({
+      id,
+      sequence: id,
+      end_message_id: end,
+      rebase_status: status,
+      ...(id === 6 ? { p1: 'MongoDB is selected' } : {}),
+    });
+  f.memory({ source_session_id: 'other-branch-origin' });
+  const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
+  let acquisitions = 0;
+  const capture = async (preset) => {
+    const request = { session_id: f.context.session.id, preset };
+    return captureSessionRead(
+      reader,
+      {
+        ...f.context,
+        request,
+        nativeRead: async (options) => {
+          acquisitions++;
+          return prepareContextRead(
+            { entries, leafId: 'latest-answer' },
+            { ...request, ...options },
+            { buildSessionProjection },
+          );
+        },
+      },
+      request,
+    );
+  };
+  const summaryIds = (result) => [
+    ...new Set(
+      result.units
+        .filter((u) => u.source?.reader_item?.startsWith('compartment:'))
+        .map((u) => u.source.reader_item),
+    ),
+  ];
+  assert.deepEqual(summaryIds(await capture('latest')), ['compartment:3', 'compartment:4']);
+  const recent = await capture('recent');
+  assert.deepEqual(
+    summaryIds(recent),
+    [1, 2, 3, 4].map((id) => `compartment:${id}`),
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:1').branch_relation,
+    'on_branch',
+    'compaction does not remove raw ancestry',
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:3').branch_relation,
+    'unknown',
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:4').branch_relation,
+    'unknown',
+    'unresolved MC boundaries cannot establish ancestry',
+  );
+  assert.ok(
+    recent.units.some((u) => u.source.reader_item === 'memory:1'),
+    'project memories are independent of session branches',
+  );
+  assert.deepEqual(recent.reader.coverage[0], {
+    type: 'summary',
+    selected: 4,
+    total: 6,
+    excluded: 2,
+  });
+  const full = await capture('full');
+  assert.deepEqual(
+    summaryIds(full),
+    [1, 2, 3, 4, 5, 6].map((id) => `compartment:${id}`),
+  );
+  const historical = full.units.find((u) => u.source.reader_item === 'compartment:6');
+  assert.equal(historical.branch_relation, 'off_branch');
+  assert.equal(historical.provenance.source_entry_id, 'old-answer');
+  assert.equal(full.leaf_id, 'latest-answer');
+  const cache = new ContextReadCache();
+  const found = cache.navigate(
+    full,
+    { session_id: f.context.session.id, preset: 'full', max_bytes: 4096 },
+    { identity: f.context.session },
+    'MongoDB',
+  );
+  assert.equal(
+    found.items[0].branch_relation,
+    'off_branch',
+    'search keeps historical branch evidence visible',
+  );
+  assert.match(
+    JSON.stringify(cache.expand([found.items[0].ref], f.context.session).units),
+    /MongoDB/,
+  );
+  const source = found.items[0].related.find((link) => link.relation === 'source_context');
+  const sourceRequest = cache.reference(source.ref).document.request;
+  assert.equal(sourceRequest.leaf_id, 'old-answer');
+  assert.equal(sourceRequest.view, 'session');
+  assert.match(
+    JSON.stringify(
+      prepareContextRead({ entries }, sourceRequest, { buildSessionProjection }).units,
+    ),
+    /MongoDB/,
+  );
+  assert.equal(
+    acquisitions,
+    3,
+    'branch evidence and appended native context share one acquisition per read',
+  );
+});
+
 test('a bounded first memory page includes the highest priority and most recent evidence', async (t) => {
   const f = await fixture(t);
   f.compartment();
@@ -338,7 +486,6 @@ test('a bounded first memory page includes the highest priority and most recent 
     {
       ...f.context,
       request: { preset: 'full' },
-      nativeRead: async () => ({ units: [], leaf_id: null }),
     },
     args,
   );

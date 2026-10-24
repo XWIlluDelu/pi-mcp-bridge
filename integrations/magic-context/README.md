@@ -36,9 +36,9 @@ and installation elsewhere do not qualify.
 
 ## Content and boundaries
 
-The reader returns `{ native: true, items, coverage }`. Bridge acquires current
-native progress through its own authorized `nativeRead()` and handles search,
-refs, expansion, budgets and frozen pagination. The reader selects stored items
+The reader returns `{ native: true, items, coverage }`. It uses Bridge's authorized
+native capture for source branch facts and current task/progress. Bridge handles
+search, refs, expansion, budgets and frozen pagination. The reader selects stored items
 using the request preset:
 
 | Preset             | Recent session compartments | Highest-priority eligible project memories |
@@ -48,12 +48,22 @@ using the request preset:
 | `full`             | All                         | All                                        |
 
 Counts are upper limits; `detail` changes presentation, never this selection.
+`latest` and `recent` exclude summaries whose native ending entry is confirmed
+on another branch **before** applying the 2/4 limit. `full` and search retain
+those historical summaries. Each summary carries `branch_relation`:
+`on_branch`, `off_branch`, or `unknown`. This describes ancestry of its ending
+entry, not whether its conclusions still apply. Compaction does not discard
+ancestors for this check. Missing entries, unresolved MC boundaries and incomplete
+ancestry stay unknown; unknown summaries remain eligible. Own-project memories
+are not filtered by the session branch.
+
 Bridge uses `full` for search, allowing older summaries and lower-priority
 memories to be found without first expanding the read preset. `coverage` reports
 `{ type, selected, total }` for `summary` and `memory` before Bridge's type filters
 and page budget. Totals count only this session's compartments with content and
 the own-project memories eligible below. MC's empty boundary markers do not
-consume summary slots. Use `recent` or `full`
+consume summary slots. Summary coverage adds `excluded` when default branch
+filtering removes stored summaries. Use `recent` or `full`
 to widen the selected set; pagination traverses only the acquired selection.
 
 - Compartments contain their P1/full stored summary as `text`, P2 (or P3) as
@@ -96,7 +106,9 @@ node --test integrations/magic-context/index.test.mjs
 The isolated SQLite fixtures cover current schema checks, session/project/harness
 matching, background registration without activation, memory visibility,
 preset limits and coverage, brief/detail content, source limitations, Git
-identity and absence of DB writes.
+identity and absence of DB writes. Branch fixtures use native Pi projection to
+check filtering before limits, compaction ancestry, unknown boundaries, retained
+historical search/source refs, and reuse of one capture for native progress.
 They do not read the user's actual memory database.
 
 Source basis: [Magic Context 0.49.20](https://github.com/cortexkit/magic-context/tree/08d2615c2aff05fd62823c195ab0ffd479d7a8e5),

@@ -606,10 +606,11 @@ export class Bridge {
             : this.pool.observations.get(s);
       retained = !runtime;
     } else {
-      const nativeRead = () =>
+      const nativeRead = ({ entry_ids } = {}) =>
         this.acquireNativeRead(s, runtime, {
           ...args,
           view: 'session',
+          ...(entry_ids !== undefined ? { entry_ids } : {}),
           ...(searchQuery ? { search_query: searchQuery } : {}),
         });
       const acquire = async () => {

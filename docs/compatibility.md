@@ -80,14 +80,14 @@ export default {
 ```
 
 The illustrative helpers above belong to the integration, not Bridge core.
-`matches` and `read` may be asynchronous. Both receive:
+`matches` and `read` may be asynchronous. Their context contains:
 
-| Field          | Meaning                                                                                                                 |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `session`      | Bridge `id`, canonical `file`, native `native_id` and recorded `cwd`.                                                   |
-| `owner`        | Registration `available`, `tools`, `commands` and native `leaf_id`. Missing information is not proof of plugin absence. |
-| `request`      | Parsed initial read arguments, including selection and detail intent. Search acquires the full effective source.        |
-| `nativeRead()` | Authorized, sanitized native acquisition using the same arguments.                                                      |
+| Field                  | Meaning                                                                                                                 |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `session`              | Bridge `id`, canonical `file`, native `native_id` and recorded `cwd`.                                                   |
+| `owner`                | Registration `available`, `tools`, `commands` and native `leaf_id`. Missing information is not proof of plugin absence. |
+| `request`              | Parsed initial read arguments, including selection and detail intent. Search acquires the full effective source.        |
+| `nativeRead(options?)` | In `read`, authorized native acquisition using the same request. Optional `entry_ids` requests branch facts.            |
 
 Owned RPCs, companions and SDK hosts expose native registrations. RPC hosts
 expose extension commands via `getCommands()` and leaf via `getEntries()`; tools
@@ -107,22 +107,26 @@ reject it. Reading never starts Pi or executes an extension tool to obtain data.
 
 `read(context)` returns `{ items, native?, coverage? }`. Each item contains:
 
-| Field     | Meaning                                                                       |
-| --------- | ----------------------------------------------------------------------------- |
-| `id`      | Unique nonempty ID within this result, up to 256 characters.                  |
-| `kind`    | Content kind, up to 64 characters; returned as the public item `type`.        |
-| `text`    | Full readable text for literal search and reference expansion.                |
-| `title`   | Optional short label.                                                         |
-| `preview` | Optional concise overview; a preview never replaces searchable full text.     |
-| `source`  | Optional bounded provenance object, at most 8192 encoded bytes.               |
-| `related` | Optional array of up to 32 `{id,relation}` links to items in the same result. |
+| Field             | Meaning                                                                                 |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `id`              | Unique nonempty ID within this result, up to 256 characters.                            |
+| `kind`            | Content kind, up to 64 characters; returned as the public item `type`.                  |
+| `text`            | Full readable text for literal search and reference expansion.                          |
+| `title`           | Optional short label.                                                                   |
+| `preview`         | Optional concise overview; a preview never replaces searchable full text.               |
+| `source`          | Optional bounded provenance object, at most 8192 encoded bytes.                         |
+| `related`         | Optional array of up to 32 `{id,relation}` links to items in the same result.           |
+| `branch_relation` | Optional `on_branch`, `off_branch`, or `unknown` for the item's native source boundary. |
 
-Optional `coverage` contains up to 16 `{type,selected,total}` rows. Each type is a
+Optional `coverage` contains up to 16 `{type,selected,total,excluded?}` rows. Each type is a
 nonempty content-kind string of up to 64 characters; counts are safe nonnegative
-integers with `selected <= total`. `total` describes the eligible items in the
-reader's declared scope, while `selected` describes items captured after its
-preset selection, before response pagination or search-result filtering. Bridge
-returns these rows as `reader.coverage` alongside the reader ID.
+integers with `selected <= total`. `total` counts items in the reader's declared
+source scope before branch or preset selection; `selected` counts the captured
+items before response pagination or search-result filtering. Bridge
+returns these rows as `reader.coverage` alongside the reader ID. Optional
+`excluded` counts items from that total excluded by selection rules (for example,
+other-branch summaries), before taking the preset limit; it cannot exceed
+`total - selected`.
 
 Use coverage when a default reader selects only a few summaries or memories.
 Increasing the page budget cannot recover items excluded from that capture;
@@ -137,6 +141,22 @@ cleaned units. This avoids a memory-only directory as the default session answer
 A reader providing its own complete task view may omit native content, but must
 state its source and coverage clearly. Do not copy the same native units into
 items and also request `native:true`.
+
+Readers that need native source facts can call
+`await context.nativeRead({entry_ids: ids})` before selecting their items. The
+list accepts at most 10,000 IDs of up to 128 characters each. The returned
+`entry_relations` maps each requested ID to `on_branch`, `off_branch`, or
+`unknown`, relative to the capture's `leaf_id`. The raw parent chain includes
+ancestors omitted from effective context by compaction. A missing target or
+incomplete chain cannot establish `off_branch`. These are structural facts,
+not judgments about whether a past decision still applies.
+
+One reader invocation shares one native capture. Repeated calls reuse it;
+requesting a different ID set after capture rejects. `native:true` appends that
+same capture. With `native:false`, its leaf still identifies the structural
+evidence but its units are not included. The module interprets its own source
+coordinates and uses `branch_relation` where that distinction helps reading;
+Bridge preserves the marker in brief rows even if other provenance is shortened.
 
 Bridge sanitizes and segments item text, groups it for brief previews, searches the
 full captured text and expands opaque references. Public reader results use
