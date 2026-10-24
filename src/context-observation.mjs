@@ -8,7 +8,7 @@ import { readSchema } from './read-schema.mjs';
 export function unavailableObservation(sessionId, reason, captureSequence = 0) {
   return {
     contract: READ_CONTRACT,
-    view: 'observed',
+    view: 'runtime',
     capture_sequence: captureSequence, // Internal IPC ordering; never rendered in public pages.
     session_id: sessionId,
     leaf_id: null,
@@ -89,7 +89,7 @@ export class ContextObservation {
       }
       this.latest = {
         contract: READ_CONTRACT,
-        view: 'observed',
+        view: 'runtime',
         capture_sequence: sequence,
         session_id: null,
         leaf_id: leaf,
@@ -117,11 +117,7 @@ export class ContextObservation {
     }
   }
   read(args, ctx) {
-    if (
-      !readSchema.safeParse(args).success ||
-      args.view !== 'observed' ||
-      args.cursor !== undefined
-    )
+    if (!readSchema.safeParse(args).success || args.view !== 'runtime' || args.cursor !== undefined)
       throw new Error('INVALID_READ_ARGUMENTS');
     const manager = ctx.sessionManager;
     if (!this.latest) {

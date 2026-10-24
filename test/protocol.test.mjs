@@ -42,6 +42,7 @@ test('modern requests are self-contained; discovery and tool list carry required
     [
       'list',
       'read',
+      'search',
       'models',
       'set_model',
       'compact',

@@ -34,12 +34,9 @@ async function fixture(t) {
           : fs.stat(path.join(options.store,session.native_id+'.json')).then(()=>true,e=>{
               if(e.code==='ENOENT')return false;throw e;
             }),
-        read: async ({session,nativeRead}) => {
-          const native = await nativeRead();
+        read: async ({session}) => {
           const stored = JSON.parse(await fs.readFile(path.join(options.store,session.native_id+'.json'),'utf8'));
-          return [...stored, ...native.units.filter(u=>u.type==='text').map(u=>({
-            role:'assistant',content:u.block.text,details:{native_source:u.source},
-          }))];
+          return {native:true,items:stored};
         },
       }));
     }};`,
@@ -55,7 +52,7 @@ async function fixture(t) {
       pi.on('context',()=>{throw new Error('READ_MUST_NOT_REPLAY_HOOK')});
       pi.on('session_start',async(_event,ctx)=>{
         await fs.writeFile(path.join(${JSON.stringify(store)},ctx.sessionManager.getSessionId()+'.json'),
-          JSON.stringify([{role:'system',content:${JSON.stringify(body)},details:{origin:'fixture-store'}}]));
+          JSON.stringify([{id:'memory',kind:'memory',text:${JSON.stringify(body)},source:{origin:'fixture-store'}}]));
       });
     };`,
   );
@@ -172,12 +169,11 @@ test('RPC host read routing sees the target session extension through public com
   assert.ok(features.commands.includes('fixture-memory'));
   assert.deepEqual(features.tools, []);
   const page = await f.call({ session_id: target.id, max_bytes: 4096 });
-  assert.equal(page.view, 'adapted');
   assert.equal(page.reader.id, 'fixture-memory');
-  assert.equal((await f.call({ session_id: plain.id })).view, 'native');
+  assert.equal((await f.call({ session_id: plain.id })).view, 'session');
 });
 
-test('one read entry routes live and saved session evidence, pages frozen context, and keeps explicit native view', async (t) => {
+test('one read entry routes live and saved session evidence, pages frozen context, and keeps explicit session view', async (t) => {
   const f = await fixture(t),
     withMemory = await f.create(),
     withoutMemory = await f.create(),
@@ -205,12 +201,24 @@ test('one read entry routes live and saved session evidence, pages frozen contex
   assert.ok(
     !(await f.bridge.pool.get(withoutMemory.id).readFeatures()).commands.includes('fixture-memory'),
   );
-  const first = await f.call({ session_id: withMemory.id, max_bytes: 4096 });
-  assert.equal(first.view, 'adapted');
+  const overview = await f.call({ session_id: withMemory.id, max_bytes: 4096 });
+  assert.equal(overview.detail, 'brief');
+  assert.equal(overview.reader.id, 'fixture-memory');
+  assert.ok(JSON.stringify(overview.items).includes('NATIVE_INPUT'));
+  assert.ok(JSON.stringify(overview.items).includes('NATIVE_ANSWER'));
+  const memory = overview.items.find((item) => item.type === 'memory');
+  assert.ok(memory.text.includes('MEMORY_CONTEXT'));
+  assert.ok(memory.text.length < body.length);
+  assert.ok(memory.ref);
+  const expanded = await f.call({ refs: [memory.ref], max_bytes: 4096 });
+  assert.ok(expanded.next_cursor);
+  assert.equal(probes, 2, 'Reference expansion must not probe or reread the owner');
+  const first = await f.call({ session_id: withMemory.id, detail: 'full', max_bytes: 4096 });
   assert.deepEqual(first.reader, { id: 'fixture-memory' });
-  assert.equal(first.selection, null);
+  assert.deepEqual(first.selection, overview.selection);
+  assert.equal(first.selection.recent_prompts, 1);
   assert.ok(first.next_cursor);
-  assert.equal(probes, 2);
+  assert.equal(probes, 4);
   await f.call({ cursor: first.next_cursor, preset: 'latest', select: {}, max_bytes: 4096 });
   const changedSelection = await f.client.callTool({
     name: 'read',
@@ -222,25 +230,36 @@ test('one read entry routes live and saved session evidence, pages frozen contex
   const pages = [first];
   while (pages.at(-1).next_cursor)
     pages.push(await f.call({ cursor: pages.at(-1).next_cursor, max_bytes: 4096 }));
-  assert.equal(probes, 2);
+  assert.equal(probes, 4);
   const items = pages.reverse().flatMap((page) => page.items);
   assert.equal(
     items
-      .filter((i) => i.source.reader_index === 0 && i.message?.content)
+      .filter((i) => i.source.reader_item === 'memory' && i.message?.content)
       .map((i) => i.message.content)
       .join(''),
     body,
   );
   assert.ok(
-    items.every((i) => Number.isInteger(i.source.reader_index) && i.source.entry_id === undefined),
+    items.some(
+      (item) => item.source.reader_item === 'memory' && item.source.entry_id === undefined,
+    ),
   );
+  assert.equal(items.find((item) => item.type === 'text').source.entry_id, 'a');
+  const expandedPages = [expanded];
+  while (expandedPages.at(-1).next_cursor)
+    expandedPages.push(await f.call({ cursor: expandedPages.at(-1).next_cursor, max_bytes: 4096 }));
   assert.equal(
-    items.find((i) => i.message?.role === 'assistant').message.details.native_source.entry_id,
-    'a',
+    expandedPages
+      .reverse()
+      .flatMap((page) => page.items)
+      .map((item) => item.message?.content ?? '')
+      .join(''),
+    body,
   );
+  assert.equal(probes, 4, 'Frozen expansion must not consult the changed backing store');
   assert.deepEqual(await fs.readFile(withMemory.file), fileBefore);
-  const native = await f.call({ session_id: withMemory.id, view: 'native' });
-  assert.equal(native.view, 'native');
+  const native = await f.call({ session_id: withMemory.id, view: 'session' });
+  assert.equal(native.view, 'session');
   assert.ok(JSON.stringify(native).includes('NATIVE_ANSWER'));
   const failed = await f.client.callTool({
     name: 'read',
@@ -250,7 +269,7 @@ test('one read entry routes live and saved session evidence, pages frozen contex
   assert.equal(JSON.parse(failed.content[0].text).error.code, 'SESSION_READER_FAILED');
   await fs.writeFile(
     path.join(f.store, withMemory.header.id + '.json'),
-    JSON.stringify([{ role: 'system', content: 'PERSISTED_MEMORY' }]),
+    JSON.stringify([{ id: 'memory', kind: 'memory', text: 'PERSISTED_MEMORY' }]),
   );
   const selected = f.bridge.compatibilityServices.sessionReaders.readers.get('fixture-memory'),
     read = selected.read;
@@ -268,19 +287,19 @@ test('one read entry routes live and saved session evidence, pages frozen contex
     { leaf_id: 'a' },
   ]) {
     const adapted = await f.call({ session_id: withMemory.id, ...args });
-    assert.equal(adapted.view, 'adapted');
+    assert.equal(adapted.reader.id, 'fixture-memory');
     assert.ok(JSON.stringify(adapted).includes('PERSISTED_MEMORY'));
     assert.ok(JSON.stringify(adapted).includes('NATIVE_ANSWER'));
     for (const [key, value] of Object.entries(args)) assert.deepEqual(requests.at(-1)[key], value);
   }
   await runtime.gracefulExit();
   const persisted = await f.call({ session_id: withMemory.id });
-  assert.equal(persisted.view, 'adapted');
+  assert.equal(persisted.reader.id, 'fixture-memory');
   assert.ok(JSON.stringify(persisted).includes('PERSISTED_MEMORY'));
   assert.equal(f.bridge.pool.get(withMemory.id), null, 'Saved routing does not start Pi');
   for (const session of [withoutMemory, saved]) {
     const native = await f.call({ session_id: session.id });
-    assert.equal(native.view, 'native');
+    assert.equal(native.view, 'session');
     assert.equal(native.reader, undefined);
     assert.ok(JSON.stringify(native).includes('NATIVE_ANSWER'));
   }
@@ -300,7 +319,7 @@ test('host session read routing uses current capabilities and refuses changed or
     session = await f.create();
   await fs.writeFile(
     path.join(f.store, session.header.id + '.json'),
-    JSON.stringify([{ role: 'system', content: 'HOST_CONTEXT' }]),
+    JSON.stringify([{ id: 'memory', kind: 'memory', text: 'HOST_CONTEXT' }]),
   );
   const controller = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session });
   f.controllers.push(controller);
@@ -321,10 +340,13 @@ test('host session read routing uses current capabilities and refuses changed or
     submit: () => assert.fail('Read must not submit work'),
     release: async () => ({ released: true }),
   });
-  assert.equal((await f.call({ session_id: session.id })).items[0].message.content, 'HOST_CONTEXT');
+  assert.equal((await f.call({ session_id: session.id })).items[0].text, 'HOST_CONTEXT');
   assert.equal(snapshots, 1);
   const readers = f.bridge.compatibilityServices.sessionReaders;
-  const unregister = readers.register('conflict', { matches: () => true, read: () => [] });
+  const unregister = readers.register('conflict', {
+    matches: () => true,
+    read: () => ({ items: [] }),
+  });
   const conflicting = await f.client.callTool({
     name: 'read',
     arguments: { session_id: session.id },
@@ -342,7 +364,7 @@ test('host session read routing uses current capabilities and refuses changed or
   assert.equal(JSON.parse(changed.content[0].text).error.code, 'READ_SOURCE_CHANGED');
   features = { ...features, available: false, commands: [] };
   selected.read = original;
-  assert.equal((await f.call({ session_id: session.id })).view, 'adapted');
+  assert.equal((await f.call({ session_id: session.id })).reader.id, 'fixture-memory');
   assert.equal(snapshots, 3);
 
   await controller.release();

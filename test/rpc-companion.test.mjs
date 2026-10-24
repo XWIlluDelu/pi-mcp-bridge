@@ -132,6 +132,7 @@ test(
       'list',
       'models',
       'read',
+      'search',
       'send',
       'set_model',
       'stop',
