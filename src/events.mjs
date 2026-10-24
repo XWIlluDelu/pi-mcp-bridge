@@ -6,6 +6,7 @@ import { atomicJson, readPrivateFile, hash } from './storage.mjs';
 import { permitted } from './permissions.mjs';
 import { knownErrorCode } from './errors.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
+import { settledResultSchema } from './settled-result.mjs';
 import {
   callbackUrl,
   signingSecret,
@@ -63,7 +64,7 @@ const recordSchema = z
 export const settledEventDefinition = {
   name: NAME,
   description:
-    'A saved Pi session finishes a native agent run, including automatic continuations. Only Bridge-owned RPC execution is observed; external TUI/RPC/SDK owners are unsupported. This is session-wide settlement, not per-prompt success or process exit. Read the supplied session_id and leaf_id for the result. Subscribe before sending work. No replay.',
+    'A saved Pi session finishes a native agent run, including automatic continuations. Only Bridge-owned RPC execution is observed; external TUI/RPC/SDK owners are unsupported. This is session-wide settlement, not per-prompt success or process exit. Includes a bounded last assistant response when available; its stop_reason is native termination, not task success. If more detail is useful, call read with the supplied read object to open Session Context at this exact leaf, including when a memory reader is enabled. Subscribe before sending work. No replay.',
   delivery: ['webhook'],
   inputSchema: {
     type: 'object',
@@ -77,8 +78,35 @@ export const settledEventDefinition = {
       session_id: { type: 'string' },
       leaf_id: { type: ['string', 'null'] },
       aborted: { type: 'boolean' },
+      result: {
+        anyOf: [
+          { type: 'null' },
+          {
+            type: 'object',
+            properties: {
+              entry_id: { type: 'string' },
+              text: { type: 'string' },
+              stop_reason: { type: ['string', 'null'] },
+              truncated: { type: 'boolean' },
+            },
+            required: ['entry_id', 'text', 'stop_reason', 'truncated'],
+            additionalProperties: false,
+          },
+        ],
+      },
+      read: {
+        type: 'object',
+        properties: {
+          session_id: { type: 'string' },
+          view: { const: 'session' },
+          leaf_id: { type: ['string', 'null'] },
+          preset: { const: 'latest' },
+        },
+        required: ['session_id', 'view', 'leaf_id', 'preset'],
+        additionalProperties: false,
+      },
     },
-    required: ['session_id', 'leaf_id', 'aborted'],
+    required: ['session_id', 'leaf_id', 'aborted', 'result', 'read'],
     additionalProperties: false,
   },
 };
@@ -321,7 +349,18 @@ export class EventSubscriptions {
       eventId: 'evt_' + randomUUID(),
       name: NAME,
       timestamp: occurrence.timestamp,
-      data: { session_id: session.id, leaf_id: occurrence.leafId, aborted: occurrence.aborted },
+      data: {
+        session_id: session.id,
+        leaf_id: occurrence.leafId,
+        aborted: occurrence.aborted,
+        result: settledResultSchema.parse(occurrence.result),
+        read: {
+          session_id: session.id,
+          view: 'session',
+          leaf_id: occurrence.leafId,
+          preset: 'latest',
+        },
+      },
       cursor: null,
     };
     // Serialize ONCE. Each retry signs and transmits these exact bytes.
