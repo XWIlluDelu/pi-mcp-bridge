@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -298,6 +299,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     assert.deepEqual(active.items, cleanDisk.items);
     const runtime = await f.bridge.pool.forRead(f.saved),
       captured = await runtime.read({ session_id: f.id });
+    assert.equal(captured.contract, packageInfo.version);
     assert.ok(Array.isArray(captured.units));
     assert.ok(!JSON.stringify(captured).includes('AAAAAAA'));
     assert.ok(!captured.units.some((unit) => unit.message?.toolsAdded));
@@ -552,6 +554,8 @@ test('read contract mismatch requests component update without sending an old op
     submit: () => assert.fail('No prompt during read'),
   });
   const runtime = await f.bridge.pool.forRead(f.saved);
+  assert.equal(runtime.record.readContract, packageInfo.version);
+  await runtime.readFeatures();
   t.mock.method(runtime, 'request', () => assert.fail('Do not probe an incompatible owner'));
   for (const declared of [undefined, 'not-the-current-read-contract']) {
     runtime.record.readContract = declared;

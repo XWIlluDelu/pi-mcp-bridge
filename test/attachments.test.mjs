@@ -1,6 +1,7 @@
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
+import packageInfo from '../package.json' with { type: 'json' };
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -430,7 +431,7 @@ test('extension confirms public dispatch without claiming admission, and idle in
     await handlers.session_start({ reason: 'reload' }, ctx);
     const refreshed = await readClaim(f.config.attachmentDir, f.session);
     assert.notEqual(refreshed.generation, record.generation);
-    assert.equal(typeof refreshed.readContract, 'string');
+    assert.equal(refreshed.readContract, packageInfo.version);
     assert.equal(refreshed.unsupportedControlMetadata, undefined);
     assert.equal(shutdown, false);
     assert.deepEqual(JSON.parse(await fs.readFile(unrelatedFile, 'utf8')), unrelatedRecord);
