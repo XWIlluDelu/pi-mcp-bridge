@@ -122,7 +122,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
               retainedInputs: op === 'stop' ? inputs : undefined,
             }),
           );
-          if (['read', 'search', 'models', 'list', 'health'].includes(op))
+          if (['read', 'search', 'submission', 'models', 'list', 'health'].includes(op))
             result = fitQuery(op, result, args, resultBudget);
           results[index] = { index, op, result };
         } catch (error) {

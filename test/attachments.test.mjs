@@ -269,7 +269,7 @@ test('attachment deletion timeout is a bounded owner setting', async (t) => {
     );
 });
 
-test('extension uses public dispatch flags, truthful unknown receipts, and idle includes compaction', async (t) => {
+test('extension confirms public dispatch without claiming admission, and idle includes compaction', async (t) => {
   const f = await fixture(t);
   const unrelated = { file: path.join(f.dir, 'unrelated.jsonl'), header: { id: 'unrelated' } };
   const unrelatedRecord = {
@@ -332,8 +332,7 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
     const runtime = new AttachedRuntime(f.config, f.session, record);
     for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
       const result = await runtime.send({ text: 'public fixture', mode });
-      assert.equal(result.status, 'unknown');
-      assert.equal(result.reason, 'PI_ACCEPTANCE_UNOBSERVABLE');
+      assert.deepEqual(result, { status: 'dispatched', admission: 'unobservable' });
     }
     assert.deepEqual(
       calls.map((x) => x.options),
@@ -367,8 +366,16 @@ test('extension uses public dispatch flags, truthful unknown receipts, and idle 
       publicOperationSchemas.send.safeParse({ ...escaped, mode: 'default' }).success,
       true,
     );
-    assert.equal((await runtime.send(escaped)).status, 'unknown');
+    assert.equal((await runtime.send(escaped)).status, 'dispatched');
     assert.equal(calls.at(-1).text, escaped.text);
+    const throwing = t.mock.method(pi, 'sendUserMessage', () => {
+      throw new Error('PRIVATE_NATIVE_DISPATCH_FAILURE');
+    });
+    assert.deepEqual(await runtime.send({ text: 'uncertain invocation' }), {
+      status: 'unknown',
+      reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
+    });
+    throwing.mock.restore();
     f.bridge.pool.instances.set(f.id, runtime);
     const connect = t.mock.method(net, 'createConnection', () => {
       throw new Error('oversized requests must not connect');
@@ -549,7 +556,8 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
     text: 'first public fixture',
     mode: 'default',
   });
-  assert.equal(receipt.status, 'unknown');
+  assert.equal(receipt.status, 'dispatched');
+  assert.equal(receipt.admission, 'unobservable');
   assert.equal(receipt.dispatch, undefined);
   assert.equal(
     (
@@ -569,7 +577,8 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
       text: 'busy ' + mode,
       mode,
     });
-    assert.equal(r.status, 'unknown');
+    assert.equal(r.status, 'dispatched');
+    assert.equal(r.admission, 'unobservable');
     assert.equal(r.dispatch, undefined);
   }
 
@@ -596,7 +605,7 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
       text: 'idle ' + mode,
       mode,
     });
-    assert.equal(r.status, 'unknown');
+    assert.equal(r.status, 'dispatched');
     await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   }
   const page = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 4096 });
@@ -610,7 +619,7 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   const oldGeneration = launched.record.generation;
   assert.equal(
     (await f.bridge.send({ session_id: f.id, text: '/fixture-reload' })).status,
-    'unknown',
+    'dispatched',
   );
   await until(async () => {
     const r = await readClaim(f.config.attachmentDir, f.session);
@@ -840,7 +849,7 @@ test('official TUI session replacement registers a fresh identity and socket los
   await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   assert.equal(
     (await f.bridge.send({ session_id: f.id, text: '/fixture-fork' })).status,
-    'unknown',
+    'dispatched',
   );
   const fork = await until(async () => (await f.bridge.sessions()).find((s) => s.id !== f.id));
   const forkClaim = await until(async () => {
@@ -859,7 +868,7 @@ test('official TUI session replacement registers a fresh identity and socket los
         text: '/fixture-resume ' + f.session.file,
       })
     ).status,
-    'unknown',
+    'dispatched',
   );
   const resumed = await until(async () => {
     const r = await readClaim(f.config.attachmentDir, f.session);
@@ -872,7 +881,7 @@ test('official TUI session replacement registers a fresh identity and socket los
 
     text: '/fixture-switch',
   });
-  assert.equal(sent.status, 'unknown');
+  assert.equal(sent.status, 'dispatched');
   const replacement = await until(async () => {
     const sessions = await f.bridge.sessions();
     return sessions.find((s) => s.id !== f.id && s.id !== fork.id);
@@ -945,6 +954,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
       'send',
       'set_model',
       'stop',
+      'submission',
     ]);
     const call = async (name, args) => {
       const result = await client.callTool({ name, arguments: args });
@@ -957,8 +967,8 @@ test('standard MCP client attaches to an existing offline TUI through the single
 
       text: 'offline MCP TUI fixture',
     });
-    assert.equal(receipt.status, 'unknown');
-    assert.equal(receipt.reason, 'PI_ACCEPTANCE_UNOBSERVABLE');
+    assert.equal(receipt.status, 'dispatched');
+    assert.equal(receipt.admission, 'unobservable');
 
     await until(async () => {
       const r = await call('read', { session_id: f.id });

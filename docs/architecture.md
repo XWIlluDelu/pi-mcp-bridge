@@ -44,8 +44,9 @@ APIs are in [module management](compatibility.md).
 2. **Request authorization.** One receive-time policy snapshot governs an
    operation, including batch items and fork checks. Identity, Stop and lifecycle
    fences remain live throughout execution.
-3. **Native outcomes.** Missing ACKs leave outcomes unknown; work is never replayed
-   automatically. Shutdown drains received ACK checks and captures.
+3. **Native outcomes.** External dispatch evidence does not imply native admission.
+   Missing ACKs leave outcomes unknown; bounded `submissions.mjs` receipts retain
+   matching late ACKs without replay. Shutdown drains received ACK checks and captures.
 4. **Ordered release.** Close admission, cancel when authorized, drain admitted
    work and captures, then close the writer and release its claim.
 5. **Native provenance.** Projection order determines prompt ownership and tool

@@ -108,7 +108,8 @@ export function assertPromptSelection(input, state) {
 }
 
 // Public admission results are not completion tracking. Only a validated native
-// disposition establishes started/queued/handled. Unknown native admission stays unknown.
+// disposition establishes started/queued/handled. Dispatch alone leaves native
+// admission unobservable; an uncertain dispatch remains unknown.
 export function promptResult(result) {
   if (!result.ok) return { status: result.uncertain ? 'unknown' : 'rejected', reason: result.code };
   if (!['started', 'queued', 'handled'].includes(result.data?.disposition))
@@ -120,6 +121,8 @@ export function promptResult(result) {
   };
 }
 export function attachedPromptResult(value) {
+  if (value?.status === 'dispatched' && value.admission === 'unobservable')
+    return { status: 'dispatched', admission: 'unobservable' };
   if (value?.status === 'accepted') return promptResult({ ok: true, data: value });
   if (
     ['skipped', 'rejected', 'unknown'].includes(value?.status) &&

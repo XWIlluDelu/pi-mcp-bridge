@@ -511,16 +511,23 @@ export default async function attachExtension(pi) {
                 const options = { expandPromptTemplates: true };
                 if (['default', 'steer'].includes(args.mode)) options.deliverAs = 'steer';
                 if (args.mode === 'follow_up') options.deliverAs = 'followUp';
-                pi.sendUserMessage(
-                  input.images
-                    ? [...(input.text ? [{ type: 'text', text: input.text }] : []), ...input.images]
-                    : input.text,
-                  options,
-                );
-                data = {
-                  status: 'unknown',
-                  reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-                };
+                try {
+                  pi.sendUserMessage(
+                    input.images
+                      ? [
+                          ...(input.text ? [{ type: 'text', text: input.text }] : []),
+                          ...input.images,
+                        ]
+                      : input.text,
+                    options,
+                  );
+                  // The public API confirms invocation, not native admission or
+                  // completion. A later input handler may transform or handle it.
+                  data = { status: 'dispatched', admission: 'unobservable' };
+                } catch {
+                  // Entering native dispatch can have side effects before a throw.
+                  data = { status: 'unknown', reason: 'PI_ACCEPTANCE_UNOBSERVABLE' };
+                }
               }
             } else if (request.op === 'bash') {
               throw new AttachmentFailure('BASH_UNSUPPORTED');

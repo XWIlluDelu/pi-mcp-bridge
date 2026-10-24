@@ -29,7 +29,7 @@ const text = (entry) =>
     : '';
 
 test(
-  'ordinary RPC and remote MCP share native owner, bounded live reads and durable unknown admission without fallback',
+  'ordinary RPC and remote MCP share native owner, bounded live reads and explicit dispatch without an admission claim',
   { timeout: 30000 },
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-companion-'),
@@ -136,6 +136,7 @@ test(
       'send',
       'set_model',
       'stop',
+      'submission',
     ]);
     assert.equal(
       (
@@ -156,8 +157,8 @@ test(
 
       text: 'REMOTE_ORDINARY_RPC',
     });
-    assert.equal(submitted.status, 'unknown');
-    assert.equal(submitted.reason, 'PI_ACCEPTANCE_UNOBSERVABLE');
+    assert.equal(submitted.status, 'dispatched');
+    assert.equal(submitted.admission, 'unobservable');
     const live = await until(async () => {
       const result = await ok('read', { session_id: saved.id, max_bytes: 4096 });
       assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 4096);
@@ -172,7 +173,8 @@ test(
 
       text: 'DEFAULT_BUSY_INPUT',
     });
-    assert.equal(queued.status, 'unknown');
+    assert.equal(queued.status, 'dispatched');
+    assert.equal(queued.admission, 'unobservable');
     await until(
       async () =>
         !(await local.getState()).isStreaming && (await local.getState()).pendingMessageCount === 0,
@@ -208,7 +210,7 @@ test(
 
       text: 'SEND_ONLY_NO_TRANSCRIPT',
     });
-    assert.equal(sendOnly.status, 'unknown');
+    assert.equal(sendOnly.status, 'dispatched');
     assert.equal(JSON.stringify(sendOnly).includes('SEND_ONLY_NO_TRANSCRIPT'), false);
     await until(async () => !(await local.getState()).isStreaming);
     config.grants.push({ session_id: saved.id, read: true, send: true });

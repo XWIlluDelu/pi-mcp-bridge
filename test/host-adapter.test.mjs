@@ -230,6 +230,23 @@ test('two-phase host reservation blocks another writer before ready and exposes 
     'RUNTIME_SESSION_CHANGED',
   );
 });
+test('host receipts preserve dispatched evidence without inventing native admission', async (t) => {
+  const f = await fixture(t);
+  let outcome = { status: 'dispatched', admission: 'unobservable', ignored: 'PRIVATE' };
+  f.callbacks.submit = async () => outcome;
+  await f.controller.ready(f.callbacks);
+  assert.deepEqual((await request(f, 'send', { text: 'fixture', mode: 'default' })).data, {
+    status: 'dispatched',
+    admission: 'unobservable',
+  });
+  for (const admission of [undefined, 'started', 'queued']) {
+    outcome = { status: 'dispatched', admission };
+    assert.equal(
+      (await request(f, 'send', { text: 'fixture', mode: 'default' })).error,
+      'INVALID_HOST_RECEIPT',
+    );
+  }
+});
 test('cooperative public reads stay bounded while fork snapshots preserve full native entries', async (t) => {
   const f = await fixture(t),
     snapshot = f.callbacks.snapshot();
