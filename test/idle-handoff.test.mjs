@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -437,7 +438,8 @@ test(
       }
       return receive.call(this, event, generation);
     });
-    const args = { session_id: f.id, timeout_ms: 50 },
+    ackTimeout(t, ['abort']);
+    const args = { session_id: f.id },
       receipt = await f.bridge.stop(args);
     assert.equal(receipt.status, 'unknown');
     assert.equal(receipt.reason, 'ACK_TIMEOUT');
@@ -466,13 +468,13 @@ test(
     pi.sendMessage({customType:'unrelated',content:'CUSTOM_TURN',display:false},{triggerTurn:true});await mark('preflight');await wait('preflight-go');}return {action:'continue'};});`,
     );
     f.cleanup.push(() => f.mark('preflight-go'));
+    ackTimeout(t, ['prompt']);
     assert.equal(
       (
         await f.bridge.send({
           session_id: f.id,
 
           text: 'HELD_PREFLIGHT',
-          timeout_ms: 50,
         })
       ).status,
       'unknown',
@@ -652,7 +654,6 @@ test(
       session_id: f.id,
 
       text: 'DIALOGS',
-      timeout_ms: 500,
     });
     assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
     assert.equal(sent.status, 'handled');
@@ -1241,11 +1242,11 @@ test(
       text: 'NORMAL_UI',
     });
     assert.equal(success.send.reason, 'EXTENSION_UI_CANCEL_SENT');
+    ackTimeout(t, ['prompt']);
     const first = await f.bridge.create({
       project: f.cwd,
 
       text: 'LATE_UI',
-      timeout_ms: 50,
     });
     assert.equal(first.status, 'unknown');
     assert.equal(first.send.reason, 'ACK_TIMEOUT');

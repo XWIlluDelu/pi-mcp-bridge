@@ -1,6 +1,6 @@
 # Public tool API
 
-Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
+Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter; native and owner requests retain their internal five-second acknowledgement budgets, not an overall execution deadline. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
 
 ## Sessions and mutations
 
@@ -69,7 +69,7 @@ Pages start with the newest selected content. Continue backwards with `cursor` a
 
 ### Compact
 
-`compact({session_id,instructions?,interrupt?,timeout_ms?})` performs native compaction. It requires `send` and proven idle by default; explicit `interrupt:true` also requires `stop` and may abort the agent even if compaction fails. Success returns bounded completion metadata; summary text requires `read`. See [compaction support and results](model-control.md#manual-compaction-compact).
+`compact({session_id,instructions?,interrupt?})` performs native compaction. It requires `send` and proven idle by default; explicit `interrupt:true` also requires `stop` and may abort the agent even if compaction fails. Success returns bounded completion metadata; summary text requires `read`. See [compaction support and results](model-control.md#manual-compaction-compact).
 
 ### Send
 
@@ -84,7 +84,7 @@ Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 - `steer`: use the native steering queue.
 - `follow_up`: use the native follow-up queue.
 
-`timeout_ms` is 50–30000, default 5000, and bounds acknowledgement rather than model execution. The result contains `status` (`started`, `queued`, `handled`, `skipped`, `rejected` or `unknown`) and a `reason` when needed. An owner unable to prove admission reports `unknown`; a handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
+Bridge waits for native input admission, not model completion. The result contains `status` (`started`, `queued`, `handled`, `skipped`, `rejected` or `unknown`) and a `reason` when needed. An owner unable to prove admission reports `unknown`; a handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
 
 Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
 
@@ -117,9 +117,14 @@ Native history and forks retain image blocks. Acknowledgement confirms admission
 
 Requires `command` permission. Pass the command without `!`; it uses Pi's native bash path, history, hooks and cancellation. Unsupported owners return `BASH_UNSUPPORTED`.
 
-The result includes captured output, exit status, cancellation/truncation flags and generation. `timeout_ms` bounds acknowledgement, not shell lifetime; a separate authorized stop can interrupt a long command.
+The result includes captured output, exit status, cancellation/truncation flags and generation. `accepted` means the native command callback returned. If the internal acknowledgement wait expires, the outcome is `unknown`: the command can still complete and store its result in native history. A separate authorized stop can interrupt a long command.
 
-`max_chars` is 256–32768, default 12000, measured in UTF-16 units. `output_complete:false` means Bridge shortened the returned prefix; native `truncated:true` describes Pi's own truncation. There is no continuation. Use read with command selection for native history instead of rerunning a command to retrieve output.
+`max_chars` is 256–32768, default 12000, measured in UTF-16 units. Two independent flags describe output coverage:
+
+- `native_truncated`: Pi truncated the original shell output. Its native result may be a tail and may include `fullOutputPath` for the full output.
+- `response_complete`: Bridge returned all of that native result's output. False means `max_chars` or a batch response budget shortened its prefix. This is output coverage, not command completion or final acknowledgement.
+
+Thus native truncation can coexist with a complete response (`true`/`true`), and Bridge can shorten either intact or natively truncated output (`false`/`false` or `true`/`false`). There is no continuation. Use read with command selection for native history instead of rerunning a command to retrieve output.
 
 ### Stop
 
@@ -172,7 +177,7 @@ Success returns a `restore_token` and project authorization scope. The manifest 
 }
 ```
 
-Wraps 1–10 operations of any other tool as `{op,args}`. Each item keeps its own permission checks, using the outer request's permission snapshot. Within a batch, same-session operations run in order through their ordinary return boundary, not model completion. Different sessions run concurrently; forks use the parent lane and independent creates can run concurrently in the same project. Results retain input order and item failures do not block later items. Invalid outer shape/count or size rejects before scheduling.
+Wraps 1–10 operations of any other tool as `{op,args}`. The schema declares both fields and enumerates all supported operation names except `batch`; `args` uses the same parameter validation as the individual tool. Malformed items return `INVALID_OPERATION` without rejecting valid siblings. Each item keeps its own permission checks, using the outer request's permission snapshot. Within a batch, same-session operations run in order through their ordinary return boundary, not model completion. Different sessions run concurrently; forks use the parent lane and independent creates can run concurrently in the same project. Results retain input order and item failures do not block later items. Invalid outer shape/count or size rejects before scheduling.
 
 Items share a 196608-byte structured budget and the [MCP envelope budget](transports.md#bounds-and-errors). Mutation statuses, child IDs, restore tokens and verified settings are retained. Command/stop may return less than `max_chars`, with accurate completeness flags; auxiliary `command.fullOutputPath` and `delete.project` may be omitted.
 

@@ -648,7 +648,10 @@ export class PiRpc {
       target = state.model;
       if (!nativeThinking) await assertThinkingLevel(target, thinkingLevel, this.config);
     }
+    let level = thinkingLevel;
     if (model && !sameModel(state.model, target)) {
+      // Keep current effort rather than model-switch defaults; Pi owns clamping.
+      level ??= state.thinkingLevel;
       // A timed-out setter keeps input fenced until its matching native ACK.
       // command() verifies late identity but never submits a prompt from that ACK.
       const changed = await this.command(
@@ -664,9 +667,9 @@ export class PiRpc {
     if (model && !sameModel(selected.model, target))
       throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     if (!nativeThinking) await assertThinkingLevel(selected.model, thinkingLevel, this.config);
-    if (thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel) {
+    if (level !== undefined && selected.thinkingLevel !== level) {
       await this.command(
-        { type: 'set_thinking_level', level: thinkingLevel },
+        { type: 'set_thinking_level', level },
         timeout,
         () => {},
         beforeDispatch,
@@ -675,7 +678,7 @@ export class PiRpc {
       selected = await this.state();
       if (
         (model && !sameModel(selected.model, target)) ||
-        (!nativeThinking && selected.thinkingLevel !== thinkingLevel)
+        (!nativeThinking && thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel)
       )
         throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     }

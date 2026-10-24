@@ -1,3 +1,4 @@
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -91,6 +92,7 @@ for (const op of ['send', 'create']) {
     async (t) => {
       const f = await fixture(t),
         { bridge } = f;
+      ackTimeout(t, ['set_model']);
       await fs.writeFile(f.gate + '.hold-selection', 'hold');
       const args = {
         ...identity(op, f),
@@ -98,7 +100,6 @@ for (const op of ['send', 'create']) {
         text: 'NEVER',
         model: choice('vision'),
         thinking_level: 'high',
-        timeout_ms: 50,
       };
       const result = await bridge[op](args),
         id = target(result, f);
@@ -134,6 +135,7 @@ for (const op of ['send', 'create']) {
       const f = await fixture(t),
         { bridge } = f,
         factory = bridge.pool.factory;
+      ackTimeout(t, ['set_thinking_level']);
       let held, rpc, receive;
       bridge.pool.factory = async (session) => {
         rpc = await factory(session);
@@ -153,7 +155,6 @@ for (const op of ['send', 'create']) {
         text: 'NEVER',
         model: choice('vision'),
         thinking_level: 'high',
-        timeout_ms: 50,
       };
       const result = await bridge[op](args),
         id = target(result, f);
@@ -245,6 +246,39 @@ test(
   },
 );
 
+for (const op of ['set_model', 'send', 'create'])
+  test(
+    op + ' model-only changes preserve current effort over native switch defaults',
+    async (t) => {
+      const f = await fixture(t),
+        { bridge } = f;
+      f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
+      f.config.piArgs[f.config.piArgs.indexOf('--thinking') + 1] = 'high';
+      const settings = JSON.parse(await fs.readFile(f.settings, 'utf8'));
+      await fs.writeFile(
+        f.settings,
+        JSON.stringify({
+          ...settings,
+          defaultThinkingLevel: 'low',
+          modelThinkingLevels: { 'model-fixture/reasoner': 'medium' },
+        }),
+      );
+      const defaults = await fs.readFile(f.settings, 'utf8');
+      const result = await bridge[op]({
+        ...identity(op, f),
+        model: choice('reasoner'),
+        ...(op === 'set_model' ? {} : { text: 'KEEP_EFFORT' }),
+      });
+      const receipt = sendReceipt(result),
+        selection = op === 'set_model' ? result : receipt.model_selection;
+      assert.deepEqual(selection, { model: choice('reasoner'), thinking_level: 'high' });
+      const entries = await releasedEntries(bridge, target(result, f));
+      if (op === 'set_model') assert.equal(entries.filter((e) => e.message).length, 0);
+      else assert.equal(replies(entries)[0].reasoning, 'high');
+      assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
+    },
+  );
+
 test(
   'model-only changes report native thinking adjustment without changing global defaults',
   { timeout: 10000 },
@@ -302,6 +336,7 @@ test(
     await bridge.pool.resolve(await bridge.session(id));
     const rpc = bridge.pool.get(id),
       receive = rpc.receiveResponse.bind(rpc);
+    ackTimeout(t, ['prompt']);
     let held;
     t.mock.method(rpc, 'receiveResponse', (event, generation) => {
       if (event.type === 'response' && event.command === 'prompt') {
@@ -316,7 +351,6 @@ test(
       text: 'ONCE',
       model: choice('vision'),
       thinking_level: 'high',
-      timeout_ms: 50,
     };
     const unknown = await bridge.send(args);
     assert.equal(unknown.status, 'unknown');

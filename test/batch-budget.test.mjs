@@ -112,7 +112,7 @@ for (const [op, longMetadata] of [
           assert.ok(text.isWellFormed());
           assert.ok(output.startsWith(text));
           assert.equal(
-            item.result[op === 'command' ? 'output_complete' : 'withdrawn_complete'],
+            item.result[op === 'command' ? 'response_complete' : 'withdrawn_complete'],
             text.length === output.length,
           );
           if (op === 'stop') assert.equal(item.result.includes_editor_draft, true);

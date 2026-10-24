@@ -25,14 +25,25 @@ test('model metadata allowlist preserves unknown, native unsupported and thinkin
     baseUrl: 'SECRET',
     cost: { input: 0 },
     compat: { secret: 'SECRET' },
+    inputLimits: { maxRequestBytes: 10000, images: { maxPerMessage: 2, maxPerRequest: 4 } },
   };
   const info = modelInfo(secret);
-  assert.deepEqual(info.thinking_levels, ['off']);
-  assert.deepEqual(info.input, ['text']);
+  assert.deepEqual(info, {
+    provider: 'p',
+    id: 'm',
+    name: 'Name',
+    input: ['text'],
+    context_window: 16000,
+    effort: ['off'],
+  });
+  assert.deepEqual(
+    modelInfo({ ...secret, reasoning: true }).effort,
+    getSupportedThinkingLevels({ ...secret, reasoning: true }),
+  );
   assert.ok(!JSON.stringify(info).includes('SECRET'));
   const unknown = modelInfo({ provider: 'p', id: 'unknown' });
   assert.equal(unknown.input, null);
-  assert.equal(unknown.thinking_levels, null);
+  assert.equal(unknown.effort, null);
   assert.equal(unknown.context_window, null);
   assert.equal(
     publicSchemas.send.safeParse({

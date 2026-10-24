@@ -41,8 +41,10 @@ export function bashOutput(receipt, record, args, resultBudget) {
         output,
         exitCode: record.exitCode,
         cancelled: record.cancelled,
-        truncated: record.truncated,
-        output_complete: record.output_complete && output.length === record.output.length,
+        // Native output may already be truncated (for example, a tail).
+        // Completeness describes only Bridge's delivery of that native output.
+        native_truncated: record.truncated,
+        response_complete: record.output_complete && output.length === record.output.length,
       },
       { fullOutputPath: record.fullOutputPath },
       resultBudget,
