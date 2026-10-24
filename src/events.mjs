@@ -7,6 +7,8 @@ import { permitted } from './permissions.mjs';
 import { knownErrorCode } from './errors.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { settledResultSchema } from './settled-result.mjs';
+import { ownerSocket } from './owner-runtime.mjs';
+import { READ_CONTRACT } from './context-read.mjs';
 import {
   callbackUrl,
   signingSecret,
@@ -64,7 +66,7 @@ const recordSchema = z
 export const settledEventDefinition = {
   name: NAME,
   description:
-    'A saved Pi session finishes a native agent run, including automatic continuations. Only Bridge-owned RPC execution is observed; external TUI/RPC/SDK owners are unsupported. This is session-wide settlement, not per-prompt success or process exit. Includes a bounded last assistant response when available; its stop_reason is native termination, not task success. If more detail is useful, call read with the supplied read object to open Session Context at this exact leaf, including when a memory reader is enabled. Subscribe before sending work. No replay.',
+    'A saved Pi session finishes a native agent run, including automatic continuations. Supports Bridge-owned RPC and ordinary TUI/RPC companions configured for this Bridge; SDK hosts and registry-only companions are unsupported. This is session-wide settlement, not per-prompt success or process exit. Includes a bounded last assistant response when available; its stop_reason is native termination, not task success. If more detail is useful, call read with the supplied read object to open Session Context at this exact leaf, including when a memory reader is enabled. Subscribe before sending work. No replay.',
   delivery: ['webhook'],
   inputSchema: {
     type: 'object',
@@ -146,6 +148,14 @@ function requireName(name) {
 // Subscription records are durable; occurrences/retries are deliberately not a
 // replay log. The Bridge's existing state-directory lock owns this store.
 export class EventSubscriptions {
+  supports(runtime) {
+    return (
+      !runtime?.attached ||
+      (['tui', 'extension'].includes(runtime.record?.kind) &&
+        runtime.record.readContract === READ_CONTRACT &&
+        runtime.record.completionSocket === ownerSocket(this.bridge.config))
+    );
+  }
   constructor(
     bridge,
     {
@@ -281,9 +291,9 @@ export class EventSubscriptions {
     } catch {
       throw new EventError(-32024, 'Forbidden');
     }
-    // Never start a writer to subscribe. Reject currently attached owners.
+    // Never start a writer to subscribe. A companion must target this Bridge.
     const runtime = await this.bridge.pool.forRead(session);
-    if (runtime?.attached)
+    if (!this.supports(runtime))
       throw new EventError(-32026, 'Unsupported', { feature: 'externalOwner' });
     const id = identity(session.id, request.delivery.url);
     return this.change(async (next) => {

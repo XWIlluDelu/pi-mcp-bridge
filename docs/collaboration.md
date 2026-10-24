@@ -9,9 +9,10 @@ instruction, and read further only when the outcome needs explanation or evidenc
 1. Use `list` to find an authorized session and its current activity. Start with
    `read({session_id})`; use `preset:"recent"` for more task background or `search`
    to locate a decision or tool result. Expand returned refs with `read`.
-2. For completion notifications from Bridge-owned RPC execution,
-   [subscribe before sending](events.md). External TUI/RPC/SDK owners have their own
-   lifecycle and are outside this event's scope.
+2. For completion notifications, [subscribe before sending](events.md).
+   Bridge-owned RPC and ordinary TUI/RPC companions connected to this Bridge
+   support `session.settled`. For a new session, call `create` without input to
+   obtain a saved session ID, subscribe, then `send` the first task.
 3. Send the instruction to that session and retain `session_id` and
    `submission_id`. `started`, `queued` and `handled` report native admission.
    `dispatched` confirms an external owner invoked Pi's public API, whose input
