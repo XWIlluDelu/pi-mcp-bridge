@@ -23,11 +23,13 @@ async function until(fn) {
 }
 
 test(
-  'authenticated MCP subscription receives real Pi settlement before exit, then reads that exact result after a later round',
+  'authenticated MCP subscription reports the final automatic continuation once, then reads that exact result after a later round',
   { timeout: 30000 },
   async (t) => {
     const dir = await fs.mkdtemp('/tmp/pi-events-native-');
     const gate = dir + '/release-shutdown';
+    const continuationReady = dir + '/continuation-ready';
+    const continuationGate = dir + '/release-continuation';
     const config = {
       ...isolatedRuntime(dir),
       stateDir: dir + '/state',
@@ -40,10 +42,33 @@ test(
       extension,
       `
     import fs from 'node:fs/promises';
-    export default pi => pi.on('session_shutdown', async () => {
-      while (!await fs.stat(${JSON.stringify(gate)}).then(()=>true,()=>false))
-        await new Promise(r=>setTimeout(r,10));
-    });
+    export default pi => {
+      let continued = false;
+      const inputText = ctx => {
+        const input = ctx.sessionManager.getBranch().findLast(e => e.message?.role === 'user')?.message.content;
+        return typeof input === 'string' ? input : input?.find(b => b.type === 'text')?.text;
+      };
+      pi.on('session_shutdown', async () => {
+        while (!await fs.stat(${JSON.stringify(gate)}).then(()=>true,()=>false))
+          await new Promise(r=>setTimeout(r,10));
+      });
+      pi.on('message_end', (event, ctx) => {
+        if (event.message.role !== 'assistant') return;
+        for (const block of event.message.content)
+          if (block.type === 'text') block.text += ' (' + inputText(ctx) + ')';
+      });
+      pi.on('agent_before_settle', async (_event, ctx) => {
+        if (continued || inputText(ctx) !== 'FIRST') return;
+        continued = true;
+        await fs.writeFile(${JSON.stringify(continuationReady)}, 'ready');
+        while (!await fs.stat(${JSON.stringify(continuationGate)}).then(()=>true,()=>false))
+          await new Promise(r=>setTimeout(r,10));
+        return {
+          entries: [{type:'custom_message', customType:'continuation-probe', content:'Finish the final report.', display:false}],
+          continue:true,
+        };
+      });
+    };
   `,
     );
     config.piArgs.push(
@@ -72,6 +97,7 @@ test(
     const service = createHttpService(bridge, { token });
     const url = await service.listen();
     t.after(async () => {
+      await fs.writeFile(continuationGate, 'go');
       await fs.writeFile(gate, 'go');
       await service.close();
       await fs.rm(dir, { recursive: true, force: true });
@@ -135,10 +161,21 @@ test(
     assert.equal(firstSend.body.result.isError, undefined, JSON.stringify(firstSend));
     const firstSubmission = firstSend.body.result.structuredContent.submission_id;
     assert.match(firstSubmission, /^[a-f0-9-]{36}$/);
+    await until(() =>
+      fs.stat(continuationReady).then(
+        () => true,
+        () => false,
+      ),
+    );
+    assert.equal(events.length, 0, 'Intermediate completion must not publish a settled event');
+    await fs.writeFile(continuationGate, 'go');
     await until(() => events.length === 1);
     const first = events[0];
     assert.equal(first.data.session_id, made.session_id);
     assert.equal(first.data.aborted, false);
+    assert.equal(first.data.result.text, 'Synthetic response 2. (FIRST)');
+    assert.equal(first.data.result.stop_reason, 'stop');
+    assert.equal(first.data.result.truncated, false);
     assert.equal(typeof first.data.leaf_id, 'string');
     assert.equal(bridge.pool.get(made.session_id).exited, false, 'completion is not process exit');
     const runtime = bridge.pool.get(made.session_id);
@@ -149,6 +186,7 @@ test(
       sequence: runtime.completionSequence,
       leafId: first.data.leaf_id,
       aborted: false,
+      result: first.data.result,
       timestamp: first.timestamp,
     };
     await assert.rejects(ownerRequest(config, duplicate), /INVALID_OWNER_COMMAND/);
@@ -164,6 +202,8 @@ test(
     await until(() => events.length === 2);
     await until(() => !bridge.pool.get(made.session_id) && !bridge.autoReleases.size);
     assert.notEqual(first.data.leaf_id, events[1].data.leaf_id);
+    assert.equal(first.data.result.text, 'Synthetic response 2. (FIRST)');
+    assert.equal(events[1].data.result.text, 'Synthetic response 1. (SECOND)');
     const receipt = await call('tools/call', {
       name: 'submission',
       arguments: { session_id: made.session_id, submission_id: firstSubmission },
@@ -173,17 +213,22 @@ test(
     assert.deepEqual(receipt.body.result.structuredContent.receipt, { status: 'started' });
     assert.equal(receipt.body.result.structuredContent.leaf_id, undefined);
     assert.equal(bridge.pool.get(made.session_id), null);
+    // A matching memory reader must not intercept the event's native leaf read.
+    const unhookReader = bridge.compatibilityServices.sessionReaders.register('memory-probe', {
+      matches: () => true,
+      read: () => assert.fail('Settlement read must bypass a current-memory reader'),
+    });
     const result = await call('tools/call', {
       name: 'read',
-      arguments: {
-        session_id: first.data.session_id,
-        leaf_id: first.data.leaf_id,
-        preset: 'latest',
-      },
+      arguments: first.data.read,
     });
+    unhookReader();
     const read = result.body.result.structuredContent;
     assert.equal(read.leaf_id, first.data.leaf_id);
-    assert.ok(JSON.stringify(read.items).includes('Synthetic response 1.'), JSON.stringify(read));
+    assert.ok(
+      JSON.stringify(read.items).includes('Synthetic response 2. (FIRST)'),
+      JSON.stringify(read),
+    );
     assert.equal(JSON.stringify(read.items).includes('SECOND'), false);
     const session = await bridge.session(made.session_id);
     assert.equal(
