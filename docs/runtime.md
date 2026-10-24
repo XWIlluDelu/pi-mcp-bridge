@@ -60,6 +60,7 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 | Native command / stop   | Including queued-input withdrawal   | Unsupported                                           | Yes                                     |
 | Manual compact          | Idle by default; explicit interrupt | Explicit interrupt                                    | Explicit interrupt                      |
 | TUI handoff             | Drain, normal EOF, reserved join    | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
+| Completion events       | Native settlement                   | Native settlement with the owner profile              | Unsupported                             |
 
 Saved reads need no writer. Send, command, compact and `set_model` may cold-start
 an RPC; stop, read, search and list do not. Model catalogs are independent of session
@@ -184,7 +185,7 @@ pi -e /absolute/pi-mcp-bridge/src/attach-extension.mjs
 
 If also set, `PI_MCP_ATTACH_DIR` must agree with the owner file. Directory-only
 `PI_MCP_ATTACH_DIR` is the low-level path for hosts managing their own scope;
-use an owner profile for scoped daily access.
+use an owner profile for scoped daily access and [completion events](events.md).
 
 Existing processes need a safe TUI `/reload` or host-managed reopen to load a
 newly configured extension. Registration happens after native file open, so it

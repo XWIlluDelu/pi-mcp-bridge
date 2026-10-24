@@ -6,6 +6,8 @@ import { syncBuiltinESMExports } from 'node:module';
 import { Webhook } from 'standardwebhooks';
 import { Bridge } from '../src/bridge.mjs';
 import { EventSubscriptions } from '../src/events.mjs';
+import { ownerSocket } from '../src/owner-runtime.mjs';
+import { READ_CONTRACT } from '../src/context-read.mjs';
 import { hash } from '../src/storage.mjs';
 import { CallbackError } from '../src/event-webhook.mjs';
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
@@ -425,16 +427,27 @@ for (const invalid of ['active record', 'file privacy'])
     assert.equal(f.sent.length, before + 1);
   });
 
-test('unsupported replay and live external owners are explicit rather than silently unobserved', async (t) => {
+test('unsupported replay and external owners without this Bridge event capability are explicit', async (t) => {
   const f = await fixture(t),
     input = request(f.session.id);
   assert.equal(
     (await f.call('events/subscribe', { ...input, cursor: 'old' })).message.error.code,
     -32026,
   );
-  t.mock.method(f.bridge.pool, 'forRead', async () => ({ attached: true }));
-  const response = await f.call('events/subscribe', input);
-  assert.equal(response.message.error.code, -32026);
-  assert.equal(response.message.error.data.feature, 'externalOwner');
+  const companion = {
+    kind: 'tui',
+    readContract: READ_CONTRACT,
+    completionSocket: ownerSocket(f.config),
+  };
+  for (const record of [
+    { ...companion, kind: 'host' },
+    { ...companion, completionSocket: undefined },
+    { ...companion, completionSocket: ownerSocket({ ...f.config, stateDir: f.dir + '/other' }) },
+  ]) {
+    t.mock.method(f.bridge.pool, 'forRead', async () => ({ attached: true, record }));
+    const response = await f.call('events/subscribe', input);
+    assert.equal(response.message.error.code, -32026);
+    assert.equal(response.message.error.data.feature, 'externalOwner');
+  }
   assert.equal(f.sent.length, 0);
 });

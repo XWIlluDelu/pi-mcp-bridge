@@ -200,22 +200,23 @@ test('large persisted histories do not prevent TUI registration or first-persist
         );
       };
       if (timing === 'before-registration') await persist();
+      const ctx = {
+        mode: 'tui',
+        sessionManager: manager,
+        isIdle: () => true,
+        hasPendingMessages: () => false,
+        shutdown: () => {
+          stopped = true;
+        },
+      };
       await handlers.session_start(
         { reason: previousSessionFile ? 'new' : 'startup', previousSessionFile },
-        {
-          mode: 'tui',
-          sessionManager: manager,
-          isIdle: () => true,
-          hasPendingMessages: () => false,
-          shutdown: () => {
-            stopped = true;
-          },
-        },
+        ctx,
       );
       previousSessionFile = file;
       if (timing === 'after-registration') {
         await persist();
-        await handlers.agent_settled({ aborted: false });
+        await handlers.agent_settled({ aborted: false }, ctx);
       }
       const session = { file, header: manager.getHeader() },
         claim = await readClaim(f.config.attachmentDir, session);
@@ -475,7 +476,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
         content: 'native persistence fixture',
         timestamp: Date.now(),
       });
-      await handlers.agent_settled({ aborted: false });
+      await handlers.agent_settled({ aborted: false }, context(manager));
       assert.equal((await runtime.read({ session_id: 'fixture' })).units.length, 1);
       await assert.rejects(
         reserveOwner(f.config.attachmentDir, session, 'rpc'),
@@ -544,9 +545,9 @@ test('missing targets do not bypass canonical parent or observed-file checks', a
       content: 'persist then remove fixture',
       timestamp: Date.now(),
     });
-    await handlers.agent_settled({ aborted: false });
+    await handlers.agent_settled({ aborted: false }, ctx);
     await fs.unlink(file);
-    await assert.rejects(handlers.agent_settled({ aborted: false }), { code: 'ENOENT' });
+    await assert.rejects(handlers.agent_settled({ aborted: false }, ctx), { code: 'ENOENT' });
     assert.equal(stopped, true);
   } finally {
     await handlers.session_shutdown({ reason: 'quit' });
@@ -583,7 +584,7 @@ test('RPC extension storage failure retains ownership without shutting down its 
     const claim = await readClaim(f.config.attachmentDir, f.session);
     await fs.link(f.session.file, alias);
     await assert.rejects(
-      handlers.agent_settled({ aborted: false }),
+      handlers.agent_settled({ aborted: false }, ctx),
       /SESSION_FILE_ALIAS_NOT_ALLOWED/,
     );
     assert.equal(shutdowns, 0);

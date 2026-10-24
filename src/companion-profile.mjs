@@ -30,6 +30,7 @@ export async function companionProfile(env = process.env) {
     file,
     dir,
     roots: config.sessionRoots,
+    ownerControl: { stateDir: config.stateDir, attachmentDir: dir },
     ...(config.piExecutable ? { piExecutable: config.piExecutable } : {}),
   };
 }

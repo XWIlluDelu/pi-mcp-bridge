@@ -91,6 +91,7 @@ export class Bridge {
     this.readCache = new ContextReadCache();
     this.autoReleases = new Set();
     this.events = new EventSubscriptions(this);
+    this.completionSequences = new Map();
     this.submissions = new Submissions();
     this.pool.onIdleCandidate = (runtime) => scheduleAutoRelease(this, runtime);
   }
@@ -1130,6 +1131,7 @@ export class Bridge {
           failure ??= error;
         } finally {
           if (this.handoffs.get(args.session_id) === marker) this.handoffs.delete(args.session_id);
+          if (trash?.moved) this.completionSequences.delete(args.session_id);
         }
       }
       return optionalResultFields(
@@ -1143,15 +1145,13 @@ export class Bridge {
       );
     });
   }
-  settledForLocal(request) {
+  async settledForLocal(request) {
     this.assertOpen();
-    const runtime = this.pool.instances.get(request.session_id);
     if (
-      !(runtime instanceof PiRpc) ||
-      !runtime.alive ||
-      request.generation !== runtime.ownerRecord?.generation ||
+      typeof request.generation !== 'string' ||
+      request.generation.length === 0 ||
       !Number.isSafeInteger(request.sequence) ||
-      request.sequence <= (runtime.completionSequence ?? 0) ||
+      request.sequence <= 0 ||
       !(
         request.leafId === null ||
         (typeof request.leafId === 'string' &&
@@ -1164,9 +1164,32 @@ export class Bridge {
       !Number.isFinite(Date.parse(request.timestamp))
     )
       throw new Error('INVALID_OWNER_COMMAND');
-    runtime.completionSequence = request.sequence;
-    this.events.observe(runtime.session, request);
-    return {};
+    const session = await this.session(request.session_id);
+    // Serialize the claim check with native replacement. No owner IPC or writer
+    // startup is needed to accept a completion, including its first occurrence.
+    return registryTransaction(this.pool.attachmentDir, async () => {
+      const claim = await readClaim(this.pool.attachmentDir, session);
+      const runtime = this.pool.instances.get(session.id);
+      if (
+        claim?.generation !== request.generation ||
+        !(await ownerAlive(claim.owner)) ||
+        (claim.kind === 'rpc'
+          ? !(runtime instanceof PiRpc) ||
+            !runtime.alive ||
+            runtime.ownerRecord?.generation !== claim.generation
+          : claim.phase !== 'ready' || !this.events.supports({ attached: true, record: claim }))
+      )
+        throw new Error('INVALID_OWNER_COMMAND');
+      const previous = this.completionSequences.get(session.id);
+      if (previous?.generation === request.generation && request.sequence <= previous.sequence)
+        throw new Error('INVALID_OWNER_COMMAND');
+      this.completionSequences.set(session.id, {
+        generation: request.generation,
+        sequence: request.sequence,
+      });
+      this.events.observe(session, request);
+      return {};
+    });
   }
   handoffForLocal(request, options) {
     return idleHandoff(this, request, options);
@@ -1320,6 +1343,7 @@ export class Bridge {
     this.readCache.clear();
     this.closePromise = (async () => {
       await this.prepareClose();
+      this.completionSequences.clear();
       while (this.pendingMutations.size) await Promise.allSettled([...this.pendingMutations]);
       await this.pool.drainAcks?.();
       await this.pool.close();

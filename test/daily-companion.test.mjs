@@ -6,6 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { RpcClient } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
+import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -31,7 +32,7 @@ for (const mode of ['tui', 'rpc'])
   test(
     'daily ' +
       mode +
-      ' loads settings companion before first persistence and survives reload/replacement',
+      ' companion registers before persistence and reports final completions across reload/replacement',
     { timeout: 30000 },
     async (t) => {
       const dir = await fs.mkdtemp('/tmp/pi-daily-'),
@@ -39,6 +40,9 @@ for (const mode of ['tui', 'rpc'])
         agent = path.join(dir, 'agent');
       const ownerFile = path.join(dir, '.config/pi-mcp-bridge/owner.json'),
         metaFile = path.join(dir, 'native.json');
+      const continuationReady = path.join(dir, 'continuation-ready'),
+        continuationGate = path.join(dir, 'release-continuation'),
+        settledMarker = path.join(dir, 'settled-input');
       const root = path.join(dir, 'sessions'),
         outside = path.join(dir, 'outside', 'outside.jsonl');
       await Promise.all(
@@ -72,6 +76,25 @@ for (const mode of ['tui', 'rpc'])
         `import fs from 'node:fs/promises';
 import {fauxProvider} from ${JSON.stringify(aiEntry)};
 export default pi=>{
+ let continued=false;
+ const inputText=ctx=>{
+  const input=ctx.sessionManager.getBranch().findLast(e=>e.message?.role==='user')?.message.content;
+  return typeof input==='string'?input:input?.find(b=>b.type==='text')?.text;
+ };
+ pi.on('message_end',(event,ctx)=>{
+  if(event.message.role==='assistant')
+   for(const block of event.message.content)
+    if(block.type==='text')block.text+=' ('+inputText(ctx)+')';
+ });
+ pi.on('agent_before_settle',async(_event,ctx)=>{
+  if(continued||inputText(ctx)!=='REMOTE_DAILY')return;
+  continued=true;
+  await fs.writeFile(${JSON.stringify(continuationReady)},'ready');
+  while(!await fs.stat(${JSON.stringify(continuationGate)}).then(()=>true,()=>false))
+   await new Promise(r=>setTimeout(r,10));
+  return {entries:[{type:'custom_message',customType:'continuation-probe',content:'Finish the final report.',display:false}],continue:true};
+ });
+ pi.on('agent_settled',async(_event,ctx)=>fs.writeFile(${JSON.stringify(settledMarker)},inputText(ctx)));
  pi.registerProvider(fauxProvider({provider:'selection-fixture',models:[{id:'other',reasoning:true,input:['text']},{id:'next',reasoning:true,input:['text']}]}).provider);
  pi.on('session_start',async(event,ctx)=>{await fs.writeFile(${JSON.stringify(metaFile + '.pending')},JSON.stringify({
   pid:process.pid,file:ctx.sessionManager.getSessionFile(),header:ctx.sessionManager.getHeader(),
@@ -126,6 +149,7 @@ export default pi=>{
       ];
       let child, local, identity, bridge;
       t.after(async () => {
+        await fs.writeFile(continuationGate, 'go');
         if (local) await local.stop();
         if (child) {
           if (identity && (await ownerAlive(identity))) {
@@ -175,9 +199,8 @@ export default pi=>{
       };
       await send('LOCAL_FIRST');
       await until(async () =>
-        exists(meta.file).then(
-          async (yes) =>
-            yes && (await fs.readFile(meta.file, 'utf8')).includes('Synthetic response'),
+        exists(settledMarker).then(
+          async (yes) => yes && (await fs.readFile(settledMarker, 'utf8')) === 'LOCAL_FIRST',
         ),
       );
       bridge = await new Bridge(config, async () => {
@@ -186,6 +209,24 @@ export default pi=>{
       const saved = await until(async () =>
         (await bridge.sessions()).find((s) => s.file === meta.file),
       );
+      const events = [];
+      bridge.events.post = async (_url, body) => {
+        const event = JSON.parse(body);
+        if (event.type === 'verification')
+          return { status: 200, body: JSON.stringify({ challenge: event.challenge }) };
+        events.push(event);
+        return { status: 204, body: '' };
+      };
+      const subscription = {
+        name: 'session.settled',
+        arguments: { session_id: saved.id },
+        delivery: {
+          mode: 'webhook',
+          url: 'https://callback.example/daily-companion',
+          secret: 'whsec_' + Buffer.alloc(32, 5).toString('base64'),
+        },
+      };
+      await bridge.events.handle('events/subscribe', subscription);
       const status = (await bridge.list({ session_id: saved.id })).sessions[0].status;
       assert.equal(claim.kind, mode === 'tui' ? 'tui' : 'extension');
       assert.deepEqual(status.capabilities, { send: true, command: false, stop: false });
@@ -226,7 +267,29 @@ export default pi=>{
           .filter((e) => e.message?.role === 'user').length,
         1,
       );
-      await bridge.send({ session_id: saved.id, text: 'REMOTE_DAILY' });
+      const receipt = await bridge.send({ session_id: saved.id, text: 'REMOTE_DAILY' });
+      assert.equal(receipt.status, 'dispatched');
+      await until(() => exists(continuationReady));
+      assert.equal(events.length, 0, 'Automatic continuation has not settled the run');
+      await fs.writeFile(continuationGate, 'go');
+      await until(() => events.length === 1);
+      const first = events[0];
+      assert.equal(first.data.session_id, saved.id);
+      assert.equal(first.data.result.text, 'Synthetic response 3. (REMOTE_DAILY)');
+      assert.equal(first.data.result.stop_reason, 'stop');
+      assert.equal(first.data.aborted, false);
+      const duplicate = {
+        op: 'settled',
+        session_id: saved.id,
+        generation: claim.generation,
+        // LOCAL_FIRST settled before Bridge startup; this is the next native run.
+        sequence: 2,
+        leafId: first.data.leaf_id,
+        aborted: false,
+        result: first.data.result,
+        timestamp: first.timestamp,
+      };
+      await assert.rejects(ownerRequest(config, duplicate), /INVALID_OWNER_COMMAND/);
       await until(async () => {
         const entries = (await fs.readFile(meta.file, 'utf8')).trim().split('\n').map(JSON.parse);
         return entries.some(
@@ -246,7 +309,14 @@ export default pi=>{
       for (const key of ['pid', 'start', 'boot']) assert.equal(claim.owner[key], before.owner[key]);
       assert.equal(await exists(before.socket), false);
       assert.deepEqual(await sockets(), [path.basename(claim.socket)]);
+      await assert.rejects(
+        ownerRequest(config, { ...duplicate, sequence: duplicate.sequence + 1 }),
+        /INVALID_OWNER_COMMAND/,
+      );
       await bridge.send({ session_id: saved.id, text: 'AFTER_RELOAD' });
+      await until(() => events.length === 2);
+      assert.equal(events[1].data.result.text, 'Synthetic response 1. (AFTER_RELOAD)');
+      assert.notEqual(events[1].data.leaf_id, first.data.leaf_id);
       await until(
         async () =>
           (await fs.readFile(meta.file, 'utf8')).includes('AFTER_RELOAD') &&
@@ -272,5 +342,8 @@ export default pi=>{
       );
       assert.deepEqual(await sockets(), []);
       assert.equal(await ownerAlive(identity), true);
+      assert.equal(events.length, 2);
+      const { secret: _secret, ...delivery } = subscription.delivery;
+      await bridge.events.handle('events/unsubscribe', { ...subscription, delivery });
     },
   );
