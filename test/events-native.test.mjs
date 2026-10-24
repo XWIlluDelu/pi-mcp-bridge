@@ -133,6 +133,8 @@ test(
       });
     const firstSend = await send('FIRST');
     assert.equal(firstSend.body.result.isError, undefined, JSON.stringify(firstSend));
+    const firstSubmission = firstSend.body.result.structuredContent.submission_id;
+    assert.match(firstSubmission, /^[a-f0-9-]{36}$/);
     await until(() => events.length === 1);
     const first = events[0];
     assert.equal(first.data.session_id, made.session_id);
@@ -157,10 +159,20 @@ test(
     assert.equal(events.length, 1);
     await fs.writeFile(gate, 'go');
     await until(() => !bridge.pool.get(made.session_id) && !bridge.autoReleases.size);
-    await send('SECOND');
+    const secondSend = await send('SECOND');
+    assert.notEqual(secondSend.body.result.structuredContent.submission_id, firstSubmission);
     await until(() => events.length === 2);
     await until(() => !bridge.pool.get(made.session_id) && !bridge.autoReleases.size);
     assert.notEqual(first.data.leaf_id, events[1].data.leaf_id);
+    const receipt = await call('tools/call', {
+      name: 'submission',
+      arguments: { session_id: made.session_id, submission_id: firstSubmission },
+    });
+    assert.equal(receipt.status, 200);
+    assert.equal(receipt.body.result.isError, undefined);
+    assert.deepEqual(receipt.body.result.structuredContent.receipt, { status: 'started' });
+    assert.equal(receipt.body.result.structuredContent.leaf_id, undefined);
+    assert.equal(bridge.pool.get(made.session_id), null);
     const result = await call('tools/call', {
       name: 'read',
       arguments: {

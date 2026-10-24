@@ -119,8 +119,8 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         (tracked.submitting || !session.isIdle || session.pendingMessageCount > 0)
       )
         return { status: 'skipped', reason: 'busy' };
-      // Public prompt() resolves at completion, not at admission. Even a
-      // synchronous throw after entering host code cannot prove no side effect.
+      // Public prompt() returns the input call's Promise, not an admission
+      // receipt. A synchronous throw after entry cannot prove no side effect.
       try {
         tracked.track(
           session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }),
@@ -130,8 +130,9 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         try {
           onError?.(error);
         } catch {}
+        return unknown();
       }
-      return unknown();
+      return { status: 'dispatched', admission: 'unobservable' };
     },
     bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
       if (

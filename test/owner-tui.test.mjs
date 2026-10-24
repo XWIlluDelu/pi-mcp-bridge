@@ -198,6 +198,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       'send',
       'set_model',
       'stop',
+      'submission',
     ]);
     const id = made.session_id;
     assert.equal(
@@ -208,7 +209,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
           text: 'PUBLIC_OWNER_SESSION_FIXTURE',
         })
       ).status,
-      'unknown',
+      'dispatched',
     );
     await until(
       async () => (await ok('read', { session_id: id })).items.some((x) => x.type === 'text'),
@@ -250,7 +251,8 @@ test('human Pi menu changes live session/project permissions enforced by actual 
 
       text: 'PRIVATE_TO_CALLER_FIXTURE',
     });
-    assert.equal(sendOnly.status, 'unknown');
+    assert.equal(sendOnly.status, 'dispatched');
+    assert.equal(sendOnly.admission, 'unobservable');
     assert.equal(sendOnly.dispatch, undefined);
     assert.ok(!JSON.stringify(sendOnly).includes('PRIVATE_TO_CALLER_FIXTURE'));
     assert.ok(!JSON.stringify(sendOnly).includes(cwd));

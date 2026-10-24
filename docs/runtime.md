@@ -50,16 +50,16 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 
 ## Runtime capabilities
 
-| Capability              | Bridge-owned RPC                    | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings            |
-| ----------------------- | ----------------------------------- | ----------------------------------------------------- | ----------------------------------------- |
-| Read context            | Session + runtime                   | Session + runtime                                     | Session projection; runtime unavailable   |
-| Live text/thinking      | Native delta events                 | Public extension events                               | When supplied by the host                 |
-| Send text/images        | Native ACK                          | Submission observable; acceptance unknown             | Native RPC ACK or SDK submission evidence |
-| Standalone `set_model`  | Native setters; busy supported      | Public setters; busy supported                        | Native setters; busy supported            |
-| Prompt + model/thinking | Proven-idle only                    | Unsupported                                           | Unsupported                               |
-| Native command / stop   | Including queued-input withdrawal   | Unsupported                                           | Yes                                       |
-| Manual compact          | Idle by default; explicit interrupt | Explicit interrupt                                    | Explicit interrupt                        |
-| TUI handoff             | Drain, normal EOF, reserved join    | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                   |
+| Capability              | Bridge-owned RPC                    | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
+| ----------------------- | ----------------------------------- | ----------------------------------------------------- | --------------------------------------- |
+| Read context            | Session + runtime                   | Session + runtime                                     | Session projection; runtime unavailable |
+| Live text/thinking      | Native delta events                 | Public extension events                               | When supplied by the host               |
+| Send text/images        | Native ACK                          | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
+| Standalone `set_model`  | Native setters; busy supported      | Public setters; busy supported                        | Native setters; busy supported          |
+| Prompt + model/thinking | Proven-idle only                    | Unsupported                                           | Unsupported                             |
+| Native command / stop   | Including queued-input withdrawal   | Unsupported                                           | Yes                                     |
+| Manual compact          | Idle by default; explicit interrupt | Explicit interrupt                                    | Explicit interrupt                      |
+| TUI handoff             | Drain, normal EOF, reserved join    | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 
 Saved reads need no writer. Send, command, compact and `set_model` may cold-start
 an RPC; stop, read, search and list do not. Model catalogs are independent of session
@@ -78,8 +78,8 @@ timed-out compaction keeps its native fence until settlement. On companion
 shutdown/switch, admission closes and admitted setters/compaction drain before
 fresh registration can retire the claim. Socket loss does not settle those calls.
 
-The ordinary companion reports `PI_ACCEPTANCE_UNOBSERVABLE` after
-`sendUserMessage()` and `BASH_UNSUPPORTED` / `STOP_UNSUPPORTED` for controls it
+The ordinary companion reports `dispatched, admission:"unobservable"` after
+a successful `sendUserMessage()` invocation, and `BASH_UNSUPPORTED` / `STOP_UNSUPPORTED` for controls it
 cannot implement. Native command support must use Pi's bash path, including
 `user_bash`, history and cancellation. Custom hosts declare capabilities from
 the callbacks they implement; command requires bash plus either cancel or stop,
@@ -319,8 +319,9 @@ unfinished, but abnormal exit, identity mismatch or a surviving writer still
 blocks handoff. These unavailable-dialog cases are distinct from sent cancellation.
 
 Prompt ACKs establish admission, not model completion. Dispatch timeout means an
-unknown outcome; inspect `list/read` before deciding on another independent call.
-There is no automatic replay. Received late ACKs create tracked identity checks;
+unknown outcome; query the returned `submission_id` for a late ACK before deciding
+on another independent call. The bounded receipt cache has no replay or durable
+journal. Received late ACKs create tracked identity checks and update that receipt;
 `drainAcks()` waits for those tasks, not indefinitely for absent ACKs. Wrong IDs,
 methods, generations or native identities cannot establish success.
 

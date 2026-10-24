@@ -266,7 +266,8 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
 
         images: [image],
       });
-      assert.equal(sent.status, route === 'rpc-host' ? 'started' : 'unknown');
+      assert.equal(sent.status, route === 'rpc-host' ? 'started' : 'dispatched');
+      if (route !== 'rpc-host') assert.equal(sent.admission, 'unobservable');
       const text = await until(async () => {
         const value = sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText();
         return value?.startsWith('IMAGE_CONTEXT:') ? value : null;
@@ -352,7 +353,8 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         text: 'HANDLE_IMAGE_TEST ' + evidence.sha256,
         images: [small],
       });
-      assert.equal(handled.status, route === 'rpc-host' ? 'handled' : 'unknown');
+      assert.equal(handled.status, route === 'rpc-host' ? 'handled' : 'dispatched');
+      if (route !== 'rpc-host') assert.equal(handled.admission, 'unobservable');
       const inputRecord = await until(async () => {
         const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
         return entries.findLast(
@@ -365,7 +367,8 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         text: 'TRANSFORM_IMAGE_TEST',
         images: [small],
       });
-      assert.ok(['started', 'unknown'].includes(transformed.status));
+      assert.equal(transformed.status, route === 'rpc-host' ? 'started' : 'dispatched');
+      if (route !== 'rpc-host') assert.equal(transformed.admission, 'unobservable');
       await until(async () => {
         const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
         return entries

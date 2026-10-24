@@ -212,6 +212,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
       'send',
       'set_model',
       'stop',
+      'submission',
     ]);
     const call = async (name, args) => {
       const result = await client.callTool({ name, arguments: args });
