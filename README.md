@@ -11,7 +11,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 - Notify ChatGPT Work chats and dots when a Bridge-owned session settles, with a leaf ID for reading that result.
 - Batch independent operations and apply seven separate permissions at default, project and session tiers.
 
-Every mutation call performs a new operation. After a lost or unknown result, inspect `list/read` before deciding whether to submit again; automatic retries can duplicate work. Send acknowledges admission, not model completion. See the [public API](docs/api.md).
+Every mutation call performs a new operation. Send/create return a `submission_id` for querying admission receipts, including late native ACKs. External owners report confirmed dispatch separately from unobservable native admission. These receipts are not model completion or retry keys; automatic retries can duplicate work. Use `list/read` for activity and results. See the [public API](docs/api.md) and [collaboration design](docs/collaboration.md).
 
 ## Start locally
 

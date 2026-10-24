@@ -12,6 +12,19 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { MCP_RESPONSE_LIMIT, toolResultBytes, TOOL_RESULT_LIMIT } from '../src/response-budget.mjs';
 
+function admissionReceipt(result, ids) {
+  const { submission_id, ...receipt } = result;
+  assert.match(
+    submission_id,
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
+  );
+  if (ids) {
+    assert.equal(ids.has(submission_id), false, 'Every independent input has a distinct ID');
+    ids.add(submission_id);
+  }
+  return receipt;
+}
+
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-mutation-api-'));
   const project = path.join(dir, 'project');
@@ -109,12 +122,16 @@ test('invalid list filters and missing mutation payloads do not dispatch', async
 
 test('identical direct, MCP and batch calls are independent submissions with minimal results', async (t) => {
   const f = await fixture(t),
-    args = { session_id: f.id, text: 'same' };
-  assert.deepEqual(await f.bridge.send(args), { status: 'started' });
+    args = { session_id: f.id, text: 'same' },
+    ids = new Set();
+  assert.deepEqual(admissionReceipt(await f.bridge.send(args), ids), { status: 'started' });
   for (let i = 0; i < 2; i++)
     assert.deepEqual(
-      (await callBridgeTool(f.bridge, 'send', args, { requestId: 'same-attempt' }))
-        .structuredContent,
+      admissionReceipt(
+        (await callBridgeTool(f.bridge, 'send', args, { requestId: 'same-attempt' }))
+          .structuredContent,
+        ids,
+      ),
       { status: 'started' },
     );
   const batch = {
@@ -125,9 +142,11 @@ test('identical direct, MCP and batch calls are independent submissions with min
   };
   for (let i = 0; i < 2; i++) {
     const result = await executeBatch(f.bridge, batch);
-    assert.ok(result.results.every((item) => item.result.status === 'started'));
+    for (const item of result.results)
+      assert.deepEqual(admissionReceipt(item.result, ids), { status: 'started' });
   }
   assert.equal(f.calls.prompt, 7);
+  assert.equal(ids.size, 7);
 });
 
 test('send validates owner admission and returns only verified explicit settings', async (t) => {
@@ -138,35 +157,38 @@ test('send validates owner admission and returns only verified explicit settings
       disposition,
       ui: { cancel_sent: ['confirm'], completion: 'unconfirmed' },
     });
-    assert.deepEqual(await f.bridge.send(args), {
+    assert.deepEqual(admissionReceipt(await f.bridge.send(args)), {
       status: disposition,
       reason: 'EXTENSION_UI_CANCEL_SENT',
     });
   }
   for (const value of [{}, { status: 'accepted' }, { disposition: 'invented' }]) {
     f.runtime.command = async () => value;
-    assert.deepEqual(await f.bridge.send(args), {
+    assert.deepEqual(admissionReceipt(await f.bridge.send(args)), {
       status: 'unknown',
       reason: 'INVALID_PROMPT_RESULT',
     });
   }
   f.runtime.command = async () => ({ disposition: 'started' });
   const model = { provider: 'fixture', id: 'chosen' };
-  assert.deepEqual(await f.bridge.send({ ...args, model, thinking_level: 'high' }), {
-    status: 'started',
-    model_selection: { model, thinking_level: 'high' },
-  });
+  assert.deepEqual(
+    admissionReceipt(await f.bridge.send({ ...args, model, thinking_level: 'high' })),
+    {
+      status: 'started',
+      model_selection: { model, thinking_level: 'high' },
+    },
+  );
   f.runtime.selectModel = async () => {
     throw Object.assign(new Error('ACK_TIMEOUT'), { uncertain: true });
   };
-  assert.deepEqual(await f.bridge.send({ ...args, model }), {
+  assert.deepEqual(admissionReceipt(await f.bridge.send({ ...args, model })), {
     status: 'unknown',
     reason: 'ACK_TIMEOUT',
   });
   t.mock.method(f.bridge.pool, 'forRead', async () => f.runtime);
   f.runtime.attached = true;
   f.runtime.send = async () => ({ status: 'accepted' });
-  assert.deepEqual(await f.bridge.send(args), {
+  assert.deepEqual(admissionReceipt(await f.bridge.send(args)), {
     status: 'unknown',
     reason: 'INVALID_PROMPT_RESULT',
   });

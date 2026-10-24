@@ -521,7 +521,7 @@ test('SDK host keeps Stop admission fenced when withdrawal capture fails during 
   assert.equal(stopped.withdrawn_text, 'withdrawn');
   assert.equal(
     (await f.bridge.send({ session_id: f.id, text: 'after cancellation' })).status,
-    'unknown',
+    'dispatched',
   );
   assert.equal(prompts, 1);
 });

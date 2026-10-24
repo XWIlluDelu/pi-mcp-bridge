@@ -380,7 +380,7 @@ test('two official SDK sessions in one host PID release independently without sh
 
     text: 'PUBLIC_A_INPUT',
   });
-  assert.equal(sentA.status, 'unknown');
+  assert.equal(sentA.status, 'dispatched');
   await until(() => !hosts[0].session.isStreaming && faux.state.callCount === 1);
   assert.match(JSON.stringify(await f.bridge.read({ session_id: savedA.id })), /PUBLIC_A_INPUT/);
   const removed = await f.bridge.delete({ session_id: savedA.id });
@@ -393,7 +393,7 @@ test('two official SDK sessions in one host PID release independently without sh
 
     text: 'PUBLIC_B_INPUT',
   });
-  assert.equal(sentB.status, 'unknown');
+  assert.equal(sentB.status, 'dispatched');
   await until(() => !hosts[1].session.isStreaming && faux.state.callCount === 2);
   assert.match(JSON.stringify(await f.bridge.read({ session_id: savedB.id })), /PUBLIC_B_INPUT/);
   assert.ok(await fs.stat(savedB.file));
@@ -525,7 +525,7 @@ test('SDK async input preparation must finish before host release permits a save
 
     text: 'PUBLIC_ASYNC_PREPARATION',
   });
-  assert.equal(sent.status, 'unknown');
+  assert.equal(sent.status, 'dispatched');
   await entered.promise;
   assert.equal(pending.size, 1);
   let deletionFinished = false;
@@ -669,7 +669,7 @@ for (const hosted of [true, false])
       }
       assert.equal(
         (await f.bridge.send({ session_id: a.id, text: '/ordinary-remote' })).status,
-        'unknown',
+        'dispatched',
       );
       await until(() => ordinary === 1);
       await session.prompt('/' + join.invocationName + ' ' + b.id);
@@ -702,7 +702,12 @@ for (const hosted of [true, false])
         text: 'BRIDGE_IDLE_ONLY',
         mode: 'idle_only',
       });
-      assert.deepEqual(idle, { status: 'skipped', reason: 'busy' });
+      assert.match(idle.submission_id, /^[a-f0-9-]{36}$/);
+      assert.deepEqual(idle, {
+        status: 'skipped',
+        reason: 'busy',
+        submission_id: idle.submission_id,
+      });
       assert.equal(session.pendingMessageCount, 1);
       assert.equal(faux.state.callCount, calls);
       assert.deepEqual(session.sessionManager.getEntries(), entries);
