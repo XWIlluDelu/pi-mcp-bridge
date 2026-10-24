@@ -63,8 +63,9 @@ content-free records for one hour, across owner auto-release but not Bridge
 restart. It stores no transcript, request fingerprint or replay instructions.
 
 **Keep result navigation native.** Existing brief reads, search and refs answer
-what the task is and which evidence matters. Existing `session.settled` events
-provide the leaf for a fixed result boundary. A submission ID cannot replace
+what the task is and which evidence matters. `session.settled` events provide a
+bounded last-response excerpt and native read arguments for a fixed result
+boundary. A submission ID cannot replace
 that leaf: steering, follow-up queues, extension handling and automatic
 continuations do not form one Pi turn per Bridge call. Consequently receipts
 never announce per-submission completion, success or failure of the user's task.
@@ -86,7 +87,8 @@ identity and evidence, not inference from busy/idle or matching message text.
    It is a snapshot, not a wait or retry. Missing/still-unknown receipts do not
    prove non-execution.
 4. Read the latest overview, then search/expand refs as needed. When subscribed
-   to supported owned-run completion events, read the supplied leaf instead.
+   to supported owned-run completion events, use the excerpt or pass the supplied
+   `read` object to the tool for more context.
 5. Continue by sending the next instruction to the same session. A new send is
    always new input, regardless of identical text.
 
@@ -95,9 +97,13 @@ schemas. Code orchestration can retain IDs and conditionally query an uncertain
 receipt, but must obey the same semantics; it does not gain replay safety or a
 per-prompt completion primitive.
 
+The [Grok Build / Bot comparison](grok-comparison.md) explains why completion
+previews use native projected responses and why Bridge does not mirror a client
+event log or copy files from paths in reports.
+
 ## Verification
 
-The complete regression run on Node 26.10.0 with Pi 1.4.0 passed 721 tests,
+The complete regression run on Node 26.10.0 with Pi 1.4.0 passed 731 tests,
 with the one opt-in Herdr integration test skipped. Formatting and diff checks
 passed. Tests use isolated temporary session/agent directories and synthetic
 providers; production services and active sessions were not restarted or changed.
@@ -107,5 +113,7 @@ text submitted twice, repeated lookup without dispatch, receipt retention after
 owner exit, queued admission remaining separate from settlement, permission
 revocation, session identity, expiry and eviction. The existing authenticated
 HTTP MCP test now exercises send → completion event → later send → old receipt
-lookup → leaf-pinned result read with real Pi. Companion/host tests cover normal,
+lookup → leaf-pinned result read with real Pi. It also verifies that automatic
+continuation sends one final result, extension-edited response text is preserved,
+and event read arguments bypass default memory routing. Companion/host tests cover normal,
 handled, transformed and queued input, plus synchronous and deferred failures.

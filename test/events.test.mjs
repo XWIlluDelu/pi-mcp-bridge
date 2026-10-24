@@ -70,6 +70,12 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
       timestamp: new Date(now).toISOString(),
       leafId: null,
       aborted: false,
+      result: {
+        entry_id: 'response',
+        text: 'Review [report](./report.md)',
+        stop_reason: 'stop',
+        truncated: false,
+      },
     });
     await Promise.all([...bridge.events.deliveries.keys()]);
   };

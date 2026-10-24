@@ -135,7 +135,7 @@ Admission that cancelled an unsupported native dialog carries `reason:"EXTENSION
 
 Records are held in Bridge memory for at most one hour, with a limit of 256 newest submissions. Restart or eviction returns `SUBMISSION_UNAVAILABLE`, which says nothing about execution. A retained `unknown` is still uncertain; an external `dispatched` does not later turn into native admission evidence. Query requires current `read` or `send` permission, or current `create` permission for that initial-create receipt, and revalidates the saved session identity. It cannot recover an ID lost with the original response.
 
-Use `list({session_id})` for current activity and `read({session_id})` for current useful content. A submission is not a work unit: several steering/follow-up inputs can share a run, and queued input can be withdrawn. Completion events remain session-wide; read their supplied `leaf_id` to retain that result boundary despite later input. See [collaboration design](collaboration.md).
+Use `list({session_id})` for current activity and `read({session_id})` for current useful content. A submission is not a work unit: several steering/follow-up inputs can share a run, and queued input can be withdrawn. Completion events remain session-wide and include a bounded last-response excerpt; pass their `read` object as tool arguments for more context at that fixed native leaf. See [collaboration design](collaboration.md).
 
 ### Image input (send and create)
 
