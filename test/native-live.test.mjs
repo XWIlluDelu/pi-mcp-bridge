@@ -96,7 +96,10 @@ test(
       leaf_id: live.leaf_id,
       max_bytes: 4096,
     });
-    assert.deepEqual(fixed.items, historical.items);
+    assert.deepEqual(
+      fixed.items.map(({ ref, ...item }) => item),
+      historical.items.map(({ ref, ...item }) => item),
+    );
     assert.equal(fixed.leaf_id, historical.leaf_id);
   },
 );
@@ -106,7 +109,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const { bridge, session, finish } = await fixture(t);
-    const read = () => bridge.read({ session_id: session.id, max_bytes: 4096 });
+    const read = () => bridge.read({ session_id: session.id, detail: 'full', max_bytes: 4096 });
     const preview = async () => {
       const result = await read();
       return result.live?.items?.some((u) => u.block?.text) ? result : null;

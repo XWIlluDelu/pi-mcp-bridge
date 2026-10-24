@@ -184,7 +184,7 @@ test('native replacement ignores old endpoint metadata and retains explicit paus
   assert.equal(after.noColdReacquire, true);
   assert.equal(after.handoffId, undefined);
   assert.deepEqual(f.errors, []);
-  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'native');
+  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'session');
   await f.runtime.switchSession(f.b.file);
   const pause = await readClaim(f.config.attachmentDir, f.a);
   assert.equal(pause.owner, null);
@@ -197,7 +197,7 @@ test('native UI rebinding retains the active writer endpoint', async (t) => {
   const before = await readClaim(f.config.attachmentDir, f.a);
   await f.runtime.session.bindExtensions({ uiContext: { notify() {} } });
   assert.deepEqual(await readClaim(f.config.attachmentDir, f.a), before);
-  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'native');
+  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'session');
   assert.deepEqual(f.errors, []);
 });
 
@@ -231,7 +231,7 @@ test('native reload does not replace the same process host controller with unsup
   }
 });
 
-test('companion observed contexts follow session replacement and never leak the previous session', async (t) => {
+test('companion runtime contexts follow session replacement and never leak the previous session', async (t) => {
   const f = await fixture(t, {
     extension: (pi) => {
       pi.on('context', (event) => ({
@@ -240,7 +240,7 @@ test('companion observed contexts follow session replacement and never leak the 
     },
   });
   const read = (target) =>
-    f.bridge.read({ session_id: target.id, view: 'observed', max_bytes: 65536 });
+    f.bridge.read({ session_id: target.id, view: 'runtime', max_bytes: 65536 });
   assert.equal((await read(f.a)).observation.reason, 'no_observation');
   f.faux.setResponses([
     fauxAssistantMessage('FIRST_ANSWER'),

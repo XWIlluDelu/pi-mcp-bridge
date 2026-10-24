@@ -1,6 +1,6 @@
 import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
 import packageInfo from '../package.json' with { type: 'json' };
-import { publicSchemas } from './tool-schemas.mjs';
+import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { publicError } from './errors.mjs';
@@ -27,7 +27,9 @@ export const descriptions = {
   compact:
     'Compact native context with send permission and proven-idle admission. Explicit interrupt:true additionally requires stop and may abort the agent even if compaction fails; it does not withdraw queues. Ordinary companions and supplied host bindings require explicit interrupt because they cannot prove idle admission. Returns completion metadata; summary text requires read. Timeout leaves the outcome unknown: inspect list/read before submitting another compaction.',
   list: 'List authorized sessions with project, name, activity and sampled runtime status. Filters combine; newest activity first. Live model/thinking values are null when unobserved. Never starts Pi. The independent creatable_projects catalog includes configured destinations with project-level list and create permission, including empty projects, regardless of session filters or pagination. A known hidden destination remains usable with create permission. Listing requires no read permission.',
-  read: 'Read an authorized session without starting Pi. Default routing uses its configured session reader or native projection; view:native forces native projection. preset/select/leaf_id customize the selected reader. Native latest returns the last prompt, assistant text and sampled thinking; recent adds summaries and three prompts; full selects all effective context. Use select to include tools, commands or system instructions. view:observed reads captured request-stage context, not final provider payload, and accepts only session_id/view/cursor/max_bytes; absent captures are unavailable. Continue backwards with cursor alone, optionally changing max_bytes; session, selection and leaf stay frozen. STALE_CURSOR requires a fresh read. READ_BUDGET_TOO_SMALL reports minimum_max_bytes. Content is sanitized, images are descriptors, and live output is transient.',
+  read: 'Understand a Pi session, then expand useful evidence. read({session_id}) returns a brief latest task/result, summaries and compact tool activity with refs; preset:recent adds three prompts, full covers the whole effective source. Default routing uses an enabled matching reader (for example memory); view:session forces Session Context, view:runtime reads a captured Runtime Context. read({refs:[...]}) expands up to eight references from one snapshot; source_context references open historical session context. Use search to locate text beyond a preview. detail:full returns selected source units directly. Continue with cursor alone, optionally changing max_bytes. Runtime captures have a capture time and may precede the latest answer; they do not accept preset/select/leaf_id. Reading never starts Pi, calls a model or reruns hooks. References/cursors are bounded and can become stale; fresh read/search obtains new ones.',
+  search:
+    'Find evidence inside one authorized Pi session using case-insensitive literal text. Searches the selected reader’s full effective content, not only previously returned pages. Default routing matches read; view:session searches Session Context, view:runtime searches the captured Runtime Context. Optional types filters returned item kinds. Returns matching snippets and refs for read({refs:[...]}). Continue search results with read({cursor:...}). Does not search other sessions or reconstruct content absent from the source, and never starts Pi or calls a model.',
   send: 'Submit text and/or native images with send permission. Images require an image-capable owner and base64 PNG/JPEG/GIF/WebP blocks, at most 5 MiB decoded total. default steers while busy; idle_only skips busy input; steer and follow_up use native queues. Explicit model/thinking settings require proven-idle Bridge-owned RPC and may add verified model_selection. Returns started/queued/handled/skipped/rejected/unknown, not model completion. Internal acknowledgement expiry does not cancel admitted input. Every call is new input; inspect list/read after an unknown outcome before deciding whether to submit again.',
   command:
     'Execute a native Pi shell command with independent command permission; omit the leading !. Returns captured output and native result metadata. native_truncated reports Pi’s own truncation; response_complete reports whether Bridge returned all of that native output, not whether the command completed. A shortened response is a prefix with no continuation; use read with command selection for native history. Internal acknowledgement expiry does not kill the shell. Unsupported owners return BASH_UNSUPPORTED. Every call executes again; do not automatically retry an unknown outcome.',
@@ -44,6 +46,7 @@ export const descriptions = {
 export const toolNames = [
   'list',
   'read',
+  'search',
   'models',
   'set_model',
   'compact',
@@ -64,6 +67,12 @@ export function toolDefinitions() {
     name,
     description: descriptions[name],
     inputSchema: toJsonSchemaCompat(publicSchemas[name], { pipeStrategy: 'input' }),
+    ...(publicOutputSchemas[name]
+      ? {
+          annotations: publicAnnotations[name],
+          outputSchema: toJsonSchemaCompat(publicOutputSchemas[name], { pipeStrategy: 'output' }),
+        }
+      : {}),
   }));
 }
 export function toolError(code, extra = {}) {

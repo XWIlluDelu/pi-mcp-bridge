@@ -9,7 +9,7 @@ import { ContextReadCache } from '../src/read-cache.mjs';
 import { readSchema } from '../src/read-schema.mjs';
 import { assertReadSnapshot } from '../src/context-read.mjs';
 
-const args = { session_id: 'ps_observed', view: 'observed' };
+const args = { session_id: 'ps_observed', view: 'runtime' };
 function fixture() {
   const data = {
     file: '/private/a.jsonl',
@@ -77,7 +77,7 @@ test('observations are detached request-stage data with honest identity, updates
   assert.ok(replacement.read(args, ctx).capture_sequence > next.capture_sequence);
 });
 
-test('observed pages share native cleaning, Unicode paging and frozen cursor budgets without native selectors', () => {
+test('runtime pages share native cleaning, Unicode paging and frozen cursor budgets without native selectors', () => {
   const { ctx, observer } = fixture();
   const body = Array.from(
     { length: 60 },
@@ -106,14 +106,14 @@ test('observed pages share native cleaning, Unicode paging and frozen cursor bud
     body,
   );
   for (const p of pages) {
-    assert.equal(p.view, 'observed');
+    assert.equal(p.view, 'runtime');
     assert.equal(p.selection, null);
     assert.equal(p.observation.id, snapshot.observation.id);
     assert.ok(Buffer.byteLength(JSON.stringify(p)) <= 4096);
   }
   const cursor = pages[0].next_cursor;
   for (const override of [
-    { view: 'native' },
+    { view: 'session' },
     { preset: 'full' },
     { select: { tools: 0 } },
     { leaf_id: null },
@@ -123,7 +123,7 @@ test('observed pages share native cleaning, Unicode paging and frozen cursor bud
     assert.equal(readSchema.safeParse({ ...args, ...override }).success, false);
 });
 
-test('observed assistant parts retain completion state without repeating large error metadata', () => {
+test('runtime assistant parts retain completion state without repeating large error metadata', () => {
   const { ctx, observer } = fixture();
   const body = 'Partial 漢😀 answer\n'.repeat(1500),
     errorMessage = 'PROVIDER_DETAIL '.repeat(1500);

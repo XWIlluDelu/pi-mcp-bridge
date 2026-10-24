@@ -1,56 +1,131 @@
 # Reading a Pi session
 
-`read` uses a matching configured session reader based on the target's live or
-persisted extension evidence, otherwise Pi's native projection. Only explicit
-`view:"native"` forces native reading; selection parameters go to the selected
-reader. [Module routing](compatibility.md#session-specific-read-routing) defines
-that contract.
+Start with `read({session_id})` to understand the current task. The default brief
+result includes readable task/result excerpts, active summaries and compact tool
+activity, with references for deeper reading. Use `search` to find evidence beyond
+those excerpts, then pass returned references to `read`.
+
+Both tools use a matching explicitly enabled session reader, otherwise Pi's native
+projection. `view:"session"` forces **Session Context**: the effective native
+context at a leaf. `view:"runtime"` selects **Runtime Context**: a captured request
+stage. Reader results identify `reader.id` and use `view:"adapted"`; callers do not
+need a plugin name to select the default path. [Module routing](compatibility.md#session-specific-read-routing)
+defines activation and content contracts.
 
 Native `buildSessionProjection` determines branch ancestry, compaction checkpoints
-and context edits. Bridge pairs tools and applies selectors before sanitizing and
-segmenting records. Reading never starts Pi, calls a model, reruns context hooks
-or writes history. The result is a readable view, not a lossless export or final
-provider payload.
+and context edits. `full` means all effective context at that leaf, including active
+summaries and retained messages; it does not mean the entire raw session log.
+Reading and searching never start Pi, call a model, rerun context hooks or write
+history. Results are sanitized readable content, not lossless exports or final
+provider payloads.
 
-## Request
+## Browse, find and expand
+
+Read a useful overview:
 
 ```json
 { "session_id": "ps_...", "max_bytes": 4096 }
 ```
 
-Continue with the returned cursor; the byte budget may change:
+If more task background is needed, use `preset:"recent"`. To locate a particular
+decision or tool result, call the separate `search` tool:
+
+```json
+{ "session_id": "ps_...", "query": "retry policy" }
+```
+
+Search is case-insensitive literal matching over the selected reader's full
+effective content, including text beyond brief previews and earlier pages. It
+searches one authorized session, not other sessions, hidden raw history, or content
+that the source never captured. `types` optionally filters returned item kinds.
+Search returns `query`, `matches`, snippets and refs. Continue its result pages
+with `read({cursor})`.
+
+Expand references from one captured result with `read`:
+
+```json
+{ "refs": ["<item.ref>", "<related.ref>"], "max_bytes": 12000 }
+```
+
+Ordinary references return their frozen, sanitized source content. Up to eight refs
+from the same capture can be expanded together; duplicate refs are expanded once.
+A `related` link with `relation:"operation"` opens a recorded nested tool operation.
+A `source_context` link opens a fresh Session Context read at an identified
+historical leaf; it gives context at that boundary, not an exact reconstruction of
+the extension's source range. Open a source-context reference by itself.
+
+Continue any result with its cursor; the byte budget may change:
 
 ```json
 { "cursor": "<next_cursor>", "max_bytes": 12000 }
 ```
 
-| Argument     | Meaning                                                                                                               |
-| ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `session_id` | Required initially; optional with a cursor.                                                                           |
-| `view`       | Omit for automatic routing; `native` forces projection, `observed` reads a capture. Continuations inherit the source. |
-| `preset`     | Native default `latest`; alternatives `recent` and `full`. Omitted continuation fields inherit.                       |
-| `select`     | Overrides for the eight selectors below.                                                                              |
-| `max_bytes`  | UTF-8 limit for the whole structured page: default 24000, range 4096–65536.                                           |
-| `cursor`     | Opaque backward continuation of a captured snapshot.                                                                  |
-| `leaf_id`    | Optional native leaf; explicit `null` means the empty root.                                                           |
-
-A continuation's explicit preset plus selectors must match all eight captured
-values. Without a preset, only explicitly supplied selectors are compared.
-Explicit view/session/leaf values must also match; conflicts return `STALE_CURSOR`.
-Defaults are applied only after deciding what to inherit.
-
-Every page uses a new [permission snapshot](configuration.md#request-permission-snapshots)
-and validates current canonical file/native identity. A cursor grants no access
-and cannot cross Bridge instances.
-
-Adapted results use `view:"adapted"`, `reader.id` and `source.reader_index` locators.
-Their native selection counts are null. They share sanitization, byte budgets and
-frozen pagination with other views.
-
-## Observed request context
+To read selected source units directly, use `detail:"full"`. This controls the
+amount of content per selected item; `preset:"full"` controls the selected range.
 
 ```json
-{ "session_id": "ps_...", "view": "observed", "max_bytes": 24000 }
+{ "session_id": "ps_...", "preset": "recent", "detail": "full" }
+```
+
+| Read argument | Meaning                                                                                              |
+| ------------- | ---------------------------------------------------------------------------------------------------- |
+| `session_id`  | Required for a fresh browse; optional with cursor or refs.                                           |
+| `view`        | Omit for automatic routing; `session` forces native projection, `runtime` reads a capture.           |
+| `preset`      | Session default `latest`; `recent` adds more prompts; `full` selects all effective content.          |
+| `select`      | Overrides for the eight Session Context selectors below.                                             |
+| `detail`      | Default `brief` returns excerpts and refs; `full` returns selected source units.                     |
+| `types`       | Optional content kinds from item `type` values; applies to brief browsing.                           |
+| `refs`        | One to eight references from one capture. Only optional `session_id` and `max_bytes` accompany refs. |
+| `cursor`      | Opaque backward continuation of a captured result.                                                   |
+| `max_bytes`   | UTF-8 limit for the whole structured page: default 24000, range 4096–65536.                          |
+| `leaf_id`     | Optional native leaf; explicit `null` means the empty root.                                          |
+
+Search accepts `session_id`, required nonempty `query` (up to 2048 characters),
+optional `view`, `types`, `leaf_id` and `max_bytes`. Runtime search rejects
+`leaf_id`. It selects the full effective source independently of earlier browsing
+selectors; this is how to find an item omitted from a `latest` overview.
+
+A continuation inherits the capture's source, detail, types, selection and leaf.
+Explicit conflicting values return `STALE_CURSOR`. When supplying a preset, its
+resolved selectors must all match; without a preset, only supplied selectors are
+compared. Cursor-only continuation is the simplest form.
+
+Every page and reference expansion uses a new
+[permission snapshot](configuration.md#request-permission-snapshots) and validates
+canonical file/native identity. Neither a cursor nor a reference grants access.
+They cannot cross Bridge instances.
+
+## Brief content
+
+Brief items have `type`, `text`, `ref`, source locators and optional `title` and
+`related` references. Search results include `matches`; supplied `types` filters
+are echoed in the result. Pagination counts distinguish earlier content
+still available from newer content already covered. Text excerpts can be shorter
+than their source; expanding the ref retrieves its captured content.
+
+Logical tool calls and results are grouped before previewing. Tool previews name
+the tool and common target fields, indicate recorded result/error status, and show
+nested operation counts and failure clues. Nested-call references expose only
+what native history recorded; missing child output is not synthesized.
+
+Reader items retain their own kinds, stable-within-capture item identity and
+provenance. Readers can supply short previews and related items while retaining
+longer text for search and expansion. Current native task/progress content can be
+included alongside extension memories through the shared reader contract.
+
+A reader may return `reader.coverage` rows such as
+`{type:"memory",selected:3,total:12}`. These count its captured versus eligible
+items within its documented scope, before pagination or search-result filtering.
+They explain a small default overview without implying that every stored extension
+record was read. Cursor pages and refs cannot recover unselected items: request
+`recent`, `full`, or use search to locate evidence in the reader's full supported
+source. Native `omissions.selection`, reader coverage and page capacity counts
+describe different boundaries.
+
+## Runtime request context
+
+```json
+{ "session_id": "ps_...", "view": "runtime", "max_bytes": 24000 }
 ```
 
 This reads the latest passively captured `context_with_system` event. All
@@ -58,8 +133,9 @@ This reads the latest passively captured `context_with_system` event. All
 Magic Context's. Later full-context handlers, projections and provider conversion
 may still change the request; capture does not establish successful dispatch.
 
-The whole captured message array is pageable. Native `preset`, `select` and
-`leaf_id` arguments reject; `selection` and `omissions.selection` are null.
+The captured message array supports brief previews, literal search, reference
+expansion and full-content pagination. Native `preset`, `select` and `leaf_id`
+arguments reject; `selection` and `omissions.selection` are null.
 Items use `source.observation_index` and split content/part positions instead of
 native entry/prompt IDs. Cursor pages freeze the view and observation metadata.
 
@@ -73,12 +149,12 @@ Available observations contain:
 | `current_leaf_id`, `later_committed_entries`, `checked_at` | Active ancestry and intervening commits checked on the first read.                                                     |
 | `owner_active`                                             | Whether the capture came from the current live observer. Retained captures report false even if another owner is live. |
 
-Subsequent answers belong to the native view. Idle memory changes are not
+Subsequent answers belong to the session view. Idle memory changes are not
 recomputed by reading, even when no new native entries exist.
 
 Owned RPCs and companions keep one bounded cleaned capture per runtime. Bridge
 retains available owned captures before normal RPC exit without a prior read;
-a successful companion observed read is also retained. The observer has a 32 MiB
+a successful companion runtime read is also retained. The observer has a 32 MiB
 accounted capture limit. The separate Bridge retention cache holds the latest
 successful capture for at most 16 sessions and approximately 32 MiB. Retention
 is memory-only and does not keep writers alive.
@@ -97,7 +173,7 @@ Missing, oversized or failed captures and changed branches report
 report `host_observer_unavailable`. Eviction or Bridge restart loses retained
 captures; a live observer can still supply its own.
 
-## Native selection
+## Session Context selection
 
 | Selector           | Counting and selection                                                                                                      |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
@@ -115,23 +191,27 @@ Counts accept nonnegative safe integers or `-1` for all; `0` selects none.
 included once, selecting at most 2N units per prompt. Identical content at
 different source positions remains distinct.
 
-Presets supply defaults; explicit `select` fields replace individual values:
+Presets supply the following defaults in both detail modes. Explicit `select`
+fields replace individual values; `detail` changes presentation, not selection:
 
 | Selector           | `latest` (default) | `recent` | `full` |
 | ------------------ | ------------------ | -------- | ------ |
 | `system`           | 0                  | 0        | -1     |
-| `summary`          | 0                  | 1        | -1     |
+| `summary`          | 1                  | 1        | -1     |
 | `recent_prompts`   | 1                  | 3        | -1     |
-| `earliest_prompts` | 0                  | 0        | -1     |
+| `earliest_prompts` | 0                  | 0        | 0      |
 | `text`             | -1                 | -1       | -1     |
-| `thinking`         | 2                  | 3        | -1     |
-| `tools`            | 0                  | 0        | -1     |
+| `thinking`         | 0                  | 0        | -1     |
+| `tools`            | 2                  | 2        | -1     |
 | `commands`         | 0                  | 0        | -1     |
 
-`latest` focuses on the last input and assistant text/thinking; `recent` adds
-active summaries and more prompts. Omitted system records count in
+`latest` and `recent` include active summaries, omit thinking, and select the
+first/last two tool units per selected prompt. `preset:"full"` selects all effective
+content in either detail mode.
+
+`latest` focuses on the last input; `recent` adds more prompts. Omitted system records count in
 `omissions.selection.system`. Use `select:{system:-1}` to include them without
-switching to full. This selector does not hide custom messages or affect observed
+switching to full. This selector does not hide custom messages or affect runtime
 captures.
 
 When system records are selected, `tools:0` removes `toolsAdded`/`toolsRemoved`
@@ -144,10 +224,11 @@ For the latest prompt plus the earliest input and first/last two tool units:
 { "session_id": "ps_...", "select": { "tools": 2, "earliest_prompts": 1 } }
 ```
 
-Overrides leave other preset values intact. With `full`, `recent_prompts:1`
-still selects every prompt because `earliest_prompts` remains `-1`; set it to `0`
-for recent-only selection. With `latest`, changing only `recent_prompts:3` retains
-its summary and thinking defaults rather than selecting `recent`.
+Overrides leave other preset values intact. All presets use
+`earliest_prompts:0`, so `recent_prompts:1` narrows even `full` to the latest
+prompt window. System, summary and command selectors remain independent. With
+`latest`, changing only `recent_prompts:3` retains its other defaults rather than
+selecting `recent`.
 
 Saved v1/v2 histories are normalized in memory by native parsing/migration.
 Malformed lines are skipped as in Pi; optional `history` reports
@@ -155,7 +236,7 @@ Malformed lines are skipped as in Pi; optional `history` reports
 or migrates disk data. Native v1 IDs assigned in memory may differ between fresh
 reads; cursor pages retain captured IDs.
 
-## Readable content
+## Full readable content
 
 Pages contain `session_id`, `view`, acquisition `source`, captured `leaf_id`,
 resolved `selection`, chronological `items`, `omissions`, `live` and `next_cursor`.
@@ -208,14 +289,14 @@ boundaries before prompt/block/tool selection. They become `type:"prompt"` with
 their native entry ID as `prompt_id` and `source.read_adapter` identifying the
 mapping. Their custom role, type, content and details remain intact. Hidden mapped
 inputs use an empty `hidden_input` boundary. Other custom messages/state do not
-become inputs. Observed captures do not apply these mappings.
+become inputs. Runtime captures do not apply these mappings.
 
-The [Intercom module](compatibility.md#input-mapping) maps `intercom_message`;
+The external [Intercom module](../integrations/intercom/README.md) maps `intercom_message`;
 disabling it and restarting restores ordinary custom-message reading.
 
 ## Capacity and continuation
 
-The first page holds the newest selected units that fit, in chronological order;
+The first page holds the newest selected items or units that fit, in source order;
 `next_cursor` moves backward. `omissions.selection` counts excluded native logical
 records. `omissions.capacity.earlier_units` and `later_units` locate a page within
 the capture; later units are already-covered newer content.
@@ -242,14 +323,16 @@ exceeding the shared budget returns an item budget error; read it separately.
 
 The cache retains detached sanitized units, at most 16 snapshots and approximately
 32 MiB of accounted memory. Excess selected data returns `READ_SNAPSHOT_TOO_LARGE`
-without narrowing selectors. Cursors are issued only after successful caching;
-a complete one-page result needs no cache entry. Batch pins needed snapshots
+without narrowing selectors. References and cursors are issued only after successful caching. Brief/search
+results with refs are cached even when they fit on one page; a complete full-detail
+page without refs needs no cache entry. Batch pins needed snapshots
 through assembly; temporary pressure returns `READ_CACHE_BUSY`.
 
 There is no inactivity expiry. LRU/capacity eviction or Bridge restart produces
-`STALE_CURSOR`; start a fresh read. Appends, owner exit, release and replacement
-otherwise leave the frozen capture intact. Every continuation rechecks permission
-and native identity, including header cwd; identity changes invalidate the cursor.
+`STALE_CURSOR` or `STALE_READ_REFERENCE`; start a fresh read/search. References
+are bounded capture handles, not permanent session URLs. Appends, owner exit, release and replacement
+otherwise leave the frozen capture intact. Every continuation and expansion rechecks permission and native identity,
+including header cwd; identity changes invalidate access to the capture.
 
 ## Live output and runtime extension events
 

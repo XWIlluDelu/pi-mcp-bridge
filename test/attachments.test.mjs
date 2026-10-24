@@ -508,7 +508,12 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.ok(history.includes('PUBLIC_TUI_HISTORY'));
   assert.ok(history.includes('PUBLIC_HEADLESS_CONTINUATION'));
   assert.ok(!history.includes('MUST_NOT_DISPATCH'));
-  const beforeClose = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 65536 });
+  const beforeClose = await f.bridge.read({
+    session_id: f.id,
+    detail: 'full',
+    preset: 'full',
+    max_bytes: 65536,
+  });
   await f.bridge.close();
   assert.equal(await ownerAlive(claim.owner), false);
   const restarted = await new Bridge(f.config).init();
@@ -518,7 +523,12 @@ test('same session continues headless after actual TUI exit with history, grants
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     const read = await loadSavedSession(await restarted.session(f.id));
     assert.deepEqual(read.entries, raw.entries);
-    const publicRead = await restarted.read({ session_id: f.id, preset: 'full', max_bytes: 65536 });
+    const publicRead = await restarted.read({
+      session_id: f.id,
+      detail: 'full',
+      preset: 'full',
+      max_bytes: 65536,
+    });
     assert.deepEqual(publicRead.items, beforeClose.items);
   } finally {
     await restarted.close();
@@ -930,6 +940,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
       'list',
       'models',
       'read',
+      'search',
       'send',
       'set_model',
       'stop',

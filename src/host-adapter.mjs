@@ -222,7 +222,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
         sessionId: target.header.id,
         ...features,
       };
-    } else if (request.op === 'read' && args.view === 'observed')
+    } else if (request.op === 'read' && args.view === 'runtime')
       data = {
         sessionFile: target.file,
         sessionId: target.header.id,

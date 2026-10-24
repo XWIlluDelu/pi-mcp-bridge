@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { contextSelection } from './read-schema.mjs';
 import { jsonBytes } from './response-budget.mjs';
 import { READ_SNAPSHOT_LIMIT, renderPreparedContextRead } from './context-read.mjs';
+import { navigationDocuments, navigationRows, documentUnits } from './read-navigation.mjs';
 
 function decode(value) {
   try {
@@ -33,11 +34,64 @@ export class ContextReadCache {
     const position = decode(cursor),
       entry = this.entries.get(position.token);
     if (!entry) throw new Error('STALE_CURSOR');
-    if (position.before > entry.snapshot.units.length) throw new Error('INVALID_CURSOR');
+    if (position.before > (entry.snapshot.navigation?.rows.length ?? entry.snapshot.units.length))
+      throw new Error('INVALID_CURSOR');
     return { position, entry };
   }
   identity(cursor) {
     return this.lookup(cursor).entry.identity;
+  }
+  reference(ref) {
+    try {
+      if (typeof ref !== 'string' || !/^[A-Za-z0-9_-]+$/.test(ref)) throw new Error();
+      const [tag, token, index, ...extra] = JSON.parse(Buffer.from(ref, 'base64url').toString());
+      if (
+        extra.length ||
+        tag !== 'ref' ||
+        typeof token !== 'string' ||
+        !/^[0-9a-f-]{36}$/.test(token) ||
+        !Number.isSafeInteger(index) ||
+        index < 0
+      )
+        throw new Error('INVALID_READ_REFERENCE');
+      const entry = this.entries.get(token);
+      if (!entry) throw new Error('STALE_READ_REFERENCE');
+      const document = entry.snapshot.navigation?.documents[index];
+      if (!document) throw new Error('INVALID_READ_REFERENCE');
+      return { token, index, entry, document };
+    } catch (error) {
+      if (['STALE_READ_REFERENCE', 'INVALID_READ_REFERENCE'].includes(error.message)) throw error;
+      throw new Error('INVALID_READ_REFERENCE');
+    }
+  }
+  referenceIdentity(ref) {
+    return this.reference(ref).entry.identity;
+  }
+  expand(refs, identity) {
+    const resolved = refs.map((ref) => this.reference(ref));
+    const first = resolved[0];
+    if (
+      resolved.some(
+        (r) =>
+          r.token !== first.token || JSON.stringify(r.entry.identity) !== JSON.stringify(identity),
+      )
+    )
+      throw new Error('INVALID_READ_REFERENCE');
+    this.entries.delete(first.token);
+    this.entries.set(first.token, first.entry);
+    const snapshot = first.entry.snapshot;
+    const units = [...new Set(resolved.map((r) => r.index))].flatMap((index) =>
+      documentUnits(snapshot, snapshot.navigation.documents[index]),
+    );
+    return {
+      ...snapshot,
+      units,
+      navigation: undefined,
+      detail: 'full',
+      request: { detail: 'full' },
+      expanded_refs: refs,
+      selection: snapshot.selection,
+    };
   }
   get(args, identity) {
     const { position, entry } = this.lookup(args.cursor),
@@ -51,14 +105,20 @@ export class ContextReadCache {
     if (
       JSON.stringify(identity) !== JSON.stringify(entry.identity) ||
       (args.session_id !== undefined && args.session_id !== snapshot.session_id) ||
-      (args.view !== undefined && args.view !== (snapshot.view ?? 'native')) ||
-      (snapshot.view === 'observed' &&
+      (args.view !== undefined && args.view !== (snapshot.view ?? 'session')) ||
+      (snapshot.view === 'runtime' &&
         [args.preset, args.select, args.leaf_id].some((v) => v !== undefined)) ||
-      (args.leaf_id !== undefined && args.leaf_id !== leaf)
+      (args.leaf_id !== undefined && args.leaf_id !== leaf) ||
+      (args.detail !== undefined && args.detail !== snapshot.request?.detail) ||
+      (args.types !== undefined &&
+        JSON.stringify(args.types) !== JSON.stringify(snapshot.request?.types))
     )
       throw new Error('STALE_CURSOR');
     if (args.preset !== undefined) {
-      if (JSON.stringify(contextSelection(args)) !== JSON.stringify(selection))
+      if (
+        JSON.stringify(contextSelection({ detail: snapshot.request?.detail, ...args })) !==
+        JSON.stringify(selection)
+      )
         throw new Error('STALE_CURSOR');
     } else if (
       Object.entries(args.select ?? {}).some(
@@ -100,14 +160,34 @@ export class ContextReadCache {
     args,
     { token = randomUUID(), cursor, identity, resultBudget, live, runtimeEvents, readPins } = {},
   ) {
-    const result = renderPreparedContextRead(snapshot, args, {
+    let rendered = snapshot;
+    if (snapshot.navigation) {
+      const reference = (index) =>
+        Buffer.from(JSON.stringify(['ref', token, index])).toString('base64url');
+      rendered = {
+        ...snapshot,
+        detail: 'brief',
+        ...(snapshot.navigation.query
+          ? { query: snapshot.navigation.query, matches: snapshot.navigation.rows.length }
+          : {}),
+        ...(snapshot.navigation.types ? { types: snapshot.navigation.types } : {}),
+        units: snapshot.navigation.rows.map((row) => ({
+          ...row,
+          ref: reference(row.ref),
+          ...(row.related
+            ? { related: row.related.map((link) => ({ ...link, ref: reference(link.ref) })) }
+            : {}),
+        })),
+      };
+    }
+    const result = renderPreparedContextRead(rendered, args, {
       cursor,
       encode: (before) => encode(token, before),
       resultBudget,
       live,
       runtimeEvents,
     });
-    if (result.next_cursor) {
+    if (result.next_cursor || (snapshot.navigation && rendered.units.length)) {
       if (!this.entries.has(token)) this.insert(token, snapshot, identity);
       if (readPins) {
         const entry = this.entries.get(token);
@@ -118,6 +198,24 @@ export class ContextReadCache {
       }
     }
     return result;
+  }
+  navigate(snapshot, args, options, query) {
+    const indexed = {
+      ...snapshot,
+      request: { ...args, detail: 'brief' },
+      navigation: {
+        documents: navigationDocuments(snapshot),
+        ...(query ? { query } : {}),
+        ...(args.types ? { types: args.types } : {}),
+      },
+    };
+    indexed.navigation.rows = navigationRows(
+      indexed,
+      indexed.navigation.documents,
+      (index) => index,
+      indexed.navigation,
+    );
+    return this.render(indexed, args, options);
   }
   clear() {
     this.entries.clear();

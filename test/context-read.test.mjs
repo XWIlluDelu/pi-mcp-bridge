@@ -105,12 +105,12 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
   assert.equal(readSchema.parse({ session_id: 's' }).preset, undefined);
   assert.deepEqual(result.selection, {
     system: 0,
-    summary: 0,
+    summary: 1,
     recent_prompts: 1,
     earliest_prompts: 0,
     text: -1,
-    thinking: 2,
-    tools: 0,
+    thinking: 0,
+    tools: 2,
     commands: 0,
   });
   assert.deepEqual(
@@ -119,21 +119,22 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
   );
   assert.equal(result.items.filter((r) => r.type === 'text').length, 8);
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'thinking').map((r) => r.block.thinking),
-    [0, 1, 6, 7].map((n) => `reason-4-${n}`),
+    result.items.filter((r) => r.type === 'tool_call').map((r) => r.call_id),
+    [0, 1, 6, 7].map((n) => `call-4-${n}`),
   );
-  assert.ok(
-    !result.items.some(
-      (r) => r.type.startsWith('tool_') || ['summary', 'command'].includes(r.type),
-    ),
+  assert.equal(result.items.filter((r) => r.type === 'tool_result').length, 4);
+  assert.equal(
+    result.items.find((r) => r.type === 'summary').parts[0].message.summary,
+    'WINDOW_SUMMARY',
   );
+  assert.ok(!result.items.some((r) => ['thinking', 'command'].includes(r.type)));
   assert.deepEqual(result.omissions.selection, {
     system: 0,
-    summary: 1,
+    summary: 0,
     prompts: 4,
     text: 32,
-    thinking: 36,
-    tools: 40,
+    thinking: 40,
+    tools: 36,
     commands: 1,
   });
   const implicit = allPages(data, { max_bytes: 4096 });
@@ -144,6 +145,15 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
   );
   assert.deepEqual(reassemble(implicit), result.items);
 
+  for (const preset of [undefined, 'latest', 'recent', 'full']) {
+    for (const select of [undefined, { thinking: 1, tools: 0, recent_prompts: 2 }]) {
+      const brief = prepareContextRead(data, { ...args, preset, select, detail: 'brief' });
+      const full = prepareContextRead(data, { ...args, preset, select, detail: 'full' });
+      assert.deepEqual(brief.selection, full.selection, 'Detail does not change selection');
+      assert.deepEqual(brief.units, full.units, 'Detail does not change selected content');
+    }
+  }
+
   const recent = render(data, { preset: 'recent' });
   assert.deepEqual(recent.selection, {
     system: 0,
@@ -151,8 +161,8 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
     recent_prompts: 3,
     earliest_prompts: 0,
     text: -1,
-    thinking: 3,
-    tools: 0,
+    thinking: 0,
+    tools: 2,
     commands: 0,
   });
   assert.deepEqual(
@@ -167,11 +177,12 @@ test('omitted preset is latest, distinct from explicit recent and full, includin
   for (const p of [2, 3, 4])
     assert.deepEqual(
       recent.items
-        .filter((r) => r.type === 'thinking' && r.prompt_id === 'u' + p)
-        .map((r) => r.block.thinking),
-      [0, 1, 2, 5, 6, 7].map((n) => `reason-${p}-${n}`),
+        .filter((r) => r.type === 'tool_call' && r.prompt_id === 'u' + p)
+        .map((r) => r.call_id),
+      [0, 1, 6, 7].map((n) => `call-${p}-${n}`),
     );
-  assert.ok(!recent.items.some((r) => r.type.startsWith('tool_') || r.type === 'command'));
+  assert.equal(recent.items.filter((r) => r.type === 'tool_result').length, 12);
+  assert.ok(!recent.items.some((r) => ['thinking', 'command'].includes(r.type)));
 
   const fullPages = allPages(data, { max_bytes: 4096, preset: 'full' }),
     full = reassemble(fullPages);
@@ -236,7 +247,10 @@ test('recent selector overrides add earliest prompts and whole first/last tool u
   );
   assert.equal(latestTools.items.filter((r) => r.type === 'tool_call').length, 16);
   assert.equal(latestTools.items.filter((r) => r.type === 'tool_result').length, 16);
-  assert.ok(!latestTools.items.some((r) => r.type === 'summary'));
+  assert.equal(
+    latestTools.items.find((r) => r.type === 'summary').parts[0].message.summary,
+    'WINDOW_SUMMARY',
+  );
   const allTools = render(data, { preset: 'recent', select: { tools: -1 } });
   assert.deepEqual(allTools.selection, { ...RECENT_SELECTION, tools: -1 });
   assert.equal(allTools.items.filter((r) => r.type === 'tool_call').length, 24);
@@ -251,8 +265,8 @@ test('recent selector overrides add earliest prompts and whole first/last tool u
   );
   assert.equal(
     fullOverride.filter((r) => r.type === 'prompt').length,
-    5,
-    'full retains earliest_prompts:-1 unless overridden',
+    1,
+    'full recent_prompts override narrows the prompt window',
   );
 });
 
@@ -288,8 +302,8 @@ test('system instructions are opt-in outside full; tools and custom notices keep
   ]);
   const before = structuredClone(data);
   for (const options of [
-    {},
-    { preset: 'recent' },
+    { select: { tools: 0 } },
+    { preset: 'recent', select: { tools: 0 } },
     { preset: 'full', select: { system: 0, tools: 0 } },
   ]) {
     const page = render(data, { max_bytes: 4096, ...options });
@@ -305,8 +319,8 @@ test('system instructions are opt-in outside full; tools and custom notices keep
     assert.equal(page.omissions.selection.system, 3);
   }
   for (const options of [
-    { select: { system: -1 } },
-    { preset: 'recent', select: { system: -1 } },
+    { select: { system: -1, tools: 0 } },
+    { preset: 'recent', select: { system: -1, tools: 0 } },
     { preset: 'full', select: { tools: 0 } },
   ]) {
     const page = render(data, { max_bytes: 4096, ...options });
@@ -757,8 +771,7 @@ test('active summaries keep their native positions and system checkpoints', () =
     ['new-cmp', 'branch'],
   );
   assert.equal(result.items[0].type, 'system');
-  const { toolsRemoved, ...instructions } = entries.at(-1).systemMessage;
-  assert.deepEqual(result.items[0].message, instructions);
+  assert.deepEqual(result.items[0].message, entries.at(-1).systemMessage);
   assert.ok(!JSON.stringify(result).includes('SUPERSEDED'));
   const none = render(data, { select: zero });
   assert.deepEqual(none.items, []);

@@ -47,17 +47,51 @@ Connected runtimes also expose `capabilities:{send,command,stop}`. Values are tr
 
 `creatable_projects` lists configured destinations with project-level `list` and `create` permission, in configuration order. It includes empty projects and is independent of session filters, pagination and session-specific grants. A known configured destination remains usable with create permission even if it is hidden from this catalog.
 
-### Read
+### Read and search
 
 ```json
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-Read uses a matching configured session reader, otherwise native projection. Explicit `view:"native"` selects native projection; `preset`, `select` and `leaf_id` customize the selected reader. Adapted results identify `reader.id`. `view:"observed"` reads captured request-stage context and accepts only `session_id`, `view`, `cursor` and `max_bytes`. Missing observations are unavailable; reading never starts Pi.
+`read` defaults to a brief task/result overview, active summaries and compact tool
+activity with references. `preset:"recent"` adds the last three prompts;
+`preset:"full"` selects the full effective source. `detail:"full"` returns selected
+source units directly. `select` adjusts Session Context content; `types` filters
+brief item kinds. Full effective context includes active compaction summaries and
+retained messages, not the entire raw history.
 
-Native `preset:"latest"` selects the last prompt, assistant text and sampled thinking. `recent` adds summaries and the last three prompts; `full` selects all effective context. Selectors add or sample system instructions, tools and commands. See [reading](reading.md) for routing, selectors, content and budgets.
+Both tools use a matching configured session reader, otherwise native projection.
+Explicit `view:"session"` selects Session Context; `view:"runtime"` selects a
+captured Runtime Context. Reader results identify `reader.id` and `view:"adapted"`.
+Runtime captures may precede the latest answer and reject `preset`, `select` and
+`leaf_id`; missing observations are unavailable. Neither tool starts Pi.
 
-Pages start with the newest selected content. Continue backwards with `cursor` alone, optionally changing `max_bytes`. Session, view, selection and leaf stay frozen; conflicting overrides, eviction or restart return `STALE_CURSOR`. Every continuation reauthorizes read.
+Use `search` to locate text across the selected reader's full effective content:
+
+```json
+{ "session_id": "ps_…", "query": "retry policy", "types": ["tool", "text"] }
+```
+
+The match is case-insensitive and literal. Search accepts optional `view`, `types`,
+`leaf_id` and `max_bytes`; Runtime Context rejects a leaf override. It requires
+read permission and searches only the specified session. Results contain matching
+snippets and refs. Open source content with `read`:
+
+```json
+{ "refs": ["<item.ref>", "<related.ref>"], "max_bytes": 12000 }
+```
+
+Up to eight refs must belong to one capture. Only optional `session_id` and
+`max_bytes` accompany refs. A `source_context` reference opens historical session
+context at its source boundary and must be read alone; it does not claim an exact
+extension-to-native source range.
+
+Pages start with the newest selected content. Continue read or search results
+backwards using `read({cursor})`, optionally changing `max_bytes`. Captured source,
+selection, detail, filters and leaf stay frozen. Conflicting overrides, eviction or
+restart invalidate cursors/references. Every continuation and expansion rechecks
+read authorization and native identity. See [reading](reading.md) for content,
+limits, references and source boundaries.
 
 ### Models
 

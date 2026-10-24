@@ -11,7 +11,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { publicError } from '../src/errors.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
-const intercom = fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url));
+const intercom = fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url));
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-compatibility-'));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -98,33 +98,6 @@ test('one module lifecycle supports independent capabilities, options and revers
     'input-stop',
   ]);
   await assert.rejects(manager.start(), /COMPATIBILITY_MODULES_CLOSED/);
-});
-
-test('input mapping and daemon environment isolation start and stop together without touching native environment', async () => {
-  const services = new CompatibilityServices(),
-    manager = new CompatibilityModules([{ module: intercom }], services),
-    env = {
-      PI_INTERCOM_SESSION: 'other-session',
-      PI_INTERCOM_SOCKET: '/socket',
-      HOME: '/home',
-      OTHER: 'keep',
-    };
-  await manager.start();
-  try {
-    assert.deepEqual(services.readInputs.snapshot(), [
-      { id: 'pi-intercom', inputCustomTypes: ['intercom_message'] },
-    ]);
-    assert.deepEqual(services.daemonEnvironment.apply(env), { HOME: '/home', OTHER: 'keep' });
-    assert.equal(env.PI_INTERCOM_SESSION, 'other-session');
-    assert.throws(
-      () => services.readInputs.register('conflict', ['intercom_message']),
-      /INVALID_READ_ADAPTER/,
-    );
-  } finally {
-    await manager.stop();
-  }
-  assert.deepEqual(services.readInputs.snapshot(), []);
-  assert.deepEqual(services.daemonEnvironment.apply(env), env);
 });
 
 test('module import and registration failures are explicit, and partial activation unwinds', async (t) => {

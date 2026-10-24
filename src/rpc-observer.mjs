@@ -138,7 +138,7 @@ export default async function rpcObserver(pi) {
                   : {
                       sessionFile: request.file,
                       sessionId: request.sessionId,
-                      ...(request.body?.view === 'observed'
+                      ...(request.body?.view === 'runtime'
                         ? observation.read(request.body, context)
                         : prepareContextRead(
                             {
