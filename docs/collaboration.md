@@ -1,119 +1,121 @@
-# Dispatch, observation and continued work
+# Working with a Pi session
 
-Bridge reuses a local Pi session and its environment. The useful cooperation loop
-is send → know what was accepted → observe activity → read useful results → send
-the next instruction in the same session. Admission, session activity and run
-completion are different facts; the API keeps them distinct.
+Bridge lets an external agent continue work in a local Pi session using its
+environment, extensions and history. Start from a useful overview, send the next
+instruction, and read further only when the outcome needs explanation or evidence.
 
-## Evidence and comparison
+## Calling workflow
 
-Reviewed on 2026-10-24 against Pi 1.4.0, Bridge's current implementation and
-Codex main commit
-[`970111f6`](https://github.com/openai/codex/commit/970111f6cb62cc02fe36a82ea7d71b37a2889c97).
+1. Use `list` to find an authorized session and its current activity. Start with
+   `read({session_id})`; use `preset:"recent"` for more task background or `search`
+   to locate a decision or tool result. Expand returned refs with `read`.
+2. For completion notifications from Bridge-owned RPC execution,
+   [subscribe before sending](events.md). External TUI/RPC/SDK owners have their own
+   lifecycle and are outside this event's scope.
+3. Send the instruction to that session and retain `session_id` and
+   `submission_id`. `started`, `queued` and `handled` report native admission.
+   `dispatched` confirms an external owner invoked Pi's public API, whose input
+   handling may still transform or handle the message.
+4. If the result is `unknown`, query `submission` with both IDs for a possible
+   late acknowledgement. A missing or still-unknown receipt does not establish
+   failure; another send would be new input.
+5. On `session.settled`, the result excerpt may be enough to understand a short
+   outcome. For more context, pass `data.read` directly as the read tool's
+   arguments. These arguments select Session Context at the completed leaf, even
+   when a memory reader handles default reads.
+6. Send the next instruction to the same session. Use `list` for current activity
+   and the reading tools for task progress and evidence.
 
-Codex App Server has native Thread / Turn / Item identities. `turn/start` awaits
-Core's start-or-steer decision and returns the actual turn identity; a busy
-request can join an existing turn. `turn/steer` uses `expectedTurnId`.
-`turn/completed` carries that same thread/turn identity, final status and error.
-This makes the return useful for the next decision without reading conversation
-text to infer whether an input arrived.
+Direct MCP calls and code orchestration use the same workflow. Code can retain
+IDs and choose the next call from the returned status; repeating a send or batch
+still repeats its mutations. See the [API](api.md) for arguments and outcomes,
+[reading](reading.md) for source selection and navigation, and [events](events.md)
+for subscriptions and delivery.
 
-Primary sources:
+## Identity and result boundaries
 
-- [App Server turn routing](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/turn_processor.rs#L661)
-  and [Core start-or-steer contract](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/codex_thread.rs#L412).
-- [Steering precondition](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L317)
-  and [completed notification construction](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/bespoke_event_handling.rs#L1378).
-- [Turn and item reads](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1760)
-  support turn summaries, item listing by turn and expansion by item IDs.
-  [Summary selection](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/turn_items_view.rs#L6)
-  uses the first user message and last agent message.
+| Value                      | Identifies                                    | Use                                                         |
+| -------------------------- | --------------------------------------------- | ----------------------------------------------------------- |
+| `session_id`               | The canonical saved Pi session                | Continue work and observe current activity.                 |
+| `submission_id`            | One Bridge send/create admission attempt      | Retrieve its receipt, including a matching late native ACK. |
+| Event `leaf_id` and `read` | The native branch boundary when a run settled | Read that result after later work has started.              |
 
-The user's dot MCP experience supplies separate evidence: `send_message` returns
-threadId, turnId and admissionOutcome; completion callbacks and latestTurn use
-the same identity. Its `read(threadId,limit,cursor)` wrapper currently lacks a
-turnId argument and can return empty items with a continuation. Those are wrapper
-observations, not App Server limits. The [harness article](https://openai.com/index/unlocking-the-codex-harness/)
-explains the shared harness and event model; [Introducing dots](https://openai.com/index/introducing-dots/)
-does not specify the private cloud_threads protocol or its delivery guarantees.
+Pi steering, follow-up queues and automatic continuations can consume several
+inputs in one run. Admission receipts therefore describe delivery/admission;
+completion notifications describe a session run. Neither establishes success of
+the user's task. The notification's `stop_reason` is the final assistant message's
+native termination reason.
 
-An ID also does not establish retry safety. Codex Core explicitly notes that
-dropping the reply waiter does not retract an already queued request. Its
-clientUserMessageId is used for user-item correlation; the reviewed path does not
-establish an idempotent replay contract.
-[Submission implementation](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/session/mod.rs#L1115).
+The companion's public `sendUserMessage()` returns void; SDK `prompt()` can resolve
+after input handling or a full run. Confirmed invocation is useful evidence even
+without an admission callback. Owned RPC has matching native ACKs, so Bridge
+retains those receipts in a bounded memory cache. These choices let the caller
+resolve uncertainty without inferring delivery from conversation text. The
+[receipt contract](api.md#submission-receipt) defines retention and authorization.
 
-## Changes chosen for Bridge
+Completion excerpts and historical reading use the same native session
+projection. Capturing at settlement keeps later replies out of the notification.
+Explicit Session Context also avoids asking a current-memory reader to recreate
+a past native leaf. Runtime Context remains a request-stage snapshot; an
+extension reader can expose its current stored memory through the shared
+[module contract](compatibility.md).
 
-**Confirm dispatch without inventing admission.** Pi's public extension
-`sendUserMessage()` returns void; SDK `prompt()` resolves after input processing
-or a full run. Its `preflightResult` option is documented as an internal hook.
-The companion previously returned `unknown / PI_ACCEPTANCE_UNOBSERVABLE` after
-every call, even when dispatch was confirmed. It now reports `dispatched` with
-`admission:"unobservable"` when the public method returns normally. Synchronous
-exceptions and transport failures remain uncertain. This removes unnecessary
-body reads to confirm dispatch while preserving the actual API boundary.
+## Design references
 
-**Retain the admission evidence already available.** Owned RPC already has a
-request UUID, matching native ACK and identity-checked late-ACK path. Send/create
-now expose that UUID as `submission_id`; `submission` retrieves the current
-receipt. Previously the late callback was empty, so an ACK received after the
-five-second return could not help the caller. The cache stores at most 256
-content-free records for one hour, across owner auto-release but not Bridge
-restart. It stores no transcript, request fingerprint or replay instructions.
+The comparisons below were reviewed on 2026-10-24 against Pi 1.4.0,
+[Codex `970111f6`](https://github.com/openai/codex/commit/970111f6cb62cc02fe36a82ea7d71b37a2889c97)
+and [Grok Build `2bdd1d6a`](https://github.com/xai-org/grok-build/commit/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8).
+They support using native evidence and keeping read, admission and completion
+boundaries explicit; their protocols are not Bridge's implementation contract.
 
-**Keep result navigation native.** Existing brief reads, search and refs answer
-what the task is and which evidence matters. `session.settled` events provide a
-bounded last-response excerpt and native read arguments for a fixed result
-boundary. A submission ID cannot replace
-that leaf: steering, follow-up queues, extension handling and automatic
-continuations do not form one Pi turn per Bridge call. Consequently receipts
-never announce per-submission completion, success or failure of the user's task.
+### Codex and dot
 
-**Keep continuation simple.** Send to the same session for follow-up work. Keep
-the existing default/steer/follow_up/idle_only choices and current model controls.
-This round adds no task scheduler, polling loop, whole-history mirror, durable
-mutation journal or synthetic turn lifecycle. Extending external-owner completion
-events or adding exact work-scoped interruption needs real native lifecycle
-identity and evidence, not inference from busy/idle or matching message text.
+Codex App Server has native Thread / Turn / Item identities. `turn/start` returns
+Core's actual start-or-steer outcome and turn identity; busy input can join an
+existing turn. `turn/steer` accepts `expectedTurnId`, and `turn/completed` carries
+the same identity, final status and error. Turn/item reads support both summaries
+and expansion. Pi does not expose an equivalent turn identity for every Bridge
+submission. [Turn routing](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/turn_processor.rs#L661),
+[Core decision](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/codex_thread.rs#L412),
+[steering](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L317),
+[completion](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/bespoke_event_handling.rs#L1378),
+[turn/item reads](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1760).
 
-## Recommended calling pattern
+Codex Core also notes that dropping a reply waiter does not retract a queued
+request. Correlation IDs alone do not establish replay safety.
+[Submission source](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/session/mod.rs#L1115).
+The observed dot MCP wrapper correlates sends, completion callbacks and latest
+turns, but its exposed read parameters differ from App Server. The public
+[harness](https://openai.com/index/unlocking-the-codex-harness/) and
+[dots](https://openai.com/index/introducing-dots/) articles do not specify the
+private `cloud_threads` protocol.
 
-1. Discover the session with `list`; send the instruction and retain both IDs.
-2. For `started/queued/handled`, use that native admission outcome. For
-   `dispatched`, the external owner invoked Pi; do not resend merely to obtain an
-   ACK its public API cannot provide.
-3. For `unknown`, call `submission` with both IDs to retrieve a possible late ACK.
-   It is a snapshot, not a wait or retry. Missing/still-unknown receipts do not
-   prove non-execution.
-4. Read the latest overview, then search/expand refs as needed. When subscribed
-   to supported owned-run completion events, use the excerpt or pass the supplied
-   `read` object to the tool for more context.
-5. Continue by sending the next instruction to the same session. A new send is
-   always new input, regardless of identical text.
+### Grok Build and Bot
 
-Direct MCP callers discover this path in the send/submission descriptions and
-schemas. Code orchestration can retain IDs and conditionally query an uncertain
-receipt, but must obey the same semantics; it does not gain replay safety or a
-per-prompt completion primitive.
+Grok headless consumes ACP message, tool and plan events. Its streaming terminal
+event carries native `sessionId`, `requestId` and whole-turn `stopReason`; text
+normally arrives in earlier events. Ordinary JSON output aggregates the text.
+ACK evidence must match the native prompt/session identity and exclude replay.
+[Headless events](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless.rs#L1752),
+[JSON output](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless.rs#L237),
+[native identity](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L488),
+[ACK matching](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless/prompt_ack.rs#L22).
 
-The [Grok Build / Bot comparison](grok-comparison.md) explains why completion
-previews use native projected responses and why Bridge does not mirror a client
-event log or copy files from paths in reports.
+Persisted `TurnCompleted` and immediate `prompt_complete` share a result mapper,
+but the producer sets `agent_result` to null on success. Some errors supply detail;
+the field does not establish successful report delivery. Bridge's excerpt instead
+comes from its existing native projected response, reducing follow-up reads.
+[Shared mapper](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/turn_completion.rs#L1),
+[producer](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/sampling/error.rs#L396).
 
-## Verification
+Grok exports client-facing `updates.jsonl` while model requests use
+`chat_history.jsonl`; its session identity supports continuation across TUI,
+headless and ACP. This is a useful distinction between the record a caller reads
+and the model's current input. [Export](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/export.rs#L1),
+[sessions](https://docs.x.ai/build/features/sessions).
 
-The complete regression run on Node 26.10.0 with Pi 1.4.0 passed 731 tests,
-with the one opt-in Herdr integration test skipped. Formatting and diff checks
-passed. Tests use isolated temporary session/agent directories and synthetic
-providers; production services and active sessions were not restarted or changed.
-
-The new submission tests cover unknown → handled/started late ACKs, identical
-text submitted twice, repeated lookup without dispatch, receipt retention after
-owner exit, queued admission remaining separate from settlement, permission
-revocation, session identity, expiry and eviction. The existing authenticated
-HTTP MCP test now exercises send → completion event → later send → old receipt
-lookup → leaf-pinned result read with real Pi. It also verifies that automatic
-continuation sends one final result, extension-edited response text is preserved,
-and event read arguments bypass default memory routing. Companion/host tests cover normal,
-handled, transformed and queued input, plus synchronous and deferred failures.
+Grok Bot documents copying files cited in a Cloud Agent's final report into its
+reply. The public material does not establish that agent's connection to
+open-source Build. Bridge delivers report text and native source context; file
+delivery would require a separate artifact-selection and transport contract.
+[Bot files and results](https://docs.x.ai/grok-bot/files-and-results#results-from-cloud-agents).
