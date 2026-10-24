@@ -23,7 +23,7 @@ export function assertContextReadResponse(page, args = {}) {
   assert.ok(Buffer.byteLength(JSON.stringify(page), 'utf8') <= (args.max_bytes ?? 24000));
   assert.ok(page.selection && page.omissions.selection && page.omissions.capacity);
   assert.ok(page.next_cursor === null || typeof page.next_cursor === 'string');
-  assert.equal(Boolean(page.next_cursor), page.omissions.capacity.earlier_units > 0);
+  assert.equal(Boolean(page.next_cursor), page.omissions.capacity.remaining_units > 0);
   for (const item of page.items) {
     assert.equal(typeof item.source.entry_id, 'string');
   }

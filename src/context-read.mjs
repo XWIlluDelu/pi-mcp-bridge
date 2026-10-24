@@ -777,7 +777,8 @@ export function renderPreparedContextRead(
   { cursor, encode, resultBudget, live, runtimeEvents } = {},
 ) {
   const end = cursor?.before ?? snapshot.units.length,
-    max = args.max_bytes ?? 24000;
+    max = args.max_bytes ?? 24000,
+    forward = snapshot.navigation?.task_order === true;
   if (end < 0 || end > snapshot.units.length) throw new Error('INVALID_CURSOR');
   const base = {
     session_id: snapshot.session_id,
@@ -809,14 +810,21 @@ export function renderPreparedContextRead(
     next_cursor: before > 0 ? encode(before) : null,
     omissions: {
       selection: snapshot.omissions,
-      capacity: { earlier_units: before, later_units: snapshot.units.length - end },
+      capacity: { remaining_units: before, previous_units: snapshot.units.length - end },
     },
   });
   const fits = (value, limit = max) => jsonBytes(value) <= limit && fitsResult(value, resultBudget);
   const items = [];
   let before = end;
   while (before > 0) {
-    let unit = snapshot.units[before - 1];
+    let unit = snapshot.units[forward ? snapshot.units.length - before : before - 1];
+    // A long task or answer should leave room for its counterpart. All brief
+    // rows use the same preview rule; their references keep the complete source.
+    if (forward && unit.ref && typeof unit.text === 'string') {
+      const rowBudget = Math.floor((max - jsonBytes(page([], before - 1)) - 2) / 2);
+      if (jsonBytes(unit) > rowBudget)
+        unit = fitNavigationRow(unit, (candidate) => jsonBytes(candidate) <= rowBudget);
+    }
     const minimal = page([unit], before - 1);
     // Previews never prevent committed history from fitting.
     if (!fits(minimal) && !items.length) {
@@ -843,7 +851,8 @@ export function renderPreparedContextRead(
               jsonBytes({ ...page([candidate], before - 1), live: null }) <= READ_PAGE_LIMIT,
           )
         : omittedUnit(unit);
-    if (!fits(page([unit, ...items], before - 1))) {
+    const nextItems = forward ? [...items, unit] : [unit, ...items];
+    if (!fits(page(nextItems, before - 1))) {
       if (items.length) break;
       if (jsonBytes(page([unit], before - 1)) <= max && resultBudget)
         throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
@@ -851,7 +860,8 @@ export function renderPreparedContextRead(
       error.minimum_max_bytes = jsonBytes({ ...page([unit], before - 1), live: null });
       throw error;
     }
-    items.unshift(unit);
+    if (forward) items.push(unit);
+    else items.unshift(unit);
     before--;
   }
   const result = page(items, before);
