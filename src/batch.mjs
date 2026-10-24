@@ -89,9 +89,13 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
       return Promise.resolve();
     }
     let sessionId = args.session_id;
-    if (op === 'read' && !sessionId && args.cursor) {
+    if (op === 'read' && !sessionId && (args.cursor || args.refs)) {
       try {
-        sessionId = bridge.readCache.identity(args.cursor).session_id;
+        sessionId = (
+          args.refs
+            ? bridge.readCache.referenceIdentity(args.refs[0])
+            : bridge.readCache.identity(args.cursor)
+        ).session_id;
       } catch (error) {
         results[index] = { index, op, error: { code: publicError(error) } };
         return Promise.resolve();
@@ -118,7 +122,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
               retainedInputs: op === 'stop' ? inputs : undefined,
             }),
           );
-          if (['read', 'models', 'list', 'health'].includes(op))
+          if (['read', 'search', 'models', 'list', 'health'].includes(op))
             result = fitQuery(op, result, args, resultBudget);
           results[index] = { index, op, result };
         } catch (error) {

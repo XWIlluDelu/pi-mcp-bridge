@@ -280,6 +280,7 @@ test(
     assert.deepEqual(parseEvidence(lastText(finalEntries)), [imageEvidence(changed)]);
     const page = await call('read', {
       session_id: made.session_id,
+      detail: 'full',
       preset: 'full',
       max_bytes: 65536,
     });

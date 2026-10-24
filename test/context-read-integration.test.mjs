@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -59,13 +60,17 @@ async function fixture(t, entries, overrides = {}) {
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
+  // These tests exercise full sanitized source units and frozen pagination.
   const call = (options) =>
-    client.callTool({ name: 'read', arguments: { session_id: made.session_id, ...options } });
+    client.callTool({
+      name: 'read',
+      arguments: { session_id: made.session_id, detail: 'full', ...options },
+    });
   const ok = async (options) => {
     const response = await call(options);
     assert.ok(!response.isError, JSON.stringify(response));
     const result = response.structuredContent;
-    assertContextReadResponse(result, { session_id: made.session_id, ...options });
+    assertContextReadResponse(result, { session_id: made.session_id, detail: 'full', ...options });
     return result;
   };
   const error = async (options, code) => {
@@ -130,7 +135,7 @@ test('public MCP reads task text plus honest image descriptors, without signatur
     method: 'tools/call',
     params: {
       name: 'read',
-      arguments: { session_id: f.id, max_bytes: 4096 },
+      arguments: { session_id: f.id, detail: 'full', max_bytes: 4096 },
       _meta: {
         [META + 'protocolVersion']: MODERN_VERSION,
         [META + 'clientCapabilities']: {},
@@ -294,6 +299,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     assert.deepEqual(active.items, cleanDisk.items);
     const runtime = await f.bridge.pool.forRead(f.saved),
       captured = await runtime.read({ session_id: f.id });
+    assert.equal(captured.contract, packageInfo.version);
     assert.ok(Array.isArray(captured.units));
     assert.ok(!JSON.stringify(captured).includes('AAAAAAA'));
     assert.ok(!captured.units.some((unit) => unit.message?.toolsAdded));
@@ -313,7 +319,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
 });
 
 test('optional input mappings agree across saved, owned RPC, companion and host reads with frozen paging and raw fork data', async (t) => {
-  const module = fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url));
+  const module = fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url));
   for (const kind of ['saved', 'rpc', 'companion', 'host']) {
     await t.test(kind, async (t) => {
       const details = {
@@ -397,6 +403,26 @@ test('optional input mappings agree across saved, owned RPC, companion and host 
         );
       }
       const fileBefore = await fs.readFile(f.saved.file);
+      const found = await f.client.callTool({
+        name: 'search',
+        arguments: {
+          session_id: f.id,
+          view: 'session',
+          query: 'PRIOR_ANSWER',
+          types: ['text'],
+        },
+      });
+      assert.ok(!found.isError, JSON.stringify(found));
+      assert.equal(found.structuredContent.matches, 1);
+      assert.equal(found.structuredContent.items[0].source.entry_id, 'a1');
+      const expanded = await f.client.callTool({
+        name: 'read',
+        arguments: {
+          refs: [found.structuredContent.items[0].ref],
+        },
+      });
+      assert.ok(!expanded.isError, JSON.stringify(expanded));
+      assert.equal(expanded.structuredContent.items[0].block.text, 'PRIOR_ANSWER');
       const first = await f.ok({ max_bytes: 4096 });
       assert.equal(first.source, kind === 'companion' ? 'tui' : kind);
       const units = chronological(await allPages(f, first));
@@ -432,7 +458,7 @@ test('optional input mappings agree across saved, owned RPC, companion and host 
 });
 
 test('disabled compatibility module leaves native custom reading intact', async (t) => {
-  const module = fileURLToPath(new URL('../src/compatibility/intercom.mjs', import.meta.url));
+  const module = fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url));
   const f = await fixture(
     t,
     [
@@ -487,7 +513,7 @@ test('batch budgets the first render of captured snapshots and preserves cursor 
       operations: [
         ...Array.from({ length: 8 }, () => ({
           op: 'read',
-          args: { session_id: f.id, max_bytes: 65536 },
+          args: { session_id: f.id, detail: 'full', max_bytes: 65536 },
         })),
         { op: 'send', args: { session_id: f.id, text: 'LATER_MUTATION' } },
       ],
@@ -528,6 +554,8 @@ test('read contract mismatch requests component update without sending an old op
     submit: () => assert.fail('No prompt during read'),
   });
   const runtime = await f.bridge.pool.forRead(f.saved);
+  assert.equal(runtime.record.readContract, packageInfo.version);
+  await runtime.readFeatures();
   t.mock.method(runtime, 'request', () => assert.fail('Do not probe an incompatible owner'));
   for (const declared of [undefined, 'not-the-current-read-contract']) {
     runtime.record.readContract = declared;

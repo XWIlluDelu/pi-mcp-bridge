@@ -427,7 +427,7 @@ export default async function attachExtension(pi) {
               };
             else if (['read', 'snapshot'].includes(request.op)) {
               const sdk =
-                request.op === 'read' && args.view !== 'observed' ? await nativeSdk(profile) : null;
+                request.op === 'read' && args.view !== 'runtime' ? await nativeSdk(profile) : null;
               const entries = ctx.sessionManager.getEntries(),
                 leafId = ctx.sessionManager.getLeafId();
               const snapshotJson =
@@ -445,7 +445,7 @@ export default async function attachExtension(pi) {
                 data = {
                   sessionFile: file,
                   sessionId: header.id,
-                  ...(args.view === 'observed'
+                  ...(args.view === 'runtime'
                     ? runtime.observation.read(args, ctx)
                     : prepareContextRead(
                         { header, entries, leafId, live: runtime.liveMessage.snapshot() },
