@@ -101,7 +101,7 @@ and deletion of the allocated worker/tool scope.
 
 ### Native control permissions
 
-`set_model`, prompt settings and `compact` use session `send`; a create call's
+`set_model`, prompt settings, `compact` and `reload` use session `send`; a create call's
 initial settings use `create`. Explicit `compact(interrupt:true)` additionally
 requires `stop`, while summary content requires `read`.
 

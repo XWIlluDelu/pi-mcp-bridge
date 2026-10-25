@@ -109,4 +109,4 @@ Host implementers should follow the [compact callback contract](runtime.md#host-
 
 ## Native settings refresh
 
-Cold starts load current on-disk settings, providers and extensions under the owner's launch profile and explicit overrides. TUI owners can use local `/reload`; the companion keeps its writer claim while replacing its endpoint. RPC and SDK hosts manage their own [reload/close lifecycle](runtime.md).
+Cold starts load current on-disk settings, providers and extensions under the owner's launch profile and explicit overrides. [`reload({session_id})`](api.md#reload) refreshes a supported idle owner without sending a task. The companion retains its writer claim while replacing its endpoint. Unsupported owners require native `/reload` or a host-managed reopen; see the [reload lifecycle](runtime.md#remote-reload).

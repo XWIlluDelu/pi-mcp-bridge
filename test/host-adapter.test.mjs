@@ -389,7 +389,7 @@ test('list observes actual host callback support across IPC, independently of ac
           activity = observed;
           const { status } = await row();
           assert.equal(status.state, expectedState);
-          assert.deepEqual(status.capabilities, expected);
+          assert.deepEqual(status.capabilities, { ...expected, reload: false });
         }
         if (expected.command) {
           assert.equal(
@@ -403,7 +403,7 @@ test('list observes actual host callback support across IPC, independently of ac
           await assert.rejects(bridge.stop({ session_id }), /NOT_FOUND_OR_DENIED/);
           await assert.rejects(bridge.read({ session_id }), /NOT_FOUND_OR_DENIED/);
           assert.deepEqual(calls, { send: 0, bash: 0, stop: 0 });
-          assert.deepEqual((await row()).status.capabilities, expected);
+          assert.deepEqual((await row()).status.capabilities, { ...expected, reload: false });
         }
         // Exercise the advertised paths without granting read.
         Object.assign(bridge.config.defaults, { send: true, command: true, stop: true });

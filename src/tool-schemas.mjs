@@ -48,6 +48,7 @@ export const publicOperationSchemas = {
       message: 'Model or thinking level required',
     }),
   compact: compactSchema,
+  reload: z.object({ session_id: id }).strict(),
   read: publicReadSchema,
   search: searchSchema,
   send: z
