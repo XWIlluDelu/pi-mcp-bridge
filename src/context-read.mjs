@@ -13,8 +13,6 @@ const UNIT_TARGET = 2048;
 
 const take = (values, n, reverse = false) =>
   n === -1 ? values : n === 0 ? [] : reverse ? values.slice(-n) : values.slice(0, n);
-const ends = (values, n) =>
-  new Set(n === -1 ? values : [...take(values, n), ...take(values, n, true)]);
 
 /**
  * The projection, not timestamps or raw-file order, is the ordering authority.
@@ -94,6 +92,13 @@ function timeline(projection, readAdapters) {
                     : 'native';
             add(type, { ...source, block_index: blockIndex }, { block, metadata });
           }
+          // A failed message can contain only thinking or an unfinished call.
+          // Its status belongs to assistant selection, not to those other kinds.
+          if (
+            !content.some((block) => block.type === 'text') &&
+            (['error', 'aborted'].includes(metadata.stopReason) || metadata.errorMessage)
+          )
+            add('native', source, { message: { ...metadata, content: [] } });
         } else add('native', source, { message });
       } else if (message.role === 'toolResult') {
         requirePrompt(source);
@@ -137,45 +142,65 @@ function timeline(projection, readAdapters) {
 
 function selectTimeline(projected, selection, readAdapters) {
   const { records, prompts, units } = timeline(projected, readAdapters);
+  const { range, content } = selection;
   const selectedPrompts = new Set([
-    ...take(prompts, selection.earliest_prompts),
-    ...take(prompts, selection.recent_prompts, true),
+    ...take(prompts, range.earliest),
+    ...take(prompts, range.recent, true),
   ]);
   const chosen = new Set();
   const totals = {
+    turns: prompts.length,
+    input: prompts.length,
+    assistant: 0,
+    thinking: 0,
+    tool: units.size,
     system: records.filter((r) => r.type === 'system').length,
     summary: records.some((r) => r.type === 'summary') ? 1 : 0,
-    prompts: prompts.length,
-    text: 0,
-    thinking: 0,
-    tools: units.size,
-    commands: 0,
+    command: records.filter((r) => r.type === 'command').length,
+    native: 0,
   };
-  const included = {
-    system: 0,
-    summary: 0,
-    prompts: selectedPrompts.size,
-    text: 0,
-    thinking: 0,
-    tools: 0,
-    commands: 0,
+  const included = Object.fromEntries(Object.keys(totals).map((key) => [key, 0]));
+  included.turns = selectedPrompts.size;
+  const failure = (record) => {
+    const message = record.metadata ?? record.message;
+    return message && (['error', 'aborted'].includes(message.stopReason) || message.errorMessage);
   };
-  for (const type of ['text', 'thinking']) {
+  const assistantRecord = (record) =>
+    record.type === 'text' || (record.type === 'native' && record.message?.role === 'assistant');
+  // Each content kind selects messages independently. Once a message qualifies,
+  // retain all its selected-kind blocks, never just a first/last block sample.
+  for (const kind of ['assistant', 'thinking']) {
+    const messages = new Map();
+    for (const record of records) {
+      if (kind === 'assistant' ? !assistantRecord(record) : record.type !== 'thinking') continue;
+      const key = `${record.source.entry_id}:${record.source.message_index}`;
+      const message = messages.get(key) ?? {
+        prompt_id: record.prompt_id,
+        records: [],
+        readable: false,
+      };
+      message.records.push(record);
+      const value = kind === 'assistant' ? record.block?.text : record.block?.thinking;
+      message.readable ||=
+        (typeof value === 'string' && value.trim().length > 0) ||
+        (kind === 'assistant' && Boolean(failure(record)));
+      messages.set(key, message);
+    }
     const groups = new Map();
-    for (const record of records)
-      if (record.type === type) {
-        totals[type]++;
-        const group = groups.get(record.prompt_id) ?? [];
-        group.push(record);
-        groups.set(record.prompt_id, group);
+    for (const message of messages.values()) {
+      if (!message.readable) continue;
+      totals[kind]++;
+      const group = groups.get(message.prompt_id) ?? [];
+      group.push(message);
+      groups.set(message.prompt_id, group);
+    }
+    for (const [id, group] of groups) {
+      if (!selectedPrompts.has(id)) continue;
+      for (const message of take(group, content[kind], true)) {
+        included[kind]++;
+        for (const record of message.records) chosen.add(record);
       }
-    for (const [id, group] of groups)
-      if (selectedPrompts.has(id)) {
-        for (const record of ends(group, selection[type])) {
-          chosen.add(record);
-          included[type]++;
-        }
-      }
+    }
   }
   const toolGroups = new Map();
   for (const unit of units.values()) {
@@ -184,45 +209,51 @@ function selectTimeline(projected, selection, readAdapters) {
     toolGroups.set(unit.prompt_id, group);
   }
   for (const [id, group] of toolGroups)
-    if (selectedPrompts.has(id)) {
-      for (const unit of ends(group, selection.tools)) {
-        included.tools++;
+    if (selectedPrompts.has(id))
+      for (const unit of take(group, content.tool, true)) {
+        included.tool++;
         for (const record of unit.records) chosen.add(record);
       }
-    }
-  const commands = records.filter((r) => r.type === 'command');
-  totals.commands = commands.length;
-  for (const record of take(commands, selection.commands, true)) {
+  for (const record of take(
+    records.filter((r) => r.type === 'command'),
+    content.command,
+    true,
+  )) {
     chosen.add(record);
-    included.commands++;
+    included.command++;
   }
   for (const record of records) {
     if (record.type === 'system') {
-      if (selection.system === 0) continue;
-      if (selection.tools === 0) {
+      if (!content.system) continue;
+      if (content.tool === 0) {
         const { toolsAdded, toolsRemoved, ...message } = record.message;
         if (!message.content?.length && !Object.keys(message.sections ?? {}).length) continue;
         record.message = message;
       }
       chosen.add(record);
       included.system++;
-      continue;
+    } else if (record.type === 'prompt') {
+      if (content.input && selectedPrompts.has(record.prompt_id)) {
+        chosen.add(record);
+        included.input++;
+      }
+    } else if (record.type === 'summary') {
+      if (content.summary !== 0) {
+        chosen.add(record);
+        included.summary = 1;
+      }
+    } else if (['custom', 'native'].includes(record.type) && !assistantRecord(record)) {
+      // Other extension/native content stays in its own input window; global
+      // context prefixes remain independent of turn selection.
+      totals.native++;
+      if (content.native && (record.prompt_id === null || selectedPrompts.has(record.prompt_id))) {
+        chosen.add(record);
+        included.native++;
+      }
     }
-    if (record.type === 'prompt' && selectedPrompts.has(record.prompt_id)) chosen.add(record);
-    if (record.type === 'summary' && selection.summary !== 0) {
-      chosen.add(record);
-      included.summary = 1;
-    }
-    // Custom/unknown context prefixes remain global; later records belong to
-    // their prompt's window. System selection must not hide extension content.
-    if (
-      ['custom', 'native'].includes(record.type) &&
-      (record.prompt_id === null || selectedPrompts.has(record.prompt_id))
-    )
-      chosen.add(record);
   }
   return {
-    records: records.filter((r) => chosen.has(r)),
+    records: records.filter((record) => chosen.has(record)),
     latestPrompt: prompts.at(-1) ?? null,
     latestPromptSelected: selectedPrompts.has(prompts.at(-1)),
     omissions: Object.fromEntries(
@@ -332,6 +363,7 @@ function cleanRecord(record) {
     'block_index',
     'observation_index',
     'reader_item',
+    'content_kind',
     'read_adapter',
   ];
   if (record.source) result.source = pick(record.source, sourceFields);
@@ -678,13 +710,6 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
       matches = new Set(),
       tools = new Set();
     for (const record of records) {
-      const kind = record.tool_id ? 'tool' : record.type;
-      if (
-        args.types?.length &&
-        !args.types.includes(kind) &&
-        !(kind === 'tool' && args.types.includes('nested_call'))
-      )
-        continue;
       if (unitText(cleanRecord(record), true).toLocaleLowerCase().includes(query)) {
         matches.add(record);
         if (record.tool_id) tools.add(record.tool_id);
@@ -740,20 +765,30 @@ export function cleanLive(raw, selection, selected) {
   const indices = new Set(),
     omissions = { ...raw.selection_omissions };
   for (const [kind, key] of [
-    ['text', 'text'],
+    ['text', 'assistant'],
     ['thinking', 'thinking'],
-    ['toolCall', 'tools'],
+    ['toolCall', 'tool'],
   ]) {
     const group = message.content
-        .map((block, index) => ({ block, index }))
-        .filter((item) => item.block.type === kind),
-      keep = ends(group, selection[key]);
-    omissions[key] = (omissions[key] ?? 0) + group.length - keep.size;
+      .map((block, index) => ({ block, index }))
+      .filter((item) => item.block.type === kind);
+    // Live text/thinking belong to one transient message. Tool calls still
+    // count independently because each is a distinct logical operation.
+    const keep =
+      key === 'tool'
+        ? take(group, selection.content.tool, true)
+        : selection.content[key] === 0
+          ? []
+          : group;
+    omissions[key] =
+      (omissions[key] ?? 0) +
+      (key === 'tool' ? group.length - keep.length : group.length && !keep.length ? 1 : 0);
     for (const { index } of keep) indices.add(index);
   }
-  message.content.forEach((block, index) => {
-    if (!['text', 'thinking', 'toolCall'].includes(block.type)) indices.add(index);
-  });
+  if (selection.content.native)
+    message.content.forEach((block, index) => {
+      if (!['text', 'thinking', 'toolCall'].includes(block.type)) indices.add(index);
+    });
   const result = {
     ...base,
     items: [],
@@ -802,15 +837,74 @@ function smallLive(live, budget) {
   }
   return jsonBytes(result) <= budget ? result : null;
 }
+// Presentation priority only allocates text space. Rows always stay in source
+// order; a cursor advances through the same frozen row sequence.
+function publicNavigationRow(unit) {
+  const { _turn, _latest, ...row } = unit;
+  return row;
+}
+function navigationTurnEnd(units, start) {
+  let turn = units[start]._turn,
+    end = start + 1;
+  // Background before a turn travels with it when possible, without becoming
+  // part of that turn's content selection.
+  for (; end < units.length; end++) {
+    const next = units[end]._turn;
+    if (next == null) continue;
+    if (turn == null) turn = next;
+    else if (next !== turn) break;
+  }
+  return end;
+}
+function fitNavigationTurn(units, fits, { shortenLatest = true } = {}) {
+  const original = units.map(publicNavigationRow);
+  if (fits(original)) return original;
+  // Compress earlier process before touching the latest reply. Input and
+  // thinking retain useful previews; no kind receives space when absent.
+  const short = units.map((unit) => {
+    const row = publicNavigationRow(unit);
+    if (unit._latest) return row;
+    const limit = ['input', 'thinking'].includes(unit.type) ? 400 : 200;
+    return row.text.length <= limit
+      ? row
+      : fitNavigationRow(row, (candidate) => candidate.text.length <= limit);
+  });
+  if (fits(short)) return short;
+  if (!shortenLatest) return null;
+  const latest = units
+    .map((unit, index) => (unit._latest ? index : -1))
+    .filter((index) => index >= 0);
+  if (!latest.length) return null;
+  const total = latest.reduce((sum, index) => sum + short[index].text.length, 0);
+  const trimmed = (limit) =>
+    short.map((row, index) => {
+      if (!units[index]._latest) return row;
+      const share = Math.floor((limit * row.text.length) / Math.max(1, total));
+      return row.text.length <= share
+        ? row
+        : fitNavigationRow(row, (candidate) => candidate.text.length <= share);
+    });
+  // Do not squeeze a long directory into empty labels merely to claim that a
+  // turn fits. Such turns continue on another page in source order.
+  if (!fits(trimmed(Math.min(total, 200 * latest.length)))) return null;
+  let low = Math.min(total, 200 * latest.length),
+    high = total;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fits(trimmed(mid))) low = mid;
+    else high = mid - 1;
+  }
+  return trimmed(low);
+}
 export function renderPreparedContextRead(
   snapshot,
   args,
   { cursor, encode, resultBudget, live, runtimeEvents } = {},
 ) {
-  const end = cursor?.before ?? snapshot.units.length,
-    max = args.max_bytes ?? 24000,
-    forward = snapshot.navigation?.task_order === true;
-  if (end < 0 || end > snapshot.units.length) throw new Error('INVALID_CURSOR');
+  const start = cursor?.offset ?? 0,
+    max = args.max_bytes ?? 24000;
+  if (start < 0 || start > snapshot.units.length) throw new Error('INVALID_CURSOR');
+  const navigation = Boolean(snapshot.navigation);
   const base = {
     session_id: snapshot.session_id,
     view: snapshot.view ?? 'session',
@@ -819,12 +913,10 @@ export function renderPreparedContextRead(
     source: snapshot.source ?? 'session_projection',
     leaf_id: snapshot.leaf_id,
     selection: snapshot.selection,
-    ...(snapshot.detail ? { detail: snapshot.detail } : {}),
+    ...(snapshot.presentation ? { presentation: snapshot.presentation } : {}),
     ...(snapshot.query ? { query: snapshot.query } : {}),
     ...(snapshot.matches !== undefined ? { matches: snapshot.matches } : {}),
-    ...(snapshot.types ? { types: snapshot.types } : {}),
     ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
-    omissions: { selection: snapshot.omissions },
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
     ...(snapshot.view !== 'runtime' &&
@@ -835,67 +927,95 @@ export function renderPreparedContextRead(
       ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
       : {}),
   };
-  const page = (items, before) => ({
+  const page = (items, offset) => ({
     ...base,
     items,
-    next_cursor: before > 0 ? encode(before) : null,
+    next_cursor: offset < snapshot.units.length ? encode(offset) : null,
     omissions: {
       selection: snapshot.omissions,
-      capacity: { remaining_units: before, previous_units: snapshot.units.length - end },
+      capacity: { remaining_units: snapshot.units.length - offset, previous_units: start },
     },
   });
-  const fits = (value, limit = max) => jsonBytes(value) <= limit && fitsResult(value, resultBudget);
+  const fits = (value) => jsonBytes(value) <= max && fitsResult(value, resultBudget);
   const items = [];
-  let before = end;
-  while (before > 0) {
-    let unit = snapshot.units[forward ? snapshot.units.length - before : before - 1];
-    // A long task or answer should leave room for its counterpart. All brief
-    // rows use the same preview rule; their references keep the complete source.
-    if (forward && unit.ref && typeof unit.text === 'string') {
-      const rowBudget = Math.floor((max - jsonBytes(page([], before - 1)) - 2) / 2);
-      if (jsonBytes(unit) > rowBudget)
-        unit = fitNavigationRow(unit, (candidate) => jsonBytes(candidate) <= rowBudget);
+  let offset = start,
+    splitUntil = start;
+  while (offset < snapshot.units.length) {
+    if (navigation && !snapshot.query && offset >= splitUntil) {
+      const end = navigationTurnEnd(snapshot.units, offset);
+      const group = snapshot.units.slice(offset, end);
+      const plain = group.map(publicNavigationRow);
+      if (fits(page([...items, ...plain], end))) {
+        items.push(...plain);
+        offset = end;
+        continue;
+      }
+      // A turn that fits an empty page is not split across the current tail.
+      if (items.length && fits(page(plain, end))) break;
+      const earlierPreviews = fitNavigationTurn(
+        group,
+        (rows) => fits(page([...items, ...rows], end)),
+        { shortenLatest: false },
+      );
+      if (earlierPreviews) {
+        items.push(...earlierPreviews);
+        offset = end;
+        continue;
+      }
+      // Before shortening a reply to use the current page tail, try preserving
+      // it on a fresh page with only the earlier process abbreviated.
+      if (
+        items.length &&
+        fitNavigationTurn(group, (rows) => fits(page(rows, end)), { shortenLatest: false })
+      )
+        break;
+      const shortened = fitNavigationTurn(group, (rows) => fits(page([...items, ...rows], end)));
+      if (shortened) {
+        items.push(...shortened);
+        offset = end;
+        continue;
+      }
+      if (items.length && fitNavigationTurn(group, (rows) => fits(page(rows, end)))) break;
+      splitUntil = end;
     }
-    const minimal = page([unit], before - 1);
-    // Previews never prevent committed history from fitting.
-    if (!fits(minimal) && !items.length) {
+    let unit = navigation ? publicNavigationRow(snapshot.units[offset]) : snapshot.units[offset];
+    // Live previews never prevent committed history from making progress.
+    if (!items.length && !fits(page([unit], offset + 1))) {
       base.live = smallLive(base.live, 256);
       delete base.runtime_events;
-      if (!fits(page([unit], before - 1))) base.live = null;
+      if (!fits(page([unit], offset + 1))) base.live = null;
     }
-    if (metadataUnit(unit) && !items.length && !fits(page([unit], before - 1)))
-      unit = fitMetadata(unit, (candidate) => fits(page([candidate], before - 1)));
+    if (metadataUnit(unit) && !items.length && !fits(page([unit], offset + 1)))
+      unit = fitMetadata(unit, (candidate) => fits(page([candidate], offset + 1)));
     if (
       unit.ref &&
       typeof unit.text === 'string' &&
       !items.length &&
-      !fits(page([unit], before - 1))
+      !fits(page([unit], offset + 1))
     )
-      unit = fitNavigationRow(unit, (candidate) => fits(page([candidate], before - 1)));
-    const maximum = { ...page([unit], before - 1), live: null };
+      unit = fitNavigationRow(unit, (candidate) => fits(page([candidate], offset + 1)));
+    const maximum = { ...page([unit], offset + 1), live: null };
     delete maximum.runtime_events;
     if (jsonBytes(maximum) > READ_PAGE_LIMIT)
       unit = metadataUnit(unit)
         ? fitMetadata(
             unit,
             (candidate) =>
-              jsonBytes({ ...page([candidate], before - 1), live: null }) <= READ_PAGE_LIMIT,
+              jsonBytes({ ...page([candidate], offset + 1), live: null }) <= READ_PAGE_LIMIT,
           )
         : omittedUnit(unit);
-    const nextItems = forward ? [...items, unit] : [unit, ...items];
-    if (!fits(page(nextItems, before - 1))) {
+    if (!fits(page([...items, unit], offset + 1))) {
       if (items.length) break;
-      if (jsonBytes(page([unit], before - 1)) <= max && resultBudget)
+      if (jsonBytes(page([unit], offset + 1)) <= max && resultBudget)
         throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
       const error = new Error('READ_BUDGET_TOO_SMALL');
-      error.minimum_max_bytes = jsonBytes({ ...page([unit], before - 1), live: null });
+      error.minimum_max_bytes = jsonBytes({ ...page([unit], offset + 1), live: null });
       throw error;
     }
-    if (forward) items.push(unit);
-    else items.unshift(unit);
-    before--;
+    items.push(unit);
+    offset++;
   }
-  const result = page(items, before);
+  const result = page(items, offset);
   if (!fits(result)) throw new Error('READ_BUDGET_TOO_SMALL');
   return structuredClone(result);
 }
@@ -953,7 +1073,17 @@ export function assertReadSnapshot(value, args) {
     !Array.isArray(value.units) ||
     (observed
       ? value.selection !== null || value.omissions !== null
-      : ['system', 'summary', 'prompts', 'text', 'thinking', 'tools', 'commands'].some(
+      : [
+          'turns',
+          'input',
+          'assistant',
+          'thinking',
+          'tool',
+          'command',
+          'system',
+          'summary',
+          'native',
+        ].some(
           (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
         )) ||
     !(value.leaf_id === null || typeof value.leaf_id === 'string') ||

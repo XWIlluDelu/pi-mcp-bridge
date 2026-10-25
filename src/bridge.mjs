@@ -9,7 +9,7 @@ import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema, searchSchema } from './read-schema.mjs';
+import { readSchema, searchSchema, ALL_CONTENT } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
@@ -530,9 +530,18 @@ export class Bridge {
   async search(input, options = {}) {
     const parsed = searchSchema.safeParse(input);
     if (!parsed.success) throw new Error('INVALID_SEARCH_ARGUMENTS');
-    const { query, ...args } = parsed.data;
+    const { query, content, ...args } = parsed.data;
+    const selected =
+      content === undefined
+        ? ALL_CONTENT
+        : Object.fromEntries(
+            Object.entries(ALL_CONTENT).map(([kind, value]) => [
+              kind,
+              content.includes(kind) ? value : typeof value === 'boolean' ? false : 0,
+            ]),
+          );
     return this.read(
-      { ...args, detail: 'brief', ...(args.view !== 'runtime' ? { preset: 'full' } : {}) },
+      { ...args, content: selected, ...(args.view !== 'runtime' ? { range: { recent: -1 } } : {}) },
       { ...options, searchQuery: query },
     );
   }
@@ -584,7 +593,7 @@ export class Bridge {
         readPins,
       });
     }
-    args = { ...args, session_id: id, detail: args.detail ?? 'brief' };
+    args = { ...args, session_id: id };
     let runtime = await this.pool.forRead(s);
     while (runtime && this.handoffs.get(id)?.runtime === runtime) {
       await runtime.autoReleaseTask;
@@ -684,7 +693,6 @@ export class Bridge {
         ...(captured.observation ? { observation: captured.observation } : {}),
         ...(captured.reader ? { reader: captured.reader } : {}),
         request: args,
-        detail: args.detail,
         leaf_id: captured.leaf_id,
         selection: captured.selection,
         omissions: captured.omissions,
@@ -710,9 +718,7 @@ export class Bridge {
       runtimeEvents: events,
       readPins,
     };
-    return args.detail === 'brief'
-      ? this.readCache.navigate(snapshot, args, renderOptions, searchQuery)
-      : this.readCache.render(snapshot, args, renderOptions);
+    return this.readCache.navigate(snapshot, args, renderOptions, searchQuery);
   }
   async acquireNativeRead(session, runtime, args) {
     if (runtime) return runtime.read(args);

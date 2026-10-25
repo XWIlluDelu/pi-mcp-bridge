@@ -163,8 +163,8 @@ test(
       async () =>
         !(await local.getState()).isStreaming && (await local.getState()).pendingMessageCount === 0,
     );
-    const history = await ok('read', { session_id: saved.id, preset: 'recent' });
-    assert.ok(history.items.some((item) => item.type === 'text'));
+    const history = await ok('read', { session_id: saved.id, range: { recent: 3 } });
+    assert.ok(history.items.some((item) => item.type === 'assistant'));
     assert.deepEqual(history.live.items, []);
     const entries = (await local.getEntries()).entries;
     assert.equal(entries.filter((entry) => text(entry) === 'REMOTE_ORDINARY_RPC').length, 1);

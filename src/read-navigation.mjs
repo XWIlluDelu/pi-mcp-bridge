@@ -1,6 +1,13 @@
+import { contentKind } from './read-schema.mjs';
+
 // Reading documents are indexes over already-authorized, sanitized units.
 // They never reconstruct provider data or run tools to recover missing results.
 const compact = (value) =>
+  String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\n+|\n+$/g, '');
+const inline = (value) =>
   String(value ?? '')
     .replace(/\s+/gu, ' ')
     .trim();
@@ -35,7 +42,8 @@ export function fitNavigationRow(row, fits) {
     if (fits({ ...base, text: excerpt(row.text, mid) })) low = mid;
     else high = mid - 1;
   }
-  return { ...base, text: excerpt(row.text, low) };
+  const text = excerpt(row.text, low);
+  return { ...base, text, ...(text !== row.text ? { truncated: true } : {}) };
 }
 
 function messageText(message, { metadata = false } = {}) {
@@ -123,21 +131,107 @@ export function documentText(snapshot, doc) {
   }
   // Split bodies repeat their stop reason, while the error detail lives once
   // in shared metadata. Keep each failure fact once beside the complete text.
-  return [assistantFailure(units), body].filter(Boolean).join('\n');
+  return [doc.kind === 'thinking' ? '' : assistantFailure(units), body].filter(Boolean).join('\n');
 }
 
-const blockKey = (source) =>
-  `${source.entry_id}:${source.message_index ?? ''}:${source.block_index ?? ''}`;
-function key(unit, index, textBlocks) {
-  if (unit.tool_id) return `tool:${unit.tool_id}`;
-  const s = unit.source ?? {};
-  if (s.reader_item !== undefined) return `item:${s.reader_item}`;
-  if (s.observation_index !== undefined) return `runtime:${s.observation_index}`;
-  if (s.entry_id !== undefined) {
-    if (textBlocks.has(blockKey(s))) return `session:${s.entry_id}:${s.message_index ?? ''}:text`;
-    return `session:${s.entry_id}:${s.message_index ?? ''}:${s.block_index ?? ''}`;
+const messageKey = (source = {}) =>
+  source.observation_index !== undefined
+    ? `runtime:${source.observation_index}`
+    : `session:${source.entry_id}:${source.message_index ?? ''}`;
+const blockKey = (source = {}) =>
+  `${messageKey(source)}:${source.block_index ?? source.content_index ?? ''}`;
+
+// A runtime capture remains untouched. Navigation applies kind filtering to a
+// derived view, including individual assistant blocks rather than the whole
+// mixed assistant message. References still contain the captured source.
+function runtimeUnits(snapshot) {
+  const units = [];
+  let turn = null;
+  for (const original of snapshot.units) {
+    const message = original.message;
+    if (message?.role === 'user') turn = `runtime:${original.source.observation_index}`;
+    if (message?.role === 'assistant' && Array.isArray(message.content) && message.content.length) {
+      const { content, ...metadata } = message;
+      for (const [index, block] of content.entries())
+        units.push({
+          ...original,
+          message: undefined,
+          metadata,
+          block,
+          type:
+            block.type === 'text'
+              ? 'text'
+              : block.type === 'thinking'
+                ? 'thinking'
+                : block.type === 'toolCall'
+                  ? 'tool_call'
+                  : 'native',
+          source: { ...original.source, block_index: original.source.content_index ?? index },
+          prompt_id: turn,
+        });
+    } else units.push({ ...original, prompt_id: turn });
   }
-  return `unit:${index}`;
+  // Failure metadata is an assistant fact even if the message has only
+  // thinking/tool blocks and those kinds are switched off.
+  const failures = new Map();
+  for (const unit of snapshot.units) {
+    const message = unit.message;
+    if (
+      message?.role === 'assistant' &&
+      (['error', 'aborted'].includes(message.stopReason) || message.errorMessage)
+    )
+      failures.set(messageKey(unit.source), {
+        ...failures.get(messageKey(unit.source)),
+        ...message,
+      });
+  }
+  for (const [key, message] of failures) {
+    const positions = units
+      .map((unit, index) => (messageKey(unit.source) === key ? index : -1))
+      .filter((index) => index >= 0);
+    if (
+      positions.some(
+        (index) => units[index].block?.type === 'text' && units[index].block.text?.trim().length,
+      )
+    )
+      continue;
+    const standalone = positions.find(
+      (index) =>
+        units[index].message?.role === 'assistant' && !units[index].message.content?.length,
+    );
+    if (standalone !== undefined) units[standalone].type = 'assistant';
+    else {
+      const previous = units[positions.at(-1)];
+      units.splice(positions.at(-1) + 1, 0, {
+        type: 'assistant',
+        source: { observation_index: previous.source.observation_index },
+        prompt_id: previous.prompt_id,
+        message: { ...message, content: [] },
+      });
+    }
+  }
+  const open = new Map(),
+    results = new Map();
+  for (const unit of units) {
+    if (unit.block?.type === 'toolCall') {
+      const id = `runtime:${blockKey(unit.source)}`;
+      unit.tool_id = id;
+      const stack = open.get(unit.block.id) ?? [];
+      stack.push(unit);
+      open.set(unit.block.id, stack);
+    } else if (unit.message?.role === 'toolResult') {
+      const source = messageKey(unit.source);
+      let pair = results.get(source);
+      if (!pair) {
+        const call = open.get(unit.message.toolCallId)?.pop();
+        pair = { id: call?.tool_id ?? `tool:${source}`, turn: call?.prompt_id ?? unit.prompt_id };
+        results.set(source, pair);
+      }
+      unit.tool_id = pair.id;
+      unit.prompt_id = pair.turn;
+    }
+  }
+  return units;
 }
 
 function toolPreview(units) {
@@ -150,85 +244,140 @@ function toolPreview(units) {
   }
   const rows = [...children.values()];
   const errors = rows.filter((c) => c.status === 'error' || c.status === 'unfinished');
-  const counts = {};
-  for (const c of rows) counts[c.name] = (counts[c.name] ?? 0) + 1;
   const args = call?.arguments ?? {};
-  const target = ['path', 'file', 'command', 'query', 'url']
-    .filter((k) => args[k] !== undefined)
-    .map(
-      (k) =>
-        `${k}: ${excerpt(typeof args[k] === 'string' ? args[k] : JSON.stringify(args[k]), 120)}`,
-    )
-    .join('; ');
-  const output = units
-    .filter((u) => u.message?.role === 'toolResult')
-    .map((u) => messageText(u.message))
-    .join('');
-  const summary = [
-    call?.name ?? result?.toolName ?? 'tool',
-    target,
-    result?.isError ? 'result: error' : result ? 'result: returned' : 'result: not recorded',
-    rows.length
-      ? `recorded operations: ${rows.length} (${Object.entries(counts)
-          .map(([k, v]) => `${k}×${v}`)
-          .join(', ')}); errors/unfinished: ${errors.length}`
-      : '',
-    ...errors.slice(0, 3).map((c) => `${c.name}: ${c.status} ${excerpt(c.error, 180)}`),
-    excerpt(output, 480),
-  ]
-    .filter(Boolean)
-    .join('\n');
-  return { summary, children: rows, name: call?.name ?? result?.toolName ?? 'tool' };
+  const field = ['path', 'file', 'command', 'query', 'url'].find(
+    (name) => args[name] !== undefined,
+  );
+  const target = field
+    ? `${field}: ${excerpt(inline(typeof args[field] === 'string' ? args[field] : JSON.stringify(args[field])), 80)}`
+    : '';
+  const status = result?.isError ? 'error' : result ? 'returned' : 'result not recorded';
+  // Only explicit failure output is a diagnostic. Successful stdout stays in
+  // the tool reference, not in the default activity directory.
+  const diagnostic = result?.isError
+    ? excerpt(
+        inline(
+          units
+            .filter((u) => u.message?.role === 'toolResult')
+            .map((u) => messageText(u.message))
+            .join(''),
+        ),
+        100,
+      )
+    : '';
+  const operations = rows.length
+    ? `${rows.length} operations: ${[...new Set(rows.map((c) => excerpt(inline(c.name), 24)))].slice(0, 3).join(', ')}${errors.length ? `; ${errors.length} error/unfinished` : ''}`
+    : '';
+  const failure = errors[0]
+    ? `${errors[0].name}: ${errors[0].status}${errors[0].error ? ' ' + excerpt(inline(errors[0].error), 100) : ''}`
+    : '';
+  return {
+    summary: [
+      excerpt(inline(call?.name ?? result?.toolName ?? 'tool'), 48),
+      target,
+      status,
+      operations,
+      diagnostic || failure,
+    ]
+      .filter(Boolean)
+      .join(' · '),
+    children: rows,
+    name: call?.name ?? result?.toolName ?? 'tool',
+  };
 }
 
 export function navigationDocuments(snapshot) {
-  const grouped = new Map();
-  // Selectors still count blocks. The brief/ref unit is the selected text of a
-  // whole assistant message, including metadata split away from those blocks.
-  const textBlocks = new Set(
-    snapshot.units
-      .filter((u) => u.type === 'text' && u.source?.entry_id !== undefined)
-      .map((u) => blockKey(u.source)),
-  );
-  snapshot.units.forEach((u, i) => {
-    const id = key(u, i, textBlocks);
+  const runtime = snapshot.view === 'runtime';
+  const units = runtime ? runtimeUnits(snapshot) : snapshot.units;
+  const content = snapshot.request?.content;
+  const enabled = (kind) =>
+    !content || Array.isArray(content)
+      ? !content?.length || content.includes(kind)
+      : content[kind] !== false && content[kind] !== 0;
+  const blockKinds = new Map(),
+    messageBodies = new Map();
+  for (const unit of units)
+    if (unit.type !== 'message_metadata') {
+      const kind = unit.tool_id ? 'tool' : contentKind(unit.kind ?? unit.type);
+      blockKinds.set(blockKey(unit.source), kind);
+      const message = messageKey(unit.source),
+        previous = messageBodies.get(message);
+      if (!previous || (kind === 'assistant' && previous.kind !== 'assistant'))
+        messageBodies.set(message, { kind, source: unit.source, tool_id: unit.tool_id });
+    }
+  const grouped = new Map(),
+    runs = new Map(),
+    keys = new Map();
+  for (const [i, unit] of units.entries()) {
+    let source = unit.source ?? {},
+      toolId = unit.tool_id;
+    let kind = unit.tool_id ? 'tool' : contentKind(unit.kind ?? unit.type);
+    if (unit.type === 'message_metadata') {
+      const body = messageBodies.get(messageKey(source));
+      kind =
+        blockKinds.get(blockKey(source)) ??
+        body?.kind ??
+        (unit.message?.role === 'assistant' ? 'assistant' : 'native');
+      // Message-level metadata belongs to that message's body, not an empty
+      // native navigation row. Its original source remains in the reference.
+      if (!blockKinds.has(blockKey(source)) && body) {
+        source = body.source;
+        toolId = body.tool_id;
+      }
+    }
+    if (unit.message?.role === 'assistant' && kind === 'native') kind = 'assistant';
+    const message = messageKey(source);
+    let id;
+    if (toolId) {
+      id = `tool:${toolId}`;
+      runs.set(message, { kind: 'tool', index: (runs.get(message)?.index ?? 0) + 1 });
+    } else if (source.reader_item !== undefined) id = `item:${source.reader_item}`;
+    else if (source.entry_id !== undefined || source.observation_index !== undefined) {
+      const block = blockKey(source);
+      id = keys.get(block);
+      if (!id) {
+        const previous = runs.get(message);
+        const run = previous?.kind === kind ? previous.index : (previous?.index ?? 0) + 1;
+        runs.set(message, { kind, index: run });
+        id = `${message}:${kind}:${run}`;
+        keys.set(block, id);
+      }
+    } else id = `unit:${i}`;
+    if (!enabled(contentKind(kind))) continue;
     if (!grouped.has(id))
       grouped.set(id, {
         id,
-        kind: u.tool_id ? 'tool' : (u.kind ?? u.type),
-        source: u.source,
+        kind,
+        source,
+        prompt_id: unit.prompt_id,
+        message,
         indices: [],
+        ...(runtime ? { units: [] } : {}),
       });
-    grouped.get(id).indices.push(i);
+    const doc = grouped.get(id);
+    doc.indices.push(i);
+    if (runtime) doc.units.push(unit);
+  }
+  const docs = [...grouped.values()].sort((a, b) => {
+    const bodyIndex = (doc) =>
+      doc.indices.find((i) => !['message_metadata', 'nested_call'].includes(units[i].type)) ??
+      doc.indices[0];
+    return bodyIndex(a) - bodyIndex(b);
   });
-  const docs = [...grouped.values()];
   for (const doc of [...docs]) {
-    const units = docUnits(snapshot, doc);
+    const values = docUnits(snapshot, doc);
     const body =
-      units.find((u) => !['message_metadata', 'nested_call'].includes(u.type)) ?? units[0];
-    if (doc.kind !== 'tool')
-      doc.kind =
-        doc.source?.observation_index !== undefined &&
-        units.some((u) => u.message?.role === 'toolResult')
-          ? 'tool_result'
-          : (body.kind ?? body.type);
+      values.find((u) => !['message_metadata', 'nested_call'].includes(u.type)) ?? values[0];
     doc.title = body.title;
     doc.preview = body.preview;
     doc.related = body.related;
     doc.branch_relation = body.branch_relation;
-    doc.assistant =
-      (doc.kind === 'text' && body.source?.entry_id !== undefined) ||
-      (doc.kind === 'native' && body.message?.role === 'assistant');
-    if (doc.kind === 'text' && doc.source?.entry_id !== undefined) {
-      const { block_index, ...messageSource } = doc.source;
-      doc.source = messageSource;
-    }
     if (body.provenance) doc.source = { ...doc.source, ...body.provenance };
     if (
       typeof body.provenance?.source_entry_id === 'string' &&
       body.provenance.source_relation === 'history_leaf'
     ) {
-      const position = docs.length;
+      doc.sourceIndex = docs.length;
       docs.push({
         id: `${doc.id}:source`,
         kind: 'source',
@@ -240,49 +389,42 @@ export function navigationDocuments(snapshot) {
           session_id: snapshot.session_id,
           view: 'session',
           leaf_id: body.provenance.source_entry_id,
-          preset: 'recent',
+          range: { recent: 3 },
         },
       });
-      doc.sourceIndex = position;
     }
-    if (doc.kind === 'tool' || doc.kind === 'tool_result') {
-      const tool = toolPreview(units);
+    if (doc.kind === 'tool') {
+      const tool = toolPreview(values);
       doc.title = tool.name;
       doc.preview = tool.summary;
       doc.children = [];
       for (const child of tool.children) {
-        const indices = doc.indices.filter((i) => snapshot.units[i].nested_call?.id === child.id);
-        const position = docs.length;
-        const childDoc = {
+        const childUnits = values.filter((u) => u.nested_call?.id === child.id);
+        const index = docs.length;
+        docs.push({
           id: `${doc.id}:nested:${child.id}`,
           parent: docs.indexOf(doc),
-          kind: 'nested_call',
+          kind: 'tool',
           title: child.name,
           source: doc.source,
-          preview: `${child.name} ${excerpt(JSON.stringify(child.arguments ?? {}), 160)}\n${child.status}${child.error ? ': ' + excerpt(child.error, 240) : ''}`,
-          ...(indices.length
-            ? { indices }
-            : { units: [{ type: 'nested_call', source: doc.source, nested_call: child }] }),
-        };
-        docs.push(childDoc);
-        doc.children.push(position);
+          preview: `${child.name} · ${child.status}${child.error ? ': ' + excerpt(inline(child.error), 140) : ''}`,
+          units: childUnits.length
+            ? childUnits
+            : [{ type: 'nested_call', source: doc.source, nested_call: child }],
+        });
+        doc.children.push(index);
       }
     }
   }
   return docs;
 }
 
-export function navigationRows(
-  snapshot,
-  documents,
-  ref,
-  { query, types, task_order = false } = {},
-) {
+export function navigationRows(snapshot, documents, ref, { query, content } = {}) {
   const matching = documents
     .map((doc, index) => ({ doc, index }))
     .filter(
       ({ doc }) =>
-        (!types?.length || types.includes(doc.kind)) &&
+        (!content?.length || content.includes(contentKind(doc.kind))) &&
         (query
           ? `${doc.title ?? ''}\n${documentText(snapshot, doc)}`
               .toLocaleLowerCase()
@@ -290,23 +432,21 @@ export function navigationRows(
           : doc.parent === undefined),
     );
   const parents = new Set(matching.map(({ doc }) => doc.parent).filter((x) => x !== undefined));
-  let selected = matching.filter(({ index }) => !query || !parents.has(index));
-  if (task_order) {
-    const prompt = selected.findLast(({ doc }) => doc.kind === 'prompt');
-    const answer = selected.findLast(
-      ({ doc, index }) => doc.assistant && (!prompt || index > prompt.index),
+  const selected = matching.filter(({ index }) => !query || !parents.has(index));
+  // Child operations occupy their parent's source position, even though their
+  // reference documents are appended after the top-level document index.
+  if (query)
+    selected.sort(
+      (a, b) => (a.doc.parent ?? a.index) - (b.doc.parent ?? b.index) || a.index - b.index,
     );
-    const priority = new Set([prompt?.index, answer?.index].filter((index) => index !== undefined));
-    const background = selected
-      .filter(({ doc, index }) => !priority.has(index) && ['summary', 'memory'].includes(doc.kind))
-      .reverse();
-    for (const { index } of background) priority.add(index);
-    selected = [
-      ...[prompt, answer].filter(Boolean),
-      ...background,
-      ...selected.filter(({ index }) => !priority.has(index)).reverse(),
-    ];
-  }
+  const latest = new Map();
+  if (!query && snapshot.view !== 'runtime')
+    for (const { doc } of selected)
+      if (
+        doc.kind === 'assistant' &&
+        docUnits(snapshot, doc).some((u) => u.block?.type === 'text' && u.block.text?.trim().length)
+      )
+        latest.set(doc.prompt_id, doc.message);
   return selected.map(({ doc, index }) => {
     const related = (doc.related ?? [])
       .map((link) => {
@@ -321,21 +461,32 @@ export function navigationRows(
     const salient = children.filter((i) =>
       documentText(snapshot, documents[i]).includes('"status":"error"'),
     );
-    for (const i of [...new Set([...salient.slice(0, 3), ...children.slice(-2)])])
+    for (const i of [...new Set([...salient.slice(0, 2), ...children.slice(-2)])])
       related.push({ relation: 'operation', ref: ref(i) });
+    const isLatest =
+      doc.kind === 'assistant' &&
+      doc.prompt_id != null &&
+      latest.get(doc.prompt_id) === doc.message;
+    const full = compact(doc.preview ?? documentText(snapshot, doc));
+    const text = query
+      ? excerpt(documentText(snapshot, doc), 640, query)
+      : isLatest
+        ? excerpt(full, 1600)
+        : doc.kind === 'tool'
+          ? full
+          : excerpt(full, ['input', 'assistant', 'thinking'].includes(doc.kind) ? 1600 : 900);
     return {
       type: doc.kind,
       ref: ref(index),
+      text,
       ...(doc.title ? { title: doc.title } : {}),
-      text: query
-        ? excerpt(documentText(snapshot, doc), 640, query)
-        : excerpt(
-            doc.preview ?? documentText(snapshot, doc),
-            doc.kind === 'prompt' || doc.kind === 'text' ? 1600 : 900,
-          ),
+      ...(text !== full && !query ? { truncated: true } : {}),
+      ...(query && text !== compact(documentText(snapshot, doc)) ? { truncated: true } : {}),
       ...(doc.source ? { source: doc.source } : {}),
       ...(doc.branch_relation ? { branch_relation: doc.branch_relation } : {}),
       ...(related.length ? { related } : {}),
+      _turn: query ? null : (doc.prompt_id ?? null),
+      _latest: isLatest,
     };
   });
 }

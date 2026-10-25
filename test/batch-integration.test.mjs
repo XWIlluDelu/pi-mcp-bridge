@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { test } from 'node:test';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
@@ -11,7 +12,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const item = (op, args) => ({ op, args });
-const completedAnswers = (read) => read.items.filter((record) => record.type === 'text').length;
+const completedAnswers = (read) =>
+  read.items.filter((record) => record.type === 'assistant').length;
 
 test('mixed public MCP batches preserve history across reconnect and isolate item failures and permissions', async (t) => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-batch-rpc-'));
@@ -62,7 +64,7 @@ test('mixed public MCP batches preserve history across reconnect and isolate ite
     const deadline = Date.now() + 10000;
     let read;
     do {
-      read = await call('read', { session_id, preset: 'full' });
+      read = await call('read', { session_id, range: { recent: -1 }, content: ALL_CONTENT });
       if (completedAnswers(read) >= expected) return read;
       await new Promise((resolve) => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
@@ -110,7 +112,7 @@ test('mixed public MCP batches preserve history across reconnect and isolate ite
 
   const operations = [
     item('send', { session_id: a, text: 'PUBLIC_BATCH_FIXTURE' }),
-    item('read', { session_id: a, preset: 'recent', max_bytes: 12000 }),
+    item('read', { session_id: a, range: { recent: 3 }, max_bytes: 12000 }),
     item('create', { project: cwd, text: 'Created inside batch' }),
     item('delete', { session_id: b }),
     item('read', { session_id: 'missing' }),
@@ -146,14 +148,14 @@ test('mixed public MCP batches preserve history across reconnect and isolate ite
 
   await client.close();
   await connect();
-  const read = await call('read', { session_id: a, preset: 'full' });
+  const read = await call('read', { session_id: a, range: { recent: -1 }, content: ALL_CONTENT });
   assert.equal(completedAnswers(read), 2);
   assert.equal(JSON.stringify(read.items).split('PUBLIC_BATCH_FIXTURE').length - 1, 1);
   assert.equal((await call('list', {})).sessions.length, 2);
   const multiple = await call('batch', {
     operations: [
-      item('read', { session_id: a, preset: 'recent' }),
-      item('read', { session_id: c, select: { thinking: 0, tools: 0 } }),
+      item('read', { session_id: a, range: { recent: 3 } }),
+      item('read', { session_id: c, content: { thinking: 0, tool: 0 } }),
     ],
   });
   assert.ok(multiple.results.every((result) => Array.isArray(result.result.items)));

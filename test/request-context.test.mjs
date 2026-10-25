@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -233,7 +234,12 @@ test('scope edits affect new requests, cached IDs and cursor pages without evict
       }),
     ).join('\n') + '\n',
   );
-  const page = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 4096 });
+  const page = await f.bridge.read({
+    session_id: f.id,
+    range: { recent: -1 },
+    content: ALL_CONTENT,
+    max_bytes: 4096,
+  });
   assert.ok(page.next_cursor);
   const expanded = {
     ...f.config,

@@ -196,7 +196,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
       'dispatched',
     );
     await until(
-      async () => (await ok('read', { session_id: id })).items.some((x) => x.type === 'text'),
+      async () => (await ok('read', { session_id: id })).items.some((x) => x.type === 'assistant'),
       'actual TUI response',
     );
     const sessionRule = (c) => c.grants.findLast((r) => r.session_id === id);
@@ -328,7 +328,9 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     );
     await until(
       async () =>
-        (await ok('read', { session_id: created.session_id })).items.some((x) => x.type === 'text'),
+        (await ok('read', { session_id: created.session_id })).items.some(
+          (x) => x.type === 'assistant',
+        ),
       'actual child RPC response',
     );
     assert.equal(
@@ -377,7 +379,7 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     await until(
       async () =>
         (await ok('read', { session_id: headless.session_id })).items.some(
-          (x) => x.type === 'text',
+          (x) => x.type === 'assistant',
         ),
       'headless response after TUI exit',
     );

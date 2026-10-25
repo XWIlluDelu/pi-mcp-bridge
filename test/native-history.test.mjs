@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -48,7 +49,11 @@ for (const version of [1, 2, 3])
     });
     const listed = await bridge.list();
     assert.equal(listed.sessions.length, 1);
-    const read = await bridge.read({ session_id: listed.sessions[0].session_id, preset: 'full' });
+    const read = await bridge.read({
+      session_id: listed.sessions[0].session_id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
     assert.ok(JSON.stringify(read).includes('USER'));
     assert.ok(JSON.stringify(read).includes('NOTE'));
     assert.deepEqual(read.history, { skipped_malformed_lines: 1, unterminated_tail: true });
@@ -107,7 +112,7 @@ test('native missing/empty cwd survives v1/v2/v3 reads without inferred project 
       await fs.writeFile(file, bytes);
       const identity = await readSessionIdentity(file);
       assert.equal(identity.cwd, null);
-      const args = { session_id: identity.id, preset: 'full' };
+      const args = { session_id: identity.id, range: { recent: -1 }, content: ALL_CONTENT };
       assert.ok(JSON.stringify(await bridge.read(args)).includes('NATIVE_NO_CWD'));
       assert.equal((await bridge.list({ session_id: identity.id })).sessions[0].project, null);
       assert.equal(
@@ -166,14 +171,19 @@ test('discarded broken branches do not block native current context; traversed c
     ['root', 'current', 'answer'],
   );
   const id = (await readSessionIdentity(file)).id;
-  const read = await bridge.read({ session_id: id, preset: 'full' });
+  const read = await bridge.read({ session_id: id, range: { recent: -1 }, content: ALL_CONTENT });
   assert.ok(JSON.stringify(read.items).includes('CURRENT'));
   assert.ok(JSON.stringify(read.items).includes('ANSWER'));
   assert.ok(!JSON.stringify(read.items).includes('DISCARDED'));
   assert.equal(read.history.skipped_malformed_lines, 1);
   assert.equal(await fs.readFile(file, 'utf8'), bytes);
   await assert.rejects(
-    bridge.read({ session_id: id, leaf_id: 'cycle-a', preset: 'full' }),
+    bridge.read({
+      session_id: id,
+      leaf_id: 'cycle-a',
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    }),
     /INVALID_SESSION_TREE/,
   );
   await fs.writeFile(file, rows.concat(rows.at(-1)).map(JSON.stringify).join('\n') + '\n');
@@ -305,9 +315,9 @@ test('fork preserves v1/v2/v3 native ancestry and compaction references without 
     await fs.writeFile(file, bytes);
     const source = await readSessionIdentity(file);
     assert.ok(
-      JSON.stringify(await bridge.read({ session_id: source.id, preset: 'full' })).includes(
-        'FORK_SOURCE_ASSISTANT',
-      ),
+      JSON.stringify(
+        await bridge.read({ session_id: source.id, range: { recent: -1 }, content: ALL_CONTENT }),
+      ).includes('FORK_SOURCE_ASSISTANT'),
     );
     const result = await bridge.create({ fork_from: source.id, project, text: 'FORK_TARGET' });
     assert.equal(result.status, 'started', JSON.stringify(result));

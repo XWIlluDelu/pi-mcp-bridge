@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MCP_RESPONSE_LIMIT } from '../src/response-budget.mjs';
@@ -303,10 +304,17 @@ test('batch reads with large shared tool metadata retain complete pageable body 
       .map(JSON.stringify)
       .join('\n') + '\n',
   );
+  const browse = await bridge.read({
+    session_id: made.session_id,
+    range: { recent: -1 },
+    content: ALL_CONTENT,
+  });
+  const tool = browse.items.find((item) => item.type === 'tool');
+  assert.ok(tool.ref);
   const response = await callBridgeTool(bridge, 'batch', {
     operations: Array.from({ length: 10 }, () => ({
       op: 'read',
-      args: { session_id: made.session_id, detail: 'full', preset: 'full', max_bytes: 65536 },
+      args: { refs: [tool.ref], max_bytes: 65536 },
     })),
   });
   assert.ok(!response.isError, JSON.stringify(response));
@@ -328,10 +336,7 @@ test('batch reads with large shared tool metadata retain complete pageable body 
     page = next.structuredContent;
     pages.push(page);
   }
-  const units = pages
-    .reverse()
-    .flatMap((p) => p.items)
-    .filter((u) => u.type === 'tool_result');
+  const units = pages.flatMap((p) => p.items).filter((u) => u.type === 'tool_result');
   assert.equal(
     units
       .flatMap((u) => u.message.content)

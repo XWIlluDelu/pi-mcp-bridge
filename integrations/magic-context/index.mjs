@@ -5,6 +5,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 
+import { contextSelection } from '../../src/read-schema.mjs';
+
 const execFileAsync = promisify(execFile);
 const SCHEMA_VERSION = 95;
 const COLUMNS = {
@@ -319,15 +321,15 @@ export function createMagicContextReader(options) {
         const end = item.source.source_entry_id;
         item.branch_relation = end ? native.entry_relations[end] : 'unknown';
       }
-      const preset = context.request?.preset ?? 'latest';
+      const { content } = contextSelection(context.request ?? {});
       const eligible =
-        preset === 'full'
+        content.summary === -1
           ? summaries
           : summaries.filter((item) => item.branch_relation !== 'off_branch');
-      const selectedSummaries =
-        preset === 'full' ? eligible : eligible.slice(preset === 'recent' ? -4 : -2);
-      const selectedMemories =
-        preset === 'full' ? memories : memories.slice(preset === 'recent' ? -5 : -3);
+      const last = (items, count) =>
+        count === -1 ? items : count === 0 ? [] : items.slice(-count);
+      const selectedSummaries = last(eligible, content.summary);
+      const selectedMemories = last(memories, content.memory);
       const excluded = summaries.length - eligible.length;
       return {
         native: true,

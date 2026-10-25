@@ -86,7 +86,7 @@ The illustrative helpers above belong to the integration, not Bridge core.
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `session`              | Bridge `id`, canonical `file`, native `native_id` and recorded `cwd`.                                                   |
 | `owner`                | Registration `available`, `tools`, `commands` and native `leaf_id`. Missing information is not proof of plugin absence. |
-| `request`              | Parsed initial read arguments, including selection and detail intent. Search acquires the full effective source.        |
+| `request`              | Parsed initial read arguments, including `range` and `content`. Search acquires all matching content kinds.             |
 | `nativeRead(options?)` | In `read`, authorized native acquisition using the same request. Optional `entry_ids` requests branch facts.            |
 
 Owned RPCs, companions and SDK hosts expose native registrations. RPC hosts
@@ -99,9 +99,9 @@ global installation alone does not establish session activation.
 
 A match overrides the default source for both read and search, including saved
 sessions. No match uses Session Context. Explicit `view:"session"` forces native
-acquisition and `view:"runtime"` uses the built-in capture. Native `preset`, `select`
-and `leaf_id` stay with the selected reader: it must honor supported intent or
-reject it. Reading never starts Pi or executes an extension tool to obtain data.
+acquisition and `view:"runtime"` uses the built-in capture. `range`, `content` and
+`leaf_id` stay with the selected reader: it must honor supported intent or reject
+it. Turn range must not silently change the reader's background-content selection. Reading never starts Pi or executes an extension tool to obtain data.
 
 ## Reader content contract
 
@@ -110,7 +110,7 @@ reject it. Reading never starts Pi or executes an extension tool to obtain data.
 | Field             | Meaning                                                                                 |
 | ----------------- | --------------------------------------------------------------------------------------- |
 | `id`              | Unique nonempty ID within this result, up to 256 characters.                            |
-| `kind`            | Content kind, up to 64 characters; returned as the public item `type`.                  |
+| `kind`            | Content kind, up to 64 characters; use the shared content names where applicable.       |
 | `text`            | Full readable text for literal search and reference expansion.                          |
 | `title`           | Optional short label.                                                                   |
 | `preview`         | Optional concise overview; a preview never replaces searchable full text.               |
@@ -118,19 +118,24 @@ reject it. Reading never starts Pi or executes an extension tool to obtain data.
 | `related`         | Optional array of up to 32 `{id,relation}` links to items in the same result.           |
 | `branch_relation` | Optional `on_branch`, `off_branch`, or `unknown` for the item's native source boundary. |
 
+Other reader kinds use the `native` content control and public item type. Their
+original name is retained in `source.content_kind`. Bridge removes disabled
+kinds before serializing the capture and sets their coverage `selected` count
+to zero. The reader remains responsible for content counts, ordering and scope.
+
 Optional `coverage` contains up to 16 `{type,selected,total,excluded?}` rows. Each type is a
 nonempty content-kind string of up to 64 characters; counts are safe nonnegative
 integers with `selected <= total`. `total` counts items in the reader's declared
-source scope before branch or preset selection; `selected` counts the captured
+source scope before branch or content selection; `selected` counts the captured
 items before response pagination or search-result filtering. Bridge
 returns these rows as `reader.coverage` alongside the reader ID. Optional
 `excluded` counts items from that total excluded by selection rules (for example,
-other-branch summaries), before taking the preset limit; it cannot exceed
+other-branch summaries), before applying the content count; it cannot exceed
 `total - selected`.
 
 Use coverage when a default reader selects only a few summaries or memories.
 Increasing the page budget cannot recover items excluded from that capture;
-`recent`, `full`, or a fresh search can request a broader selection. Counts must
+a larger content count, `-1`, or a fresh search can request broader content. Counts must
 not imply coverage of stores, visibility scopes or content kinds the reader does
 not support. Search acquires the full supported effective source; its `matches`
 count is separate from reader coverage.
@@ -158,8 +163,9 @@ evidence but its units are not included. The module interprets its own source
 coordinates and uses `branch_relation` where that distinction helps reading;
 Bridge preserves the marker in brief rows even if other provenance is shortened.
 
-Bridge sanitizes and segments item text, groups it for brief previews, searches the
-full captured text and expands opaque references. Public reader results use
+Bridge sanitizes and segments item text, creates previews, searches the full
+captured text and expands opaque references. Reader item order is preserved;
+appended native units retain their own effective source order. Public reader results use
 `view:"adapted"`, `reader.id` and `source.reader_item`; native units retain native
 locators. When `native:true`, `selection` and `omissions.selection` describe only
 the included Session Context portion. Extension content follows the reader's documented scope;
@@ -184,9 +190,9 @@ Its supported version, storage scope and provenance limits are documented there.
 
 Continuations and ordinary reference expansion use the frozen capture without
 another owner probe or reader call, while rechecking authorization and identity.
-An explicit continuation preset must match the capture's original preset, even
-if two presets happen to return identical content; native selector equivalence
-does not establish reader scope equivalence. See the [read arguments](reading.md#browse-find-and-expand).
+Any explicit continuation range or content fields must agree with the capture.
+Native turn equivalence alone does not establish equivalence of reader background
+selection; summary and memory counts are part of the frozen request. See the [read arguments](reading.md#browse-find-and-expand).
 Multiple matches report `SESSION_READER_CONFLICT`; reader exceptions report
 `SESSION_READER_FAILED` without substituting native content. Before publication,
 Bridge rechecks native identity and applicability, including an owner that appeared

@@ -56,11 +56,13 @@ Connected runtimes also expose `capabilities:{send,command,stop}`. Values are tr
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-`read` defaults to a brief current task/result view, summaries and compact tool
-activity with references. `preset` controls scope: `latest` is the default,
-`recent` adds task background, and `full` selects the full effective source.
-`detail:"full"` returns selected source units instead of previews. `select` adjusts
-Session Context content; `types` filters brief item kinds.
+`read` selects the last three input turns by default and returns content in source
+order. `range:{recent:N,earliest:N}` selects turns; `recent:-1` includes all
+effective turns. `content` independently controls input visibility and message or
+tool counts. Defaults include all assistant text, the latest thinking message and
+one logical tool operation per turn. Tools are short navigation; refs expand the
+captured source. Each turn’s latest assistant text receives priority within the
+page budget without changing display order.
 
 Omit `view` to use a matching configured reader or native projection. Explicit
 `view:"session"` selects Session Context; `view:"runtime"` selects a captured
@@ -71,7 +73,7 @@ Use `search` to find literal, case-insensitive text across one session's full
 supported source, independently of the earlier brief selection:
 
 ```json
-{ "session_id": "ps_…", "query": "retry policy", "types": ["tool", "text"] }
+{ "session_id": "ps_…", "query": "retry policy", "content": ["tool", "assistant"] }
 ```
 
 Expand useful result references with `read`:
@@ -232,7 +234,7 @@ Success returns a `restore_token` and project authorization scope. The manifest 
 {
   "operations": [
     { "op": "send", "args": { "session_id": "ps_A", "text": "Review A" } },
-    { "op": "read", "args": { "session_id": "ps_A", "preset": "recent" } },
+    { "op": "read", "args": { "session_id": "ps_A", "range": { "recent": 3 } } },
     { "op": "send", "args": { "session_id": "ps_B", "text": "Review B" } }
   ]
 }

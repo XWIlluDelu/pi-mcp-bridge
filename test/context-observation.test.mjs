@@ -84,7 +84,7 @@ test('runtime pages share native cleaning, Unicode paging and frozen cursor budg
     (_, i) => 'Paragraph ' + i + ' 漢😀'.repeat(30) + '\n\n',
   ).join('');
   observer.capture({ messages: [{ role: 'user', content: body }] }, ctx);
-  const snapshot = observer.read(args, ctx),
+  const snapshot = { ...observer.read(args, ctx), request: args },
     cache = new ContextReadCache(),
     identity = { session_id: args.session_id, file: 'a', native_id: 'native-a' };
   let page = cache.render(snapshot, { ...args, max_bytes: 4096 }, { identity });
@@ -96,10 +96,10 @@ test('runtime pages share native cleaning, Unicode paging and frozen cursor budg
       captured = cache.get(a, identity);
     page = cache.render(captured.snapshot, a, { ...captured, identity });
     pages.push(page);
+    assert.ok(pages.length < 200, 'pagination must advance');
   }
   assert.equal(
-    [...pages]
-      .reverse()
+    pages
       .flatMap((p) => p.items)
       .map((u) => u.message?.content ?? '')
       .join(''),
@@ -114,12 +114,12 @@ test('runtime pages share native cleaning, Unicode paging and frozen cursor budg
   const cursor = pages[0].next_cursor;
   for (const override of [
     { view: 'session' },
-    { preset: 'full' },
-    { select: { tools: 0 } },
+    { range: { recent: -1 } },
+    { content: { tool: 1 } },
     { leaf_id: null },
   ])
     assert.throws(() => cache.get({ cursor, ...override }, identity), /STALE_CURSOR/);
-  for (const override of [{ preset: 'full' }, { select: {} }, { leaf_id: null }])
+  for (const override of [{ range: { recent: -1 } }, { range: {} }, { leaf_id: null }])
     assert.equal(readSchema.safeParse({ ...args, ...override }).success, false);
 });
 
@@ -132,7 +132,7 @@ test('runtime assistant parts retain completion state without repeating large er
       { messages: [{ role: 'assistant', content: [text(body)], stopReason, errorMessage }] },
       ctx,
     );
-    const snapshot = observer.read(args, ctx),
+    const snapshot = { ...observer.read(args, ctx), request: args },
       cache = new ContextReadCache(),
       identity = { session_id: args.session_id };
     assert.equal(
@@ -147,10 +147,9 @@ test('runtime assistant parts retain completion state without repeating large er
         captured = cache.get(next, identity);
       page = cache.render(captured.snapshot, next, { ...captured, identity });
       pages.push(page);
+      assert.ok(pages.length < 200, 'pagination must advance');
     }
-    const parts = [...pages]
-      .reverse()
-      .flatMap((p) => p.items.filter((unit) => unit.message?.content));
+    const parts = pages.flatMap((p) => p.items.filter((unit) => unit.message?.content));
     assert.ok(parts.every((unit) => unit.message.stopReason === stopReason));
     assert.equal(
       parts

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderContextRead } from './fixtures/read-pages.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 
 const text = (value) => ({ type: 'text', text: value });
 function history(messages) {
@@ -12,10 +12,15 @@ function history(messages) {
   }));
 }
 function read(entries, options = {}) {
-  return renderContextRead(
+  const snapshot = prepareContextRead(
     { header: { id: 'native' }, entries, leafId: entries.at(-1)?.id ?? null },
-    { session_id: 'selection-fixture', max_bytes: 65536, ...options },
+    { session_id: 'selection-fixture', ...options },
   );
+  return {
+    items: snapshot.units,
+    selection: snapshot.selection,
+    omissions: { selection: snapshot.omissions },
+  };
 }
 const user = (content) => ({ role: 'user', content });
 const answer = (content) => ({ role: 'assistant', content: [text(content)] });
@@ -39,7 +44,7 @@ test('tool floods do not displace selected instructions, interior conclusions or
   messages.push(answer('CORRECTION_RESPONSE'), user('continue'), answer('OK'));
   const entries = history(messages),
     before = JSON.stringify(entries);
-  const result = read(entries, { preset: 'full', select: { thinking: 0, tools: 2 } });
+  const result = read(entries, { range: { recent: -1 }, content: { thinking: 0, tool: 2 } });
   for (const marker of [
     'INITIAL_DIRECTION',
     'INTERIOR_INSTRUCTION',
@@ -50,34 +55,85 @@ test('tool floods do not displace selected instructions, interior conclusions or
     assert.ok(JSON.stringify(result).includes(marker), marker);
   assert.deepEqual(
     result.items.filter((r) => r.type === 'tool_call').map((r) => r.call_id),
-    ['tool-0', 'tool-1', 'tool-98', 'tool-99'],
+    ['tool-98', 'tool-99'],
   );
   assert.deepEqual(
     result.items.filter((r) => r.type === 'tool_result').map((r) => r.message.isError),
-    [false, false, true, false],
+    [true, false],
   );
   assert.ok(
     result.items.filter((r) => r.type.startsWith('tool_')).every((r) => r.prompt_id === 'e4'),
   );
-  assert.equal(result.omissions.selection.tools, 96);
-  assert.equal(result.omissions.selection.prompts, 0);
+  assert.equal(result.omissions.selection.tool, 98);
+  assert.equal(result.omissions.selection.input, 0);
   assert.equal(JSON.stringify(entries), before, 'selection does not mutate native history');
 });
 
-test('first/last sampling is source-stable with thousands of blocks and reports intentional omissions', () => {
+test('message counts preserve all text blocks and select thinking independently', () => {
   const content = Array.from({ length: 1000 }, (_, index) => text('BLOCK_' + index));
-  const entries = history([user('task'), { role: 'assistant', content }]);
-  const result = read(entries, { select: { text: 1, thinking: 0, tools: 0 } });
+  const entries = history([
+    user('task'),
+    {
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'EARLIER_THINKING' }, text('old answer')],
+    },
+    { role: 'assistant', content },
+    { role: 'assistant', content: [{ type: 'thinking', thinking: 'LATEST_THINKING' }] },
+  ]);
+  const result = read(entries, { content: { assistant: 1, thinking: 1, tool: 0 } });
+  const body = result.items.filter((record) => record.type === 'text');
+  assert.equal(body.length, 1000);
+  assert.equal(body[0].block.text, 'BLOCK_0');
+  assert.equal(body.at(-1).block.text, 'BLOCK_999');
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'text').map((r) => r.source.block_index),
-    [0, 999],
+    result.items
+      .filter((record) => record.type === 'thinking')
+      .map((record) => record.block.thinking),
+    ['LATEST_THINKING'],
   );
-  assert.equal(result.omissions.selection.text, 998);
-  assert.ok(!JSON.stringify(result).includes('BLOCK_499'));
-  const repeated = read(entries, { select: { text: 1, thinking: 0, tools: 0 }, max_bytes: 4096 });
-  assert.deepEqual(repeated.selection, result.selection);
-  assert.deepEqual(repeated.items, result.items);
-  assert.deepEqual(repeated.omissions.selection, result.omissions.selection);
+  assert.equal(result.omissions.selection.assistant, 1);
+  assert.equal(result.omissions.selection.thinking, 1);
+  assert.ok(!JSON.stringify(result).includes('old answer'));
+  assert.ok(!JSON.stringify(result).includes('EARLIER_THINKING'));
+});
+
+test('hiding input does not remove the selected turn or its assistant messages', () => {
+  const entries = history([
+    user('old input'),
+    answer('old answer'),
+    user('latest input'),
+    answer('latest answer'),
+  ]);
+  const result = read(entries, { range: { recent: 1 }, content: { input: false } });
+  assert.equal(
+    result.items.some((record) => record.type === 'prompt'),
+    false,
+  );
+  assert.deepEqual(
+    result.items.map((record) => record.block.text),
+    ['latest answer'],
+  );
+  assert.equal(result.omissions.selection.turns, 1);
+  assert.equal(result.omissions.selection.input, 2);
+});
+
+test('assistant selection retains a failed thinking-only message independently of thinking', () => {
+  const entries = history([
+    user('task'),
+    answer('earlier progress'),
+    {
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'unfinished reasoning' }],
+      stopReason: 'error',
+      errorMessage: 'provider request failed',
+    },
+  ]);
+  const result = read(entries, { content: { assistant: 1, thinking: 0, tool: 0 } });
+  const failure = result.items.find((record) => record.message?.role === 'assistant');
+  assert.equal(failure.message.stopReason, 'error');
+  assert.equal(failure.message.errorMessage, 'provider request failed');
+  assert.ok(!JSON.stringify(result).includes('unfinished reasoning'));
+  assert.ok(!JSON.stringify(result).includes('earlier progress'));
 });
 
 test('earliest/recent prompt union is independent of surrounding tool count and preserves repeated inputs', () => {
@@ -88,7 +144,7 @@ test('earliest/recent prompt union is independent of surrounding tool count and 
   }
   const entries = history(messages),
     prompts = entries.filter((e) => e.message.role === 'user');
-  const result = read(entries, { select: { earliest_prompts: 2, recent_prompts: 2, tools: 0 } });
+  const result = read(entries, { range: { earliest: 2, recent: 2 }, content: { tool: 0 } });
   assert.deepEqual(
     result.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
     [prompts[0].id, prompts[1].id, prompts[38].id, prompts[39].id],
@@ -97,8 +153,8 @@ test('earliest/recent prompt union is independent of surrounding tool count and 
     result.items.filter((r) => r.type === 'text').map((r) => r.block.text),
     ['answer-0', 'answer-1', 'answer-38', 'answer-39'],
   );
-  assert.equal(result.omissions.selection.prompts, 36);
-  assert.equal(result.omissions.selection.tools, 100);
+  assert.equal(result.omissions.selection.input, 36);
+  assert.equal(result.omissions.selection.tool, 100);
 });
 
 test('native replacement is selected at original source positions without reviving hidden content', () => {
@@ -124,19 +180,19 @@ test('native replacement is selected at original source positions without revivi
     },
     { type: 'context_edit', id: 'hide', parentId: 'replace', targetId: 'e2', replacement: null },
   );
-  const result = read(entries, { select: { thinking: 0, text: 1 } });
+  const result = read(entries, { content: { thinking: 0, assistant: 1 } });
   assert.deepEqual(
     result.items.filter((r) => r.type === 'text').map((r) => r.block.text),
-    ['REPLACEMENT_FIRST', 'REPLACEMENT_LAST'],
+    ['REPLACEMENT_FIRST', 'REPLACEMENT_MIDDLE', 'REPLACEMENT_LAST'],
   );
   assert.deepEqual(
     result.items.filter((r) => r.type === 'text').map((r) => r.source.block_index),
-    [1, 3],
+    [1, 2, 3],
   );
   assert.ok(!JSON.stringify(result).includes('PRIVATE'));
   assert.ok(!JSON.stringify(result).includes('OPAQUE_SIGNATURE'));
   assert.equal(result.omissions.selection.thinking, 1);
-  assert.equal(result.omissions.selection.text, 1);
+  assert.equal(result.omissions.selection.assistant, 0);
   assert.equal(read(entries, { leaf_id: 'e1' }).items.at(-1).block.text, 'ORIGINAL_PRIVATE');
 });
 
@@ -150,7 +206,7 @@ test('failed result remains an orphan after native context edit hides its origin
     targetId: 'e1',
     replacement: null,
   });
-  const result = read(entries, { select: { tools: -1 } }),
+  const result = read(entries, { content: { tool: -1 } }),
     record = result.items.find((r) => r.type === 'tool_result');
   assert.equal(record.pairing, 'orphan_result');
   assert.equal(record.message.isError, true);
@@ -158,7 +214,7 @@ test('failed result remains an orphan after native context edit hides its origin
   assert.equal(record.prompt_id, 'e0');
   assert.ok(!JSON.stringify(result).includes('HIDDEN_COMMAND'));
   assert.equal(
-    read(entries, { select: { tools: 0 } }).items.some((r) => r.type === 'tool_result'),
+    read(entries, { content: { tool: 0 } }).items.some((r) => r.type === 'tool_result'),
     false,
   );
 });
@@ -196,12 +252,9 @@ test('active summaries exclude superseded and context-hidden parts at each nativ
     result.items
       .filter((r) => r.type === 'summary')
       .flatMap((r) => r.parts.map((p) => p.message.summary));
-  assert.deepEqual(summaries(read(entries, { preset: 'recent' })), ['ACTIVE']);
-  assert.deepEqual(summaries(read(entries, { preset: 'recent', leaf_id: 'branch' })), [
-    'ACTIVE',
-    'HIDDEN_BRANCH',
-  ]);
-  assert.deepEqual(summaries(read(entries, { preset: 'recent', leaf_id: 'kept' })), ['SUPERSEDED']);
+  assert.deepEqual(summaries(read(entries, {})), ['ACTIVE']);
+  assert.deepEqual(summaries(read(entries, { leaf_id: 'branch' })), ['ACTIVE', 'HIDDEN_BRANCH']);
+  assert.deepEqual(summaries(read(entries, { leaf_id: 'kept' })), ['SUPERSEDED']);
   assert.deepEqual(summaries(read(entries, { leaf_id: null })), []);
 });
 
@@ -224,7 +277,7 @@ test('split-turn compaction keeps failed/repaired tools and conclusion attached 
     },
     { type: 'message', id: 'new', parentId: 'split', message: user('NEW_CORRECTION') },
   );
-  const result = read(entries, { preset: 'recent', select: { tools: -1 } }),
+  const result = read(entries, { content: { tool: -1 } }),
     prefix = result.items.find((r) => r.type === 'prompt' && r.synthetic);
   assert.equal(prefix.reason, 'context_prefix');
   const records = result.items.filter((r) => ['tool_call', 'tool_result', 'text'].includes(r.type));
@@ -258,7 +311,7 @@ test('selection does not serialize deliberately omitted tool-result payloads', (
         },
       },
     ];
-  const rendered = read(entries, { select: { tools: 0 } });
+  const rendered = read(entries, { content: { tool: 0 } });
   assert.equal(rendered.items.filter((r) => r.type.startsWith('tool_')).length, 0);
-  assert.equal(rendered.omissions.selection.tools, 64);
+  assert.equal(rendered.omissions.selection.tool, 64);
 });

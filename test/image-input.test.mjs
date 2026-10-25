@@ -1,3 +1,5 @@
+import { readSource } from './fixtures/read-source.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -278,10 +280,10 @@ test(
     assert.equal(batch.results[0].result.status, 'started');
     const finalEntries = await completed(made.session_id);
     assert.deepEqual(parseEvidence(lastText(finalEntries)), [imageEvidence(changed)]);
-    const page = await call('read', {
+    const page = await readSource((request) => call('read', request), {
       session_id: made.session_id,
-      detail: 'full',
-      preset: 'full',
+      range: { recent: -1 },
+      content: ALL_CONTENT,
       max_bytes: 65536,
     });
     assert.ok(!JSON.stringify(page).includes(image.data));

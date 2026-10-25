@@ -1,3 +1,5 @@
+import { readSource } from './fixtures/read-source.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -465,9 +467,14 @@ test('same session continues headless after actual TUI exit with history, grants
   });
   assert.equal(first.dispatch, undefined);
   await until(async () => {
-    const r = await f.bridge.read({ session_id: f.id, preset: 'full' });
+    const r = await f.bridge.read({
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
     return (
-      r.items.some((x) => x.type === 'text') && !(await f.bridge.pool.get(f.id).state()).isStreaming
+      r.items.some((x) => x.type === 'assistant') &&
+      !(await f.bridge.pool.get(f.id).state()).isStreaming
     );
   });
   process.kill(launched.record.owner.pid, 'SIGTERM');
@@ -502,8 +509,12 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.notEqual(claim.generation, launched.record.generation);
   assert.equal(f.bridge.pool.instances.size, 1);
   await until(async () => {
-    const r = await f.bridge.read({ session_id: f.id, preset: 'full' });
-    return r.items.filter((x) => x.type === 'text').length === 2;
+    const r = await f.bridge.read({
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
+    return r.items.filter((x) => x.type === 'assistant').length === 2;
   });
   const raw = await loadSavedSession(f.session);
   assert.ok(raw.entries.some((x) => x.customType === 'headless-profile'));
@@ -511,10 +522,10 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.ok(history.includes('PUBLIC_TUI_HISTORY'));
   assert.ok(history.includes('PUBLIC_HEADLESS_CONTINUATION'));
   assert.ok(!history.includes('MUST_NOT_DISPATCH'));
-  const beforeClose = await f.bridge.read({
+  const beforeClose = await readSource(f.bridge, {
     session_id: f.id,
-    detail: 'full',
-    preset: 'full',
+    range: { recent: -1 },
+    content: ALL_CONTENT,
     max_bytes: 65536,
   });
   await f.bridge.close();
@@ -526,10 +537,10 @@ test('same session continues headless after actual TUI exit with history, grants
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     const read = await loadSavedSession(await restarted.session(f.id));
     assert.deepEqual(read.entries, raw.entries);
-    const publicRead = await restarted.read({
+    const publicRead = await readSource(restarted, {
       session_id: f.id,
-      detail: 'full',
-      preset: 'full',
+      range: { recent: -1 },
+      content: ALL_CONTENT,
       max_bytes: 65536,
     });
     assert.deepEqual(publicRead.items, beforeClose.items);
@@ -605,14 +616,15 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   }
   const page = await f.bridge.read({
     session_id: f.id,
-    preset: 'full',
-    detail: 'full',
+    range: { recent: -1 },
+    content: ALL_CONTENT,
     max_bytes: 4096,
   });
   assert.ok(page.next_cursor);
   const beforeReload = await f.bridge.read({
     session_id: f.id,
-    preset: 'full',
+    range: { recent: -1 },
+    content: ALL_CONTENT,
     cursor: page.next_cursor,
   });
   assert.equal(JSON.stringify(await loadSavedSession(f.session)).includes('must skip'), false);
@@ -627,7 +639,8 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   });
   const afterReload = await f.bridge.read({
     session_id: f.id,
-    preset: 'full',
+    range: { recent: -1 },
+    content: ALL_CONTENT,
     cursor: page.next_cursor,
   });
   assert.deepEqual(afterReload.items, beforeReload.items);
@@ -636,7 +649,10 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   const restarted = await new Bridge(f.config).init();
   t.after(() => restarted.close());
 
-  assert.ok((await restarted.read({ session_id: f.id, preset: 'full' })).items.length > 0);
+  assert.ok(
+    (await restarted.read({ session_id: f.id, range: { recent: -1 }, content: ALL_CONTENT })).items
+      .length > 0,
+  );
   const removed = await restarted.delete({ session_id: f.id });
   assert.equal(removed.status, 'deleted');
   assert.equal(await ownerAlive(launched.record.owner), false);
@@ -844,7 +860,7 @@ test('official TUI session replacement registers a fresh identity and socket los
   const launched = await tui(t, f);
   await f.bridge.send({ session_id: f.id, text: 'public fork fixture' });
   await until(async () =>
-    (await f.bridge.read({ session_id: f.id })).items.some((x) => x.type === 'text'),
+    (await f.bridge.read({ session_id: f.id })).items.some((x) => x.type === 'assistant'),
   );
   await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   assert.equal(
@@ -956,7 +972,7 @@ test('standard MCP client attaches to an existing offline TUI through the single
 
     await until(async () => {
       const r = await call('read', { session_id: f.id });
-      return r.items.some((x) => x.type === 'text');
+      return r.items.some((x) => x.type === 'assistant');
     });
     const created = await call('create', {
       project: f.cwd,

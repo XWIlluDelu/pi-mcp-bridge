@@ -17,7 +17,7 @@ export function renderContextRead(data, args) {
     return cache.render(captured.snapshot, args, { ...captured, identity });
   }
   const { live, ...snapshot } = prepareContextRead(data, args);
-  return cache.render(snapshot, args, { identity, live });
+  return cache.render({ ...snapshot, request: args }, args, { identity, live });
 }
 export function assertContextReadResponse(page, args = {}) {
   assert.ok(Buffer.byteLength(JSON.stringify(page), 'utf8') <= (args.max_bytes ?? 24000));
@@ -28,4 +28,4 @@ export function assertContextReadResponse(page, args = {}) {
     assert.equal(typeof item.source.entry_id, 'string');
   }
 }
-export const chronological = (pages) => [...pages].reverse().flatMap((page) => page.items);
+export const chronological = (pages) => pages.flatMap((page) => page.items);
