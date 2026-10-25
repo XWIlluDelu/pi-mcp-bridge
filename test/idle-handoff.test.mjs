@@ -743,7 +743,7 @@ for (const settings of [false, true])
         session_id: f.id,
 
         text: 'IDLE_RACE',
-        mode: settings ? 'default' : 'idle_only',
+        mode: settings ? 'steer' : 'idle_only',
         ...(settings ? { thinking_level: 'off' } : {}),
       });
       assert.equal(result.status, 'rejected');

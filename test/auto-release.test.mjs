@@ -544,7 +544,7 @@ test(
       assert.equal(rpc.child.stdin.writableEnded, false);
       identityGo.resolve();
       const result = await running;
-      assert.equal(result.status, 'accepted');
+      assert.equal(result.status, 'completed');
       assert.equal(result.output, 'NATIVE_OUTPUT');
       await released(f, rpc);
       assert.equal(f.runtimes.length, 1, 'output recovery never reruns or cold-starts the command');
@@ -694,7 +694,7 @@ for (const slow of [false, true])
         assert.equal((await f.bridge.list({ session_id: f.id })).sessions[0].status.state, 'busy');
         await f.mark('finish');
       } else {
-        assert.equal(result.status, 'accepted');
+        assert.equal(result.status, 'completed');
         assert.equal(result.output, 'audit-ok');
       }
       await released(f, rpc);

@@ -34,16 +34,16 @@ test('model metadata allowlist preserves unknown, native unsupported and thinkin
     name: 'Name',
     input: ['text'],
     context_window: 16000,
-    effort: ['off'],
+    thinking_levels: ['off'],
   });
   assert.deepEqual(
-    modelInfo({ ...secret, reasoning: true }).effort,
+    modelInfo({ ...secret, reasoning: true }).thinking_levels,
     getSupportedThinkingLevels({ ...secret, reasoning: true }),
   );
   assert.ok(!JSON.stringify(info).includes('SECRET'));
   const unknown = modelInfo({ provider: 'p', id: 'unknown' });
   assert.equal(unknown.input, null);
-  assert.equal(unknown.effort, null);
+  assert.equal(unknown.thinking_levels, null);
   assert.equal(unknown.context_window, null);
   assert.equal(
     publicSchemas.send.safeParse({
@@ -150,7 +150,7 @@ test(
       ).status,
       'queued',
     );
-    for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
+    for (const mode of ['steer', 'follow_up', 'idle_only']) {
       const result = await bridge.send({
         session_id: id,
 

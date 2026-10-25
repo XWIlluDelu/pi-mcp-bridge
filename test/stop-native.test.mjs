@@ -155,12 +155,15 @@ for (const op of ['send', 'command'])
       });
       assert.equal(
         restarted.results[1].result.status,
-        op === 'send' ? 'started' : 'accepted',
+        op === 'send' ? 'started' : 'completed',
         JSON.stringify(restarted),
       );
       assert.equal(f.bridge.inputs.size, 0);
       await until(() => !f.bridge.pool.get(id) && !f.bridge.autoReleases.size);
-      assert.equal((await f.bridge[op](fresh.args)).status, op === 'send' ? 'started' : 'accepted');
+      assert.equal(
+        (await f.bridge[op](fresh.args)).status,
+        op === 'send' ? 'started' : 'completed',
+      );
     },
   );
 
@@ -212,7 +215,7 @@ async function exerciseBash(f, native) {
     command,
     max_chars: 512,
   });
-  assert.equal(first.status, 'accepted');
+  assert.equal(first.status, 'completed');
   assert.equal(first.native_truncated, false);
   assert.equal(first.exitCode, 0);
   assert.equal(first.response_complete, false);
@@ -243,6 +246,7 @@ async function exerciseBash(f, native) {
 
     command: 'printf nonzero; exit 7',
   });
+  assert.equal(failing.status, 'completed');
   assert.equal(failing.exitCode, 7);
   assert.equal(failing.output, 'nonzero');
   Object.assign(rule, { list: true, read: true, send: true, stop: true });
@@ -265,7 +269,7 @@ async function exerciseBash(f, native) {
     assert.equal((await f.bridge.stop({ session_id: id })).status, 'accepted');
   }
   const cancelled = await bash;
-  assert.equal(cancelled.status, 'accepted');
+  assert.equal(cancelled.status, 'completed');
   assert.equal(cancelled.cancelled, true);
   assert.equal((await native.getState()).sessionId, f.saved.header.id);
 }

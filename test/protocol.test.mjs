@@ -100,10 +100,9 @@ test('modern versions, required metadata and unknown methods use official error 
 test('public mutation payloads are validated before dispatch', async () => {
   const defs = toolDefinitions();
   assert.deepEqual(defs.find((t) => t.name === 'send').inputSchema.properties.mode.enum, [
-    'default',
-    'idle_only',
     'steer',
     'follow_up',
+    'idle_only',
   ]);
   let called = 0;
   const bridge = {

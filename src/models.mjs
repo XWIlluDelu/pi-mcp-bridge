@@ -66,7 +66,7 @@ export function modelInfo(model, getSupportedThinkingLevels) {
     input,
     context_window: numberOrNull(model.contextWindow),
     // This is the same native helper used by AgentSession, not a Bridge guess.
-    effort: reasoning === null ? null : getSupportedThinkingLevels(model),
+    thinking_levels: reasoning === null ? null : getSupportedThinkingLevels(model),
   };
 }
 export function catalogPage(models, args = {}, getSupportedThinkingLevels) {

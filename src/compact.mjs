@@ -53,8 +53,7 @@ export function compactReceipt(value) {
   )
     throw Object.assign(new Error('INVALID_COMPACT_RESULT'), { uncertain: true });
   return {
-    status: 'accepted',
-    completion: 'completed',
+    status: 'completed',
     first_kept_entry_id: value.firstKeptEntryId,
     tokens_before: value.tokensBefore,
     estimated_tokens_after:

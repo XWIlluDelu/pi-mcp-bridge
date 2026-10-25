@@ -216,13 +216,12 @@ test('RPC uses existing demultiplexed public client and preserves ACK dispositio
     },
   };
   const binding = createRpcHostBinding(client);
-  for (const [mode, behavior] of [
-    ['default', 'steer'],
-    ['idle_only', undefined],
-    ['steer', 'steer'],
-    ['follow_up', 'followUp'],
+  for (const [input, behavior] of [
+    [{}, 'steer'],
+    [{ mode: 'idle_only' }, undefined],
+    [{ mode: 'follow_up' }, 'followUp'],
   ]) {
-    assert.deepEqual(await binding.submit({ text: 'public', mode }), {
+    assert.deepEqual(await binding.submit({ text: 'public', ...input }), {
       status: 'accepted',
       disposition,
     });

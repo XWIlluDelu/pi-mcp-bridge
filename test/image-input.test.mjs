@@ -213,7 +213,7 @@ test(
       [image],
     );
 
-    for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
+    for (const mode of ['steer', 'follow_up', 'idle_only']) {
       const args = {
         session_id: made.session_id,
 
