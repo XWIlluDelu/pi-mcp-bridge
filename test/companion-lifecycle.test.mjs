@@ -16,7 +16,7 @@ import {
   RpcClient,
 } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 import { claimFile, readClaim } from '../src/attachments.mjs';
 import { pathToFileURL } from 'node:url';
 import { reserveHostSession } from '../src/host-adapter.mjs';

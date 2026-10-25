@@ -21,7 +21,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => {

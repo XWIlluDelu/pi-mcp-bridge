@@ -1,6 +1,6 @@
 # Public tool API
 
-Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter; native and owner requests retain their internal five-second acknowledgement budgets, not an overall execution deadline. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
+Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter. Native and owner acknowledgements normally have a five-second budget; companion reload waits up to ten seconds for a fresh ready owner. Owned RPC reload follows normal shutdown and startup, including native lifecycle hooks. These waits do not cancel native execution. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
 
 ## Sessions and mutations
 
@@ -14,7 +14,7 @@ Every mutation call is a new operation, including identical calls. There is no d
 | `queued`     | Pi queued a send/create prompt.                                                |
 | `handled`    | Native input handling completed, such as an extension command.                 |
 | `dispatched` | An external owner invoked Pi; its public API cannot report native admission.   |
-| `completed`  | A command or compaction finished and returned its native result.               |
+| `completed`  | A command, compaction or reload finished with the tool's completion evidence.  |
 | `accepted`   | Stop was accepted; `acknowledgement` describes the available native evidence.  |
 | `rejected`   | Definite refusal, explained by `reason`.                                       |
 | `skipped`    | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
@@ -104,6 +104,34 @@ covers retention and authorization.
 ### Compact
 
 `compact({session_id,instructions?,interrupt?})` performs native compaction. It requires `send` and proven idle by default; explicit `interrupt:true` also requires `stop` and may abort the agent even if compaction fails. Success returns bounded completion metadata; summary text requires `read`. See [compaction support and results](model-control.md#manual-compaction-compact).
+
+### Reload
+
+```json
+{ "session_id": "ps_…" }
+```
+
+`reload` requires `send` and refreshes an active owner's Pi resources and Bridge
+companion. It has no interrupt, wait or owner-specific options. It preserves
+saved history and resets extension-local state. The caller can use it after
+`OWNER_READ_REFRESH_REQUIRED` or after changing the owner's resource settings.
+
+| Result                                          | Meaning                                                                                                                                                                               |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `completed`, `owner_version`, `read_compatible` | Native reload finished and Bridge confirmed a fresh ready owner for the same session. The version identifies its Bridge component; compatibility says whether it matches this Bridge. |
+| `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                                        |
+| `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                                                   |
+| `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                                                 |
+| `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh started but completion could not be confirmed. Companion confirmation waits up to ten seconds. Inspect `list/read` before another call.                                       |
+
+`read_compatible:false` means native reload completed but the configured component
+is still a different Bridge version. Correct the component path before reloading
+again. Repeated calls perform another reload; they are not status lookups.
+
+Current ordinary TUI/RPC companions and Bridge-owned RPCs support reload. Host
+adapters are not restarted by this operation. Old companions without this feature
+need one native `/reload` or host-managed reopen to load it. See the
+[reload lifecycle](runtime.md#remote-reload) for ownership and admission boundaries.
 
 ### Send
 

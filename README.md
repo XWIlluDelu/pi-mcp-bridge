@@ -6,7 +6,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 
 - List authorized sessions, read recent turns in source order, search effective context and expand referenced messages or evidence.
 - Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
-- Send text and images, run native shell commands, select model/thinking settings, compact context and stop work.
+- Send text and images, run native shell commands, select model/thinking settings, compact context, reload idle sessions and stop work.
 - Create or fork saved sessions, optionally sending a first task, and move deleted sessions to recoverable trash while retaining project files.
 - Notify ChatGPT Work chats and dots when an owned RPC or connected TUI/RPC companion settles, with a short result excerpt and pinned native reading arguments.
 - Batch independent operations and apply seven separate permissions at default, project and session tiers.
@@ -43,7 +43,7 @@ For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for s
 
 Cold resume uses the owner's native settings, authentication, tools, extensions and project configuration. Bridge-owned RPCs release when their work is safely idle and resume saved sessions for later work.
 
-[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to register ordinary TUI/RPC owners. New extension settings take effect when loaded by the running process. To open a Bridge session in a native TUI:
+[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to register ordinary TUI/RPC owners. Use [`reload({session_id})`](docs/api.md#reload) to apply resource changes to a supported idle owner; a companion without reload support needs one native refresh first. To open a Bridge session in a native TUI:
 
 ```sh
 node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID

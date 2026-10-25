@@ -55,6 +55,7 @@ const enums = {
     'get_available_models',
     'get_available_thinking_levels',
     'compact',
+    'reload',
     'health',
     'list',
     'read',

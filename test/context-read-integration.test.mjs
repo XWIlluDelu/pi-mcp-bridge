@@ -16,7 +16,7 @@ import { makeServer } from '../src/server.mjs';
 import { assertContextReadResponse, chronological } from './fixtures/read-pages.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { reserveOwner, updateOwner } from '../src/attachments.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';

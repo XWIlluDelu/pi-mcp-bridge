@@ -50,20 +50,21 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 
 ## Runtime capabilities
 
-| Capability              | Bridge-owned RPC                    | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
-| ----------------------- | ----------------------------------- | ----------------------------------------------------- | --------------------------------------- |
-| Read context            | Session + runtime                   | Session + runtime                                     | Session projection; runtime unavailable |
-| Live text/thinking      | Native delta events                 | Public extension events                               | When supplied by the host               |
-| Send text/images        | Native ACK                          | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
-| Standalone `set_model`  | Native setters; busy supported      | Public setters; busy supported                        | Native setters; busy supported          |
-| Prompt + model/thinking | Proven-idle only                    | Unsupported                                           | Unsupported                             |
-| Native command / stop   | Including queued-input withdrawal   | Unsupported                                           | Yes                                     |
-| Manual compact          | Idle by default; explicit interrupt | Explicit interrupt                                    | Explicit interrupt                      |
-| TUI handoff             | Drain, normal EOF, reserved join    | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
-| Completion events       | Native settlement                   | Native settlement with the owner profile              | Unsupported                             |
+| Capability              | Bridge-owned RPC                     | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
+| ----------------------- | ------------------------------------ | ----------------------------------------------------- | --------------------------------------- |
+| Read context            | Session + runtime                    | Session + runtime                                     | Session projection; runtime unavailable |
+| Live text/thinking      | Native delta events                  | Public extension events                               | When supplied by the host               |
+| Send text/images        | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
+| Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
+| Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
+| Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
+| Manual compact          | Idle by default; explicit interrupt  | Explicit interrupt                                    | Explicit interrupt                      |
+| Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | Unsupported                             |
+| TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
+| Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
 Saved reads need no writer. Send, command, compact and `set_model` may cold-start
-an RPC; stop, read, search and list do not. Model catalogs are independent of session
+an RPC; reload, stop, read, search and list do not. Model catalogs are independent of session
 owners. See [native controls](model-control.md) and [read formats](reading.md).
 
 After prompt/control work, an owned RPC normally exits by EOF once ACKs, native
@@ -91,6 +92,35 @@ while busy. `follow_up` uses the native follow-up queue while busy. Idle-only ch
 queues, plus unfinished SDK prompt promises including input preparation. It skips
 busy work instead of queueing it. Remote companion/host inputs refuse
 `/bridge-join` and collision aliases; join remains owner-local.
+
+## Remote reload
+
+[`reload({session_id})`](api.md#reload) uses `send` permission and acts only on an
+active owner. `list.status.capabilities.reload` reports support. Busy work is refused, including pending input and admitted control
+operations; there is no interrupt option or deferred reload. A saved session is
+left saved, and an explicit local pause remains in force.
+
+An ordinary companion invokes Pi's native resource reload. Its old endpoint
+closes during `session_shutdown`; the claim continues blocking other writers
+until `session_start` publishes a fresh ready generation for the same session.
+Bridge confirms that registration, waits for the native reload handler to finish,
+and reports its component version. The companion observes public SDK operation
+lifetimes so asynchronous input preparation and standalone bash also block reload;
+new operations are refused while resources are being replaced. A closed
+socket or an input acknowledgement alone is not completion evidence. An owned
+RPC exits normally and starts a fresh worker with current resources. Native
+shutdown/startup hooks are allowed to finish; Bridge does not kill them on a timer.
+
+Reload preserves saved messages and resets extension-local state, including the
+previous Runtime Context capture. It reads the owner's configured resources;
+it does not rewrite extension paths. A successful reload can therefore return
+`read_compatible:false` when those paths still select an older Bridge component.
+
+Host adapters remain under their host's lifecycle and return
+`RELOAD_UNSUPPORTED`; Bridge never restarts a host implicitly. An ordinary RPC
+process using the companion is supported without taking over its pipes. Existing
+companions without reload capability need one native reload or host-managed
+reopen before this operation becomes available.
 
 ## Model settings and compaction
 

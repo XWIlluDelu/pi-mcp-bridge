@@ -25,7 +25,7 @@ import {
   attachedPromptResult,
 } from './prompt-input.mjs';
 import { ContextReadCache } from './read-cache.mjs';
-import { prepareContextRead } from './context-read.mjs';
+import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { CompatibilityModules } from './compatibility.mjs';
 import { CompatibilityServices } from './compatibility-services.mjs';
 import { captureSessionRead } from './session-readers.mjs';
@@ -309,6 +309,9 @@ export class Bridge {
   stop(args, options) {
     return this.#mutation('stop', args, options, this.#stop);
   }
+  reload(args, options) {
+    return this.#mutation('reload', args, options, this.#reload);
+  }
   compact(args, options) {
     return this.#mutation('compact', args, options, this.#compact);
   }
@@ -340,6 +343,60 @@ export class Bridge {
     const settled = () => this.pendingMutations.delete(work);
     work.then(settled, settled);
     return work;
+  }
+  async #reload(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
+    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
+      requestContext = await (requestContext ?? this.captureRequestContext());
+      this.assertOpen();
+      const session = await this.session(args.session_id, requestContext);
+      this.check('send', session, requestContext);
+      return this.mutationLock(session.id, 'send', requestContext, async () => {
+        let runtime,
+          marker,
+          replacementStarted = false;
+        try {
+          checkInput();
+          if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
+          runtime = await this.pool.forRead(session);
+          if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
+          if (runtime.attached) return await runtime.reload(checkInput);
+          if (!(runtime instanceof PiRpc)) throw new Error('RELOAD_UNSUPPORTED');
+          await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
+          checkInput();
+          if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
+          marker = { kind: 'reload', controller: new AbortController() };
+          this.handoffs.set(session.id, marker);
+          runtime.handoffPending = true;
+          await runtime.gracefulExit(marker.controller.signal);
+          replacementStarted = true;
+          this.pool.instances.delete(session.id);
+          checkInput();
+          const replacement = await this.pool.resolve(session);
+          markForAutoRelease(replacement);
+          if (!(replacement instanceof PiRpc) || replacement === runtime)
+            throw new Error('RELOAD_UNCONFIRMED');
+          const version = replacement.ownerRecord?.readContract;
+          if (version !== READ_CONTRACT) throw new Error('RELOAD_UNCONFIRMED');
+          return { status: 'completed', owner_version: version, read_compatible: true };
+        } catch (error) {
+          const uncertain = error.uncertain || replacementStarted || runtime?.gracefulExitPromise;
+          return {
+            status: uncertain ? 'unknown' : 'rejected',
+            reason: [
+              'RUNTIME_BUSY',
+              'MODEL_SELECTION_PENDING',
+              'PROMPT_ADMISSION_PENDING',
+              'RELOAD_IN_PROGRESS',
+            ].includes(error.code ?? error.message)
+              ? 'RELOAD_BUSY'
+              : safeReason(error),
+          };
+        } finally {
+          if (marker && this.handoffs.get(session.id) === marker) this.handoffs.delete(session.id);
+          if (marker && runtime && !runtime.gracefulExitPromise) runtime.handoffPending = false;
+        }
+      });
+    });
   }
   async #compact(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
     return this.withInput(args.session_id, pendingInput, async (checkInput) => {

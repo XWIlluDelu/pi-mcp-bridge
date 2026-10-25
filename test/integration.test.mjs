@@ -216,6 +216,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
       'list',
       'models',
       'read',
+      'reload',
       'search',
       'send',
       'set_model',

@@ -23,7 +23,7 @@ async function until(fn, label) {
   }
   throw new Error('Deadline: ' + label);
 }
-test('human Pi menu changes live session/project permissions enforced by actual MCP and Pi runtimes', async () => {
+test('remote TUI reload preserves history and native permission menus still govern MCP operations', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-ui-'));
   const cwd = path.join(dir, 'project'),
     childFolder = path.join(cwd, 'child'),
@@ -198,6 +198,37 @@ test('human Pi menu changes live session/project permissions enforced by actual 
     await until(
       async () => (await ok('read', { session_id: id })).items.some((x) => x.type === 'assistant'),
       'actual TUI response',
+    );
+    await until(
+      async () => (await ok('list', { session_id: id })).sessions[0]?.status.state === 'idle',
+      'TUI settled before remote reload',
+    );
+    const messageEntries = async () =>
+      (await fs.readFile(session.file, 'utf8'))
+        .trim()
+        .split('\n')
+        .map(JSON.parse)
+        .filter((entry) => entry.type === 'message');
+    const beforeReload = await messageEntries();
+    const previousOwner = owner;
+    const reloaded = await ok('reload', { session_id: id });
+    assert.equal(reloaded.status, 'completed', JSON.stringify(reloaded));
+    assert.equal(reloaded.owner_version, client.getServerVersion().version);
+    assert.equal(reloaded.read_compatible, true);
+    owner = await readClaim(config.attachmentDir, session);
+    for (const field of ['pid', 'start', 'boot'])
+      assert.equal(
+        owner.owner[field],
+        previousOwner.owner[field],
+        'Reload retains the exact native process',
+      );
+    assert.notEqual(owner.generation, previousOwner.generation);
+    assert.equal(owner.phase, 'ready');
+    assert.deepEqual(await messageEntries(), beforeReload, 'Reload preserves saved messages');
+    const afterReload = await ok('read', { session_id: id });
+    assert.ok(afterReload.items.some((item) => item.type === 'assistant'));
+    assert.ok(
+      afterReload.items.some((item) => item.text?.includes('PUBLIC_OWNER_SESSION_FIXTURE')),
     );
     const sessionRule = (c) => c.grants.findLast((r) => r.session_id === id);
     await edit(0, 3, 0, (c) => sessionRule(c)?.command === true);

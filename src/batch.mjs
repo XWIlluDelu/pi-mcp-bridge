@@ -101,7 +101,7 @@ export async function executeBatch(bridge, input, { requestContext } = {}) {
         return Promise.resolve();
       }
     }
-    const pendingInput = ['send', 'command', 'compact'].includes(op)
+    const pendingInput = ['send', 'command', 'compact', 'reload'].includes(op)
       ? bridge.registerInput(sessionId)
       : undefined;
     if (pendingInput) inputs.add(pendingInput);

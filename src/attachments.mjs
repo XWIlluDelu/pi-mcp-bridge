@@ -17,6 +17,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { assertReadFeatures } from './read-features.mjs';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
@@ -398,7 +399,7 @@ export class AttachedRuntime {
     );
   }
   async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
-    const mutating = ['set_model', 'send', 'stop', 'bash', 'compact'].includes(op);
+    const mutating = ['set_model', 'send', 'stop', 'bash', 'compact', 'reload'].includes(op);
     const serialized =
       JSON.stringify({
         op,
@@ -433,6 +434,7 @@ export class AttachedRuntime {
       'imagesSupported',
       'readContract',
       'completionSocket',
+      'reloadSupported',
     ];
     if (
       Object.keys(current).some((key) => !fields.includes(key)) ||
@@ -513,6 +515,11 @@ export class AttachedRuntime {
             else throw new Error();
             return;
           }
+          if (
+            op === 'reload' &&
+            ['RELOAD_BUSY', 'RELOAD_IN_PROGRESS', 'RELOAD_UNSUPPORTED'].includes(response.error)
+          )
+            return finish(new AttachmentFailure(response.error));
           if (
             op === 'compact' &&
             [
@@ -671,6 +678,67 @@ export class AttachedRuntime {
       error.uncertain = true;
       throw error;
     }
+  }
+  async reload(beforeDispatch) {
+    if (this.record.reloadSupported !== true) throw new AttachmentFailure('RELOAD_UNSUPPORTED');
+    try {
+      const receipt = await this.request('reload', {}, 5000, beforeDispatch);
+      if (receipt?.reloading !== true)
+        throw new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE', true);
+    } catch (error) {
+      if (!error.uncertain) throw error;
+      // Native reload closes the old endpoint. A lost ACK does not establish
+      // failure; confirm only the replacement belonging to this exact owner.
+    }
+    try {
+      const original = this.record;
+      const deadline = Date.now() + 10000;
+      while (Date.now() < deadline) {
+        const current = await readClaim(this.config.attachmentDir, this.session);
+        if (
+          !current ||
+          current.file !== original.file ||
+          current.sessionId !== original.sessionId ||
+          current.kind !== original.kind ||
+          current.mode !== original.mode ||
+          current.owner?.pid !== original.owner.pid ||
+          current.owner?.start !== original.owner.start ||
+          current.owner?.boot !== original.owner.boot ||
+          !(await ownerAlive(original.owner))
+        )
+          break;
+        if (current.generation !== original.generation && current.phase === 'ready') {
+          if (typeof current.readContract !== 'string') break;
+          const replacement = new AttachedRuntime(this.config, this.session, current, {
+            compatibility: this.compatibility,
+          });
+          try {
+            const state = await replacement.state(
+              Math.max(1, Math.min(1000, deadline - Date.now())),
+            );
+            if (state.sessionFile !== original.file || state.sessionId !== original.sessionId)
+              break;
+            if (
+              (await readClaim(this.config.attachmentDir, this.session))?.generation !==
+              current.generation
+            )
+              break;
+            if (state.reloadComplete === true)
+              return {
+                status: 'completed',
+                owner_version: current.readContract,
+                read_compatible: current.readContract === READ_CONTRACT,
+              };
+          } catch (error) {
+            if (error.code === 'RUNTIME_SESSION_CHANGED') break;
+          }
+        }
+        await delay(25);
+      }
+    } catch {
+      // Once dispatched, an unreadable replacement cannot prove rejection.
+    }
+    throw new AttachmentFailure('RELOAD_UNCONFIRMED', true);
   }
   compact(body, timeout, beforeDispatch) {
     return this.request('compact', body, timeout, beforeDispatch);

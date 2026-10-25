@@ -53,12 +53,14 @@ function runtimeCapabilities(runtime, state) {
     // declared by the owner; AttachedRuntime's wrappers do not prove support.
     return {
       send: true,
+      reload: runtime.record?.reloadSupported === true,
       command: host ? state.capabilities.command : false,
       stop: host ? state.capabilities.stop : false,
     };
   }
   return {
     send: typeof runtime.command === 'function',
+    reload: runtime.ownerRecord?.kind === 'rpc',
     command: typeof runtime.executeBash === 'function',
     stop: typeof runtime.stopExecution === 'function',
   };
