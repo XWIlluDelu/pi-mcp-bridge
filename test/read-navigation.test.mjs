@@ -607,9 +607,9 @@ async function bridgeFixture(t) {
   let acquisitions = 0;
   bridge.pool.forRead = async () => ({
     generation: 'fixture',
-    entries: async () => {
+    read: async (args) => {
       acquisitions++;
-      return { entries, leafId: 'a2' };
+      return prepareContextRead({ entries, leafId: 'a2' }, args, { buildSessionProjection });
     },
   });
   return {

@@ -79,12 +79,7 @@ export class PiRpc {
     this.inputActivitySequence = 0;
     this.modelMutation = null;
     this.compactionMutation = null;
-    this.settlement = {
-      generation: this.generation,
-      sequence: 0,
-      observed_at: null,
-      aborted: null,
-    };
+    this.settlementSequence = 0;
     this.requiredSettlementSequence = 0;
     this.launchSettled = Promise.withResolvers();
   }
@@ -276,15 +271,9 @@ export class PiRpc {
       }
       return;
     }
-    if (event.type === 'agent_start')
-      this.requiredSettlementSequence = this.settlement.sequence + 1;
+    if (event.type === 'agent_start') this.requiredSettlementSequence = this.settlementSequence + 1;
     if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
-      this.settlement = {
-        generation,
-        sequence: this.settlement.sequence + 1,
-        observed_at: new Date().toISOString(),
-        aborted: event.aborted,
-      };
+      this.settlementSequence++;
       this.onIdleCandidate?.();
       return; // Settlement alone never clears an unresolved prompt ACK fence.
     }
@@ -327,7 +316,7 @@ export class PiRpc {
     )
       this.requiredSettlementSequence = Math.max(
         this.requiredSettlementSequence,
-        (req.settlementSequence ?? this.settlement.sequence) + 1,
+        (req.settlementSequence ?? this.settlementSequence) + 1,
       );
     if (
       this.compactionMutation?.id === event.id &&
@@ -475,7 +464,7 @@ export class PiRpc {
         onLate: onLate && diagnostics.bind(onLate),
         generation,
         commandType: command.type,
-        settlementSequence: this.settlement.sequence,
+        settlementSequence: this.settlementSequence,
         written: false,
         timedOut: false,
         log: diagnostics.capture(),
@@ -573,7 +562,7 @@ export class PiRpc {
       this.promptAdmission ||
       this.modelMutation ||
       this.compactionMutation ||
-      this.settlement.sequence < this.requiredSettlementSequence ||
+      this.settlementSequence < this.requiredSettlementSequence ||
       [...this.pending.values()].some(
         (r) =>
           ![

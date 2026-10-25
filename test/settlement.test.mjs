@@ -2,23 +2,25 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PiRpc } from '../src/rpc.mjs';
 
-test('settled observations are session-wide and scoped to the exact runtime generation', () => {
+test('settlement advances only for the current generation and preserves pending admission', () => {
   const rpc = new PiRpc({}, {});
-  const initial = { ...rpc.settlement };
+  rpc.receiveResponse({ type: 'agent_start' }, rpc.generation);
   rpc.receiveResponse({ type: 'agent_settled', aborted: false }, 'retired-generation');
   rpc.receiveResponse({ type: 'agent_settled' }, rpc.generation);
-  assert.deepEqual(rpc.settlement, initial);
+  assert.equal(rpc.settlementSequence, 0);
+  assert.equal(rpc.hasUnsettledWork(), true);
   rpc.promptAdmission = { id: 'unresolved', generation: rpc.generation };
   rpc.receiveResponse({ type: 'agent_settled', aborted: false }, rpc.generation);
-  assert.equal(rpc.settlement.sequence, 1);
-  assert.equal(rpc.settlement.aborted, false);
-  assert.ok(Number.isFinite(Date.parse(rpc.settlement.observed_at)));
+  assert.equal(rpc.settlementSequence, 1);
   assert.equal(rpc.promptAdmission.id, 'unresolved');
+  assert.equal(rpc.hasUnsettledWork(), true);
+  rpc.promptAdmission = null;
+  assert.equal(rpc.hasUnsettledWork(), false);
+  rpc.receiveResponse({ type: 'agent_start' }, rpc.generation);
   rpc.receiveResponse({ type: 'agent_settled', aborted: true }, rpc.generation);
-  assert.equal(rpc.settlement.sequence, 2);
-  assert.equal(rpc.settlement.aborted, true);
+  assert.equal(rpc.settlementSequence, 2);
+  assert.equal(rpc.hasUnsettledWork(), false);
   const replacement = new PiRpc({}, {});
   assert.notEqual(replacement.generation, rpc.generation);
-  assert.equal(replacement.settlement.sequence, 0);
-  assert.equal(replacement.settlement.observed_at, null);
+  assert.equal(replacement.settlementSequence, 0);
 });

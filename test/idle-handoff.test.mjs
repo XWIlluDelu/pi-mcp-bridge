@@ -330,7 +330,7 @@ test(
         state.pendingMessageCount === 0 &&
         observed.isIdle &&
         !observed.hasPendingMessages &&
-        rpc.settlement.sequence >= rpc.requiredSettlementSequence
+        rpc.settlementSequence >= rpc.requiredSettlementSequence
       );
     }, 'native settled and queues drained');
     // All queued RPC work is accounted for by ACK and settlement evidence.
@@ -481,7 +481,7 @@ test(
     );
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
-    await until(() => rpc.settlement.sequence === 1);
+    await until(() => rpc.settlementSequence === 1);
     assert.equal((await rpc.state()).isStreaming, false);
     assert.ok(rpc.promptAdmission);
     let done = false;
@@ -495,7 +495,7 @@ test(
     assert.equal(await ownerAlive(old.owner), true);
     await f.mark('preflight-go');
     await joined;
-    assert.equal(rpc.settlement.sequence, 2);
+    assert.equal(rpc.settlementSequence, 2);
     assert.equal(rpc.child.exitCode, 0);
     const raw = await fs.readFile(f.session.file, 'utf8');
     assert.ok(raw.includes('HELD_PREFLIGHT'));
@@ -521,7 +521,7 @@ test(
     const rpc = f.bridge.pool.get(f.id);
     await until(() => exists(path.join(f.dir, 'settled-hook')));
     assert.equal((await rpc.state()).isStreaming, false);
-    assert.equal(rpc.settlement.sequence, 0);
+    assert.equal(rpc.settlementSequence, 0);
     let done = false;
     const joined = transfer(f).then((x) => {
       done = true;
@@ -533,7 +533,7 @@ test(
     assert.equal(rpc.gracefulExitPromise, undefined);
     await f.mark('settled-go');
     await joined;
-    assert.equal(rpc.settlement.sequence, 1);
+    assert.equal(rpc.settlementSequence, 1);
     await cancel(f);
   },
 );
@@ -629,7 +629,7 @@ test(
     assert.equal(rpc.gracefulExitPromise, undefined);
     await f.mark('external-go');
     assert.equal((await joining).status, 'reserved');
-    assert.equal(rpc.settlement.sequence, 1);
+    assert.equal(rpc.settlementSequence, 1);
     assert.equal(rpc.child.exitCode, 0);
     assert.equal(rpc.child.signalCode, null);
     await cancel(f);

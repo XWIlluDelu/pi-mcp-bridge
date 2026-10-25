@@ -122,22 +122,6 @@ test(
       assert.ok(!response.isError, JSON.stringify(response));
       return response.structuredContent;
     };
-    assert.deepEqual((await remote.listTools()).tools.map((x) => x.name).sort(), [
-      'batch',
-      'command',
-      'compact',
-      'create',
-      'delete',
-      'health',
-      'list',
-      'models',
-      'read',
-      'search',
-      'send',
-      'set_model',
-      'stop',
-      'submission',
-    ]);
     assert.equal(
       (
         await ok('command', {

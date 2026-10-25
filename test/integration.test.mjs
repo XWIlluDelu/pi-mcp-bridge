@@ -3,6 +3,7 @@ import { aiEntry } from './fixtures/pi.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { test } from 'node:test';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
@@ -125,6 +126,11 @@ test('real Pi SDK with faux provider sends, persists, reads and resumes (no real
       alive: true,
       state: async () => ({ isStreaming: session.isStreaming, isCompacting: session.isCompacting }),
       entries: async () => ({ entries: manager.getEntries(), leafId: manager.getLeafId() }),
+      read: async (args) =>
+        prepareContextRead(
+          { ...saved, entries: manager.getEntries(), leafId: manager.getLeafId() },
+          args,
+        ),
       command: async (command) =>
         new Promise((resolve, reject) => {
           const task = session

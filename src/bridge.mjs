@@ -715,20 +715,8 @@ export class Bridge {
       : this.readCache.render(snapshot, args, renderOptions);
   }
   async acquireNativeRead(session, runtime, args) {
-    if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
-      return runtime.read(args);
-    if (runtime) {
-      const active = await runtime.entries();
-      if (
-        !active.entries.every((entry) => typeof entry.id === 'string' && entry.id.length <= 128) ||
-        !(
-          active.leafId === null ||
-          (typeof active.leafId === 'string' && active.leafId.length <= 128)
-        )
-      )
-        throw new Error('INVALID_RUNTIME_ENTRIES');
-      session = { ...session, entries: active.entries, leafId: active.leafId, live: active.live };
-    } else session = await loadSavedSession(session, { omitImageData: true, config: this.config });
+    if (runtime) return runtime.read(args);
+    session = await loadSavedSession(session, { omitImageData: true, config: this.config });
     return prepareContextRead(session, args, {
       ...(await nativeSdk(this.config, launchProfile(this.config).env)),
       readAdapters: this.compatibilityServices.readInputs.snapshot(),

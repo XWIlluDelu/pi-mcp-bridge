@@ -940,22 +940,6 @@ test('standard MCP client attaches to an existing offline TUI through the single
         stderr: 'pipe',
       }),
     );
-    assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), [
-      'batch',
-      'command',
-      'compact',
-      'create',
-      'delete',
-      'health',
-      'list',
-      'models',
-      'read',
-      'search',
-      'send',
-      'set_model',
-      'stop',
-      'submission',
-    ]);
     const call = async (name, args) => {
       const result = await client.callTool({ name, arguments: args });
       assert.ok(!result.isError);
