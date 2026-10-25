@@ -219,7 +219,7 @@ test('live registration is target-specific and still requires the matching proje
   assert.equal(await reader.matches({ ...f.context, owner }), false);
 });
 
-test('stored content uses brief/detail tiers and honest source relationships without database writes', async (t) => {
+test('stored summaries use existing MC tiers and source relationships without database writes', async (t) => {
   const f = await fixture(t);
   f.compartment();
   f.compartment({ id: 2, sequence: 2, p2: '', p3: 'Second decision', rebase_status: 'unresolved' });
@@ -242,7 +242,10 @@ test('stored content uses brief/detail tiers and honest source relationships wit
   const before = await fs.readFile(f.database);
   const reader = createMagicContextReader({ database: f.database });
   assert.equal(await reader.matches(f.context), true);
-  const result = await reader.read({ ...f.context, request: { preset: 'full' } });
+  const result = await reader.read({
+    ...f.context,
+    request: { content: { summary: -1, memory: -1 } },
+  });
   assert.equal(result.native, true);
   assert.deepEqual(
     result.items.map((item) => item.id),
@@ -284,44 +287,48 @@ test('stored content uses brief/detail tiers and honest source relationships wit
   );
 });
 
-test('presets select real summaries and eligible memories, excluding empty boundary markers', async (t) => {
+test('content counts select stored summaries and eligible memories independently of turn range', async (t) => {
   const f = await fixture(t);
   for (let id = 1; id <= 6; id++) f.compartment({ id, sequence: id });
-  for (let id = 1; id <= 8; id++) {
+  for (let id = 1; id <= 8; id++)
     f.memory({ id, importance: id === 2 ? 95 : 50, updated_at: id * 1000 });
-  }
   f.compartment({ id: 7, session_id: 'other-session' });
-  // MC keeps all-empty compartments to track excluded raw rows, not as summaries.
   for (const id of [8, 9])
     f.compartment({ id, sequence: id, title: '', content: '', p1: null, p2: null, p3: null });
   f.memory({ id: 9, status: 'archived' });
   f.memory({ id: 10, project_path: 'other-project' });
   const reader = createMagicContextReader({ database: f.database });
-  for (const detail of ['brief', 'full']) {
-    for (const [preset, compartmentIds, memoryIds] of [
-      [undefined, [5, 6], [7, 8, 2]],
-      ['latest', [5, 6], [7, 8, 2]],
-      ['recent', [3, 4, 5, 6], [5, 6, 7, 8, 2]],
-      ['full', [1, 2, 3, 4, 5, 6], [1, 3, 4, 5, 6, 7, 8, 2]],
-    ]) {
-      const result = await reader.read({ ...f.context, request: { preset, detail } });
-      assert.deepEqual(
-        result.items.map((item) => item.id),
-        [
-          ...compartmentIds.map((id) => `compartment:${id}`),
-          ...memoryIds.map((id) => `memory:${id}`),
-        ],
-      );
-      assert.deepEqual(result.coverage, [
-        { type: 'summary', selected: compartmentIds.length, total: 6 },
-        { type: 'memory', selected: memoryIds.length, total: 8 },
-      ]);
-      assert.ok(result.items.every((item) => item.text.length > 0));
-    }
+  for (const [content, compartmentIds, memoryIds] of [
+    [undefined, [5, 6], [7, 8, 2]],
+    [{ summary: 4, memory: 5 }, [3, 4, 5, 6], [5, 6, 7, 8, 2]],
+    [{ summary: -1, memory: -1 }, [1, 2, 3, 4, 5, 6], [1, 3, 4, 5, 6, 7, 8, 2]],
+    [{ summary: 0, memory: 0 }, [], []],
+  ]) {
+    const request = { content, range: { recent: 1 } };
+    const result = await reader.read({ ...f.context, request });
+    assert.deepEqual(
+      result.items.map((item) => item.id),
+      [
+        ...compartmentIds.map((id) => `compartment:${id}`),
+        ...memoryIds.map((id) => `memory:${id}`),
+      ],
+    );
+    assert.deepEqual(result.coverage, [
+      { type: 'summary', selected: compartmentIds.length, total: 6 },
+      { type: 'memory', selected: memoryIds.length, total: 8 },
+    ]);
+    assert.ok(result.items.every((item) => item.text.length > 0));
+    assert.deepEqual(
+      (
+        await reader.read({ ...f.context, request: { ...request, range: { recent: -1 } } })
+      ).items.map((item) => item.id),
+      result.items.map((item) => item.id),
+      'Changing the native turn range must not change stored background selection',
+    );
   }
 });
 
-test('default MC reads exclude known other-branch summaries before limiting, while full retains their sources', async (t) => {
+test('default MC reads exclude known other-branch summaries before limiting, while unlimited summaries retain their sources', async (t) => {
   const f = await fixture(t);
   const message = (id, parentId, role, text) => ({
     type: 'message',
@@ -367,8 +374,8 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   f.memory({ source_session_id: 'other-branch-origin' });
   const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
   let acquisitions = 0;
-  const capture = async (preset) => {
-    const request = { session_id: f.context.session.id, preset };
+  const capture = async (summary) => {
+    const request = { session_id: f.context.session.id, content: { summary } };
     return captureSessionRead(
       reader,
       {
@@ -393,8 +400,8 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
         .map((u) => u.source.reader_item),
     ),
   ];
-  assert.deepEqual(summaryIds(await capture('latest')), ['compartment:3', 'compartment:4']);
-  const recent = await capture('recent');
+  assert.deepEqual(summaryIds(await capture(2)), ['compartment:3', 'compartment:4']);
+  const recent = await capture(4);
   assert.deepEqual(
     summaryIds(recent),
     [1, 2, 3, 4].map((id) => `compartment:${id}`),
@@ -423,7 +430,7 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     total: 6,
     excluded: 2,
   });
-  const full = await capture('full');
+  const full = await capture(-1);
   assert.deepEqual(
     summaryIds(full),
     [1, 2, 3, 4, 5, 6].map((id) => `compartment:${id}`),
@@ -435,7 +442,7 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   const cache = new ContextReadCache();
   const brief = cache.navigate(
     recent,
-    { session_id: f.context.session.id, preset: 'recent' },
+    { session_id: f.context.session.id, content: { summary: 4 } },
     { identity: f.context.session },
   );
   const validator = new AjvJsonSchemaValidator();
@@ -448,7 +455,7 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   }
   const found = cache.navigate(
     full,
-    { session_id: f.context.session.id, preset: 'full', max_bytes: 4096 },
+    { session_id: f.context.session.id, content: { summary: -1, memory: -1 }, max_bytes: 4096 },
     { identity: f.context.session },
     'MongoDB',
   );
@@ -478,38 +485,43 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   );
 });
 
-test('a bounded first memory page includes the highest priority and most recent evidence', async (t) => {
+test('stored memory pages follow the captured source order without losing selected priority evidence', async (t) => {
   const f = await fixture(t);
   f.compartment();
-  for (let id = 1; id <= 12; id++) {
+  for (let id = 1; id <= 12; id++)
     f.memory({
       id,
       importance: id === 12 ? 95 : 50,
       updated_at: id * 1000,
       content: `Memory ${id}: ${'Relevant project evidence. '.repeat(30)}`,
     });
-  }
   const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
   const args = {
     session_id: f.context.session.id,
-    detail: 'brief',
-    types: ['memory'],
+    content: { summary: 0, memory: -1 },
     max_bytes: 4096,
   };
-  const captured = await captureSessionRead(
-    reader,
-    {
-      ...f.context,
-      request: { preset: 'full' },
-    },
-    args,
+  const captured = await captureSessionRead(reader, { ...f.context, request: args }, args);
+  const cache = new ContextReadCache(),
+    identity = f.context.session;
+  const pages = [cache.navigate(captured, args, { identity })];
+  while (pages.at(-1).next_cursor) {
+    const nextArgs = { cursor: pages.at(-1).next_cursor, max_bytes: 4096 };
+    const next = cache.get(nextArgs, identity);
+    const page = cache.render(next.snapshot, nextArgs, { ...next, identity });
+    assert.notEqual(
+      page.next_cursor,
+      nextArgs.cursor,
+      'A cursor must advance through source content',
+    );
+    pages.push(page);
+  }
+  assert.deepEqual(
+    pages.flatMap((page) => page.items).map((item) => item.source.memory_id),
+    Array.from({ length: 12 }, (_, index) => index + 1),
   );
-  const page = new ContextReadCache().navigate(captured, args, { identity: f.context.session });
-  assert.ok(page.next_cursor);
-  assert.ok(page.items.some((item) => item.source.memory_id === 12));
-  assert.ok(!page.items.some((item) => item.source.memory_id === 1));
   assert.deepEqual(captured.reader.coverage, [
-    { type: 'summary', selected: 1, total: 1 },
+    { type: 'summary', selected: 0, total: 1 },
     { type: 'memory', selected: 12, total: 12 },
   ]);
 });

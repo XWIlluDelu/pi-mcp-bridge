@@ -5,6 +5,7 @@ import {
   validateReadEntryIds,
 } from './context-read.mjs';
 import { jsonBytes } from './response-budget.mjs';
+import { CONTENT_KINDS, contentKind, contextSelection } from './read-schema.mjs';
 
 // A distinct capability under the shared module lifecycle, not a replacement
 // for input mappings. Each reader assesses the target session's own evidence.
@@ -97,6 +98,7 @@ export async function captureSessionRead(reader, context, args) {
   )
     throw new Error('INVALID_SESSION_READ');
   const target = { units: [], accountedBytes: 0 };
+  const { content } = contextSelection(args);
   const ids = new Set();
   for (const item of result.items) {
     if (
@@ -130,16 +132,22 @@ export async function captureSessionRead(reader, context, args) {
     )
       throw new Error('INVALID_SESSION_READ');
     ids.add(item.id);
+    const kind = contentKind(item.kind);
+    // Readers own item counts and ordering. Core only enforces the shared kind
+    // switches before serialization, so omitted content cannot fill the cache.
+    if (content[kind] === false || content[kind] === 0) continue;
+    const originalKind =
+      !CONTENT_KINDS.includes(item.kind) && kind === 'native' ? { content_kind: item.kind } : {};
     const start = target.units.length;
     appendUnits(target, {
-      type: item.kind,
-      source: { reader_item: item.id },
+      type: kind,
+      source: { reader_item: item.id, ...originalKind },
       message: { role: 'custom', customType: item.kind, content: item.text },
     });
     for (const unit of target.units.slice(start)) {
-      unit.kind = item.kind;
+      unit.kind = kind;
       if (item.title) unit.title = item.title.slice(0, 256);
-      if (item.source) unit.provenance = structuredClone(item.source);
+      if (item.source) unit.provenance = { ...structuredClone(item.source), ...originalKind };
       if (item.branch_relation) unit.branch_relation = item.branch_relation;
     }
     if (target.units[start]) {
@@ -157,7 +165,16 @@ export async function captureSessionRead(reader, context, args) {
     view: 'adapted',
     reader: {
       id: reader.id,
-      ...(result.coverage ? { coverage: structuredClone(result.coverage) } : {}),
+      ...(result.coverage
+        ? {
+            coverage: result.coverage.map((row) => ({
+              ...structuredClone(row),
+              ...(content[contentKind(row.type)] === false || content[contentKind(row.type)] === 0
+                ? { selected: 0 }
+                : {}),
+            })),
+          }
+        : {}),
     },
     session_id: args.session_id,
     leaf_id: native ? native.leaf_id : context.owner.leaf_id,

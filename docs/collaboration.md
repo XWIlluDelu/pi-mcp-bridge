@@ -7,8 +7,9 @@ instruction, and read further only when the outcome needs explanation or evidenc
 ## Calling workflow
 
 1. Use `list` to find an authorized session and its current activity. Start with
-   `read({session_id})`; use `preset:"recent"` for more task background or `search`
-   to locate a decision or tool result. Expand returned refs with `read`.
+   `read({session_id})` for the last three input turns in source order. Increase
+   `range.recent` for more background, or use `search` to locate a decision or
+   tool result. Expand returned refs with `read`.
 2. For completion notifications, [subscribe before sending](events.md).
    Bridge-owned RPC and ordinary TUI/RPC companions connected to this Bridge
    support `session.settled`. For a new session, call `create` without input to

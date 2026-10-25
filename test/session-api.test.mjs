@@ -253,7 +253,6 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   assert.equal(f.bridge.pool.get(prepared.session_id), null);
   const preparedRead = await f.bridge.read({
     session_id: prepared.session_id,
-    detail: 'full',
   });
   assert.ok(JSON.stringify(preparedRead.items).includes('parent'));
   const preparedHistory = await loadSavedSession(await f.bridge.session(prepared.session_id));

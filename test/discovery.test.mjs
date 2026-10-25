@@ -1,3 +1,5 @@
+import { readSource } from './fixtures/read-source.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -91,10 +93,10 @@ test('history larger than 32 MiB remains locatable, readable, sendable and delet
   assert.equal(identity.id, f.session.id);
   assert.equal('entries' in identity, false);
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
-  const context = await f.bridge.read({
+  const context = await readSource(f.bridge, {
     session_id: f.session.id,
-    detail: 'full',
-    preset: 'full',
+    range: { recent: -1 },
+    content: ALL_CONTENT,
     max_bytes: 4096,
   });
   assert.equal(context.items.at(-1).source.entry_id, 'big');

@@ -103,6 +103,7 @@ const readableResult = z
   .object({
     session_id: z.string(),
     view: z.enum(['session', 'runtime', 'adapted']),
+    presentation: z.enum(['preview', 'source']).optional(),
     reader: z
       .object({
         id: z.string(),
@@ -118,10 +119,8 @@ const readableResult = z
           .optional(),
       })
       .optional(),
-    detail: z.enum(['brief', 'full']).optional(),
     query: z.string().optional(),
     matches: z.number().int().nonnegative().optional(),
-    types: z.array(z.string()).optional(),
     items: z.array(
       z
         .object({
@@ -129,6 +128,7 @@ const readableResult = z
           ref: z.string().optional(),
           title: z.string().optional(),
           text: z.string().optional(),
+          truncated: z.boolean().optional(),
           source: z.record(z.unknown()).optional(),
           branch_relation: z.enum(['on_branch', 'off_branch', 'unknown']).optional(),
           related: z.array(z.object({ relation: z.string(), ref: z.string() })).optional(),

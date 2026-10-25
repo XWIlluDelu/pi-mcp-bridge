@@ -197,6 +197,12 @@ test(
     assert.equal(first.data.session_id, made.session_id);
     assert.equal(first.data.aborted, false);
     assert.equal(first.data.result.text, 'Synthetic response 2. (FIRST)');
+    assert.deepEqual(first.data.read, {
+      session_id: made.session_id,
+      view: 'session',
+      leaf_id: first.data.leaf_id,
+      range: { recent: 1 },
+    });
     assert.equal(first.data.result.stop_reason, 'stop');
     assert.equal(first.data.result.truncated, false);
     assert.equal(typeof first.data.leaf_id, 'string');

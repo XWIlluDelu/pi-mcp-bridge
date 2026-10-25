@@ -6,7 +6,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
 import { appendUnits, prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/context-read.mjs';
 import { navigationDocuments, navigationRows, documentText } from '../src/read-navigation.mjs';
-import { contextSelection, readSchema, searchSchema } from '../src/read-schema.mjs';
+import { contextSelection, readSchema, searchSchema, ALL_CONTENT } from '../src/read-schema.mjs';
 import { toolDefinitions } from '../src/protocol.mjs';
 import { jsonBytes } from '../src/response-budget.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -19,7 +19,12 @@ const identity = {
   native_id: 'native',
   native_cwd: '/fixture',
 };
-const args = { session_id: 'fixture', detail: 'brief', preset: 'full', max_bytes: 4096 };
+const args = {
+  session_id: 'fixture',
+  range: { recent: -1 },
+  content: ALL_CONTENT,
+  max_bytes: 4096,
+};
 const textUnit = (entry, text, extra = {}) => ({
   type: 'text',
   source: { entry_id: entry, message_index: 0, block_index: 0 },
@@ -74,72 +79,135 @@ function taskHistory({
   return { entries, leafId: entries.at(-1).id };
 }
 
-test('long-task brief prioritizes its input and complete selected answer, then pages one frozen index', () => {
+test('long tasks keep source order, preserve selected answer blocks and advance one frozen cursor', () => {
   const data = taskHistory();
   for (const max_bytes of [24000, 4096]) {
     const request = { session_id: 'fixture', max_bytes };
     const captured = prepareContextRead(data, request, { buildSessionProjection });
     const cache = new ContextReadCache();
     let page = cache.navigate(captured, request, { identity });
-    assert.equal(page.items[0].type, 'prompt');
+    assert.equal(page.items[0].type, 'input');
     assert.match(page.items[0].text, /CURRENT TASK/);
-    assert.equal(page.items[1].type, 'text');
-    assert.match(page.items[1].text, /FINAL CONCLUSION.*VALIDATION.*NEXT STEP/);
-    const answer = cache.expand([page.items[1].ref], identity);
-    assert.equal(answer.units.length, 3);
-    assert.deepEqual(
-      answer.units.map((unit) => unit.source.block_index),
-      [0, 1, 2],
-    );
-    assert.equal(page.omissions.capacity.previous_units, 0);
-    const refs = [];
+    const all = [];
     for (let count = 0; ; count++) {
       assert.ok(count < 40, 'pagination terminates');
       assert.ok(jsonBytes(page) <= max_bytes);
-      refs.push(...page.items.map((item) => item.ref));
+      assert.ok(page.items.length);
+      all.push(...page.items);
       assert.equal(Boolean(page.next_cursor), page.omissions.capacity.remaining_units > 0);
       if (!page.next_cursor) break;
       const next = cache.get({ cursor: page.next_cursor }, identity);
       page = cache.render(next.snapshot, { max_bytes }, { ...next, identity });
-      assert.equal(page.omissions.capacity.previous_units, refs.length);
+      assert.equal(page.omissions.capacity.previous_units, all.length);
     }
-    assert.equal(new Set(refs).size, refs.length, 'no duplicated rows across task-order pages');
-    assert.equal(
-      refs.length,
-      navigationDocuments(captured).filter((doc) => doc.parent === undefined).length,
+    assert.equal(new Set(all.map((row) => row.ref)).size, all.length);
+    assert.deepEqual(
+      all.map((row) => row.source.entry_index),
+      all.map((row) => row.source.entry_index).sort((a, b) => a - b),
     );
-    // Brief presentation never changes the selected native units or their order.
-    const full = cache.render(
-      captured,
-      { ...request, detail: 'full', max_bytes: 65536 },
-      { identity },
+    const answer = all.at(-1);
+    assert.match(answer.text, /FINAL CONCLUSION[\s\S]*VALIDATION[\s\S]*NEXT STEP/);
+    const expanded = cache.expand([answer.ref], identity);
+    assert.deepEqual(
+      expanded.units.map((unit) => unit.source.block_index),
+      [0, 1, 2],
     );
-    assert.equal(full.items.at(-1).source.entry_id, data.leafId);
-    assert.equal(full.items.at(-1).source.block_index, 2);
   }
 });
 
-test('small UTF-8 brief pages share space between a long input and answer and retain their source refs', () => {
+test('a long latest reply shares a chronological page with input and thinking and expands without loss', () => {
   const data = taskHistory({
     task: '当前输入：' + '约束与需求🔎'.repeat(700),
-    answer: [{ type: 'text', text: '最新结论：' + '进展与证据🔎'.repeat(700) }],
-    loops: 1,
+    answer: [
+      { type: 'thinking', thinking: '当前判断：' + '理由与方向🔎'.repeat(500) },
+      { type: 'text', text: '最新结论：' + '进展与证据🔎'.repeat(700) },
+    ],
+    loops: 0,
   });
   const request = { session_id: 'fixture', max_bytes: 4096 };
   const captured = prepareContextRead(data, request, { buildSessionProjection });
   const cache = new ContextReadCache();
   const page = cache.navigate(captured, request, { identity });
   assert.ok(jsonBytes(page) <= 4096);
-  assert.equal(page.items[0].type, 'prompt');
-  assert.match(page.items[0].text, /当前输入/);
-  assert.equal(page.items[1].type, 'text');
-  assert.match(page.items[1].text, /最新结论/);
-  for (const item of page.items.slice(0, 2)) {
+  assert.deepEqual(
+    page.items.map((item) => item.type),
+    ['input', 'thinking', 'assistant'],
+  );
+  assert.equal(page.next_cursor, null);
+  for (const item of page.items) {
+    assert.ok(item.text.length > 0);
+    assert.equal(item.truncated, true);
     assert.ok(
       !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(item.text),
     );
     assert.ok(jsonBytes(cache.expand([item.ref], identity).units) > 4096);
   }
+});
+
+test('each selected turn keeps a fitting latest reply complete and pages between turns', () => {
+  const entries = [];
+  const add = (role, content) =>
+    entries.push({
+      type: 'message',
+      id: `entry-${entries.length}`,
+      parentId: entries.at(-1)?.id ?? null,
+      message: { role, content },
+    });
+  const answer = 'Conclusion with several independently useful details. '.repeat(32);
+  for (let n = 0; n < 3; n++) {
+    add('user', `Task ${n}`);
+    add('assistant', [{ type: 'text', text: `Plan ${n}: inspect then report.` }]);
+    add('assistant', [{ type: 'text', text: `${n}: ${answer}` }]);
+  }
+  const request = { session_id: 'fixture', max_bytes: 4096 };
+  const captured = prepareContextRead({ entries }, request, { buildSessionProjection });
+  const cache = new ContextReadCache();
+  let page = cache.navigate(captured, request, { identity });
+  for (let n = 0; n < 3; n++) {
+    assert.deepEqual(
+      page.items.map((item) => item.type),
+      ['input', 'assistant', 'assistant'],
+    );
+    assert.equal(page.items.at(-1).text, `${n}: ${answer}`);
+    assert.ok(!page.items.at(-1).truncated);
+    if (n < 2) {
+      const next = cache.get({ cursor: page.next_cursor }, identity);
+      page = cache.render(next.snapshot, { max_bytes: 4096 }, { ...next, identity });
+    }
+  }
+  assert.equal(page.next_cursor, null);
+});
+
+test('moving a turn to the next page preserves its reply before shrinking it into a page tail', () => {
+  const entries = [];
+  const add = (role, text) =>
+    entries.push({
+      type: 'message',
+      id: `entry-${entries.length}`,
+      parentId: entries.at(-1)?.id ?? null,
+      message: { role, content: role === 'user' ? text : [{ type: 'text', text }] },
+    });
+  add('user', 'Earlier task');
+  add('assistant', 'Earlier answer. '.repeat(125));
+  add('user', 'Current task');
+  add('assistant', 'First investigation details. '.repeat(180));
+  add('assistant', 'Second investigation details. '.repeat(180));
+  const latest = 'Current conclusion with important qualifications. '.repeat(50);
+  add('assistant', latest);
+  const request = { session_id: 'fixture', max_bytes: 6000 };
+  const captured = prepareContextRead({ entries }, request, { buildSessionProjection });
+  const cache = new ContextReadCache();
+  const first = cache.navigate(captured, request, { identity });
+  assert.deepEqual(
+    first.items.map((item) => item.source.entry_id),
+    ['entry-0', 'entry-1'],
+  );
+  const next = cache.get({ cursor: first.next_cursor }, identity);
+  const second = cache.render(next.snapshot, { max_bytes: 6000 }, { ...next, identity });
+  assert.equal(second.items.at(-1).text, latest);
+  assert.ok(!second.items.at(-1).truncated);
+  assert.equal(second.next_cursor, null);
+  assert.ok(second.items.slice(1, -1).every((item) => item.truncated));
 });
 
 test('navigation groups split source parts, separates source namespaces and never deduplicates equal text', () => {
@@ -210,17 +278,17 @@ test('codemode overview groups by canonical tool identity and surfaces nested fa
   assert.equal(overview.length, 3);
   const tool = overview[0];
   assert.equal(tool.type, 'tool');
-  assert.match(tool.text, /recorded operations: 3/);
-  assert.match(tool.text, /errors\/unfinished: 2/);
+  assert.match(tool.text, /3 operations/);
+  assert.match(tool.text, /2 error\/unfinished/);
   assert.match(tool.text, /run_tests: error assertion: expected permission denied/);
-  assert.match(tool.text, /write_file: unfinished/);
+  assert.ok(tool.related.some((link) => link.relation === 'operation'));
   assert.ok(tool.text.length < 900);
   assert.doesNotMatch(tool.text, /irrelevant/);
-  assert.match(overview[2].text, /result: not recorded/);
+  assert.match(overview[2].text, /result not recorded/);
   assert.match(overview[2].text, /\/another\/file/);
   const hits = rows(snap, { query: 'permission denied' });
   assert.equal(hits.length, 1);
-  assert.equal(hits[0].type, 'nested_call');
+  assert.equal(hits[0].type, 'tool');
   assert.match(hits[0].text, /permission denied/);
 });
 
@@ -235,7 +303,7 @@ test('search examines full split documents and returns a match outside the norma
   assert.equal(hits.length, 1);
   assert.match(hits[0].text, /NEEDLE evidence/);
   assert.ok(hits[0].text.length < 650);
-  assert.equal(rows(snap, { query: 'needle', types: ['tool'] }).length, 0);
+  assert.equal(rows(snap, { query: 'needle', content: ['tool'] }).length, 0);
 });
 
 test('brief and search retain assistant failure facts once across native and runtime split content', () => {
@@ -364,7 +432,7 @@ test('search filters before bounded capture and retains the complete matching lo
     { toolCallId: 'target-call', toolName: 'read', isError: false },
   );
   const data = { header: { id: 'native-fixture' }, entries, leafId: result.id };
-  const request = { session_id: identity.session_id, preset: 'full' };
+  const request = { session_id: identity.session_id, range: { recent: -1 }, content: ALL_CONTENT };
   const sdk = { buildSessionProjection };
   assert.throws(() => prepareContextRead(data, request, sdk), /READ_SNAPSHOT_TOO_LARGE/);
   const found = prepareContextRead(data, { ...request, search_query: 'needle-verification' }, sdk);
@@ -414,17 +482,101 @@ test('runtime tool results retain their role and child navigation when nested ca
   const documents = navigationDocuments(snap);
   const overview = navigationRows(snap, documents, (i) => i);
   assert.equal(overview.length, 1);
-  assert.equal(overview[0].type, 'tool_result');
+  assert.equal(overview[0].type, 'tool');
   assert.equal(overview[0].title, 'codemode');
   assert.match(overview[0].text, /run_tests: error Assertion failed/);
-  assert.match(overview[0].text, /Actual test summary: 35 passed/);
+  assert.doesNotMatch(overview[0].text, /Actual test summary: 35 passed/);
   assert.doesNotMatch(overview[0].text, /irrelevant/);
   const operation = overview[0].related.find((r) => r.relation === 'operation');
-  assert.equal(documents[operation.ref].kind, 'nested_call');
+  assert.equal(documents[operation.ref].kind, 'tool');
   const hits = navigationRows(snap, documents, (i) => i, { query: 'Assertion failed' });
   assert.equal(hits.length, 1);
-  assert.equal(hits[0].type, 'nested_call');
+  assert.equal(hits[0].type, 'tool');
   assert.ok(hits[0].related.some((r) => r.relation === 'parent'));
+});
+
+test('runtime content switches preserve message block order and independent failure facts', () => {
+  const runtime = {
+    view: 'runtime',
+    units: [],
+    accountedBytes: 0,
+    request: { content: { tool: 0 } },
+  };
+  appendUnits(runtime, {
+    type: 'assistant',
+    source: { observation_index: 0 },
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'First observation' },
+        { type: 'thinking', thinking: 'Reconsider the constraint' },
+        { type: 'text', text: 'Revised response' },
+        {
+          type: 'toolCall',
+          id: 'hidden-call',
+          name: 'bash',
+          arguments: { command: 'private operation' },
+        },
+      ],
+    },
+  });
+  const visible = rows(runtime);
+  assert.deepEqual(
+    visible.map((row) => row.type),
+    ['assistant', 'thinking', 'assistant'],
+  );
+  assert.deepEqual(
+    visible.map((row) => row.text),
+    ['First observation', 'Reconsider the constraint', 'Revised response'],
+  );
+  assert.doesNotMatch(JSON.stringify(visible), /private operation/);
+  const failed = {
+    view: 'runtime',
+    units: [],
+    accountedBytes: 0,
+    request: { content: { thinking: 0, tool: 0 } },
+  };
+  appendUnits(failed, {
+    type: 'assistant',
+    source: { observation_index: 1 },
+    message: {
+      role: 'assistant',
+      content: [{ type: 'thinking', thinking: 'Unfinished investigation' }],
+      stopReason: 'error',
+      errorMessage: 'Provider unavailable',
+    },
+  });
+  const failure = rows(failed);
+  assert.equal(failure.length, 1);
+  assert.equal(failure[0].type, 'assistant');
+  assert.match(failure[0].text, /Provider unavailable/);
+  assert.doesNotMatch(failure[0].text, /Unfinished investigation/);
+});
+
+test('message metadata joins its input reference without an empty navigation row', () => {
+  const target = { units: [], accountedBytes: 0 };
+  const body = 'A structured input\n  - preserve indentation\n'.repeat(150);
+  appendUnits(target, {
+    type: 'prompt',
+    prompt_id: 'input',
+    source: { entry_id: 'input', message_index: 0 },
+    message: {
+      role: 'user',
+      timestamp: 123,
+      content: [
+        { type: 'text', text: body },
+        { type: 'image', mimeType: 'image/png', data: 'omitted' },
+      ],
+    },
+  });
+  const snap = snapshot(target.units);
+  const docs = navigationDocuments(snap),
+    result = navigationRows(snap, docs, (index) => index);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, 'input');
+  assert.match(result[0].text, /\n  - preserve indentation/);
+  assert.ok(docs[0].indices.some((index) => snap.units[index].type === 'message_metadata'));
+  assert.match(documentText(snap, docs[0]), /image image\/png/);
 });
 
 test('adapter items expose related memory and source-boundary navigation without source body duplication', () => {
@@ -462,7 +614,7 @@ test('single-page references are retained, expand source content and enforce sna
   assert.equal(page.items[0].text, 'Short');
   const ref = page.items[0].ref;
   assert.deepEqual(cache.referenceIdentity(ref), identity);
-  assert.equal(cache.reference(ref).document.kind, 'text');
+  assert.equal(cache.reference(ref).document.kind, 'assistant');
   const expanded = cache.expand([ref, ref], identity);
   assert.deepEqual(expanded.units, snap.units);
   assert.equal(expanded.navigation, undefined);
@@ -596,7 +748,7 @@ test('Bridge search finds older effective content, expands frozen evidence and r
     /INVALID_READ_ARGUMENTS/,
   );
   assert.equal(f.acquisitions(), 0, 'internal predicates are rejected before source acquisition');
-  const brief = await f.bridge.read({ session_id: f.id });
+  const brief = await f.bridge.read({ session_id: f.id, range: { recent: 1 } });
   assert.doesNotMatch(JSON.stringify(brief.items), /unique middle decision/);
   const found = await f.bridge.search({ session_id: f.id, query: 'UNIQUE MIDDLE DECISION' });
   assert.equal(found.matches, 1);
@@ -665,10 +817,12 @@ for (const paired of [false, true]) {
     let page = await f.bridge.read({
       session_id: f.id,
       view: 'session',
-      preset: 'full',
-      detail: 'full',
+      range: { recent: -1 },
+      content: ALL_CONTENT,
       max_bytes: 4096,
     });
+    const tool = page.items.find((item) => item.type === 'tool');
+    page = await f.bridge.read({ refs: [tool.ref], max_bytes: 4096 });
     let boundary;
     while (boundary === undefined) {
       for (const item of page.items) {
@@ -711,11 +865,17 @@ test('Bridge reference expansion rejects a changed native cwd without reacquirin
 test('read/search schemas and MCP discovery describe a usable navigation path', () => {
   assert.ok(readSchema.safeParse({ refs: ['opaque-ref'] }).success);
   assert.ok(!readSchema.safeParse({ refs: ['opaque-ref'], detail: 'full' }).success);
-  assert.ok(!readSchema.safeParse({ session_id: 's', view: 'runtime', preset: 'full' }).success);
+  assert.ok(
+    !readSchema.safeParse({ session_id: 's', view: 'runtime', range: { recent: 1 } }).success,
+  );
   assert.ok(!searchSchema.safeParse({ session_id: 's', query: ' ' }).success);
   assert.ok(
-    searchSchema.safeParse({ session_id: 's', view: 'runtime', query: 'failure', types: ['tool'] })
-      .success,
+    searchSchema.safeParse({
+      session_id: 's',
+      view: 'runtime',
+      query: 'failure',
+      content: ['tool'],
+    }).success,
   );
   const tools = toolDefinitions();
   const read = tools.find((tool) => tool.name === 'read');
