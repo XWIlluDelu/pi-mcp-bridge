@@ -1,21 +1,15 @@
 # Architecture and verification
 
-## Development policy
+## Component versions
 
-Support the current Bridge and matching companion/host components; update them
-at a safe native lifecycle boundary. Native history projection and raw fork
-snapshots remain supported. [AGENTS.md](../AGENTS.md) defines development and
-production-operation constraints.
+`package.json` defines the Bridge version reported by MCP and used for owner read
+compatibility. Bridge and companion/host components must match. A different or
+missing owner read version returns refresh guidance without taking over its
+writer; update running components at a safe native lifecycle boundary.
 
-`package.json` defines the Bridge release version, reported by MCP and used for
-owner read compatibility. Main publishes a plain semantic version with a matching
-`v<version>` Git tag; deployment records also identify the commit. Update Bridge
-and companion/host components together. A different or missing owner read
-version requests a refresh without taking over its writer.
-
-Auto-dev uses the next intended release's prerelease version, starting at
-`<next-version>-dev.1` and incrementing the suffix for development iterations.
-Publishing main removes the suffix; the next release cycle starts again at 1.
+Native history projection and raw fork snapshots remain supported independently
+of the Bridge control version. [AGENTS.md](../AGENTS.md) defines release,
+development and production-operation rules.
 
 ## Components
 

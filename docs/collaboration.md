@@ -63,60 +63,10 @@ extension reader can expose its current stored memory through the shared
 
 ## Design references
 
-The comparisons below were reviewed on 2026-10-24 against Pi 1.4.0,
-[Codex `970111f6`](https://github.com/openai/codex/commit/970111f6cb62cc02fe36a82ea7d71b37a2889c97)
-and [Grok Build `2bdd1d6a`](https://github.com/xai-org/grok-build/commit/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8).
-They support using native evidence and keeping read, admission and completion
-boundaries explicit; their protocols are not Bridge's implementation contract.
-
-### Codex and dot
-
-Codex App Server has native Thread / Turn / Item identities. `turn/start` returns
-Core's actual start-or-steer outcome and turn identity; busy input can join an
-existing turn. `turn/steer` accepts `expectedTurnId`, and `turn/completed` carries
-the same identity, final status and error. Turn/item reads support both summaries
-and expansion. Pi does not expose an equivalent turn identity for every Bridge
-submission. [Turn routing](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/turn_processor.rs#L661),
-[Core decision](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/codex_thread.rs#L412),
-[steering](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/turn.rs#L317),
-[completion](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/bespoke_event_handling.rs#L1378),
-[turn/item reads](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L1760).
-
-Codex Core also notes that dropping a reply waiter does not retract a queued
-request. Correlation IDs alone do not establish replay safety.
-[Submission source](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/core/src/session/mod.rs#L1115).
-The observed dot MCP wrapper correlates sends, completion callbacks and latest
-turns, but its exposed read parameters differ from App Server. The public
-[harness](https://openai.com/index/unlocking-the-codex-harness/) and
-[dots](https://openai.com/index/introducing-dots/) articles do not specify the
-private `cloud_threads` protocol.
-
-### Grok Build and Bot
-
-Grok headless consumes ACP message, tool and plan events. Its streaming terminal
-event carries native `sessionId`, `requestId` and whole-turn `stopReason`; text
-normally arrives in earlier events. Ordinary JSON output aggregates the text.
-ACK evidence must match the native prompt/session identity and exclude replay.
-[Headless events](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless.rs#L1752),
-[JSON output](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless.rs#L237),
-[native identity](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L488),
-[ACK matching](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/src/headless/prompt_ack.rs#L22).
-
-Persisted `TurnCompleted` and immediate `prompt_complete` share a result mapper,
-but the producer sets `agent_result` to null on success. Some errors supply detail;
-the field does not establish successful report delivery. Bridge's excerpt instead
-comes from its existing native projected response, reducing follow-up reads.
-[Shared mapper](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/turn_completion.rs#L1),
-[producer](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/sampling/error.rs#L396).
-
-Grok exports client-facing `updates.jsonl` while model requests use
-`chat_history.jsonl`; its session identity supports continuation across TUI,
-headless and ACP. This is a useful distinction between the record a caller reads
-and the model's current input. [Export](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/export.rs#L1),
-[sessions](https://docs.x.ai/build/features/sessions).
-
-Grok Bot documents copying files cited in a Cloud Agent's final report into its
-reply. The public material does not establish that agent's connection to
-open-source Build. Bridge delivers report text and native source context; file
-delivery would require a separate artifact-selection and transport contract.
-[Bot files and results](https://docs.x.ai/grok-bot/files-and-results#results-from-cloud-agents).
+The design draws on native operation/result correlation in
+[Codex App Server](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/turn_processor.rs#L661)
+and [Grok Build's completion mapping](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/turn_completion.rs#L1),
+and on Grok's separation of [client-facing session records](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/export.rs#L1)
+from model input. Reviewed with Pi 1.4.0 on 2026-10-24, these references informed
+Bridge's separate admission receipts, settlement results and context views. Pi's
+native evidence defines the implemented boundaries described above.
