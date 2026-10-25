@@ -168,7 +168,7 @@ troubleshooting ends.
 ## Troubleshooting fake-IP proxy DNS
 
 `events/subscribe` can return HTTP 400 / JSON-RPC `-32015 CallbackEndpointError`
-with `callback_reason: blocked_address` when DNS resolves the callback to a
+with `data.reason:"blocked_address"` when DNS resolves the callback to a
 nonpublic address. Some proxies return synthetic fake-IP addresses, such as
 `198.18.0.0/15`, which Bridge rejects before connecting.
 
