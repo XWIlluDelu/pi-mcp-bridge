@@ -88,7 +88,7 @@ test(
     const owned = f.bridge.pool.get(f.id);
     const owner = owned.ownerRecord.owner;
     const generation = owned.ownerRecord.generation;
-    await until(() => owned.settlement.sequence === 1);
+    await until(() => owned.settlementSequence === 1);
     const result = await exec(process.execPath, [
       path.join(base, 'src/owner-runtime.mjs'),
       f.file,
@@ -366,7 +366,7 @@ for (const overlap of [false, true])
       );
       const owned = f.bridge.pool.get(f.id);
       owned.autoReleaseWanted = false; // Exercise explicit release after completion.
-      if (overlap) await until(() => owned.settlement.sequence === 1);
+      if (overlap) await until(() => owned.settlementSequence === 1);
       const state = await owned.state();
       assert.equal(state.isStreaming, !overlap); // input hooks precede busy; before_agent_start no longer does.
       assert.equal(state.pendingMessageCount, 0);
@@ -399,7 +399,7 @@ for (const overlap of [false, true])
         assert.equal(await ownerAlive(owner), true);
       }
       await fs.writeFile(gate, 'continue');
-      await until(() => owned.settlement.sequence === (overlap ? 2 : 1));
+      await until(() => owned.settlementSequence === (overlap ? 2 : 1));
       await until(async () => (await owned.idleSnapshot()).status === 'idle');
       const released = await exec(process.execPath, [
         path.join(base, 'src/owner-runtime.mjs'),

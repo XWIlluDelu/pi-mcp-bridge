@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -55,9 +56,9 @@ async function fixture(t) {
   let acquisitions = 0;
   bridge.pool.forRead = async () => ({
     generation: 'fixture',
-    entries: async () => {
+    read: async (args) => {
       acquisitions++;
-      return { entries, leafId: 'a' };
+      return prepareContextRead({ entries, leafId: 'a' }, args);
     },
   });
   t.after(async () => {

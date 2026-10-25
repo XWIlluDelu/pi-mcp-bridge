@@ -42,7 +42,7 @@ test('selection keeps its admission grant through native model discovery', async
 for (const operation of ['send', 'create'])
   test(
     operation +
-      ' selection timeout fences new input, late ACK repairs only the outcome and never sends a prompt',
+      ' model ACK timeout fences input; late ACK does not continue thinking selection or prompt submission',
     { timeout: 15000 },
     async (t) => {
       const f = await fixture(t),
@@ -51,6 +51,7 @@ for (const operation of ['send', 'create'])
       await fs.writeFile(f.gate + '.hold-selection', 'hold');
       const args = {
         model: choice('vision'),
+        thinking_level: 'high',
         ...(operation === 'create'
           ? { project: f.cwd, text: 'NEVER_SENT' }
           : { session_id: id, text: 'NEVER_SENT' }),
@@ -83,6 +84,9 @@ for (const operation of ['send', 'create'])
       assert.equal((result.send ?? result).model_selection, undefined);
       const entries = await releasedEntries(bridge, target);
       assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'vision');
+      assert.ok(
+        !entries.some((e) => e.type === 'thinking_level_change' && e.thinkingLevel === 'high'),
+      );
 
       assert.equal(
         (await savedEntries(bridge, target)).filter((e) => e.message?.role === 'user').length,

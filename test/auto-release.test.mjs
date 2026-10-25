@@ -212,7 +212,7 @@ test(
     assert.equal(made.send.status, 'handled');
     const rpc = f.runtimes[0];
     await released(f, rpc);
-    assert.equal(rpc.settlement.sequence, 0);
+    assert.equal(rpc.settlementSequence, 0);
     const rows = (await fs.readFile(rpc.session.file, 'utf8')).trim().split('\n').map(JSON.parse);
     assert.ok(rows.some((e) => e.customType === 'handled-input'));
   },
@@ -369,7 +369,7 @@ test(
       text: 'SETTLED',
     });
     assert.equal(receipt.status, 'unknown');
-    await until(() => rpc.settlement.sequence > 0);
+    await until(() => rpc.settlementSequence > 0);
     await rpc.autoReleaseTask;
     assert.ok(held);
     assert.ok(rpc.promptAdmission);
@@ -539,7 +539,7 @@ test(
         running = f.bridge.command({ ...args, command: 'printf "NATIVE_OUTPUT"' });
       await checking.promise;
       await f.mark('finish');
-      await until(() => rpc.settlement.sequence > 0);
+      await until(() => rpc.settlementSequence > 0);
       await rpc.autoReleaseTask;
       assert.equal(rpc.child.stdin.writableEnded, false);
       identityGo.resolve();
@@ -949,7 +949,7 @@ for (const window of ['ack', 'identity'])
         await f.mark('input-go');
         await until(() => exists(f.dir + '/second-provider'));
         await f.mark('finish');
-        await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
+        await until(() => rpc.settlementSequence === rpc.requiredSettlementSequence);
         assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
         await released(f, rpc);
       } finally {
@@ -968,7 +968,7 @@ test(
     await f.mark('input-go'); // This case observes the later native run boundary.
     const rpc = await f.bridge.pool.resolve(f.session);
     await rpc.command({ type: 'prompt', message: 'FIRST' });
-    await until(() => rpc.settlement.sequence === 1);
+    await until(() => rpc.settlementSequence === 1);
     const reached = Promise.withResolvers(),
       go = Promise.withResolvers(),
       identity = rpc.assertProcessIdentity.bind(rpc);
@@ -990,7 +990,7 @@ test(
       await until(
         () =>
           exists(f.dir + '/second-provider') &&
-          rpc.settlement.sequence < rpc.requiredSettlementSequence,
+          rpc.settlementSequence < rpc.requiredSettlementSequence,
       );
       go.resolve();
       await assert.rejects(releasing, /RUNTIME_BUSY/);
@@ -998,7 +998,7 @@ test(
       assert.equal(f.bridge.handoffs.has(f.id), false);
       assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, false);
       await f.mark('finish');
-      await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
+      await until(() => rpc.settlementSequence === rpc.requiredSettlementSequence);
       assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
     } finally {
       go.resolve();
