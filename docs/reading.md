@@ -86,9 +86,12 @@ optional `view`, `types`, `leaf_id` and `max_bytes`. Runtime search rejects
 selectors; this is how to find an item omitted from a `latest` overview.
 
 A continuation inherits the capture's source, detail, types, selection and leaf.
-Explicit conflicting values return `STALE_CURSOR`. When supplying a preset, its
-resolved selectors must all match; without a preset, only supplied selectors are
-compared. Cursor-only continuation is the simplest form.
+Explicit conflicting values return `STALE_CURSOR`. For Session Context, an explicit
+preset is accepted when all its resolved selectors match the capture; without a
+preset, only supplied selectors are compared. For adapted captures, an explicit
+preset must also match the original preset (default `latest`): the reader's scope
+can differ even when native selectors are equivalent. Start a fresh read to change
+that scope. Cursor-only continuation is the simplest form.
 
 Every page and reference expansion uses a new
 [permission snapshot](configuration.md#request-permission-snapshots) and validates

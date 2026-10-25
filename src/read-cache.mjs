@@ -115,9 +115,11 @@ export class ContextReadCache {
     )
       throw new Error('STALE_CURSOR');
     if (args.preset !== undefined) {
+      // Readers can interpret presets independently of native selectors.
       if (
+        (snapshot.view === 'adapted' && args.preset !== (snapshot.request?.preset ?? 'latest')) ||
         JSON.stringify(contextSelection({ detail: snapshot.request?.detail, ...args })) !==
-        JSON.stringify(selection)
+          JSON.stringify(selection)
       )
         throw new Error('STALE_CURSOR');
     } else if (

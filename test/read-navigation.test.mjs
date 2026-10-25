@@ -142,39 +142,6 @@ test('small UTF-8 brief pages share space between a long input and answer and re
   }
 });
 
-test('orphan tool result names visible in brief are searchable during native acquisition', () => {
-  const entries = [
-    {
-      type: 'message',
-      id: 'u',
-      parentId: null,
-      message: { role: 'user', content: 'Inspect the failure' },
-    },
-    {
-      type: 'message',
-      id: 'result',
-      parentId: 'u',
-      message: {
-        role: 'toolResult',
-        toolCallId: 'missing-call',
-        toolName: 'special_tool',
-        isError: true,
-        content: [{ type: 'text', text: 'permission denied' }],
-      },
-    },
-  ];
-  const data = { entries, leafId: 'result' };
-  const request = { session_id: 'fixture', preset: 'full' };
-  const sdk = { buildSessionProjection };
-  const brief = rows(prepareContextRead(data, request, sdk));
-  assert.equal(brief.find((item) => item.type === 'tool').title, 'special_tool');
-  const found = prepareContextRead(data, { ...request, search_query: 'special_tool' }, sdk);
-  const hits = rows(found, { query: 'special_tool' });
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].title, 'special_tool');
-  assert.match(hits[0].text, /permission denied/);
-});
-
 test('navigation groups split source parts, separates source namespaces and never deduplicates equal text', () => {
   const snap = snapshot([
     textUnit('a', 'first ', { part: 1 }),
@@ -646,6 +613,88 @@ test('Bridge search finds older effective content, expands frozen evidence and r
   await assert.rejects(f.bridge.read({ refs }), /NOT_FOUND_OR_DENIED/);
   assert.equal(f.acquisitions(), 2);
 });
+
+for (const paired of [false, true]) {
+  test(`Bridge search preserves continuous tool output across source parts (${paired ? 'paired' : 'orphan'})`, async (t) => {
+    const f = await bridgeFixture(t);
+    f.bridge.pool.forRead = async () => null;
+    const body = Array.from(
+      { length: 350 },
+      (_, i) =>
+        `Entry ${String(i).padStart(4, '0')}: a distinct diagnostic observation for the investigation.`,
+    ).join(' ');
+    const entries = [
+      {
+        type: 'message',
+        id: 'task',
+        parentId: null,
+        message: { role: 'user', content: 'Inspect the diagnostic evidence.' },
+      },
+      ...(paired
+        ? [
+            {
+              type: 'message',
+              id: 'call',
+              parentId: 'task',
+              message: {
+                role: 'assistant',
+                content: [
+                  { type: 'toolCall', id: 'diagnostic-call', name: 'special_tool', arguments: {} },
+                ],
+              },
+            },
+          ]
+        : []),
+      {
+        type: 'message',
+        id: 'result',
+        parentId: paired ? 'call' : 'task',
+        message: {
+          role: 'toolResult',
+          toolCallId: 'diagnostic-call',
+          toolName: 'special_tool',
+          isError: false,
+          content: [{ type: 'text', text: body }],
+        },
+      },
+    ];
+    await fs.writeFile(
+      f.session.file,
+      [f.session.header, ...entries].map((entry) => JSON.stringify(entry)).join('\n') + '\n',
+    );
+    let page = await f.bridge.read({
+      session_id: f.id,
+      view: 'session',
+      preset: 'full',
+      detail: 'full',
+      max_bytes: 4096,
+    });
+    let boundary;
+    while (boundary === undefined) {
+      for (const item of page.items) {
+        if (item.message?.role !== 'toolResult') continue;
+        const fragment = item.message.content?.find((block) => block.type === 'text')?.text;
+        if (!fragment) continue;
+        const start = body.indexOf(fragment);
+        const end = start + fragment.length;
+        if (start >= 0 && end > 40 && end < body.length - 40) boundary = end;
+      }
+      if (boundary !== undefined || !page.next_cursor) break;
+      page = await f.bridge.read({ cursor: page.next_cursor, max_bytes: 4096 });
+    }
+    assert.ok(boundary !== undefined, 'long output has a source-part boundary');
+    // Derive the query from the original output around an observed boundary,
+    // without depending on the splitter's target size or text reconstruction.
+    const phrase = body.slice(boundary - 40, boundary + 40);
+    assert.ok(body.includes(phrase));
+    const found = await f.bridge.search({ session_id: f.id, query: phrase });
+    assert.equal(found.matches, 1);
+    assert.ok(found.items[0].text.includes(phrase));
+    const named = await f.bridge.search({ session_id: f.id, query: 'special_tool' });
+    assert.equal(named.matches, 1);
+    assert.equal(named.items[0].title, 'special_tool');
+  });
+}
 
 test('Bridge reference expansion rejects a changed native cwd without reacquiring content', async (t) => {
   const f = await bridgeFixture(t);

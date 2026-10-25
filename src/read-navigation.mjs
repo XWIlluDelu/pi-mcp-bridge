@@ -41,7 +41,6 @@ export function fitNavigationRow(row, fits) {
 function messageText(message, { metadata = false } = {}) {
   if (!message) return '';
   const texts = [];
-  if (metadata && message.toolName) texts.push(message.toolName);
   if (typeof message.command === 'string') texts.push(`command: ${message.command}`);
   if (message.role === 'bashExecution')
     texts.push(
@@ -99,7 +98,14 @@ function assistantFailure(units) {
     : '';
 }
 export function unitText(unit, metadata = false) {
-  return [assistantFailure([unit]), unitBodyText(unit, metadata)].filter(Boolean).join('\n');
+  // Acquisition searches complete records. Document titles carry tool names;
+  // repeating them in split bodies would break continuous output phrases.
+  const names = metadata
+    ? [unit.message?.toolName, ...(unit.parts ?? []).map((part) => part.message?.toolName)]
+    : [];
+  return [...names, assistantFailure([unit]), unitBodyText(unit, metadata)]
+    .filter(Boolean)
+    .join('\n');
 }
 const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot.units[i]);
 export const documentUnits = docUnits;

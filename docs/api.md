@@ -55,45 +55,40 @@ Connected runtimes also expose `capabilities:{send,command,stop}`. Values are tr
 { "session_id": "ps_…", "max_bytes": 24000 }
 ```
 
-`read` defaults to a brief task/result overview, active summaries and compact tool
-activity with references. `preset:"recent"` selects the last three prompts;
-`preset:"full"` selects the full effective source. `detail:"full"` returns selected
-source units directly. `select` adjusts Session Context content; `types` filters
-brief item kinds. Full effective context includes active compaction summaries and
-retained messages, not the entire raw history.
+`read` defaults to a brief current task/result view, summaries and compact tool
+activity with references. `preset` controls scope: `latest` is the default,
+`recent` adds task background, and `full` selects the full effective source.
+`detail:"full"` returns selected source units instead of previews. `select` adjusts
+Session Context content; `types` filters brief item kinds.
 
-Both tools use a matching configured session reader, otherwise native projection.
-Explicit `view:"session"` selects Session Context; `view:"runtime"` selects a
-captured Runtime Context. Reader results identify `reader.id` and `view:"adapted"`.
-Runtime captures may precede the latest answer and reject `preset`, `select` and
-`leaf_id`; missing observations are unavailable. Neither tool starts Pi.
+Omit `view` to use a matching configured reader or native projection. Explicit
+`view:"session"` selects Session Context; `view:"runtime"` selects a captured
+request-stage Runtime Context. Adapted results identify `reader.id`. Both tools
+require read permission and never start Pi.
 
-Use `search` to locate text across the selected reader's full effective content:
+Use `search` to find literal, case-insensitive text across one session's full
+supported source, independently of the earlier brief selection:
 
 ```json
 { "session_id": "ps_…", "query": "retry policy", "types": ["tool", "text"] }
 ```
 
-The match is case-insensitive and literal. Search accepts optional `view`, `types`,
-`leaf_id` and `max_bytes`; Runtime Context rejects a leaf override. It requires
-read permission and searches only the specified session. Results contain matching
-snippets and refs. Open source content with `read`:
+Expand useful result references with `read`:
 
 ```json
 { "refs": ["<item.ref>", "<related.ref>"], "max_bytes": 12000 }
 ```
 
-Up to eight refs must belong to one capture. Only optional `session_id` and
-`max_bytes` accompany refs. A `source_context` reference opens historical session
-context at its source boundary and must be read alone; it does not claim an exact
-extension-to-native source range.
+Continue either tool's result through `read`, optionally changing the byte budget:
 
-Pages start with the newest selected content. Continue read or search results
-backwards using `read({cursor})`, optionally changing `max_bytes`. Captured source,
-selection, detail, filters and leaf stay frozen. Conflicting overrides, eviction or
-restart invalidate cursors/references. Every continuation and expansion rechecks
-read authorization and native identity. See [reading](reading.md) for content,
-limits, references and source boundaries.
+```json
+{ "cursor": "<next_cursor>", "max_bytes": 12000 }
+```
+
+[Reading a Pi session](reading.md) defines source boundaries, selection, reference
+combinations and Runtime restrictions. Its [continuation contract](reading.md#capacity-and-continuation)
+describes page order. The [frozen snapshot contract](reading.md#frozen-bounded-snapshots)
+covers retention and authorization.
 
 ### Models
 
