@@ -222,11 +222,11 @@ test('two-phase host reservation blocks another writer before ready and exposes 
     'INVALID_ATTACHED_SEND',
   );
   assert.equal(
-    (await request(f, 'send', { text: 'fixture', mode: 'default' })).data.status,
+    (await request(f, 'send', { text: 'fixture', mode: 'steer' })).data.status,
     'accepted',
   );
   assert.equal(
-    (await request(f, 'send', { text: 'fixture', mode: 'default' }, { generation: 'stale' })).error,
+    (await request(f, 'send', { text: 'fixture', mode: 'steer' }, { generation: 'stale' })).error,
     'RUNTIME_SESSION_CHANGED',
   );
 });
@@ -235,14 +235,14 @@ test('host receipts preserve dispatched evidence without inventing native admiss
   let outcome = { status: 'dispatched', admission: 'unobservable', ignored: 'PRIVATE' };
   f.callbacks.submit = async () => outcome;
   await f.controller.ready(f.callbacks);
-  assert.deepEqual((await request(f, 'send', { text: 'fixture', mode: 'default' })).data, {
+  assert.deepEqual((await request(f, 'send', { text: 'fixture', mode: 'steer' })).data, {
     status: 'dispatched',
     admission: 'unobservable',
   });
   for (const admission of [undefined, 'started', 'queued']) {
     outcome = { status: 'dispatched', admission };
     assert.equal(
-      (await request(f, 'send', { text: 'fixture', mode: 'default' })).error,
+      (await request(f, 'send', { text: 'fixture', mode: 'steer' })).error,
       'INVALID_HOST_RECEIPT',
     );
   }
@@ -419,7 +419,7 @@ test('list observes actual host callback support across IPC, independently of ac
             command: 'fixture',
           }),
           stopped = await bridge.stop({ session_id });
-        assert.equal(command.status, expected.command ? 'accepted' : 'rejected');
+        assert.equal(command.status, expected.command ? 'completed' : 'rejected');
         if (!expected.command) assert.equal(command.reason, 'BASH_UNSUPPORTED');
         assert.equal(stopped.status, stop ? 'accepted' : 'rejected');
         if (!stop) assert.equal(stopped.reason, 'STOP_UNSUPPORTED');
@@ -489,13 +489,13 @@ test('host release waits for admitted preparation, fences new input, and release
     return { released: true };
   };
   await f.controller.ready(f.callbacks);
-  const sending = request(f, 'send', { text: 'fixture', mode: 'default' });
+  const sending = request(f, 'send', { text: 'fixture', mode: 'steer' });
   await entered.promise;
   const releasing = f.controller.release();
   assert.ok(await readClaim(f.attachmentDir, f.session));
   assert.equal(released, false);
   assert.equal(
-    (await request(f, 'send', { text: 'second', mode: 'default' })).error,
+    (await request(f, 'send', { text: 'second', mode: 'steer' })).error,
     'RUNTIME_SESSION_CHANGED',
   );
   finish.resolve();
@@ -542,7 +542,7 @@ test('release cancels native bash before draining admitted result capture and cl
   assert.equal(closed, false);
   assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'transitioning');
   assert.equal(
-    (await request(f, 'send', { text: 'fenced', mode: 'default' })).error,
+    (await request(f, 'send', { text: 'fenced', mode: 'steer' })).error,
     'RUNTIME_SESSION_CHANGED',
   );
   captureFinish.resolve();
@@ -581,7 +581,7 @@ test('host cancel drains preparation and native bash without a remote stop callb
     return { released: true };
   };
   await f.controller.ready(f.callbacks);
-  const sending = request(f, 'send', { text: 'preparing', mode: 'default' });
+  const sending = request(f, 'send', { text: 'preparing', mode: 'steer' });
   let bashing, releasing;
   try {
     assert.equal(
@@ -663,7 +663,7 @@ test('identity is checked after asynchronous host submission', async (t) => {
   };
   await f.controller.ready(f.callbacks);
   assert.equal(
-    (await request(f, 'send', { text: 'fixture', mode: 'default' })).error,
+    (await request(f, 'send', { text: 'fixture', mode: 'steer' })).error,
     'RUNTIME_SESSION_CHANGED',
   );
   assert.ok(await readClaim(f.attachmentDir, f.session));

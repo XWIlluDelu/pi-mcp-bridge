@@ -106,7 +106,7 @@ for (const [op, longMetadata] of [
         assert.equal(result.results.length, 10);
         for (const item of result.results) {
           assert.equal(item.error, undefined, JSON.stringify(item));
-          assert.equal(item.result.status, 'accepted');
+          assert.equal(item.result.status, op === 'command' ? 'completed' : 'accepted');
           const text = item.result[op === 'command' ? 'output' : 'withdrawn_text'];
           assert.ok(text.length > 0);
           assert.ok(text.isWellFormed());

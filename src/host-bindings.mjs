@@ -109,7 +109,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
             setThinkingLevel: (level) => session.setThinkingLevel(level),
           })
         : undefined,
-    submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
+    submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
@@ -282,7 +282,7 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
           setThinkingLevel: (level) => tracked.track(client.setThinkingLevel(level)),
         })
       : undefined,
-    submit: async ({ text, images, model, thinking_level, mode = 'default', beforeDispatch }) => {
+    submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');

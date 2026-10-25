@@ -14,7 +14,8 @@ Every mutation call is a new operation, including identical calls. There is no d
 | `queued`     | Pi queued a send/create prompt.                                                |
 | `handled`    | Native input handling completed, such as an extension command.                 |
 | `dispatched` | An external owner invoked Pi; its public API cannot report native admission.   |
-| `accepted`   | A command, stop or compact operation returned its native result.               |
+| `completed`  | A command or compaction finished and returned its native result.               |
+| `accepted`   | Stop was accepted; `acknowledgement` describes the available native evidence.  |
 | `rejected`   | Definite refusal, explained by `reason`.                                       |
 | `skipped`    | Not submitted, such as idle-only finding busy work or stop finding no runtime. |
 | `unknown`    | Dispatch or outcome is uncertain.                                              |
@@ -105,15 +106,14 @@ covers retention and authorization.
 ### Send
 
 ```json
-{ "session_id": "ps_…", "text": "Review the change", "mode": "default" }
+{ "session_id": "ps_…", "text": "Review the change" }
 ```
 
 Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 
-- `default`: ordinary native Enter semantics, steering while busy.
+- `steer` (default): start input when idle; use the native steering queue while busy.
 - `idle_only`: skip if busy/pending; a saved session may first cold-start.
-- `steer`: use the native steering queue.
-- `follow_up`: use the native follow-up queue.
+- `follow_up`: use the native follow-up queue while busy.
 
 Bridge waits for native input admission where observable, not model completion. A tracked submission returns `submission_id` and `status`. Native ACKs establish `started`, `queued` or `handled`; `skipped` and `rejected` mean input was not submitted. An external companion/SDK owner that successfully invokes Pi returns `dispatched, admission:"unobservable"`: delivery to the Pi API is confirmed, but input hooks may still transform, handle or reject it. It is unnecessary to read history merely to confirm that dispatch, and it is unsafe to resend it automatically. A synchronous exception or transport uncertainty remains `unknown`. A handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
 
@@ -160,7 +160,7 @@ Native history and forks retain image blocks. Acknowledgement confirms admission
 
 Requires `command` permission. Pass the command without `!`; it uses Pi's native bash path, history, hooks and cancellation. Unsupported owners return `BASH_UNSUPPORTED`.
 
-The result includes captured output, exit status, cancellation/truncation flags and generation. `accepted` means the native command callback returned. If the internal acknowledgement wait expires, the outcome is `unknown`: the command can still complete and store its result in native history. A separate authorized stop can interrupt a long command.
+The result includes captured output, exit status, cancellation/truncation flags and generation. `status:"completed"` means the native command returned a result; inspect `exitCode` and `cancelled` to determine how it ended. If the internal acknowledgement wait expires, the outcome is `unknown`: the command can still complete and store its result in native history. A separate authorized stop can interrupt a long command.
 
 `max_chars` is 256–32768, default 12000, measured in UTF-16 units. Two independent flags describe output coverage:
 
@@ -176,6 +176,8 @@ Thus native truncation can coexist with a complete response (`true`/`true`), and
 ```
 
 Requires only `stop`. It cancels native agent/bash activity, withdraws queued input in native order and returns `withdrawn_text`, including whether the capture contained an editor draft. Captured text can accompany an uncertain final acknowledgement. `max_chars` uses command's bounds; `withdrawn_complete:false` marks an incomplete prefix. Withdrawn unsent text may not exist in history, and there is no result continuation.
+
+`status:"accepted"` confirms the stop callback returned. `acknowledgement:"native_ack"` records a native acknowledgement; `"requested"` records a host's cancellation request.
 
 Stop never cold-starts Pi. It invalidates pending Bridge inputs, including batch items waiting for a lane or permission snapshot. An explicit stop→send sequence within one batch runs in order; a separate stop still withdraws pending input. Already-dispatched asynchronous native `input` or `user_bash` hooks may resume after Stop's acknowledgement. See [shutdown and in-flight work](runtime.md#shutdown-and-in-flight-acks).
 

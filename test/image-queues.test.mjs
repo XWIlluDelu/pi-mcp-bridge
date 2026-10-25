@@ -73,7 +73,6 @@ test(
     const steering = await bridge.send({
       session_id: made.session_id,
 
-      mode: 'default',
       images: [steer],
     });
     assert.ok(['started', 'queued', 'handled'].includes(steering.status), JSON.stringify(steering));

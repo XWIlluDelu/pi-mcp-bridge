@@ -246,7 +246,7 @@ test('standard MCP stdio client initializes and exercises the single-operation t
   }
 });
 
-test('MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and content read', async (t) => {
+test('MCP -> official Pi RPC -> faux provider: auto-resume, default steering, queue modes and content read', async (t) => {
   const f = await configFixture(t);
   f.config.piArgs.push(
     '-e',
@@ -289,7 +289,6 @@ test('MCP -> official Pi RPC -> faux provider: auto-resume, all four modes and c
       session_id,
 
       text: 'default steering',
-      mode: 'default',
     });
     assert.equal(native.status, 'queued');
     const steer = await call('send', {
@@ -397,7 +396,7 @@ export default function(pi){
     assert.equal((await runtime.state()).isStreaming, true); // Pi 1.3 counts before_agent_start as an active run.
     assert.ok(Array.isArray((await runtime.entries()).entries));
 
-    for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
+    for (const mode of ['steer', 'follow_up', 'idle_only']) {
       const receipt = await bridge.send({
         session_id,
 

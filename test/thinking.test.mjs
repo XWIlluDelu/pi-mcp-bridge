@@ -174,7 +174,7 @@ test(
       ),
       'Expected native prompt admission',
     );
-    for (const mode of ['default', 'steer', 'follow_up', 'idle_only']) {
+    for (const mode of ['steer', 'follow_up', 'idle_only']) {
       const result = await bridge.send({
         session_id: id,
 

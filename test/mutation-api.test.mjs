@@ -204,7 +204,7 @@ test('command and stop return bounded prefixes without handles or continuation a
     };
     for (let i = 0; i < 2; i++) {
       const result = await f.bridge[op](args);
-      assert.equal(result.status, 'accepted');
+      assert.equal(result.status, op === 'command' ? 'completed' : 'accepted');
       assert.equal(result[op === 'command' ? 'response_complete' : 'withdrawn_complete'], false);
     }
     assert.equal(f.calls[op], 2);

@@ -86,8 +86,8 @@ cannot implement. Native command support must use Pi's bash path, including
 the callbacks they implement; command requires bash plus either cancel or stop,
 while remote stop requires the complete stop callback.
 
-Default send follows TUI Enter and steers while busy; follow-up uses Pi's follow-up
-queue and native consumption modes. Idle-only checks both busy state and pending
+Send defaults to `steer`: it starts input when idle and uses Pi's steering queue
+while busy. `follow_up` uses the native follow-up queue while busy. Idle-only checks both busy state and pending
 queues, plus unfinished SDK prompt promises including input preparation. It skips
 busy work instead of queueing it. Remote companion/host inputs refuse
 `/bridge-join` and collision aliases; join remains owner-local.
