@@ -239,3 +239,45 @@ test('expanded adapted references retain their original scope for cursor validat
     }
   }
 });
+
+test('adapted cursors preserve reader preset independently of equivalent native selectors', async (t) => {
+  const f = await fixture(t);
+  const unregister = f.bridge.compatibilityServices.sessionReaders.register('scoped-memory', {
+    matches: () => true,
+    read: ({ request }) => ({
+      native: true,
+      items: [
+        { id: 'latest-memory', kind: 'memory', text: 'Current memory details.\n\n'.repeat(600) },
+        ...(request.preset === 'recent'
+          ? [{ id: 'earlier-memory', kind: 'memory', text: 'Earlier memory evidence.' }]
+          : []),
+      ],
+    }),
+  });
+  t.after(unregister);
+  const latest = await f.bridge.read({ session_id: f.id });
+  const recent = await f.bridge.read({
+    session_id: f.id,
+    preset: 'recent',
+    select: { recent_prompts: 1 },
+  });
+  assert.equal(latest.items.filter((item) => item.type === 'memory').length, 1);
+  assert.equal(recent.items.filter((item) => item.type === 'memory').length, 2);
+  assert.deepEqual(latest.selection, recent.selection);
+  const expanded = await f.bridge.read({
+    refs: [latest.items.find((item) => item.type === 'memory').ref],
+    max_bytes: 4096,
+  });
+  assert.ok(expanded.next_cursor);
+  const inherited = await f.bridge.read({ cursor: expanded.next_cursor });
+  const same = await f.bridge.read({ cursor: expanded.next_cursor, preset: 'latest' });
+  assert.deepEqual(same.items, inherited.items);
+  await assert.rejects(
+    f.bridge.read({
+      cursor: expanded.next_cursor,
+      preset: 'recent',
+      select: { recent_prompts: 1 },
+    }),
+    /STALE_CURSOR/,
+  );
+});

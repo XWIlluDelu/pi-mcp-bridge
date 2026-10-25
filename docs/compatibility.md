@@ -184,6 +184,9 @@ Its supported version, storage scope and provenance limits are documented there.
 
 Continuations and ordinary reference expansion use the frozen capture without
 another owner probe or reader call, while rechecking authorization and identity.
+An explicit continuation preset must match the capture's original preset, even
+if two presets happen to return identical content; native selector equivalence
+does not establish reader scope equivalence. See the [read arguments](reading.md#browse-find-and-expand).
 Multiple matches report `SESSION_READER_CONFLICT`; reader exceptions report
 `SESSION_READER_FAILED` without substituting native content. Before publication,
 Bridge rechecks native identity and applicability, including an owner that appeared
