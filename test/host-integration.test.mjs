@@ -22,6 +22,7 @@ import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
 import attachExtension from '../src/companion.mjs';
+import { READ_CONTRACT } from '../src/context-read.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => {
@@ -211,6 +212,146 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   const deleted = await f.bridge.delete({ session_id: saved.id });
   assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
   await assert.rejects(fs.stat(saved.file), { code: 'ENOENT' });
+  assert.equal(f.spawned(), 0);
+});
+
+test('SDK host reload refreshes native resources, preserves history and keeps its neighboring session usable', async (t) => {
+  const f = await fixture(t),
+    saved = [await f.create('reload'), await f.create('neighbor')],
+    inputEntered = deferred(),
+    inputRelease = deferred(),
+    reloadEntered = deferred(),
+    reloadRelease = deferred();
+  const faux = fauxProvider({ provider: 'host-reload-fixture' });
+  faux.setResponses([
+    fauxAssistantMessage('BEFORE_RELOAD'),
+    fauxAssistantMessage('AFTER_RELOAD'),
+    fauxAssistantMessage('NEIGHBOR_STILL_USABLE'),
+  ]);
+  const modelRuntime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsPath: null,
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  });
+  modelRuntime.registerNativeProvider(faux.provider);
+  const sessions = [],
+    loads = [0, 0],
+    starts = [0, 0],
+    errors = [];
+  f.cleanups.push(async () => {
+    inputRelease.resolve();
+    reloadRelease.resolve();
+    for (const session of sessions) {
+      await session.abort();
+      session.dispose();
+    }
+  });
+  for (let index = 0; index < saved.length; index++) {
+    const controller = await reserveHostSession({
+      attachmentDir: f.config.attachmentDir,
+      session: saved[index],
+    });
+    f.controllers.push(controller);
+    const agentDir = path.join(f.dir, 'reload-agent-' + index),
+      settings = SettingsManager.inMemory({
+        cacheWarming: 'off',
+        retry: { enabled: false },
+        compaction: { enabled: false },
+      });
+    const loader = new DefaultResourceLoader({
+      cwd: f.cwd,
+      agentDir,
+      settingsManager: settings,
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      systemPrompt: 'Isolated native reload fixture.',
+      extensionFactories: [
+        (pi) => {
+          pi.registerProvider(faux.provider);
+          pi.registerCommand('resource_' + ++loads[index], { handler: async () => {} });
+          pi.on('session_start', () => {
+            starts[index]++;
+          });
+          pi.on('input', async (event) => {
+            if (event.text !== 'HOLD_LOCAL_INPUT') return;
+            inputEntered.resolve();
+            await inputRelease.promise;
+            return { action: 'handled' };
+          });
+          pi.on('session_shutdown', async (event) => {
+            if (event.reason !== 'reload') return;
+            reloadEntered.resolve();
+            await reloadRelease.promise;
+          });
+        },
+      ],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd: f.cwd,
+      agentDir,
+      modelRuntime,
+      model: faux.getModel(),
+      thinkingLevel: 'off',
+      tools: [],
+      resourceLoader: loader,
+      sessionManager: SessionManager.open(saved[index].file),
+      settingsManager: settings,
+    });
+    sessions.push(session);
+    await controller.ready(createSdkHostBinding(session));
+    await session.bindExtensions({ mode: 'rpc', onError: (error) => errors.push(error) });
+  }
+  const [session, neighbor] = sessions,
+    beforeClaims = await Promise.all(saved.map((item) => readClaim(f.config.attachmentDir, item)));
+  await session.prompt('PRESERVE_THIS_HISTORY');
+  const before = structuredClone(session.sessionManager.getEntries()),
+    neighborBefore = structuredClone(neighbor.sessionManager.getEntries());
+  const preparing = session.prompt('HOLD_LOCAL_INPUT');
+  await inputEntered.promise;
+  assert.equal(session.isIdle, true); // Native streaming state alone misses this work.
+  assert.deepEqual(await f.bridge.reload({ session_id: saved[0].id }), {
+    status: 'rejected',
+    reason: 'RELOAD_BUSY',
+  });
+  assert.deepEqual(loads, [1, 1]);
+  inputRelease.resolve();
+  await preparing;
+  const reloading = f.bridge.reload({ session_id: saved[0].id });
+  await reloadEntered.promise;
+  await assert.rejects(session.prompt('MUST_NOT_ENTER'), /RELOAD_IN_PROGRESS/);
+  reloadRelease.resolve();
+  assert.deepEqual(await reloading, {
+    status: 'completed',
+    owner_version: READ_CONTRACT,
+    read_compatible: true,
+  });
+  assert.deepEqual(loads, [2, 1]);
+  assert.deepEqual(starts, [2, 1]);
+  assert.deepEqual(session.sessionManager.getEntries(), before);
+  assert.deepEqual(neighbor.sessionManager.getEntries(), neighborBefore);
+  assert.deepEqual(
+    await Promise.all(saved.map((item) => readClaim(f.config.attachmentDir, item))),
+    beforeClaims,
+  );
+  const commands = session.extensionRunner.getRegisteredCommands().map((command) => command.name);
+  assert.ok(commands.includes('resource_2'));
+  assert.ok(!commands.includes('resource_1'));
+  assert.equal(
+    (await f.bridge.send({ session_id: saved[0].id, text: 'CONTINUE_RELOADED' })).status,
+    'dispatched',
+  );
+  await until(() => JSON.stringify(session.sessionManager.getEntries()).includes('AFTER_RELOAD'));
+  await neighbor.prompt('CONTINUE_NEIGHBOR');
+  assert.match(
+    JSON.stringify(await f.bridge.read({ session_id: saved[1].id })),
+    /NEIGHBOR_STILL_USABLE/,
+  );
+  assert.deepEqual(errors, []);
   assert.equal(f.spawned(), 0);
 });
 

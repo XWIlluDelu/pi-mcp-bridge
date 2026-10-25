@@ -558,7 +558,10 @@ export class AttachedRuntime {
             ].includes(response.error)
           )
             return finish(new AttachmentFailure(response.error));
-          if (mutating && ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS'].includes(response.error))
+          if (
+            mutating &&
+            ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS', 'RELOAD_IN_PROGRESS'].includes(response.error)
+          )
             return finish(new AttachmentFailure(response.error));
           if (op === 'bash' && response.error === 'BASH_UNSUPPORTED')
             return finish(new AttachmentFailure('BASH_UNSUPPORTED'));
@@ -681,6 +684,23 @@ export class AttachedRuntime {
   }
   async reload(beforeDispatch) {
     if (this.record.reloadSupported !== true) throw new AttachmentFailure('RELOAD_UNSUPPORTED');
+    if (this.record.kind === 'host') {
+      let receipt;
+      try {
+        receipt = await this.request('reload', {}, 10000, beforeDispatch);
+      } catch (error) {
+        if (error.uncertain) throw new AttachmentFailure('RELOAD_UNCONFIRMED', true);
+        throw error;
+      }
+      if (receipt?.reloaded !== true) throw new AttachmentFailure('RELOAD_UNCONFIRMED', true);
+      // The host adapter stays loaded while its native session reloads. Its
+      // awaited callback is completion evidence, not a replacement generation.
+      return {
+        status: 'completed',
+        owner_version: this.record.readContract,
+        read_compatible: this.record.readContract === READ_CONTRACT,
+      };
+    }
     try {
       const receipt = await this.request('reload', {}, 5000, beforeDispatch);
       if (receipt?.reloading !== true)
