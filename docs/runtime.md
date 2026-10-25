@@ -59,7 +59,7 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 | Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
 | Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
 | Manual compact          | Idle by default; explicit interrupt  | Explicit interrupt                                    | Explicit interrupt                      |
-| Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | Unsupported                             |
+| Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | SDK native reload; RPC host callback    |
 | TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 | Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
@@ -116,11 +116,32 @@ previous Runtime Context capture. It reads the owner's configured resources;
 it does not rewrite extension paths. A successful reload can therefore return
 `read_compatible:false` when those paths still select an older Bridge component.
 
-Host adapters remain under their host's lifecycle and return
-`RELOAD_UNSUPPORTED`; Bridge never restarts a host implicitly. An ordinary RPC
-process using the companion is supported without taking over its pipes. Existing
-companions without reload capability need one native reload or host-managed
-reopen before this operation becomes available.
+SDK host bindings call the existing session's `reload()` and use the same native
+operation guard as companions. Create the binding before accepting local input so
+the guard observes input preparation as well as model execution. Their controller
+and writer remain in place; completion is the resolved native reload, not a new owner generation. Other
+sessions sharing the host process remain untouched. The adapter reports its own
+loaded Bridge version because native resource reload does not reimport host code.
+
+Native Pi RPC has no reload command. `createRpcHostBinding(client, { reload })`
+therefore accepts the host's native reload callback. Custom host adapters can
+provide the same callback in `ready(callbacks)`:
+
+```text
+reload({sessionFile, sessionId, beforeDispatch}) -> Promise<{reloaded:true}>
+```
+
+The callback checks idle and fences every local admission path, including input
+preparation, then calls `beforeDispatch()` immediately before native reload.
+Resolve only after that reload finishes, preserving the current writer and native
+session identity. The adapter fences its own mutations while waiting. A command
+ACK is not completion; an exception after dispatch is an unknown outcome. Missing
+a callback is reported by `list.status.capabilities.reload:false`.
+
+Inspire currently owns ordinary Pi RPC workers that load the companion, so it
+uses the companion path directly. Bridge reload runs inside that worker; it does
+not restart Inspire or replace the worker. Inspire's local `/reload` action is a
+separate host-managed worker reopen.
 
 ## Model settings and compaction
 

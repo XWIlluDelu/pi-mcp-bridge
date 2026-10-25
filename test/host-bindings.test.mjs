@@ -390,3 +390,156 @@ test('SDK handled bash is recorded after stop; only fallback execution rechecks 
     }
   }
 });
+
+class ReloadSession {
+  constructor() {
+    Object.assign(this, idle);
+    this.sessionManager = {};
+    this.reloadCalls = 0;
+  }
+  async prompt(work) {
+    return await work;
+  }
+  async executeBash(work) {
+    return await work;
+  }
+  async reload() {
+    this.reloadCalls++;
+    this.entered?.resolve();
+    await this.reloadWork;
+  }
+}
+
+test('SDK reload refuses local input preparation and fences local operations until native completion', async () => {
+  const session = new ReloadSession(),
+    binding = createSdkHostBinding(session),
+    preparation = Promise.withResolvers();
+  const preparing = session.prompt(preparation.promise);
+  assert.equal(session.isIdle, true);
+  assert.equal((await binding.state()).isIdle, false);
+  await assert.rejects(
+    binding.reload({
+      ...idle,
+      beforeDispatch: () => assert.fail('Busy reload must not dispatch'),
+    }),
+    /RELOAD_BUSY/,
+  );
+  assert.equal(session.reloadCalls, 0);
+  preparation.resolve();
+  await preparing;
+
+  const completion = Promise.withResolvers();
+  session.entered = Promise.withResolvers();
+  session.reloadWork = completion.promise;
+  let settled = false;
+  const reloading = binding.reload({ ...idle }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await session.entered.promise;
+  assert.equal(settled, false);
+  assert.equal((await binding.state()).isIdle, false);
+  await assert.rejects(session.prompt('must not run'), /RELOAD_IN_PROGRESS/);
+  await assert.rejects(session.executeBash('must not run'), /RELOAD_IN_PROGRESS/);
+  completion.resolve();
+  assert.deepEqual(await reloading, { reloaded: true });
+  assert.equal((await binding.state()).isIdle, true);
+  assert.equal(await session.prompt('continued'), 'continued');
+});
+
+test('SDK reload clears admission on dispatch rejection, native failure, and identity changes', async () => {
+  const session = new ReloadSession(),
+    binding = createSdkHostBinding(session);
+  await assert.rejects(
+    binding.reload({
+      ...idle,
+      beforeDispatch: () => {
+        throw new Error('PERMISSION_REVOKED');
+      },
+    }),
+    /PERMISSION_REVOKED/,
+  );
+  assert.equal(session.reloadCalls, 0);
+  assert.equal(await session.prompt('still usable'), 'still usable');
+
+  const failure = Promise.withResolvers();
+  session.reloadWork = failure.promise;
+  const failed = binding.reload({ ...idle });
+  failure.reject(new Error('NATIVE_RELOAD_FAILED'));
+  await assert.rejects(failed, /NATIVE_RELOAD_FAILED/);
+  assert.equal((await binding.state()).isIdle, true);
+
+  session.reloadWork = Promise.resolve().then(() => {
+    session.sessionId = 'changed';
+  });
+  await assert.rejects(binding.reload({ ...idle }), /RUNTIME_SESSION_CHANGED/);
+  assert.equal((await binding.state()).isIdle, true);
+
+  // Object-based test substitutes must not install observers on Object.prototype.
+  const unsupported = createSdkHostBinding({ ...sdk(() => {}), reload: async () => {} });
+  assert.equal(unsupported.reload, undefined);
+});
+
+test('RPC reload delegates safe admission and waits host confirmation on the same native session', async () => {
+  const value = { ...idle },
+    completion = Promise.withResolvers(),
+    entered = Promise.withResolvers();
+  let dispatched = 0,
+    settled = false;
+  const client = {
+    getState: async () => value,
+    prompt: () => assert.fail('Reload must not submit a prompt'),
+  };
+  assert.equal(createRpcHostBinding(client).reload, undefined);
+  const binding = createRpcHostBinding(client, {
+    reload: async ({ sessionFile, sessionId, beforeDispatch }) => {
+      assert.deepEqual(
+        { sessionFile, sessionId },
+        {
+          sessionFile: idle.sessionFile,
+          sessionId: idle.sessionId,
+        },
+      );
+      beforeDispatch();
+      entered.resolve();
+      return await completion.promise;
+    },
+  });
+  const work = binding.reload({ ...idle, beforeDispatch: () => dispatched++ }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await entered.promise;
+  assert.equal(dispatched, 1);
+  assert.equal(settled, false);
+  completion.resolve({ reloaded: true });
+  assert.deepEqual(await work, { reloaded: true });
+
+  const switched = createRpcHostBinding(client, {
+    reload: async () => {
+      value.sessionId = 'another';
+      return { reloaded: true };
+    },
+  });
+  await assert.rejects(switched.reload({ ...idle }), /RUNTIME_SESSION_CHANGED/);
+});
+
+test('RPC reload preserves host busy refusal and requires explicit completion', async () => {
+  const client = { getState: async () => idle };
+  const busy = createRpcHostBinding(client, {
+    reload: async () => {
+      throw new Error('RELOAD_BUSY');
+    },
+  });
+  await assert.rejects(
+    busy.reload({
+      ...idle,
+      beforeDispatch: () => assert.fail('Busy reload must not dispatch'),
+    }),
+    /RELOAD_BUSY/,
+  );
+  const unconfirmed = createRpcHostBinding(client, {
+    reload: async () => ({ accepted: true }),
+  });
+  await assert.rejects(unconfirmed.reload({ ...idle }), /RELOAD_UNCONFIRMED/);
+});

@@ -7,6 +7,7 @@ import { SEND_MODES, hasPromptSettings, promptOptions as options } from './promp
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
+import { reloadAdmission } from './reload-admission.mjs';
 const unknown = () => ({
   status: 'unknown',
   reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
@@ -55,11 +56,22 @@ function tracker(release, onError) {
 
 export function createSdkHostBinding(session, { release, onError } = {}) {
   const tracked = tracker(release, onError);
+  // Install before the host admits local work: public operation lifetimes also
+  // cover input preparation, which Pi's isIdle does not include.
+  const admission =
+    session.constructor !== Object &&
+    typeof session.constructor?.prototype?.reload === 'function' &&
+    session.sessionManager
+      ? reloadAdmission(session.constructor)
+      : null;
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
     ...('sessionName' in session ? { sessionName: session.sessionName ?? null } : {}),
-    isIdle: session.isIdle && !tracked.submitting,
+    isIdle:
+      session.isIdle &&
+      !tracked.submitting &&
+      (!admission || admission.idle(session.sessionManager)),
     isStreaming: session.isStreaming,
     isCompacting: session.isCompacting,
     isBashRunning: session.isBashRunning,
@@ -81,6 +93,28 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       return { ...before, entries, leafId };
     },
     supportsImages: true,
+    reload: admission
+      ? async ({ beforeDispatch, ...expected }) => {
+          const before = identity(session);
+          assertIdentity(expected, before);
+          const operation = admission.begin(
+            session.sessionManager,
+            {
+              isIdle: () => session.isIdle && !session.isBashRunning,
+              hasPendingMessages: () => session.pendingMessageCount > 0,
+            },
+            tracked.submitting,
+          );
+          try {
+            beforeDispatch?.();
+            await operation.run(() => tracked.track(session.reload()));
+            assertIdentity(before, identity(session));
+            return { reloaded: true };
+          } finally {
+            operation.cancel();
+          }
+        }
+      : undefined,
     compact:
       typeof session.compact === 'function'
         ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
@@ -217,7 +251,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   };
 }
 
-export function createRpcHostBinding(client, { release, onError } = {}) {
+export function createRpcHostBinding(client, { release, reload, onError } = {}) {
   const tracked = tracker(release, onError);
   const state = async () => {
     const value = await client.getState();
@@ -255,6 +289,21 @@ export function createRpcHostBinding(client, { release, onError } = {}) {
       };
     },
     supportsImages: true,
+    // RpcClient has no reload command. The host callback must atomically refuse
+    // busy local work, invoke beforeDispatch immediately before native reload,
+    // and await completion on the same writer. A prompt ACK is not completion;
+    // replacing the writer belongs to the host's registration lifecycle.
+    reload:
+      typeof reload === 'function'
+        ? async ({ beforeDispatch, ...expected }) => {
+            const before = await state();
+            assertIdentity(expected, before);
+            const result = await tracked.track(reload({ ...identity(before), beforeDispatch }));
+            if (result?.reloaded !== true) throw new Error('RELOAD_UNCONFIRMED');
+            assertIdentity(before, await state());
+            return { reloaded: true };
+          }
+        : undefined,
     compact:
       typeof client.compact === 'function'
         ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {

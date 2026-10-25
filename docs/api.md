@@ -1,6 +1,6 @@
 # Public tool API
 
-Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter. Native and owner acknowledgements normally have a five-second budget; companion reload waits up to ten seconds for a fresh ready owner. Owned RPC reload follows normal shutdown and startup, including native lifecycle hooks. These waits do not cancel native execution. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
+Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter. Native and owner acknowledgements normally have a five-second budget; companion and host reload confirmation waits up to ten seconds. Owned RPC reload follows normal shutdown and startup, including native lifecycle hooks. These waits do not cancel native execution. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
 
 ## Sessions and mutations
 
@@ -111,27 +111,27 @@ covers retention and authorization.
 { "session_id": "ps_…" }
 ```
 
-`reload` requires `send` and refreshes an active owner's Pi resources and Bridge
-companion. It has no interrupt, wait or owner-specific options. It preserves
-saved history and resets extension-local state. The caller can use it after
+`reload` requires `send` and refreshes an active owner's Pi resources. It has no
+interrupt, wait or owner-specific options. It preserves saved history and resets extension-local state. The caller can use it after
 `OWNER_READ_REFRESH_REQUIRED` or after changing the owner's resource settings.
 
-| Result                                          | Meaning                                                                                                                                                                               |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `completed`, `owner_version`, `read_compatible` | Native reload finished and Bridge confirmed a fresh ready owner for the same session. The version identifies its Bridge component; compatibility says whether it matches this Bridge. |
-| `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                                        |
-| `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                                                   |
-| `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                                                 |
-| `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh started but completion could not be confirmed. Companion confirmation waits up to ten seconds. Inspect `list/read` before another call.                                       |
+| Result                                          | Meaning                                                                                                                                                        |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `completed`, `owner_version`, `read_compatible` | Native reload finished for the same session. The version identifies the loaded Bridge component; compatibility says whether it matches this Bridge.            |
+| `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                 |
+| `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                            |
+| `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                          |
+| `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh may have started; completion could not be confirmed. Companion and host confirmation waits up to ten seconds. Inspect `list/read` before another call. |
 
-`read_compatible:false` means native reload completed but the configured component
-is still a different Bridge version. Correct the component path before reloading
-again. Repeated calls perform another reload; they are not status lookups.
+`read_compatible:false` means native reload completed but the loaded Bridge
+component still differs. Align the configured companion or host binding with
+Bridge before retrying read. Repeated calls perform another reload; they are not
+status lookups.
 
-Current ordinary TUI/RPC companions and Bridge-owned RPCs support reload. Host
-adapters are not restarted by this operation. Old companions without this feature
-need one native `/reload` or host-managed reopen to load it. See the
-[reload lifecycle](runtime.md#remote-reload) for ownership and admission boundaries.
+Bridge-owned RPC, ordinary TUI/RPC companions and SDK host bindings support
+reload. RPC host bindings use the host's reload callback. A host binding remains
+loaded while Pi resources reload; updating that binding follows its host's normal
+component loading lifecycle. See [reload integration](runtime.md#remote-reload).
 
 ### Send
 

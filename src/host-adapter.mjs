@@ -70,6 +70,8 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
     bashing = false,
     settingModel = false,
     compacting = false,
+    submitting = 0,
+    reloading = false,
     releasing = false,
     writerReleased = false,
     releasePromise,
@@ -162,6 +164,8 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       stoppingAtEntry = stopping;
     const observed = await state(),
       args = request.body ?? {};
+    if (reloading && !['state', 'read', 'read_features', 'snapshot'].includes(request.op))
+      fail('RELOAD_IN_PROGRESS');
     if (
       ['bash', 'stop'].includes(request.op) &&
       (Object.keys(args).some(
@@ -197,7 +201,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
           ? { sessionName: observed.sessionName }
           : {}),
         isIdle:
-          bashing || stopping || settingModel || compacting
+          bashing || stopping || settingModel || compacting || reloading || submitting
             ? false
             : typeof observed.isIdle === 'boolean'
               ? observed.isIdle
@@ -282,6 +286,42 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
           ),
         };
       }
+    } else if (request.op === 'reload') {
+      if (typeof callbacks.reload !== 'function') fail('RELOAD_UNSUPPORTED');
+      if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
+      if (
+        bashing ||
+        stopping ||
+        settingModel ||
+        compacting ||
+        submitting ||
+        observed.isIdle === false ||
+        observed.isStreaming === true ||
+        observed.isCompacting === true ||
+        observed.isBashRunning === true ||
+        pendingMessageCount > 0
+      )
+        fail('RELOAD_BUSY');
+      beforeDispatch();
+      reloading = true;
+      let dispatched = false;
+      try {
+        const result = await callbacks.reload({
+          sessionFile: target.file,
+          sessionId: target.header.id,
+          beforeDispatch: () => {
+            beforeDispatch();
+            dispatched = true;
+          },
+        });
+        if (!dispatched || result?.reloaded !== true) fail('RELOAD_UNCONFIRMED');
+        data = { reloaded: true };
+      } catch (error) {
+        if (dispatched) fail('RELOAD_UNCONFIRMED');
+        throw error;
+      } finally {
+        reloading = false;
+      }
     } else if (request.op === 'set_model') {
       if (typeof callbacks.setModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
       const input = modelSettingsSchema.safeParse(args);
@@ -289,6 +329,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       if (settingModel) fail('MODEL_SELECTION_PENDING');
       const beforeModelDispatch = () => {
         if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
+        if (reloading) fail('RELOAD_IN_PROGRESS');
       };
       beforeModelDispatch();
       settingModel = true;
@@ -337,9 +378,14 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
-      data =
-        remotePromptRejection(input.text) ??
-        receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
+      submitting++;
+      try {
+        data =
+          remotePromptRejection(input.text) ??
+          receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
+      } finally {
+        submitting--;
+      }
     } else if (request.op === 'bash') {
       if (!supportsBash()) fail('BASH_UNSUPPORTED');
       if (typeof args.command !== 'string' || !args.command.length || args.command.length > 100000)
@@ -423,11 +469,12 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
             'bash',
             'setModel',
             'compact',
+            'reload',
           ].includes(key),
       ) ||
       (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
-      ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact', 'readFeatures'].some(
+      ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact', 'reload', 'readFeatures'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
       )
     )
@@ -467,7 +514,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
                 Number.isInteger(request.body?.timeout_ms)
               )
                 socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
-              if (request.op === 'compact') socket.setTimeout(0);
+              if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
               let data;
               if (request.op === 'release') data = await release();
               else {
@@ -508,6 +555,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
         phase: 'ready',
         imagesSupported: callbacks.supportsImages === true,
         readContract: READ_CONTRACT,
+        reloadSupported: typeof callbacks.reload === 'function',
       });
       if (closed || releasing) {
         await retire();

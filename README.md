@@ -43,7 +43,7 @@ For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for s
 
 Cold resume uses the owner's native settings, authentication, tools, extensions and project configuration. Bridge-owned RPCs release when their work is safely idle and resume saved sessions for later work.
 
-[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to register ordinary TUI/RPC owners. Use [`reload({session_id})`](docs/api.md#reload) to apply resource changes to a supported idle owner; a companion without reload support needs one native refresh first. To open a Bridge session in a native TUI:
+[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to register ordinary TUI/RPC owners. Use [`reload({session_id})`](docs/api.md#reload) to apply resource changes to an idle owner. To open a Bridge session in a native TUI:
 
 ```sh
 node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
