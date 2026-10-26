@@ -479,21 +479,19 @@ export function navigationRows(snapshot, documents, ref, { query, content } = {}
       doc.kind === 'assistant' &&
       doc.prompt_id != null &&
       latest.get(doc.prompt_id) === doc.message;
-    const full = compact(doc.preview ?? documentText(snapshot, doc));
-    const text = query
-      ? excerpt(documentText(snapshot, doc), 640, query)
-      : isLatest
-        ? excerpt(full, 1600)
-        : doc.kind === 'tool'
-          ? full
-          : excerpt(full, ['input', 'assistant', 'thinking'].includes(doc.kind) ? 1600 : 900);
+    const full = compact(
+      query ? documentText(snapshot, doc) : (doc.preview ?? documentText(snapshot, doc)),
+    );
+    let text;
+    if (query) text = excerpt(full, 640, query);
+    else if (doc.kind === 'tool') text = full;
+    else text = excerpt(full, ['input', 'assistant', 'thinking'].includes(doc.kind) ? 1600 : 900);
     return {
       type: doc.kind,
       ref: ref(index),
       text,
       ...(doc.title ? { title: doc.title } : {}),
-      ...(text !== full && !query ? { truncated: true } : {}),
-      ...(query && text !== compact(documentText(snapshot, doc)) ? { truncated: true } : {}),
+      ...(text !== full ? { truncated: true } : {}),
       ...(doc.source ? { source: doc.source } : {}),
       ...(doc.branch_relation ? { branch_relation: doc.branch_relation } : {}),
       ...(related.length ? { related } : {}),

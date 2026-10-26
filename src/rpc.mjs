@@ -30,6 +30,12 @@ import {
   AttachedRuntime,
   AttachmentFailure,
 } from './attachments.mjs';
+const READ_COMMANDS = new Set([
+  'get_state',
+  'get_entries',
+  'get_available_models',
+  'get_available_thinking_levels',
+]);
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) {
     super(code);
@@ -328,15 +334,7 @@ export class PiRpc {
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation)
       this.promptAdmission = null;
     const notifyIdle = () => {
-      if (
-        ![
-          'get_state',
-          'get_entries',
-          'get_available_models',
-          'get_available_thinking_levels',
-        ].includes(req.commandType)
-      )
-        this.onIdleCandidate?.();
+      if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
     };
     const ui = uiSnapshot(req.uiFacts);
     const result = event.success
@@ -470,15 +468,7 @@ export class PiRpc {
         log: diagnostics.capture(),
       };
       const discardRead = () => {
-        if (
-          [
-            'get_state',
-            'get_entries',
-            'get_available_models',
-            'get_available_thinking_levels',
-          ].includes(command.type)
-        )
-          this.pending.delete(id);
+        if (READ_COMMANDS.has(command.type)) this.pending.delete(id);
       };
       req.timer = setTimeout(() => {
         req.timedOut = true;
@@ -563,15 +553,7 @@ export class PiRpc {
       this.modelMutation ||
       this.compactionMutation ||
       this.settlementSequence < this.requiredSettlementSequence ||
-      [...this.pending.values()].some(
-        (r) =>
-          ![
-            'get_state',
-            'get_entries',
-            'get_available_models',
-            'get_available_thinking_levels',
-          ].includes(r.commandType),
-      ),
+      [...this.pending.values()].some((r) => !READ_COMMANDS.has(r.commandType)),
     );
   }
   async idleSnapshot() {

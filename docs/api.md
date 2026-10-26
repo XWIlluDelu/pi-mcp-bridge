@@ -288,7 +288,19 @@ overtake it. Another create call creates another child.
 
 Requires only `delete`. It authorizes interruption of the target writer, including during release or handoff, and moves the native session to private trash while preserving project files. Delete fences new writers until termination and the move finish. A shared host that cannot close only this session returns `DELETE_SHARED_OWNER`; Bridge does not kill its other sessions. See [deletion lifecycle](runtime.md#explicit-deletion) for switching, process termination and partial failures.
 
-Success returns a `restore_token` and project authorization scope. The manifest under `stateDir/trash` records original/trash paths. Restore is an owner operation: inspect the manifest and confirm writers are closed before restoring. Each new delete call is another attempt, not a lookup of the previous result.
+Success returns a `restore_token` and project authorization scope. The session
+moves to `<original-directory>/.pi-mcp-trash/<restore_token>.jsonl`,
+with an authoritative `<restore_token>.restore.json` record in that trash
+directory. `stateDir/trash/<restore_token>.restore.json` is an index copy;
+backing up `stateDir` alone does not preserve deleted session content.
+
+Restore is an owner operation, with no Bridge restore tool or CLI. The record
+contains `original_path`, `trash_path` and `metadata_path`. Confirm writers are
+closed and the original path is vacant before moving the saved file back.
+Recovery records are prepared before the move and retain `phase:"prepared"`
+after success: inspect both file paths rather than treating the record as proof
+that deletion finished. Each new delete call is another attempt, not a lookup of
+the previous result.
 
 ### Batch
 

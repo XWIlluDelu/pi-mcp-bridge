@@ -11,6 +11,7 @@ import { diagnostics } from './diagnostics.mjs';
 import {
   SUPPORTED_VERSIONS,
   modernMessage,
+  isRpcRequest,
   dispatchModern,
   validateModernHeaders,
   boundMessage,
@@ -178,17 +179,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       const body = await parseBody(req);
       if (record.disconnected) return;
       diagnostics.emit('http.request', { method: body.method });
-      if (
-        body.jsonrpc !== '2.0' ||
-        typeof body.method !== 'string' ||
-        (body.params !== undefined &&
-          (!body.params || typeof body.params !== 'object' || Array.isArray(body.params))) ||
-        (body.id !== undefined &&
-          !(
-            (typeof body.id === 'number' && Number.isSafeInteger(body.id)) ||
-            (typeof body.id === 'string' && Buffer.byteLength(body.id) <= 1024)
-          ))
-      )
+      if (!isRpcRequest(body))
         return jsonResponse(res, 400, rpcError(null, -32600, 'Invalid request'));
       const deadline = setTimeout(() => {
         if (body.id !== undefined)

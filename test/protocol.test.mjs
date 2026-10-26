@@ -11,6 +11,7 @@ import {
   boundMessage,
   toolDefinitions,
   validateModernHeaders,
+  isRpcRequest,
 } from '../src/protocol.mjs';
 import { BridgeStdioTransport } from '../src/protocol-stdio.mjs';
 
@@ -27,6 +28,46 @@ const deferred = () => {
   const promise = new Promise((r) => (resolve = r));
   return { promise, resolve };
 };
+
+test('transport request envelopes allow notifications and enforce parameter and ID boundaries', () => {
+  const request = { jsonrpc: '2.0', method: 'ping' };
+  assert.equal(isRpcRequest(request), true, 'notifications may omit both ID and params');
+  assert.equal(isRpcRequest({ ...request, params: {} }), true);
+  for (const params of [null, [], false, 1, 'invalid'])
+    assert.equal(isRpcRequest({ ...request, params }), false);
+  for (const id of [
+    0,
+    Number.MIN_SAFE_INTEGER,
+    Number.MAX_SAFE_INTEGER,
+    '',
+    'a'.repeat(1024),
+    '🙂'.repeat(256),
+  ])
+    assert.equal(isRpcRequest({ ...request, id }), true);
+  for (const id of [
+    null,
+    false,
+    [],
+    {},
+    0.5,
+    Number.MIN_SAFE_INTEGER - 1,
+    Number.MAX_SAFE_INTEGER + 1,
+    'a'.repeat(1025),
+    '🙂'.repeat(256) + 'a',
+  ])
+    assert.equal(isRpcRequest({ ...request, id }), false);
+  for (const body of [
+    null,
+    false,
+    1,
+    'request',
+    [],
+    {},
+    { ...request, jsonrpc: '1.0' },
+    { ...request, method: null },
+  ])
+    assert.equal(isRpcRequest(body), false);
+});
 
 test('modern requests are self-contained; discovery and tool list carry required fields', async () => {
   const discovery = await dispatchModern(stub, message('server/discover'));

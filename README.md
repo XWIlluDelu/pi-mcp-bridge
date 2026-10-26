@@ -79,6 +79,7 @@ The launcher negotiates ownership before opening the session. See [runtime integ
 | Receive completion notifications                                | [Events](docs/events.md)                                                               |
 | Connect a live Pi owner or integrate an SDK/RPC host            | [Runtime integration](docs/runtime.md)                                                 |
 | Enable an optional plugin reader or input mapping               | [Compatibility modules](docs/compatibility.md)                                         |
+| Investigate a failed request or service operation               | [Diagnostics](docs/configuration.md#diagnostics)                                       |
 | Develop or verify Bridge                                        | [Architecture and verification](docs/architecture.md)                                  |
 
 ## Development

@@ -178,12 +178,12 @@ or exhausted delivery attempts are dropped. Incoming Tunnel reconnection does
 not affect the outbound retry loop.
 
 Polling, streaming, `gap` and `terminated` notifications are unsupported.
-Interruption can lose occurrences or pending deliveries. `PI_MCP_LOG=1`
-enables content-free delivery success/failure/drop diagnostics. For network
-troubleshooting, `PI_MCP_LOG_CALLBACK_HOST=1` additionally records the parsed
-callback hostname before verification. Neither setting logs full callback URLs,
-secrets, bodies or conversation content. Remove the hostname setting when
-troubleshooting ends.
+Interruption can lose occurrences or pending deliveries. With
+[Bridge diagnostics enabled](configuration.md#diagnostics), delivery logs report
+success, failure and drops. For network troubleshooting, also set
+`PI_MCP_LOG_CALLBACK_HOST=1` in the launch environment to record the parsed
+callback hostname before verification. Full callback URLs and secrets remain
+excluded. Remove the hostname setting when troubleshooting ends.
 
 ## Troubleshooting fake-IP proxy DNS
 
