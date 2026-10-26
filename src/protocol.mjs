@@ -26,6 +26,8 @@ export const descriptions = {
     'Change a session’s model and/or thinking_level without sending a prompt. Requires send permission and at least one setting. Model-only changes preserve current effort with Pi’s compatible fallback if unsupported. Busy sessions are supported: issued provider requests keep their selection; later calls use the current choice. Returns actual model and thinking_level, including native adjustment. May cold-resume a saved session; unsupported owners reject. Global defaults stay unchanged. An uncertain error may follow a partial change; inspect list.status before another call.',
   compact:
     'Compact native context with send permission and proven-idle admission. Explicit interrupt:true additionally requires stop and may abort the agent even if compaction fails; it does not withdraw queues. Ordinary companions and supplied host bindings require explicit interrupt because they cannot prove idle admission. Returns status:completed with compaction metadata once native compaction finishes; summary text requires read. Timeout leaves the outcome unknown: inspect list/read before submitting another compaction.',
+  reload:
+    'Reload Pi resources for one idle session with send permission. Supports Bridge-owned RPC, ordinary TUI/RPC companions and host bindings with reload support. Active or pending work returns rejected/RELOAD_BUSY; no active owner returns skipped/no_active_owner. completed confirms native refresh and includes owner_version and read_compatible for the loaded Bridge component. Host bindings remain loaded during native resource reload. Unconfirmed refresh returns unknown/RELOAD_UNCONFIRMED; inspect list/read before retrying. Reload preserves history and resets extension-local state. It does not send a task, interrupt work or queue a future reload.',
   list: 'List authorized sessions with project, name, activity and sampled runtime status. Filters combine; newest activity first. Live model/thinking values are null when unobserved. Never starts Pi. The independent creatable_projects catalog includes configured destinations with project-level list and create permission, including empty projects, regardless of session filters or pagination. A known hidden destination remains usable with create permission. Listing requires no read permission.',
   read: 'Read a Pi session in source order, then expand useful messages or evidence. By default selects the last three input turns, includes input and all assistant text, and takes the latest thinking message and logical tool operation per turn. range:{recent:N,earliest:N} selects turns only; -1 means all. content controls input visibility and per-kind counts independently. Tools are short navigation with refs; each turn’s latest assistant text receives priority within the page budget. Omit view for an enabled matching reader, use view:session for native Session Context or view:runtime for a request-stage capture. Runtime rejects range/leaf_id and only accepts whole-kind content switches (0/-1 or booleans as declared). read({refs:[...]}) expands up to eight frozen references; source_context refs open historical Session Context. Continue with cursor alone, optionally changing max_bytes. Search locates text beyond the default selection. Reading never starts Pi, calls a model or reruns hooks. Stale references/cursors require a fresh read/search.',
   search:
@@ -52,6 +54,7 @@ export const toolNames = [
   'models',
   'set_model',
   'compact',
+  'reload',
   'send',
   'submission',
   'command',
@@ -85,7 +88,7 @@ export function toolError(code, extra = {}) {
       ...(code === 'OWNER_READ_REFRESH_REQUIRED'
         ? {
             recovery:
-              'Update the session owner companion at an idle boundary (native /reload where supported), then retry read. Changing read arguments will not refresh the owner.',
+              'Call reload for this session at an idle boundary, then retry read. If reload is unsupported, update the configured companion and use native /reload or a host-managed reopen once. Changing read arguments will not refresh the owner.',
           }
         : ['ATTACHMENT_PROTOCOL_MISMATCH', 'OWNER_COMPONENT_UPDATE_REQUIRED'].includes(code)
           ? {

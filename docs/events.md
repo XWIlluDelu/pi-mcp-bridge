@@ -188,8 +188,9 @@ nonpublic address. Some proxies return synthetic fake-IP addresses, such as
 
 Service activation, restart and plugin changes require owner authorization.
 Update Bridge and its matching companion/observer together, coordinating any
-interruption of in-flight work. Existing ordinary owners need a safe native
-`/reload` or host-managed reopen to load the updated companion.
+interruption of in-flight work. Supported idle owners can use
+[`reload({session_id})`](api.md#reload); owners without that capability need a
+native `/reload` or host-managed reopen to load the updated companion.
 
 1. Refresh/rescan the plugin and confirm that `session.settled` appears.
 2. In the intended Work chat, subscribe to an authorized saved session and ask

@@ -230,7 +230,12 @@ export default pi=>{
       await bridge.events.handle('events/subscribe', subscription);
       const status = (await bridge.list({ session_id: saved.id })).sessions[0].status;
       assert.equal(claim.kind, mode === 'tui' ? 'tui' : 'extension');
-      assert.deepEqual(status.capabilities, { send: true, command: false, stop: false });
+      assert.deepEqual(status.capabilities, {
+        send: true,
+        reload: true,
+        command: false,
+        stop: false,
+      });
       const defaultsBeforeSelection = await fs.readFile(path.join(agent, 'settings.json'), 'utf8');
       const selected = await bridge.set_model({
         session_id: saved.id,

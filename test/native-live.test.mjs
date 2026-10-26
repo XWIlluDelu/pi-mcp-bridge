@@ -72,7 +72,7 @@ test(
     });
     const busy = await status();
     assert.equal(busy.state, 'busy');
-    assert.deepEqual(busy.capabilities, { send: true, command: true, stop: true });
+    assert.deepEqual(busy.capabilities, { send: true, reload: true, command: true, stop: true });
     assert.equal(live.live.source, 'rpc_message_events');
     assert.equal(live.live.transient, true);
     assert.ok(!live.items.some((item) => item.type === 'assistant'));

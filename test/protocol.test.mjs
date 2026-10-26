@@ -46,6 +46,7 @@ test('modern requests are self-contained; discovery and tool list carry required
       'models',
       'set_model',
       'compact',
+      'reload',
       'send',
       'submission',
       'command',
@@ -115,6 +116,10 @@ test('public mutation payloads are validated before dispatch', async () => {
       called++;
       return { status: 'started' };
     },
+    reload: async () => {
+      called++;
+      return { status: 'skipped', reason: 'no_active_owner' };
+    },
   };
   const first = await dispatchModern(
     bridge,
@@ -149,6 +154,23 @@ test('public mutation payloads are validated before dispatch', async () => {
   );
   assert.equal(unknown.message.result.isError, true);
   assert.equal(called, 2);
+  const reload = await dispatchModern(
+    bridge,
+    message('tools/call', { name: 'reload', arguments: { session_id: 'ps_test' } }),
+  );
+  assert.deepEqual(reload.message.result.structuredContent, {
+    status: 'skipped',
+    reason: 'no_active_owner',
+  });
+  const interruptReload = await dispatchModern(
+    bridge,
+    message('tools/call', {
+      name: 'reload',
+      arguments: { session_id: 'ps_test', interrupt: true },
+    }),
+  );
+  assert.equal(interruptReload.message.result.structuredContent.error.code, 'INVALID_ARGUMENTS');
+  assert.equal(called, 3);
 });
 test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
   const bridge = {
@@ -168,6 +190,7 @@ test('owner read refresh is a lifecycle error in text and structured tool result
   assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   assert.equal(result.structuredContent.error.code, 'OWNER_READ_REFRESH_REQUIRED');
   assert.match(result.structuredContent.error.recovery, /idle boundary/);
+  assert.match(result.structuredContent.error.recovery, /Call reload/);
   assert.match(result.structuredContent.error.recovery, /Changing read arguments will not/);
 });
 
