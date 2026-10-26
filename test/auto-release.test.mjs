@@ -960,6 +960,85 @@ test(
   },
 );
 
+for (const reply of ['busy', 'unknown'])
+  test(
+    `idle completion during a pending ${reply} seal reply preserves the right release outcome`,
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `const original=AgentSession.prototype.prompt;let started=false;AgentSession.prototype.prompt=function(...args){if(!started){started=true;const session=this;void wait('native-bash-go').then(()=>session.executeBash('touch '+JSON.stringify(dir+'/native-bash-start')+'; while [ ! -e '+JSON.stringify(dir+'/finish')+' ]; do sleep 0.02; done; printf NATIVE_BASH_DONE'));}return original.apply(this,args);};pi.on('input',()=>({action:'handled'}));`,
+      );
+      const extension = f.dir + '/fixture.mjs';
+      await fs.writeFile(
+        extension,
+        "import {AgentSession} from '@earendil-works/pi-coding-agent';\n" +
+          (await fs.readFile(extension, 'utf8')),
+      );
+      const rpc = await f.bridge.pool.resolve(f.session),
+        seal = AttachedRuntime.prototype.seal,
+        candidate = f.bridge.idleCandidateForLocal.bind(f.bridge),
+        initial = Promise.withResolvers(),
+        busy = Promise.withResolvers(),
+        ack = Promise.withResolvers(),
+        completed = Promise.withResolvers();
+      let calls = 0;
+      t.mock.method(f.bridge, 'idleCandidateForLocal', (request) => {
+        const result = candidate(request);
+        if (!calls) initial.resolve();
+        else completed.resolve();
+        return result;
+      });
+      await rpc.command({ type: 'prompt', message: 'CAPTURE_NATIVE_SESSION' });
+      await initial.promise;
+      await until(() => rpc.pendingInputs === 0);
+      t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+        calls++;
+        const result = await seal.apply(this, args);
+        if (!result.sealed) {
+          busy.resolve();
+          await ack.promise;
+          if (reply === 'unknown')
+            throw Object.assign(new Error('LOST_SEAL_REPLY'), { uncertain: true });
+        }
+        return result;
+      });
+      await f.mark('native-bash-go');
+      try {
+        await until(() => exists(f.dir + '/native-bash-start'));
+        assert.equal((await rpc.idleSnapshot()).status, 'idle');
+        rpc.autoReleaseWanted = true;
+        rpc.onIdleCandidate();
+        const releasing = rpc.autoReleaseTask;
+        await busy.promise;
+        assert.equal(rpc.exitSeal, 'unknown');
+        await f.mark('finish');
+        await completed.promise;
+        ack.resolve();
+        await releasing;
+        assert.ok(JSON.stringify(await f.rows()).includes('NATIVE_BASH_DONE'));
+        if (reply === 'busy') {
+          assert.equal(rpc.exited, true, 'the completion must survive the pending busy reply');
+          assert.equal(calls, 2);
+          assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+        } else {
+          assert.equal(rpc.exited, false);
+          assert.equal(rpc.exitSeal, 'unknown');
+          assert.equal(rpc.handoffPending, true);
+          assert.equal(rpc.child.stdin.writableEnded, false);
+          assert.equal(calls, 1, 'a completion hint cannot replay an uncertain seal');
+          assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+          assert.equal(f.bridge.autoReleases.size, 0);
+          assert.equal((await f.bridge.releaseForLocal({ session_id: f.id })).status, 'released');
+          assert.equal(calls, 2);
+        }
+      } finally {
+        ack.resolve();
+        await f.mark('finish');
+      }
+    },
+  );
+
 test(
   'child seal preserves native input whose activity notification has not arrived',
   { timeout: 15000 },

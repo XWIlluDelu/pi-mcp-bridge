@@ -437,6 +437,17 @@ gap between them. A busy child refuses without sealing; auto-release leaves it
 open and waits for later settlement. Parent-side cached activity alone cannot
 authorize EOF.
 
+The current native idle interface omits queued `deliverAs:"nextTurn"` custom
+messages and a same-file resume in progress. Owned idle shutdown can therefore
+discard that queued context or lose its seal during session replacement. These
+two cases need native queue and lifecycle visibility before this contract can
+protect them.
+
+Already admitted reads finish before sealing. A new capture racing with local
+release, handoff or reload may return `RUNTIME_SHUTTING_DOWN`; retry after that
+lifecycle operation completes. Frozen cursors remain subject to their normal
+identity and permission checks.
+
 Once sealed, the child rejects new business work, including work requested by
 shutdown hooks. Hooks may still record cleanup state without starting new work.
 Bridge sends EOF only after confirming the seal for the same session and owner
