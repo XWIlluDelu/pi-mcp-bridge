@@ -406,7 +406,12 @@ export class EventSubscriptions {
       // subscription's lifetime. A stale file/header cannot retarget an event.
       try {
         const current = await this.authorize(session.id);
-        if (current.file !== session.file || current.header.id !== session.header.id) return;
+        if (
+          current.file !== session.file ||
+          current.header.id !== session.header.id ||
+          current.header.cwd !== session.header.cwd
+        )
+          return;
       } catch (error) {
         if (!this.bridge.closing && error.message === 'NOT_FOUND_OR_DENIED')
           await this.change((next) => {

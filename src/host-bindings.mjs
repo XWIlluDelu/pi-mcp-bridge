@@ -56,6 +56,7 @@ function tracker(release, onError) {
 
 export function createSdkHostBinding(session, { release, onError } = {}) {
   const tracked = tracker(release, onError);
+  let pendingBashes = 0;
   // Install before the host admits local work: public operation lifetimes also
   // cover input preparation, which Pi's isIdle does not include.
   const admission =
@@ -65,7 +66,10 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       ? reloadAdmission(session.constructor)
       : null;
   const isIdle = () =>
-    session.isIdle && !tracked.submitting && (!admission || admission.idle(session.sessionManager));
+    session.isIdle &&
+    !pendingBashes &&
+    !tracked.submitting &&
+    (!admission || admission.idle(session.sessionManager));
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
@@ -102,7 +106,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
               isIdle: () => session.isIdle && !session.isBashRunning,
               hasPendingMessages: () => session.pendingMessageCount > 0,
             },
-            tracked.submitting,
+            tracked.submitting || pendingBashes > 0,
           );
           try {
             beforeDispatch?.();
@@ -176,29 +180,36 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       const before = identity(session);
       assertIdentity(expected, before);
       beforeDispatch?.();
-      const handled = await session.extensionRunner.emitUserBash({
-        type: 'user_bash',
-        command,
-        excludeFromContext: false,
-        cwd: session.sessionManager.getCwd(),
-      });
-      assertIdentity(before, identity(session));
-      let result;
-      if (handled?.result) {
-        result = handled.result;
-        session.recordBashResult(command, result, { excludeFromContext: false });
-      } else {
-        beforeDispatch?.();
-        result = await tracked.track(
-          session.executeBash(command, undefined, {
-            excludeFromContext: false,
-            operations: handled?.operations,
-          }),
-        );
+      // Native executeBash observation excludes the user_bash hook and result
+      // delivery. Keep idle admission fenced across the entire host operation.
+      pendingBashes++;
+      try {
+        const handled = await session.extensionRunner.emitUserBash({
+          type: 'user_bash',
+          command,
+          excludeFromContext: false,
+          cwd: session.sessionManager.getCwd(),
+        });
+        assertIdentity(before, identity(session));
+        let result;
+        if (handled?.result) {
+          result = handled.result;
+          session.recordBashResult(command, result, { excludeFromContext: false });
+        } else {
+          beforeDispatch?.();
+          result = await tracked.track(
+            session.executeBash(command, undefined, {
+              excludeFromContext: false,
+              operations: handled?.operations,
+            }),
+          );
+        }
+        assertIdentity(before, identity(session));
+        await onResult(nativeBashResult(result));
+        return nativeBashResult(result);
+      } finally {
+        pendingBashes--;
       }
-      assertIdentity(before, identity(session));
-      await onResult(nativeBashResult(result));
-      return nativeBashResult(result);
     },
     stop: async ({ onWithdraw, ...expected } = {}) => {
       if (

@@ -117,6 +117,34 @@ export function unitText(unit, metadata = false) {
 }
 const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot.units[i]);
 export const documentUnits = docUnits;
+
+// System sections and tool descriptions repeat their field labels in source
+// pages. Rejoin only consecutive parts of the same field for searchable text.
+function systemField(unit) {
+  const message = unit.message;
+  if (message?.role !== 'system') return null;
+  const sections = Object.entries(message.sections ?? {});
+  if (sections.length === 1 && typeof sections[0][1] === 'string') {
+    const [name, text] = sections[0];
+    return {
+      key: JSON.stringify([unit.source, 'sections', name]),
+      text,
+      replace: (value) => ({ ...message, sections: { [name]: value } }),
+    };
+  }
+  for (const key of ['toolsAdded', 'toolsRemoved']) {
+    const tools = message[key];
+    if (tools?.length !== 1 || typeof tools[0]?.description !== 'string') continue;
+    const { description, ...fields } = tools[0];
+    return {
+      key: JSON.stringify([unit.source, key, fields]),
+      text: description,
+      replace: (value) => ({ ...message, [key]: [{ ...fields, description: value }] }),
+    };
+  }
+  return null;
+}
+
 export function documentText(snapshot, doc) {
   const units = docUnits(snapshot, doc);
   if (units.length && units.every((unit) => unit.message?.role === 'bashExecution')) {
@@ -132,14 +160,35 @@ export function documentText(snapshot, doc) {
     return messageText(message, { metadata: true });
   }
   let body = '',
-    previousBlock;
-  for (const unit of units) {
-    const text = unitBodyText(unit, true);
+    previousBlock,
+    previousSystemField = false;
+  for (let index = 0; index < units.length; index++) {
+    const unit = units[index],
+      field = systemField(unit);
+    let text = unitBodyText(unit, true);
+    if (field && unit.part === 1) {
+      const parts = [field.text];
+      while (index + 1 < units.length) {
+        const next = units[index + 1],
+          nextField = systemField(next);
+        if (next.part !== parts.length + 1 || nextField?.key !== field.key) break;
+        parts.push(nextField.text);
+        index++;
+      }
+      text = messageText(field.replace(parts.join('')), { metadata: true });
+    }
     if (!text) continue;
     const block = unit.source?.block_index ?? unit.source?.content_index;
-    if (block !== undefined && previousBlock !== undefined && block !== previousBlock) body += '\n';
+    if (
+      body &&
+      (field ||
+        previousSystemField ||
+        (block !== undefined && previousBlock !== undefined && block !== previousBlock))
+    )
+      body += '\n';
     body += text;
     previousBlock = block;
+    previousSystemField = Boolean(field);
   }
   // Split bodies repeat their stop reason, while the error detail lives once
   // in shared metadata. Keep each failure fact once beside the complete text.
