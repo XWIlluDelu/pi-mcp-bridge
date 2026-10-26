@@ -34,6 +34,10 @@ test('daily profile uses native HOME/XDG config and existing scope without copyi
     file: f.file,
     dir: path.join(f.config.stateDir, 'ipc'),
     roots: f.config.sessionRoots,
+    ownerControl: {
+      stateDir: f.config.stateDir,
+      attachmentDir: path.join(f.config.stateDir, 'ipc'),
+    },
   });
   assert.deepEqual(
     await companionProfile({ HOME: '/not-used', XDG_CONFIG_HOME: path.join(f.dir, '.config') }),

@@ -202,6 +202,70 @@ test('native UI rebinding retains the active writer endpoint', async (t) => {
   assert.deepEqual(f.errors, []);
 });
 
+test('accepted companion completion survives same-process session replacement and keeps its original leaf', async (t) => {
+  const f = await fixture(t);
+  f.faux.setResponses([
+    fauxAssistantMessage('ORIGINAL_SESSION_RESULT'),
+    fauxAssistantMessage('REPLACEMENT_SESSION_RESULT'),
+  ]);
+  const attempts = [];
+  let releaseDelivery;
+  const gate = new Promise((resolve) => {
+    releaseDelivery = resolve;
+  });
+  f.finishers.push(releaseDelivery);
+  f.bridge.events.retryDelays = [0];
+  f.bridge.events.post = async (_url, body) => {
+    const event = JSON.parse(body);
+    if (event.type === 'verification')
+      return { status: 200, body: JSON.stringify({ challenge: event.challenge }) };
+    attempts.push(body);
+    if (attempts.length === 1) {
+      await gate;
+      return { status: 503, body: '' };
+    }
+    return { status: 204, body: '' };
+  };
+  const subscribe = (session) =>
+    f.bridge.events.handle('events/subscribe', {
+      name: 'session.settled',
+      arguments: { session_id: session.id },
+      delivery: {
+        mode: 'webhook',
+        url: 'https://callback.example/companion-lifecycle',
+        secret: 'whsec_' + Buffer.alloc(32, 6).toString('base64'),
+      },
+    });
+  await subscribe(f.a);
+  const ownerA = await readClaim(f.config.attachmentDir, f.a);
+  await f.runtime.session.prompt('Finish the original session.');
+  await until(() => attempts.length === 1);
+  const original = JSON.parse(attempts[0]);
+  assert.equal(original.data.result.text, 'ORIGINAL_SESSION_RESULT');
+  await f.runtime.switchSession(f.b.file);
+  const ownerB = await readClaim(f.config.attachmentDir, f.b);
+  assert.equal(ownerB.owner.pid, ownerA.owner.pid);
+  assert.notEqual(ownerB.generation, ownerA.generation);
+  releaseDelivery();
+  await until(() => attempts.length === 2 && !f.bridge.events.deliveries.size);
+  assert.equal(
+    attempts[1],
+    attempts[0],
+    'Retry preserves the accepted occurrence after replacement',
+  );
+  await subscribe(f.b);
+  await f.runtime.session.prompt('Finish the replacement session.');
+  await until(() => attempts.length === 3);
+  const replacement = JSON.parse(attempts[2]);
+  assert.equal(original.data.session_id, f.a.id);
+  assert.equal(replacement.data.session_id, f.b.id);
+  assert.equal(replacement.data.result.text, 'REPLACEMENT_SESSION_RESULT');
+  const originalRead = JSON.stringify(await f.bridge.read(original.data.read));
+  assert.match(originalRead, /ORIGINAL_SESSION_RESULT/);
+  assert.doesNotMatch(originalRead, /REPLACEMENT_SESSION_RESULT/);
+  assert.deepEqual(f.errors, []);
+});
+
 test('native resume at the same path retires only the replaced native identity', async (t) => {
   const f = await fixture(t);
   const before = await readClaim(f.config.attachmentDir, f.a);

@@ -8,7 +8,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 - Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
 - Send text and images, run native shell commands, select model/thinking settings, compact context and stop work.
 - Create or fork saved sessions, optionally sending a first task, and move deleted sessions to recoverable trash while retaining project files.
-- Notify ChatGPT Work chats and dots when a Bridge-owned session settles, with a short result excerpt and pinned native reading arguments.
+- Notify ChatGPT Work chats and dots when an owned RPC or connected TUI/RPC companion settles, with a short result excerpt and pinned native reading arguments.
 - Batch independent operations and apply seven separate permissions at default, project and session tiers.
 
 See [working with a session](docs/collaboration.md) for the dispatch, observation and continuation workflow, and the [public API](docs/api.md) for tool arguments and outcomes.

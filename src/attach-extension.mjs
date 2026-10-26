@@ -32,6 +32,8 @@ import {
 import { LiveMessageObserver } from './live-message.mjs';
 import { ContextObservation } from './context-observation.mjs';
 import { nativeReadFeatures } from './read-features.mjs';
+import { SettledObserver } from './settled-observer.mjs';
+import { ownerSocket } from './owner-runtime.mjs';
 import {
   privateDirectory,
   processIdentity,
@@ -197,12 +199,20 @@ export default async function attachExtension(pi) {
   // All native context transforms have finished before this phase, regardless
   // of extension load order. Never mutate the observed event.
   pi.on('context_with_system', (event, ctx) => active?.observation.capture(event, ctx));
+  pi.on('agent_start', (_event, ctx) => {
+    if (active?.ready && active.manager === ctx.sessionManager)
+      active.settled?.start(ctx.sessionManager);
+  });
   // These events occur after the relevant persistence; every IPC request also
   // validates, including the first request after a previously absent file appears.
-  pi.on('agent_settled', async () => {
-    if (!active?.ready) return;
-    active.liveMessage.reset();
-    await validateStorage(active);
+  pi.on('agent_settled', async (event, ctx) => {
+    const runtime = active;
+    if (!runtime?.ready || runtime.manager !== ctx.sessionManager) return;
+    // Freeze leaf and result at native settlement, before storage/IPC awaits.
+    const occurrence = runtime.settled?.capture(event, ctx.sessionManager);
+    runtime.liveMessage.reset();
+    await validateStorage(runtime);
+    if (occurrence) await runtime.settled.send(occurrence);
   });
   for (const event of ['session_info_changed', 'session_compact'])
     pi.on(event, async () => {
@@ -268,6 +278,7 @@ export default async function attachExtension(pi) {
         generation: randomUUID(),
         owner,
         phase: 'starting',
+        ...(profile.ownerControl ? { completionSocket: ownerSocket(profile.ownerControl) } : {}),
       };
       record.socket = path.join(dir, `${owner.pid}-${record.generation.slice(0, 8)}.sock`);
       let fileObserved;
@@ -335,6 +346,9 @@ export default async function attachExtension(pi) {
         fileObserved,
         liveMessage: new LiveMessageObserver('extension_message_events'),
         observation: new ContextObservation(record.generation),
+        settled: profile.ownerControl
+          ? new SettledObserver(profile.ownerControl, record.generation)
+          : null,
       };
       active = runtime;
       const activity = () => ({
