@@ -9,6 +9,10 @@ import { test } from 'node:test';
 import module, { createMagicContextReader } from './index.mjs';
 import { captureSessionRead } from '../../src/session-readers.mjs';
 import { ContextReadCache } from '../../src/read-cache.mjs';
+import { prepareContextRead } from '../../src/context-read.mjs';
+import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
+import { toolDefinitions } from '../../src/protocol.mjs';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 // The reader's current contract is checked against MC 0.49.20 schema 95.
 // Only the tables and columns it queries are needed in these isolated fixtures.
@@ -42,9 +46,11 @@ async function fixture(t) {
     session: { id: 'ps_public', native_id: 'native-public', cwd },
     owner: { available: false, commands: [], tools: [] },
     request: {},
-    nativeRead: () => {
-      throw new Error('Only the core may invoke nativeRead');
-    },
+    nativeRead: async ({ entry_ids } = {}) => ({
+      units: [],
+      leaf_id: null,
+      entry_relations: Object.fromEntries((entry_ids ?? []).map((id) => [id, 'unknown'])),
+    }),
   };
   db.prepare('INSERT INTO session_projects VALUES(?,?,?)').run('native-public', 'pi', identity);
   t.after(async () => {
@@ -213,7 +219,7 @@ test('live registration is target-specific and still requires the matching proje
   assert.equal(await reader.matches({ ...f.context, owner }), false);
 });
 
-test('stored content uses brief/detail tiers and honest source relationships without database writes', async (t) => {
+test('stored summaries use existing MC tiers and source relationships without database writes', async (t) => {
   const f = await fixture(t);
   f.compartment();
   f.compartment({ id: 2, sequence: 2, p2: '', p3: 'Second decision', rebase_status: 'unresolved' });
@@ -236,7 +242,10 @@ test('stored content uses brief/detail tiers and honest source relationships wit
   const before = await fs.readFile(f.database);
   const reader = createMagicContextReader({ database: f.database });
   assert.equal(await reader.matches(f.context), true);
-  const result = await reader.read({ ...f.context, request: { preset: 'full' } });
+  const result = await reader.read({
+    ...f.context,
+    request: { content: { summary: -1, memory: -1 } },
+  });
   assert.equal(result.native, true);
   assert.deepEqual(
     result.items.map((item) => item.id),
@@ -278,76 +287,241 @@ test('stored content uses brief/detail tiers and honest source relationships wit
   );
 });
 
-test('presets select real summaries and eligible memories, excluding empty boundary markers', async (t) => {
+test('content counts select stored summaries and eligible memories independently of turn range', async (t) => {
   const f = await fixture(t);
   for (let id = 1; id <= 6; id++) f.compartment({ id, sequence: id });
-  for (let id = 1; id <= 8; id++) {
+  for (let id = 1; id <= 8; id++)
     f.memory({ id, importance: id === 2 ? 95 : 50, updated_at: id * 1000 });
-  }
   f.compartment({ id: 7, session_id: 'other-session' });
-  // MC keeps all-empty compartments to track excluded raw rows, not as summaries.
   for (const id of [8, 9])
     f.compartment({ id, sequence: id, title: '', content: '', p1: null, p2: null, p3: null });
   f.memory({ id: 9, status: 'archived' });
   f.memory({ id: 10, project_path: 'other-project' });
   const reader = createMagicContextReader({ database: f.database });
-  for (const detail of ['brief', 'full']) {
-    for (const [preset, compartmentIds, memoryIds] of [
-      [undefined, [5, 6], [7, 8, 2]],
-      ['latest', [5, 6], [7, 8, 2]],
-      ['recent', [3, 4, 5, 6], [5, 6, 7, 8, 2]],
-      ['full', [1, 2, 3, 4, 5, 6], [1, 3, 4, 5, 6, 7, 8, 2]],
-    ]) {
-      const result = await reader.read({ ...f.context, request: { preset, detail } });
-      assert.deepEqual(
-        result.items.map((item) => item.id),
-        [
-          ...compartmentIds.map((id) => `compartment:${id}`),
-          ...memoryIds.map((id) => `memory:${id}`),
-        ],
-      );
-      assert.deepEqual(result.coverage, [
-        { type: 'summary', selected: compartmentIds.length, total: 6 },
-        { type: 'memory', selected: memoryIds.length, total: 8 },
-      ]);
-      assert.ok(result.items.every((item) => item.text.length > 0));
-    }
+  for (const [content, compartmentIds, memoryIds] of [
+    [undefined, [5, 6], [7, 8, 2]],
+    [{ summary: 4, memory: 5 }, [3, 4, 5, 6], [5, 6, 7, 8, 2]],
+    [{ summary: -1, memory: -1 }, [1, 2, 3, 4, 5, 6], [1, 3, 4, 5, 6, 7, 8, 2]],
+    [{ summary: 0, memory: 0 }, [], []],
+  ]) {
+    const request = { content, range: { recent: 1 } };
+    const result = await reader.read({ ...f.context, request });
+    assert.deepEqual(
+      result.items.map((item) => item.id),
+      [
+        ...compartmentIds.map((id) => `compartment:${id}`),
+        ...memoryIds.map((id) => `memory:${id}`),
+      ],
+    );
+    assert.deepEqual(result.coverage, [
+      { type: 'summary', selected: compartmentIds.length, total: 6 },
+      { type: 'memory', selected: memoryIds.length, total: 8 },
+    ]);
+    assert.ok(result.items.every((item) => item.text.length > 0));
+    assert.deepEqual(
+      (
+        await reader.read({ ...f.context, request: { ...request, range: { recent: -1 } } })
+      ).items.map((item) => item.id),
+      result.items.map((item) => item.id),
+      'Changing the native turn range must not change stored background selection',
+    );
   }
 });
 
-test('a bounded first memory page includes the highest priority and most recent evidence', async (t) => {
+test('default MC reads exclude known other-branch summaries before limiting, while unlimited summaries retain their sources', async (t) => {
+  const f = await fixture(t);
+  const message = (id, parentId, role, text) => ({
+    type: 'message',
+    id,
+    parentId,
+    timestamp: '2026-01-01T00:00:00Z',
+    message: { role, content: [{ type: 'text', text }], timestamp: 0 },
+  });
+  const entries = [
+    message('root', null, 'user', 'Choose the storage design'),
+    message('common', 'root', 'assistant', 'Common design constraints'),
+    message('current-input', 'common', 'user', 'Use PostgreSQL'),
+    message('current-answer', 'current-input', 'assistant', 'PostgreSQL is selected'),
+    {
+      type: 'compaction',
+      id: 'compact',
+      parentId: 'current-answer',
+      timestamp: '2026-01-01T00:00:00Z',
+      firstKeptEntryId: 'current-input',
+      summary: 'Shared design constraints',
+      tokensBefore: 2000,
+    },
+    message('latest-input', 'compact', 'user', 'Continue the PostgreSQL implementation'),
+    message('latest-answer', 'latest-input', 'assistant', 'Implementing PostgreSQL'),
+    message('old-input', 'common', 'user', 'Use MongoDB'),
+    message('old-answer', 'old-input', 'assistant', 'MongoDB is selected'),
+  ];
+  for (const [id, end, status] of [
+    [1, 'common', 'ok'],
+    [2, 'current-answer', 'ok'],
+    [3, 'missing', 'ok'],
+    [4, 'old-answer', 'unresolved'],
+    [5, 'old-input', 'ok'],
+    [6, 'old-answer', 'ok'],
+  ])
+    f.compartment({
+      id,
+      sequence: id,
+      end_message_id: end,
+      rebase_status: status,
+      ...(id === 6 ? { p1: 'MongoDB is selected' } : {}),
+    });
+  f.memory({ source_session_id: 'other-branch-origin' });
+  const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
+  let acquisitions = 0;
+  const capture = async (summary) => {
+    const request = { session_id: f.context.session.id, content: { summary } };
+    return captureSessionRead(
+      reader,
+      {
+        ...f.context,
+        request,
+        nativeRead: async (options) => {
+          acquisitions++;
+          return prepareContextRead(
+            { entries, leafId: 'latest-answer' },
+            { ...request, ...options },
+            { buildSessionProjection },
+          );
+        },
+      },
+      request,
+    );
+  };
+  const summaryIds = (result) => [
+    ...new Set(
+      result.units
+        .filter((u) => u.source?.reader_item?.startsWith('compartment:'))
+        .map((u) => u.source.reader_item),
+    ),
+  ];
+  assert.deepEqual(summaryIds(await capture(2)), ['compartment:3', 'compartment:4']);
+  const recent = await capture(4);
+  assert.deepEqual(
+    summaryIds(recent),
+    [1, 2, 3, 4].map((id) => `compartment:${id}`),
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:1').branch_relation,
+    'on_branch',
+    'compaction does not remove raw ancestry',
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:3').branch_relation,
+    'unknown',
+  );
+  assert.equal(
+    recent.units.find((u) => u.source.reader_item === 'compartment:4').branch_relation,
+    'unknown',
+    'unresolved MC boundaries cannot establish ancestry',
+  );
+  assert.ok(
+    recent.units.some((u) => u.source.reader_item === 'memory:1'),
+    'project memories are independent of session branches',
+  );
+  assert.deepEqual(recent.reader.coverage[0], {
+    type: 'summary',
+    selected: 4,
+    total: 6,
+    excluded: 2,
+  });
+  const full = await capture(-1);
+  assert.deepEqual(
+    summaryIds(full),
+    [1, 2, 3, 4, 5, 6].map((id) => `compartment:${id}`),
+  );
+  const historical = full.units.find((u) => u.source.reader_item === 'compartment:6');
+  assert.equal(historical.branch_relation, 'off_branch');
+  assert.equal(historical.provenance.source_entry_id, 'old-answer');
+  assert.equal(full.leaf_id, 'latest-answer');
+  const cache = new ContextReadCache();
+  const brief = cache.navigate(
+    recent,
+    { session_id: f.context.session.id, content: { summary: 4 } },
+    { identity: f.context.session },
+  );
+  const validator = new AjvJsonSchemaValidator();
+  for (const name of ['read', 'search']) {
+    const validate = validator.getValidator(
+      toolDefinitions().find((tool) => tool.name === name).outputSchema,
+    );
+    const checked = validate(brief);
+    assert.equal(checked.valid, true, checked.errorMessage);
+  }
+  const found = cache.navigate(
+    full,
+    { session_id: f.context.session.id, content: { summary: -1, memory: -1 }, max_bytes: 4096 },
+    { identity: f.context.session },
+    'MongoDB',
+  );
+  assert.equal(
+    found.items[0].branch_relation,
+    'off_branch',
+    'search keeps historical branch evidence visible',
+  );
+  assert.match(
+    JSON.stringify(cache.expand([found.items[0].ref], f.context.session).units),
+    /MongoDB/,
+  );
+  const source = found.items[0].related.find((link) => link.relation === 'source_context');
+  const sourceRequest = cache.reference(source.ref).document.request;
+  assert.equal(sourceRequest.leaf_id, 'old-answer');
+  assert.equal(sourceRequest.view, 'session');
+  assert.match(
+    JSON.stringify(
+      prepareContextRead({ entries }, sourceRequest, { buildSessionProjection }).units,
+    ),
+    /MongoDB/,
+  );
+  assert.equal(
+    acquisitions,
+    3,
+    'branch evidence and appended native context share one acquisition per read',
+  );
+});
+
+test('stored memory pages follow the captured source order without losing selected priority evidence', async (t) => {
   const f = await fixture(t);
   f.compartment();
-  for (let id = 1; id <= 12; id++) {
+  for (let id = 1; id <= 12; id++)
     f.memory({
       id,
       importance: id === 12 ? 95 : 50,
       updated_at: id * 1000,
       content: `Memory ${id}: ${'Relevant project evidence. '.repeat(30)}`,
     });
-  }
   const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
   const args = {
     session_id: f.context.session.id,
-    detail: 'brief',
-    types: ['memory'],
+    content: { summary: 0, memory: -1 },
     max_bytes: 4096,
   };
-  const captured = await captureSessionRead(
-    reader,
-    {
-      ...f.context,
-      request: { preset: 'full' },
-      nativeRead: async () => ({ units: [], leaf_id: null }),
-    },
-    args,
+  const captured = await captureSessionRead(reader, { ...f.context, request: args }, args);
+  const cache = new ContextReadCache(),
+    identity = f.context.session;
+  const pages = [cache.navigate(captured, args, { identity })];
+  while (pages.at(-1).next_cursor) {
+    const nextArgs = { cursor: pages.at(-1).next_cursor, max_bytes: 4096 };
+    const next = cache.get(nextArgs, identity);
+    const page = cache.render(next.snapshot, nextArgs, { ...next, identity });
+    assert.notEqual(
+      page.next_cursor,
+      nextArgs.cursor,
+      'A cursor must advance through source content',
+    );
+    pages.push(page);
+  }
+  assert.deepEqual(
+    pages.flatMap((page) => page.items).map((item) => item.source.memory_id),
+    Array.from({ length: 12 }, (_, index) => index + 1),
   );
-  const page = new ContextReadCache().navigate(captured, args, { identity: f.context.session });
-  assert.ok(page.next_cursor);
-  assert.ok(page.items.some((item) => item.source.memory_id === 12));
-  assert.ok(!page.items.some((item) => item.source.memory_id === 1));
   assert.deepEqual(captured.reader.coverage, [
-    { type: 'summary', selected: 1, total: 1 },
+    { type: 'summary', selected: 0, total: 1 },
     { type: 'memory', selected: 12, total: 12 },
   ]);
 });

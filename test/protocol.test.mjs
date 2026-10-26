@@ -64,12 +64,14 @@ test('modern requests are self-contained; discovery and tool list carry required
   assert.equal(listed.cacheScope, 'private');
   const read = listed.tools.find((tool) => tool.name === 'read').inputSchema;
   assert.equal(
-    read.properties.preset.default,
+    read.properties.range.default,
     undefined,
-    'Cursor-only continuation must not acquire an explicit preset',
+    'Cursor-only continuation must not acquire a new range',
   );
-  assert.deepEqual(read.properties.preset.enum, ['latest', 'recent', 'full']);
-  assert.ok(!(read.required ?? []).includes('preset'));
+  assert.equal(read.properties.range.properties.recent.minimum, -1);
+  assert.equal(read.properties.content.properties.input.type, 'boolean');
+  assert.equal(read.properties.content.properties.assistant.minimum, -1);
+  assert.ok(!(read.required ?? []).includes('range'));
   const direct = await dispatchModern(
     stub,
     message('tools/call', { name: 'list', arguments: { project: 'abc' } }),

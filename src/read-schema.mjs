@@ -1,33 +1,109 @@
 import { z } from 'zod';
 
 const count = z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER);
-export const contextSelectSchema = z
+export const CONTENT_KINDS = Object.freeze([
+  'input',
+  'assistant',
+  'thinking',
+  'tool',
+  'summary',
+  'memory',
+  'system',
+  'command',
+  'native',
+]);
+// Native source-unit names differ from public content controls. Extensions may
+// expose additional source kinds; they remain readable under the native switch.
+export function contentKind(kind) {
+  const mapped =
+    {
+      prompt: 'input',
+      text: 'assistant',
+      tool_call: 'tool',
+      tool_result: 'tool',
+      nested_call: 'tool',
+      custom: 'native',
+    }[kind] ?? kind;
+  return CONTENT_KINDS.includes(mapped) ? mapped : 'native';
+}
+export const DEFAULT_RANGE = Object.freeze({ recent: 3, earliest: 0 });
+export const DEFAULT_CONTENT = Object.freeze({
+  input: true,
+  assistant: -1,
+  thinking: 1,
+  tool: 1,
+  summary: 2,
+  memory: 3,
+  system: false,
+  command: 0,
+  native: true,
+});
+export const ALL_CONTENT = Object.freeze({
+  input: true,
+  assistant: -1,
+  thinking: -1,
+  tool: -1,
+  summary: -1,
+  memory: -1,
+  system: true,
+  command: -1,
+  native: true,
+});
+export const rangeSchema = z
   .object({
-    system: z
-      .union([z.literal(-1), z.literal(0)])
+    recent: count
+      .describe('Last N input turns; default 3; -1 includes all effective turns.')
+      .optional(),
+    earliest: count
+      .describe('Also include first N input turns; default 0; overlaps are deduplicated.')
+      .optional(),
+  })
+  .strict();
+export const contentSchema = z
+  .object({
+    input: z
+      .boolean()
+      .describe('Include the input message of each selected turn; default true.')
+      .optional(),
+    assistant: count
       .describe(
-        'Native system instructions/sections: 0 omits, -1 includes. Defaults to 0 except full.',
+        'Last N assistant messages with body text or failure status per turn; -1 includes all (default). All text blocks of a selected message stay together.',
       )
-      .optional(),
-    summary: z
-      .union([z.literal(-1), z.literal(0), z.literal(1)])
-      .describe('Active native summaries: 0 omits; 1/-1 includes.')
-      .optional(),
-    recent_prompts: count.describe('Last N input turns; -1 includes all.').optional(),
-    earliest_prompts: count.describe('Also include first N input turns; default 0.').optional(),
-    text: count
-      .describe('First N and last N assistant text blocks per selected input; -1 includes all.')
       .optional(),
     thinking: count
-      .describe('First N and last N thinking blocks per selected input; default 0 outside full.')
-      .optional(),
-    tools: count
       .describe(
-        'First N and last N logical tool units per input (at most 2N); a call and its paired result count once. Default 2 outside full. A codemode batch counts once; brief previews summarize its recorded operations. 0 also omits tool declarations.',
+        'Last N messages with readable thinking per turn; default 1. 0 omits, -1 includes all. Selected thinking blocks stay in source order.',
       )
       .optional(),
-    commands: count
-      .describe('Last N native shell command records, independently of selected prompts.')
+    tool: count
+      .describe(
+        'Last N logical tool operations per turn; default 1. A call and its paired result count once; a codemode batch counts once. 0 omits, -1 includes all.',
+      )
+      .optional(),
+    summary: count
+      .describe(
+        'Summary background, independent of turns: 0 omits, -1 includes all. Native active summaries form one group; readers select their own summary items. Default 2.',
+      )
+      .optional(),
+    memory: count
+      .describe(
+        'Last N eligible memory items supplied by the reader, independent of turns; default 3; 0 omits, -1 includes all.',
+      )
+      .optional(),
+    system: z
+      .boolean()
+      .describe('Include native system instructions and sections; default false.')
+      .optional(),
+    command: count
+      .describe(
+        'Last N native shell command records, independent of turns; default 0; -1 includes all.',
+      )
+      .optional(),
+    native: z
+      .boolean()
+      .describe(
+        'Include other custom/native context in selected turns and global prefixes; default true.',
+      )
       .optional(),
   })
   .strict();
@@ -38,34 +114,20 @@ export const readSchema = z
     view: z
       .enum(['session', 'runtime'])
       .describe(
-        'Omit for automatic reader routing; session forces native context, runtime reads the request-stage capture.',
+        'Omit for automatic reader routing; session forces native context; runtime reads the request-stage capture.',
       )
       .optional(),
-    preset: z
-      .enum(['latest', 'recent', 'full'])
-      .describe(
-        'Session scope: latest input (default), last 3 inputs, or all effective context. Detail does not change selection.',
-      )
-      .optional(),
-    select: contextSelectSchema.optional(),
+    range: rangeSchema.optional(),
+    content: contentSchema.optional(),
     leaf_id: z.string().min(1).max(128).nullable().optional(),
     cursor: z.string().min(1).max(4096).optional(),
     refs: z
       .array(z.string().min(1).max(4096))
       .min(1)
       .max(8)
-      .describe('Expand references returned by read/search from one captured session.')
-      .optional(),
-    detail: z
-      .enum(['brief', 'full'])
       .describe(
-        'Browsing defaults to brief. Full returns selected source content. References expand to full content.',
+        'Expand up to eight references from one frozen capture into original selected source content.',
       )
-      .optional(),
-    types: z
-      .array(z.string().min(1).max(64))
-      .max(16)
-      .describe('Content kinds from returned item type values; filters brief browsing.')
       .optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),
   })
@@ -79,25 +141,25 @@ export const readSchema = z
   .refine(
     (args) =>
       !args.refs ||
-      [
-        args.cursor,
-        args.view,
-        args.preset,
-        args.select,
-        args.leaf_id,
-        args.types,
-        args.detail,
-      ].every((v) => v === undefined),
-    { message: 'References accept only optional session_id and max_bytes' },
+      [args.cursor, args.view, args.range, args.content, args.leaf_id].every(
+        (v) => v === undefined,
+      ),
+    {
+      message: 'References accept only optional session_id and max_bytes',
+    },
   )
-  .refine((args) => args.detail !== 'full' || args.types === undefined, {
-    message: 'Type filtering applies to brief browsing and search',
-  })
   .refine(
     (args) =>
       args.view !== 'runtime' ||
-      [args.preset, args.select, args.leaf_id].every((value) => value === undefined),
-    { message: 'Runtime reads do not accept session selection or leaf overrides' },
+      (args.range === undefined &&
+        args.leaf_id === undefined &&
+        Object.values(args.content ?? {}).every(
+          (value) => typeof value === 'boolean' || value === 0 || value === -1,
+        )),
+    {
+      message:
+        'Runtime captures accept content switches (booleans or 0/-1), but no turn range, finite counts or leaf override',
+    },
   );
 
 export const searchSchema = z
@@ -109,10 +171,17 @@ export const searchSchema = z
       .min(1)
       .max(2048)
       .describe(
-        'Case-insensitive literal text across the selected reader’s full effective content, not just the current page.',
+        'Case-insensitive literal text across the reader’s full effective content, independent of read sampling.',
       ),
     view: z.enum(['session', 'runtime']).optional(),
-    types: z.array(z.string().min(1).max(64)).max(16).optional(),
+    content: z
+      .array(z.enum(CONTENT_KINDS))
+      .min(1)
+      .max(CONTENT_KINDS.length)
+      .describe(
+        'Content kinds to search; omit for all supported kinds. Uses the same names as read.content.',
+      )
+      .optional(),
     leaf_id: z.string().min(1).max(128).nullable().optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),
   })
@@ -121,45 +190,15 @@ export const searchSchema = z
     message: 'Runtime captures do not accept a leaf override',
   });
 
-export const FULL_SELECTION = Object.freeze({
-  system: -1,
-  summary: -1,
-  recent_prompts: -1,
-  earliest_prompts: 0,
-  text: -1,
-  thinking: -1,
-  tools: -1,
-  commands: -1,
-});
-export const RECENT_SELECTION = Object.freeze({
-  system: 0,
-  summary: 1,
-  recent_prompts: 3,
-  earliest_prompts: 0,
-  text: -1,
-  thinking: 0,
-  tools: 2,
-  commands: 0,
-});
-export const LATEST_SELECTION = Object.freeze({
-  system: 0,
-  summary: 1,
-  recent_prompts: 1,
-  earliest_prompts: 0,
-  text: -1,
-  thinking: 0,
-  tools: 2,
-  commands: 0,
-});
-export function contextSelection(args) {
+export function contextSelection(args = {}) {
   return {
-    ...(args.preset === 'full'
-      ? FULL_SELECTION
-      : args.preset === 'recent'
-        ? RECENT_SELECTION
-        : LATEST_SELECTION),
-    ...Object.fromEntries(
-      Object.entries(args.select ?? {}).filter(([, value]) => value !== undefined),
-    ),
+    range: args.view === 'runtime' ? null : { ...DEFAULT_RANGE, ...defined(args.range) },
+    content: {
+      ...(args.view === 'runtime' ? ALL_CONTENT : DEFAULT_CONTENT),
+      ...defined(args.content),
+    },
   };
+}
+function defined(value) {
+  return Object.fromEntries(Object.entries(value ?? {}).filter(([, item]) => item !== undefined));
 }

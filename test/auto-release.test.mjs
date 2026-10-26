@@ -284,7 +284,7 @@ test(
     await until(() => exists(f.dir + '/shutdown'));
     const reading = f.bridge.read({ session_id: f.id });
     await f.mark('shutdown-go');
-    assert.ok((await reading).items.some((i) => i.type === 'text'));
+    assert.ok((await reading).items.some((i) => i.type === 'assistant'));
     assert.equal(f.runtimes.length, 1);
     assert.equal(f.bridge.pool.get(f.id), null);
     await f.bridge.read({ session_id: f.id });

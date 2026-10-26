@@ -9,6 +9,8 @@ import { SessionManager } from './fixtures/pi.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Bridge } from '../src/bridge.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { readSource } from './fixtures/read-source.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { makeServer } from '../src/server.mjs';
 import { assertContextReadResponse, chronological } from './fixtures/read-pages.mjs';
@@ -60,17 +62,17 @@ async function fixture(t, entries, overrides = {}) {
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
-  // These tests exercise full sanitized source units and frozen pagination.
+  // Browse through the public contract; explicitly expand refs when checking source units.
   const call = (options) =>
     client.callTool({
       name: 'read',
-      arguments: { session_id: made.session_id, detail: 'full', ...options },
+      arguments: { session_id: made.session_id, ...options },
     });
   const ok = async (options) => {
     const response = await call(options);
     assert.ok(!response.isError, JSON.stringify(response));
     const result = response.structuredContent;
-    assertContextReadResponse(result, { session_id: made.session_id, detail: 'full', ...options });
+    assertContextReadResponse(result, { session_id: made.session_id, ...options });
     return result;
   };
   const error = async (options, code) => {
@@ -90,6 +92,7 @@ async function fixture(t, entries, overrides = {}) {
     cleanup,
     call,
     ok,
+    source: (options = {}) => readSource(ok, options),
     error,
   };
 }
@@ -135,7 +138,7 @@ test('public MCP reads task text plus honest image descriptors, without signatur
     method: 'tools/call',
     params: {
       name: 'read',
-      arguments: { session_id: f.id, detail: 'full', max_bytes: 4096 },
+      arguments: { session_id: f.id, max_bytes: 4096 },
       _meta: {
         [META + 'protocolVersion']: MODERN_VERSION,
         [META + 'clientCapabilities']: {},
@@ -154,12 +157,13 @@ test('public MCP reads task text plus honest image descriptors, without signatur
   assert.ok(JSON.stringify(page).includes('IMPORTANT TASK'));
   assert.ok(!JSON.stringify(page).includes('AAAAAAA'));
   assert.ok(!JSON.stringify(page).includes('NATIVE_SECRET'));
-  assert.deepEqual(page.items[0].message.content[1], {
+  const source = await readSource(f.ok, { max_bytes: 4096 });
+  assert.deepEqual(source.items[0].message.content[1], {
     type: 'image',
     mime_type: 'image/png',
     data_omitted: true,
   });
-  assert.equal(page.items[1].metadata.stopReason, 'stop');
+  assert.equal(source.items[1].metadata.stopReason, 'stop');
 });
 
 test('cursor-only direct/MCP/batch continuation inherits custom selection and frozen content after append', async (t) => {
@@ -168,10 +172,14 @@ test('cursor-only direct/MCP/batch continuation inherits custom selection and fr
       message('u', null, 'user', 'task'),
       message('a', 'u', 'assistant', [text(value)]),
     ]);
-  const first = await f.ok({
+  const browse = await f.ok({
     max_bytes: 4096,
-    preset: 'full',
-    select: { thinking: 0, tools: 0, commands: 0 },
+    range: { recent: -1 },
+    content: { ...ALL_CONTENT, thinking: 0, tool: 0, command: 0 },
+  });
+  const first = await f.ok({
+    refs: [browse.items.find((item) => item.type === 'assistant').ref],
+    max_bytes: 4096,
   });
   assert.ok(first.next_cursor);
   await fs.appendFile(
@@ -181,7 +189,7 @@ test('cursor-only direct/MCP/batch continuation inherits custom selection and fr
   const direct = await f.bridge.read({
     cursor: first.next_cursor,
     max_bytes: 8192,
-    select: { tools: 0 },
+    content: { tool: 0 },
   });
   assert.equal(direct.leaf_id, 'a');
   const batch = await f.client.callTool({
@@ -190,9 +198,9 @@ test('cursor-only direct/MCP/batch continuation inherits custom selection and fr
   });
   assert.deepEqual(batch.structuredContent.results[0].result.selection, first.selection);
   for (const extra of [
-    { preset: 'latest' },
-    { select: { text: 0 } },
-    { select: { system: 0 } },
+    { range: { recent: 1 } },
+    { content: { assistant: 0 } },
+    { content: { system: false } },
     { leaf_id: null },
   ])
     await f.error({ cursor: first.next_cursor, ...extra }, 'STALE_CURSOR');
@@ -215,7 +223,11 @@ test('owned RPC exit and controller changes cannot invalidate frozen history or 
     message('a', 'u', 'assistant', [text(paragraphs())]),
   ]);
   const rpc = await f.bridge.pool.resolve(f.saved);
-  const first = await f.ok({ max_bytes: 4096 });
+  const browse = await f.ok({ max_bytes: 4096 });
+  const first = await f.ok({
+    refs: [browse.items.find((item) => item.type === 'assistant').ref],
+    max_bytes: 4096,
+  });
   assert.equal(first.source, 'rpc');
   await f.bridge.pool.stop(f.id);
   assert.equal(rpc.alive, false);
@@ -251,7 +263,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
   ];
   for (const kind of ['host', 'companion']) {
     const f = await fixture(t, entries),
-      cleanDisk = await f.ok({ max_bytes: 65536 });
+      cleanDisk = await f.source({ max_bytes: 65536 });
     if (kind === 'host') {
       const owner = await reserveHostSession({
         attachmentDir: f.config.attachmentDir,
@@ -295,7 +307,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
         },
       );
     }
-    const active = await f.ok({ max_bytes: 65536 });
+    const active = await f.source({ max_bytes: 65536 });
     assert.deepEqual(active.items, cleanDisk.items);
     const runtime = await f.bridge.pool.forRead(f.saved),
       captured = await runtime.read({ session_id: f.id });
@@ -305,7 +317,11 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     assert.ok(!captured.units.some((unit) => unit.message?.toolsAdded));
     assert.equal(captured.omissions.system, 1);
     assert.ok(!captured.units.some((unit) => unit.type === 'system'));
-    const full = await runtime.read({ session_id: f.id, preset: 'full' });
+    const full = await runtime.read({
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
     assert.ok(full.units.some((unit) => unit.message?.content === 'READ_RULES'));
     assert.ok(full.units.some((unit) => unit.message?.toolsAdded?.[0].name === 'declared'));
     const raw = await runtime.snapshot();
@@ -409,7 +425,7 @@ test('optional input mappings agree across saved, owned RPC, companion and host 
           session_id: f.id,
           view: 'session',
           query: 'PRIOR_ANSWER',
-          types: ['text'],
+          content: ['assistant'],
         },
       });
       assert.ok(!found.isError, JSON.stringify(found));
@@ -423,7 +439,8 @@ test('optional input mappings agree across saved, owned RPC, companion and host 
       });
       assert.ok(!expanded.isError, JSON.stringify(expanded));
       assert.equal(expanded.structuredContent.items[0].block.text, 'PRIOR_ANSWER');
-      const first = await f.ok({ max_bytes: 4096 });
+      const browse = await f.ok({ range: { recent: 1 }, max_bytes: 4096 });
+      const first = await f.ok({ refs: browse.items.map((item) => item.ref), max_bytes: 4096 });
       assert.equal(first.source, kind === 'companion' ? 'tui' : kind);
       const units = chronological(await allPages(f, first));
       assert.ok(units.every((unit) => ['i2', 'a2'].includes(unit.source.entry_id)));
@@ -475,7 +492,7 @@ test('disabled compatibility module leaves native custom reading intact', async 
     ],
     { compatibilityModules: [{ module, enabled: false }] },
   );
-  const result = await f.ok();
+  const result = await f.source();
   const input = result.items.find((item) => item.source.entry_id === 'i');
   assert.equal(input.type, 'custom');
   assert.equal(input.prompt_id, 'u');
@@ -507,13 +524,18 @@ test('batch budgets the first render of captured snapshots and preserves cursor 
       return { status: 'accepted', disposition: 'handled' };
     },
   });
+  const captures = [];
+  for (let i = 0; i < 8; i++) captures.push(await f.ok({ max_bytes: 4096 }));
   const response = await f.client.callTool({
     name: 'batch',
     arguments: {
       operations: [
-        ...Array.from({ length: 8 }, () => ({
+        ...captures.map((capture) => ({
           op: 'read',
-          args: { session_id: f.id, detail: 'full', max_bytes: 65536 },
+          args: {
+            refs: [capture.items.find((item) => item.type === 'assistant').ref],
+            max_bytes: 65536,
+          },
         })),
         { op: 'send', args: { session_id: f.id, text: 'LATER_MUTATION' } },
       ],
@@ -530,7 +552,7 @@ test('batch budgets the first render of captured snapshots and preserves cursor 
     const next = await follow(f, result.next_cursor);
     assert.equal(result.leaf_id, 'a');
     assert.equal(next.leaf_id, 'a');
-    assert.equal(next.items.at(-1).part + 1, result.items[0].part);
+    assert.equal(result.items.at(-1).part + 1, next.items[0].part);
     assert.ok(!JSON.stringify(next).includes('LATER_MUTATION'));
   }
   assert.equal(snapshots, 8, 'No reacquisition for cursor pages or budget resizing');
@@ -615,7 +637,21 @@ test('saved and owned reads omit old image bytes before capture, but raw fork sn
   const before = await fs.readFile(f.saved.file),
     owned = await f.ok({ max_bytes: 4096 });
   assert.equal(owned.source, 'rpc');
-  assert.deepEqual(owned.items, saved.items);
+  const expand = async (page) =>
+    chronological(
+      await allPages(
+        f,
+        await f.ok({
+          refs: page.items.map((item) => item.ref),
+          max_bytes: 65536,
+        }),
+      ),
+    );
+  assert.deepEqual(
+    await expand(owned),
+    await expand(saved),
+    'Saved and owned captures retain the same source content despite different page metadata',
+  );
   assert.equal(snapshots, 0, 'ordinary read must not transfer the raw native log');
   const pages = await allPages(f, owned);
   assert.equal(pages.at(-1).next_cursor, null);
@@ -624,7 +660,7 @@ test('saved and owned reads omit old image bytes before capture, but raw fork sn
   assert.ok(pages.every((page) => page.omissions.selection.system === 1));
   assert.ok(!pages.flatMap((page) => page.items).some((unit) => unit.type === 'system'));
   assert.ok(!pages.flatMap((page) => page.items).some((unit) => unit.message?.toolsAdded));
-  const full = await rpc.read({ session_id: f.id, preset: 'full' });
+  const full = await rpc.read({ session_id: f.id, range: { recent: -1 }, content: ALL_CONTENT });
   assert.ok(full.units.some((unit) => unit.message?.content === 'OWNED_RULES'));
   assert.ok(full.units.some((unit) => unit.message?.toolsAdded?.[0].name === 'owned_tool'));
   assert.deepEqual(await fs.readFile(f.saved.file), before);

@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -362,7 +363,11 @@ test(
         const messages = await client.getMessages();
         return messages.at(-1)?.role === 'assistant' && !(await client.getState()).isStreaming;
       });
-      const view = await bridge.read({ session_id: session.id, preset: 'full' });
+      const view = await bridge.read({
+        session_id: session.id,
+        range: { recent: -1 },
+        content: ALL_CONTENT,
+      });
       assert.ok(JSON.stringify(view.items).includes(text));
     }
     assert.ok(!(await fs.readFile(b.file, 'utf8')).includes('AFTER_REFUSAL_A'));
@@ -458,9 +463,13 @@ for (const allowed of [true, false])
         const sent = await f.bridge.send({ session_id: f.a.id, text: 'AFTER_SWITCH' });
         assert.equal(sent.status, 'started', JSON.stringify(sent));
         await until(() => !f.bridge.pool.get(f.a.id) && !f.bridge.autoReleases.size);
-        const current = await f.bridge.read({ session_id: f.a.id, preset: 'full' });
+        const current = await f.bridge.read({
+          session_id: f.a.id,
+          range: { recent: -1 },
+          content: ALL_CONTENT,
+        });
         assert.ok(JSON.stringify(current.items).includes('AFTER_SWITCH'));
-        assert.ok(current.items.some((e) => e.type === 'text'));
+        assert.ok(current.items.some((e) => e.type === 'assistant'));
         assert.deepEqual(f.errors, []);
       },
     );
@@ -520,7 +529,11 @@ for (const outcome of ['handled', 'rejected'])
         'dispatched',
       );
       await until(() => f.faux.state.callCount > calls && session.isIdle);
-      const current = await f.bridge.read({ session_id: f.a.id, preset: 'full' });
+      const current = await f.bridge.read({
+        session_id: f.a.id,
+        range: { recent: -1 },
+        content: ALL_CONTENT,
+      });
       assert.ok(JSON.stringify(current.items).includes('AFTER_PREFLIGHT'));
       assert.ok(!JSON.stringify(current.items).includes('SECOND_IDLE_ONLY'));
     },

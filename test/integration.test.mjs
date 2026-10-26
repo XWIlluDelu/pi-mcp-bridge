@@ -1,8 +1,11 @@
+import { readSource } from './fixtures/read-source.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { test } from 'node:test';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
@@ -125,6 +128,11 @@ test('real Pi SDK with faux provider sends, persists, reads and resumes (no real
       alive: true,
       state: async () => ({ isStreaming: session.isStreaming, isCompacting: session.isCompacting }),
       entries: async () => ({ entries: manager.getEntries(), leafId: manager.getLeafId() }),
+      read: async (args) =>
+        prepareContextRead(
+          { ...saved, entries: manager.getEntries(), leafId: manager.getLeafId() },
+          args,
+        ),
       command: async (command) =>
         new Promise((resolve, reject) => {
           const task = session
@@ -303,7 +311,7 @@ test('MCP -> official Pi RPC -> faux provider: auto-resume, default steering, qu
     const deadline = Date.now() + 10000;
     let observed;
     do {
-      observed = await call('read', { session_id, preset: 'full' });
+      observed = await call('read', { session_id, range: { recent: -1 }, content: ALL_CONTENT });
       if (
         JSON.stringify(observed).includes('Synthetic response 3.') &&
         JSON.stringify(observed).includes('please follow up')
@@ -464,12 +472,12 @@ test('official Pi RPC preserves Unicode line separators in native session messag
       content = 'Before\u2028between\u2029after 😀 汉字';
     manager.appendMessage({ role: 'user', content, timestamp: Date.now() });
     assert.equal(
-      (await bridge.read({ session_id: made.session_id, detail: 'full' })).items[0].message.content,
+      (await readSource(bridge, { session_id: made.session_id })).items[0].message.content,
       content,
     );
     const runtime = await bridge.pool.resolve(await bridge.session(made.session_id));
     assert.equal((await runtime.state()).sessionId, saved.header.id);
-    const live = await bridge.read({ session_id: made.session_id, detail: 'full' });
+    const live = await readSource(bridge, { session_id: made.session_id });
     assert.equal(live.items[0].message.content, content);
   } finally {
     await bridge.close();
