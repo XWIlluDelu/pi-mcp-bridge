@@ -771,12 +771,12 @@ export class Bridge {
     });
   }
   async #send(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
-    if (!SEND_MODES.includes(args.mode ?? 'default')) throw new Error('INVALID_ARGUMENTS');
+    if (!SEND_MODES.includes(args.mode ?? 'steer')) throw new Error('INVALID_ARGUMENTS');
     return this.withInput(args.session_id, pendingInput, async (beforeDispatch) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
       const input = promptInput(args);
-      const body = input === undefined ? undefined : { ...input, mode: args.mode ?? 'default' };
+      const body = input === undefined ? undefined : { ...input, mode: args.mode ?? 'steer' };
       let target;
       try {
         target = await this.session(args.session_id, requestContext);
@@ -911,7 +911,7 @@ export class Bridge {
             if (typeof runtime.executeBash !== 'function') throw new Error('BASH_UNSUPPORTED');
             generation = runtime.generation ?? runtime.record?.generation ?? null;
             output = inlineBashResult(await runtime.executeBash({ ...args, beforeDispatch }));
-            return { status: 'accepted', generation };
+            return { status: 'completed', generation };
           } catch (error) {
             if (error.result) output = inlineBashResult(error.result);
             return {
@@ -1059,7 +1059,7 @@ export class Bridge {
               type: 'prompt',
               message: input.text,
               ...(input.images ? { images: input.images } : {}),
-              ...promptOptions(hasPromptSettings(input) ? 'idle_only' : 'default'),
+              ...promptOptions(hasPromptSettings(input) ? 'idle_only' : 'steer'),
             },
             undefined,
             onLate,

@@ -49,7 +49,7 @@ for (const operation of ['send', 'create', 'command'])
       const result = await bridge[operation](args);
       assert.equal(
         result.status,
-        operation === 'command' ? 'accepted' : 'started',
+        operation === 'command' ? 'completed' : 'started',
         JSON.stringify(result),
       );
       assert.deepEqual(dispatched, [operation === 'command' ? 'bash' : 'prompt']);

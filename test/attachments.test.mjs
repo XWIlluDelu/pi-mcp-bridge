@@ -330,8 +330,8 @@ test('extension confirms public dispatch without claiming admission, and idle in
     await handlers.session_start({ reason: 'startup' }, ctx);
     const record = await readClaim(f.config.attachmentDir, f.session);
     const runtime = new AttachedRuntime(f.config, f.session, record);
-    for (const mode of ['default', 'idle_only', 'steer', 'follow_up']) {
-      const result = await runtime.send({ text: 'public fixture', mode });
+    for (const input of [{}, { mode: 'idle_only' }, { mode: 'follow_up' }]) {
+      const result = await runtime.send({ text: 'public fixture', ...input });
       assert.deepEqual(result, { status: 'dispatched', admission: 'unobservable' });
     }
     assert.deepEqual(
@@ -339,7 +339,6 @@ test('extension confirms public dispatch without claiming admission, and idle in
       [
         { expandPromptTemplates: true, deliverAs: 'steer' },
         { expandPromptTemplates: true },
-        { expandPromptTemplates: true, deliverAs: 'steer' },
         { expandPromptTemplates: true, deliverAs: 'followUp' },
       ],
     );
@@ -352,20 +351,16 @@ test('extension confirms public dispatch without claiming admission, and idle in
       }),
       (error) => error.message === 'STOP_IN_PROGRESS' && !error.uncertain,
     );
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 3);
     idle = false;
     assert.equal((await runtime.send({ text: 'compacting', mode: 'idle_only' })).status, 'skipped');
-    assert.equal(calls.length, 4);
+    assert.equal(calls.length, 3);
     const escaped = {
       session_id: f.id,
 
       text: '\0'.repeat(100000),
-      mode: 'default',
     };
-    assert.equal(
-      publicOperationSchemas.send.safeParse({ ...escaped, mode: 'default' }).success,
-      true,
-    );
+    assert.equal(publicOperationSchemas.send.safeParse(escaped).success, true);
     assert.equal((await runtime.send(escaped)).status, 'dispatched');
     assert.equal(calls.at(-1).text, escaped.text);
     const throwing = t.mock.method(pi, 'sendUserMessage', () => {
@@ -553,8 +548,8 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
   const receipt = await f.bridge.send({
     session_id: f.id,
 
-    text: 'first public fixture',
-    mode: 'default',
+    // Force source pagination independently of the number of send modes below.
+    text: 'first public fixture\n' + 'captured source '.repeat(500),
   });
   assert.equal(receipt.status, 'dispatched');
   assert.equal(receipt.admission, 'unobservable');
@@ -570,7 +565,7 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
     ).status,
     'skipped',
   );
-  for (const mode of ['default', 'steer', 'follow_up']) {
+  for (const mode of ['steer', 'follow_up']) {
     const r = await f.bridge.send({
       session_id: f.id,
 
@@ -584,7 +579,7 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
 
   // Queue consumption may combine inputs in one native loop. Verify native
   // user history, not one assistant response per external submission.
-  const expectedInputs = ['first public fixture', 'busy default', 'busy steer', 'busy follow_up'];
+  const expectedInputs = ['first public fixture', 'busy steer', 'busy follow_up'];
   await until(async () => {
     const native = await loadSavedSession(f.session);
     const inputs = native.entries
@@ -608,7 +603,12 @@ test('official offline Pi TUI attaches, sends all modes, reloads, resumes attach
     assert.equal(r.status, 'dispatched');
     await until(async () => !(await f.bridge.pool.get(f.id).state()).isStreaming);
   }
-  const page = await f.bridge.read({ session_id: f.id, preset: 'full', max_bytes: 4096 });
+  const page = await f.bridge.read({
+    session_id: f.id,
+    preset: 'full',
+    detail: 'full',
+    max_bytes: 4096,
+  });
   assert.ok(page.next_cursor);
   const beforeReload = await f.bridge.read({
     session_id: f.id,

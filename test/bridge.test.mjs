@@ -142,18 +142,17 @@ test('idle_only skips busy while native and strategy modes retain Pi semantics',
     'skipped',
   );
   assert.equal(f.runtime.calls.length, 0);
-  await f.bridge.send({ session_id: f.id, text: 'x', mode: 'default' });
-  await f.bridge.send({ session_id: f.id, text: 'x', mode: 'steer' });
+  await f.bridge.send({ session_id: f.id, text: 'x' });
   await f.bridge.send({ session_id: f.id, text: 'x', mode: 'follow_up' });
   assert.deepEqual(
     f.runtime.calls.map((c) => c.streamingBehavior),
-    ['steer', 'steer', 'followUp'],
+    ['steer', 'followUp'],
   );
   await assert.rejects(
     f.bridge.send({ session_id: f.id, text: 'x', mode: 'unknown' }),
     /INVALID_ARGUMENTS/,
   );
-  assert.equal(f.runtime.calls.length, 3);
+  assert.equal(f.runtime.calls.length, 2);
 });
 
 test('independent concurrent calls all submit even with identical payloads', async (t) => {

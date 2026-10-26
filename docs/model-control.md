@@ -19,7 +19,7 @@ The catalog uses the same user Pi installation as CLI execution. A short-lived n
 
 Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Failures return `MODEL_CATALOG_UNAVAILABLE`; `PI_MCP_LOG=1` records content-free `catalog_stage` and `catalog_reason` diagnostics.
 
-The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain only `provider`, `id`, `name`, `input`, `context_window` and `effort`. `effort` lists Pi's supported thinking levels (`["off"]` for a model without reasoning). Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
+The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain only `provider`, `id`, `name`, `input`, `context_window` and `thinking_levels`. `thinking_levels` lists Pi's supported thinking levels (`["off"]` for a model without reasoning). Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
 
 For a live session's actual selection, use [list status](api.md#list): `status.model` and `status.thinking_level` come from its owner and are null when unobserved.
 
@@ -99,7 +99,7 @@ Default compaction requires `send` and proven idle. Owned RPCs can establish idl
 
 Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
 
-An accepted result means compaction completed. It returns `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. The internal five-second acknowledgement budget does not abort compaction; an expired wait returns an unknown outcome, and native history can show a later completed summary. Attached operations retain their input fence until the native callback or controller Promise settles.
+`status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. The internal five-second acknowledgement budget does not abort compaction; an expired wait returns an unknown outcome, and native history can show a later completed summary. Attached operations retain their input fence until the native callback or controller Promise settles.
 
 The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect list/read; a new call performs another compaction.
 

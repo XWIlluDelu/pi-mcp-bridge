@@ -111,7 +111,7 @@ test('command and batch distinguish native truncation from response completeness
         arguments: { operations: [{ op: 'command', args }] },
       });
       for (const result of [direct.structuredContent, batch.structuredContent.results[0].result]) {
-        assert.equal(result.status, 'accepted');
+        assert.equal(result.status, 'completed');
         assert.equal(result.native_truncated, native_truncated);
         assert.equal(result.response_complete, max_chars === 32768);
         assert.equal(result.output, output.slice(0, result.output.length));
@@ -218,7 +218,7 @@ test('shutdown drains already admitted inline command output instead of discardi
   const closing = f.bridge.close();
   finish.resolve();
   const result = await pending;
-  assert.equal(result.structuredContent.status, 'accepted');
+  assert.equal(result.structuredContent.status, 'completed');
   assert.equal(result.structuredContent.output, 'known during shutdown');
   await closing;
 });

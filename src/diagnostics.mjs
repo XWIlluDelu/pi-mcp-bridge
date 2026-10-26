@@ -82,6 +82,7 @@ const enums = {
     'warning',
     'error',
     'accepted',
+    'completed',
     'dispatched',
     'unknown',
     'rejected',
@@ -93,7 +94,7 @@ const enums = {
   kind: ['saved', 'rpc', 'attached'],
   transport: ['stdio', 'http'],
   disposition: ['started', 'queued', 'handled'],
-  mode: ['default', 'idle_only', 'steer', 'follow_up'],
+  mode: ['steer', 'follow_up', 'idle_only'],
 };
 const refs = new Set(['mcp_id_ref', 'session_ref']);
 export const diagnosticRef = (value) =>

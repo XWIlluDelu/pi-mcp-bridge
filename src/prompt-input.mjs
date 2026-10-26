@@ -6,7 +6,7 @@ export const hasPromptSettings = (input) =>
 // Fit a complete base64 prompt (including text/JSON overhead) into the existing
 // 8 MiB MCP/IPC request bound. No URL fetching or local-path access is implied.
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-export const SEND_MODES = ['default', 'idle_only', 'steer', 'follow_up'];
+export const SEND_MODES = ['steer', 'follow_up', 'idle_only'];
 // Native slash dispatch precedes input events. Owner-local control must be
 // refused at remote admission, including Pi's command collision suffixes.
 export function remotePromptRejection(text) {
@@ -15,7 +15,7 @@ export function remotePromptRejection(text) {
     : null;
 }
 export const promptOptions = (mode) =>
-  ['default', 'steer'].includes(mode)
+  mode === 'steer'
     ? { streamingBehavior: 'steer' }
     : mode === 'follow_up'
       ? { streamingBehavior: 'followUp' }

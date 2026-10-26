@@ -650,7 +650,7 @@ export class AttachedRuntime {
       {
         text: args.text,
         ...(args.images ? { images: args.images } : {}),
-        mode: args.mode ?? 'default',
+        mode: args.mode ?? 'steer',
       },
       undefined,
       args.beforeDispatch,
