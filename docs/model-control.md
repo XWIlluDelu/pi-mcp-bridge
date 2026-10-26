@@ -1,5 +1,11 @@
 # Model discovery and native controls
 
+Use `models` to discover configured choices, `list` to inspect a live session's
+current selection, and `set_model` to change that selection without sending work.
+Settings on `send` or `create` instead apply immediately before that call's input
+and have stricter idle and validation requirements. [Runtime capabilities](runtime.md#runtime-capabilities)
+describe which owner types support each operation.
+
 | Operation                | Purpose                                        | Owner support                                           | Permission                             |
 | ------------------------ | ---------------------------------------------- | ------------------------------------------------------- | -------------------------------------- |
 | `models`                 | Native configured catalog                      | No session owner needed                                 | Effective execution authorization      |
@@ -17,7 +23,12 @@ Authorization requires effective `send`, `command` or `create` on a configured p
 
 The catalog uses the same user Pi installation as CLI execution. A short-lived native `ModelRuntime` helper reads the owner's launch-profile agent directory, inherited environment and existing model/provider/auth configuration and caches. It uses the trusted Bridge cwd, disables network refresh and loads no session, resource or extension factories. Credential and cache stores are read-only, including when files are missing. Callers cannot select a different environment.
 
-Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Failures return `MODEL_CATALOG_UNAVAILABLE`; `PI_MCP_LOG=1` records content-free `catalog_stage` and `catalog_reason` diagnostics.
+Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Pi installation and launch-profile errors retain their own codes; see [native environment](configuration.md#native-environment). Failures running or decoding the catalog helper return `MODEL_CATALOG_UNAVAILABLE`; [Bridge diagnostics](configuration.md#diagnostics) record `catalog_stage` and `catalog_reason` to identify the failing stage without exposing credentials or provider configuration.
+
+An absent catalog entry therefore does not establish that a model is unavailable
+to an already-running owner. Standalone selection resolves the requested model
+against that owner's available models. The catalog also performs no provider
+request, so it does not verify network access or successful generation.
 
 The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain only `provider`, `id`, `name`, `input`, `context_window` and `thinking_levels`. `thinking_levels` lists Pi's supported thinking levels (`["off"]` for a model without reasoning). Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
 
@@ -48,7 +59,12 @@ Busy selection is supported. Issued provider requests keep their captured settin
 
 Owned RPCs, ordinary TUI/RPC companions and supplied SDK/RPC bindings support native setters. Custom hosts use the optional [setModel callback](runtime.md#host-model-setter); a missing callback returns `MODEL_SELECTION_UNSUPPORTED`. Without a live owner, Bridge validates the saved session/cwd and cold-resumes an owned RPC, which becomes eligible for normal idle release, including after failure. Native launch overrides apply at each cold start.
 
-The acknowledgement budget is five seconds per native/IPC request; there is no tool timeout parameter. A lost or late confirmation produces `uncertain:true` and the setting may already have changed. Late acknowledgement resolves the input fence without applying another setting. Inspect `list.status` and authorized read before another call.
+The acknowledgement budget is five seconds per native/IPC request; there is no
+tool timeout parameter. A lost or late confirmation produces `uncertain:true`
+and the setting may already have changed. Owned RPCs retain matching late-ACK
+tracking; attached setters stay fenced until their native call settles. Neither
+path retries the selection. Inspect `list.status` and authorized read before
+another call.
 
 ### Empty-context resume limitation
 
@@ -72,7 +88,11 @@ Send and create accept either setting, including create's first prompt, together
 - Both: validate thinking against the target model before either change.
 - Neither: follow native selection, including cold-start restoration, launch overrides, availability and the [empty-context limitation](#empty-context-resume-limitation).
 
-Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, restricted to the target's supported set. Unsupported explicit levels return `THINKING_LEVEL_UNSUPPORTED`; unknown support returns `THINKING_SUPPORT_UNKNOWN`.
+Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, restricted
+to the target's supported set. Unsupported explicit levels return
+`THINKING_LEVEL_UNSUPPORTED`; unknown support returns `THINKING_SUPPORT_UNKNOWN`.
+This prompt-specific validation differs from standalone `set_model`, which
+returns Pi's actual selection after native clamping.
 
 Explicit prompt settings require a proven-idle Bridge-owned RPC with no pending input. Busy work returns `MODEL_SELECTION_BUSY` (`idle_only` skips without changes), unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`, and companions/shared hosts return `MODEL_SELECTION_UNSUPPORTED`. Plain queued sends use native settings when consumed.
 

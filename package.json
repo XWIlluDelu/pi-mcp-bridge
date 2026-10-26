@@ -4,6 +4,7 @@
   "type": "module",
   "version": "0.7.0",
   "description": "Permissioned MCP access to native Pi sessions with single-writer coordination.",
+  "license": "MIT",
   "engines": {
     "node": ">=22.19.0"
   },
