@@ -1,5 +1,25 @@
 # Native runtime, ownership and local entry
 
+Start with a working [owner configuration](configuration.md) and
+[MCP connection](transports.md). A **session** is a saved native Pi history;
+its **owner** is the live process permitted to write it. The MCP client and the
+Bridge service are separate from that writer.
+
+Choose the entry path that matches how you use Pi:
+
+| Starting point                                               | Setup                                                                                              |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| Saved session with no live owner                             | No manual attachment is needed. An authorized execution call can cold-start a Bridge-owned RPC.    |
+| Daily Pi TUI or an ordinary RPC owned by another application | [Load the companion](#daily-tui-and-ordinary-rpc-registration) using the same owner configuration. |
+| A host application integrating the public SDK/RPC APIs       | Follow the [host registration lifecycle](#host-registration-lifecycle).                            |
+| Open a session currently controlled by Bridge in a terminal  | Use the [native launcher](#open-a-bridge-session-in-a-native-terminal), which negotiates handoff.  |
+
+Registration makes an owner reachable; [permissions](configuration.md) still
+decide which operations a remote caller may perform. The capability table below
+describes implementation support, independently of those grants.
+
+## Ownership and cooperating writers
+
 Bridge reuses a cooperating live Pi instance and starts an RPC child only when
 no live registered writer owns the saved session. Ownership binds the canonical
 file to an exact Linux process: PID, process start time and boot ID. Native
@@ -63,6 +83,11 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 | TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 | Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
+The host column describes the supplied bindings; a custom host exposes only the
+callbacks it implements. In particular, an RPC host must provide its own reload
+callback. Use `list.status.capabilities` to inspect a connected owner's advertised
+send, command, stop and reload support.
+
 Saved reads need no writer. Send, command, compact and `set_model` may cold-start
 an RPC; reload, stop, read, search and list do not. Model catalogs are independent of session
 owners. See [native controls](model-control.md) and [read formats](reading.md).
@@ -87,10 +112,9 @@ cannot implement. Native command support must use Pi's bash path, including
 the callbacks they implement; command requires bash plus either cancel or stop,
 while remote stop requires the complete stop callback.
 
-Send defaults to `steer`: it starts input when idle and uses Pi's steering queue
-while busy. `follow_up` uses the native follow-up queue while busy. Idle-only checks both busy state and pending
-queues, plus unfinished SDK prompt promises including input preparation. It skips
-busy work instead of queueing it. Remote companion/host inputs refuse
+The [send modes](api.md#send) use native steering/follow-up queues. For companions
+and SDK bindings, `idle_only` also checks unfinished public SDK calls, including
+input preparation, before invoking Pi. Remote companion/host inputs refuse
 `/bridge-join` and collision aliases; join remains owner-local.
 
 ## Remote reload
@@ -197,6 +221,11 @@ Updating files takes effect only after the running owner reloads or reopens.
 
 ## Daily TUI and ordinary RPC registration
 
+First confirm that the owner configuration's `sessionRoots` includes the native
+session location and grants the intended operations. Loading the companion does
+not grant access by itself. Use the same installed Bridge checkout as the service;
+the running components must implement the current control interface.
+
 Add the installed companion's canonical path to Pi's existing settings
 (`~/.pi/agent/settings.json`, or the selected `PI_CODING_AGENT_DIR`), preserving
 other extensions/settings:
@@ -243,6 +272,46 @@ newly configured extension. Registration happens after native file open, so it
 cannot make blindly launching `--session` into an owned file safe. A GUI started
 first can expose its Pi through the companion; one opened after a Bridge-owned
 RPC needs shared control or an explicit handoff.
+
+After loading, check the owner status with `list({session_id})` through the
+running Bridge. A fresh native session appears in discovery only after Pi
+persists it. For an active in-scope session, `saved` means no cooperating live
+owner was found; `unavailable` or a protocol mismatch needs investigation before
+sending work.
+See [runtime capabilities](#runtime-capabilities) for the operations registration
+provides and [events](events.md) for notification setup.
+
+## Host registration lifecycle
+
+Use `reserveHostSession` from `src/host-adapter.mjs` when an application controls
+the actual writer. `createSdkHostBinding` and `createRpcHostBinding` from
+`src/host-bindings.mjs` adapt existing public APIs; they do not open sessions,
+spawn Pi, or take over an RPC client's stdio.
+
+1. Before opening the target, reserve its canonical `session:{file,header}` in
+   the Bridge's `attachmentDir`. Supply `owner` from `processIdentity(writerPid)`
+   for an RPC child; the default identity is the current process, suitable for an
+   in-process SDK writer. A separate RPC child can start without a session before
+   reservation, then switch to the reserved target.
+2. Open the target through the host's native API. Create the SDK binding before
+   admitting local input so its operation observer can track input preparation.
+   Pass `piExecutable` to `reserveHostSession` when the selected Pi installation
+   is not the one resolved from the host's PATH.
+3. Publish with `await controller.ready(binding)` once `state()` and `snapshot()`
+   describe the reserved session. Keep the native writer under the host's
+   lifecycle control and the controller bound to that session. A session change
+   needs a new reservation and the release contract below, not reuse of a
+   controller with a different native identity.
+4. If remote release is supported, provide a `release` callback that fences local
+   admission, aborts/drains all session work and closes the actual writer before
+   returning `{released:true}`. `controller.close()` disconnects the adapter; it
+   does not establish that a still-live writer has released the file.
+
+Custom callbacks follow the same identity and lifecycle requirements. Model,
+compaction and reload contracts appear above; command/stop result callbacks are
+described under [shutdown and in-flight ACKs](#shutdown-and-in-flight-acks).
+[Host integration tests](../test/host-integration.test.mjs) demonstrate the SDK
+and RPC reservation sequences with isolated synthetic sessions.
 
 ## Open a Bridge session in a native terminal
 

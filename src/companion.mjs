@@ -555,9 +555,13 @@ export default async function attachExtension(pi, { AgentSession } = {}) {
                 throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
               if (!SEND_MODES.includes(args.mode))
                 throw new AttachmentFailure('INVALID_ATTACHED_SEND');
-              const rejection = remotePromptRejection(input.text);
+              const rejection = remotePromptRejection(input.text),
+                currentActivity = activity();
               if (rejection) data = rejection;
-              else if (args.mode === 'idle_only' && (!ctx.isIdle() || ctx.hasPendingMessages()))
+              else if (
+                args.mode === 'idle_only' &&
+                (!currentActivity.idle || currentActivity.pending_messages)
+              )
                 data = { status: 'skipped', reason: 'busy' };
               else {
                 const options = { expandPromptTemplates: true };

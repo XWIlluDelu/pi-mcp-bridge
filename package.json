@@ -2,8 +2,9 @@
   "name": "pi-mcp-bridge",
   "private": true,
   "type": "module",
-  "version": "0.7.0-dev.5",
+  "version": "0.7.0-dev.6",
   "description": "Permissioned MCP access to native Pi sessions with single-writer coordination.",
+  "license": "MIT",
   "engines": {
     "node": ">=22.19.0"
   },

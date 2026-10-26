@@ -306,6 +306,69 @@ test('search examines full split documents and returns a match outside the norma
   assert.equal(rows(snap, { query: 'needle', content: ['tool'] }).length, 0);
 });
 
+for (const view of ['session', 'runtime']) {
+  test(`${view} search preserves continuous command output and per-part execution state`, () => {
+    const output = Array.from(
+      { length: 350 },
+      (_, i) => `Entry ${String(i).padStart(4, '0')}: a distinct diagnostic observation.`,
+    ).join(' ');
+    for (const command of ['generate-diagnostics', 'long-command-'.repeat(100)]) {
+      const message = {
+        role: 'bashExecution',
+        command,
+        output,
+        exitCode: 23,
+        cancelled: true,
+        truncated: true,
+      };
+      const request = {
+        session_id: identity.session_id,
+        view,
+        content: ALL_CONTENT,
+        ...(view === 'session' ? { range: { recent: -1 } } : {}),
+      };
+      const capture = (query) => {
+        if (view === 'session')
+          return prepareContextRead(
+            {
+              entries: [{ type: 'message', id: 'command', parentId: null, message }],
+              leafId: 'command',
+            },
+            { ...request, ...(query ? { search_query: query } : {}) },
+            { buildSessionProjection },
+          );
+        const target = { units: [], accountedBytes: 0 };
+        appendUnits(target, { type: 'command', source: { observation_index: 0 }, message });
+        return snapshot(target.units, { view, selection: null, omissions: null });
+      };
+      const captured = capture();
+      const parts = captured.units.filter((unit) => typeof unit.message?.output === 'string');
+      assert.ok(parts.length > 1);
+      const boundary = parts[0].message.output.length;
+      const phrase = output.slice(boundary - 30, boundary + 30);
+      const cache = new ContextReadCache();
+      const found = cache.navigate(capture(phrase), request, { identity }, phrase);
+      assert.equal(found.matches, 1);
+      assert.ok(found.items[0].text.includes(phrase));
+      const expanded = cache.expand([found.items[0].ref], identity);
+      const expandedParts = expanded.units.filter(
+        (unit) => typeof unit.message?.output === 'string',
+      );
+      assert.equal(expandedParts.map((unit) => unit.message.output).join(''), output);
+      for (const unit of expandedParts)
+        for (const key of ['exitCode', 'cancelled', 'truncated'])
+          assert.equal(unit.message[key], message[key]);
+      assert.equal(rows(captured, { query: command }).length, 1);
+      assert.equal(rows(captured, { query: 'exit: 23; cancelled' }).length, 1);
+      const text = documentText(captured, navigationDocuments(captured)[0]);
+      assert.equal(
+        text,
+        `command: ${command}\nexit: 23; cancelled; native output truncated\n${output}`,
+      );
+    }
+  });
+}
+
 test('brief and search retain assistant failure facts once across native and runtime split content', () => {
   for (const [stopReason, errorMessage, text] of [
     ['error', 'Upstream authentication failed', 'Partial response'],

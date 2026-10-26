@@ -4,29 +4,42 @@ Bridge lets an external agent continue work in a local Pi session using its
 environment, extensions and history. Start from a useful overview, send the next
 instruction, and read further only when the outcome needs explanation or evidence.
 
+Complete [local setup](../README.md#start-locally) and grant the intended
+[operations](configuration.md#seven-independent-rights) before this workflow.
+Discovery, history reading and execution have independent permissions; finding
+a session does not authorize sending to it, and a known ID can be usable even
+when discovery is denied.
+
 ## Calling workflow
 
-1. Use `list` to find an authorized session and its current activity. Start with
-   `read({session_id})` for the last three input turns in source order. Increase
-   `range.recent` for more background, or use `search` to locate a decision or
-   tool result. Expand returned refs with `read`.
+1. Use `list({})` to find an authorized session and its current activity, or use
+   a known `session_id` directly with an authorized operation. For new work,
+   choose a project from `creatable_projects` and call `create({project})` to
+   save an empty session. For existing work, start with `read({session_id})`
+   for the last three input turns in source order. Increase `range.recent` for
+   more background, or use `search` to locate a decision or tool result. Expand
+   returned refs with `read`.
 2. For completion notifications, [subscribe before sending](events.md).
    Bridge-owned RPC and ordinary TUI/RPC companions connected to this Bridge
-   support `session.settled`. For a new session, call `create` without input to
-   obtain a saved session ID, subscribe, then `send` the first task.
-3. Send the instruction to that session and retain `session_id` and
+   support `session.settled`. For a new session, subscribe to its saved ID before
+   sending the first task.
+3. Call `send({session_id,text})` and retain `session_id` and any returned
    `submission_id`. `started`, `queued` and `handled` report native admission.
    `dispatched` confirms an external owner invoked Pi's public API, whose input
    handling may still transform or handle the message.
-4. If the result is `unknown`, query `submission` with both IDs for a possible
-   late acknowledgement. A missing or still-unknown receipt does not establish
-   failure; another send would be new input.
+4. If the result is `unknown` and includes a `submission_id`, query `submission`
+   with both IDs for a possible late acknowledgement. If the response or receipt
+   is unavailable, inspect current activity and history before deciding on new
+   input. Neither a missing receipt nor a still-unknown one establishes failure;
+   another send would be new input.
 5. On `session.settled`, the result excerpt may be enough to understand a short
    outcome. For more context, pass `data.read` directly as the read tool's
    arguments. These arguments select Session Context at the completed leaf, even
    when a memory reader handles default reads.
-6. Send the next instruction to the same session. Use `list` for current activity
-   and the reading tools for task progress and evidence.
+6. Without notifications, use `list({session_id})` for sampled activity and
+   `read({session_id})` for current progress and results when needed. An idle or
+   saved state alone does not establish the task's outcome. Review the result,
+   then send the next instruction to the same session.
 
 Direct MCP calls and code orchestration use the same workflow. Code can retain
 IDs and choose the next call from the returned status; repeating a send or batch
@@ -43,8 +56,10 @@ for subscriptions and delivery.
 | Event `leaf_id` and `read` | The native branch boundary when a run settled | Read that result after later work has started.              |
 
 Pi steering, follow-up queues and automatic continuations can consume several
-inputs in one run. Admission receipts therefore describe delivery/admission;
-completion notifications describe a session run. Neither establishes success of
+inputs in one run. A reading [input turn](reading.md#turn-range-and-content)
+groups an input with following projected content; it is not a completion unit.
+Admission receipts therefore describe delivery/admission; completion
+notifications describe a session run. Neither establishes success of
 the user's task. The notification's `stop_reason` is the final assistant message's
 native termination reason.
 

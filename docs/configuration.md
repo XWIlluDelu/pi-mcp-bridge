@@ -5,6 +5,52 @@ permissions. [The example](../deploy/owner.example.json) denies every operation;
 replace its paths with the projects and native session roots intended for access.
 The Bridge rejects unsafe configuration files without changing their permissions.
 
+## Configure one project
+
+Start from the example copied in the [local setup](../README.md#start-locally).
+For a project such as `/home/example/project`, edit these fields together:
+
+1. Choose `stateDir` for Bridge's private state, separate from native session
+   storage. Leave `attachmentDir` unset to use `stateDir/ipc`, or choose a shared
+   private directory for all cooperating owners.
+2. Set `sessionRoots` to the directories containing the native sessions you want
+   to expose. Pi's `/session` command shows the current session file; use its
+   containing directory, not the file itself or the project directory. If Bridge
+   will create sessions, include the destination chosen by Pi's
+   [storage settings](#storage-and-project-paths).
+3. Add the canonical project path to `folders` if it should be a creation target.
+   This does not grant access. Existing sessions are authorized by their recorded
+   project cwd, independently of where their files are stored.
+4. Keep the example's complete deny-by-default baseline and replace `grants:[]`
+   with the project overrides you need. For example, the following permits
+   session collaboration and creation while leaving direct commands and deletion
+   disabled:
+
+```json
+[
+  {
+    "folder": "/home/example/project",
+    "list": true,
+    "read": true,
+    "send": true,
+    "stop": true,
+    "create": true,
+    "command": false,
+    "delete": false
+  }
+]
+```
+
+`send` allows Pi to use its native tools and extensions; `command:false` disables
+only Bridge's direct shell operation. See [native environment](#native-environment)
+for explicit runtime overrides and [permission resolution](#seven-independent-rights)
+for inheritance. All clients of this owner configuration share its policy; the
+configuration does not define separate caller identities.
+
+Connect through [stdio or HTTP](transports.md#choose-a-process-topology), then
+follow the [first-connection checks](../README.md#verify-the-first-connection).
+The settings reference below covers additional controls and later policy edits.
+
 ## Settings
 
 Unknown fields and incomplete baseline permissions are rejected. Project and
@@ -117,23 +163,9 @@ admission may read identity metadata, but no history or owner state. See
 All apply at default/project tiers; sessions may override all except `create`,
 which targets a project.
 
-Example project override:
-
-```json
-{
-  "folder": "/home/example/project",
-  "list": true,
-  "read": true,
-  "send": true,
-  "stop": true,
-  "create": true,
-  "command": false,
-  "delete": false
-}
-```
-
-A session override is `{"session_id":"ps_…","send":false}`. Each right resolves
-in this order:
+The [first-project example](#configure-one-project) shows a project override.
+A session override is `{"session_id":"ps_…","send":false}`. Put each override
+inside the `grants` array. Each right resolves in this order:
 
 1. Latest explicit boolean for the exact session.
 2. Latest explicit boolean at the most specific containing project path, then

@@ -204,6 +204,46 @@ test('SDK snapshot retains native entries and idle-only busy never dispatches', 
   assert.equal(snapshot.sessionId, idle.sessionId);
 });
 
+test('SDK idle-only skips local input preparation while ordinary delivery remains available', async () => {
+  const preparation = Promise.withResolvers(),
+    prompts = [];
+  class Session {
+    constructor() {
+      Object.assign(this, idle);
+      this.sessionManager = {};
+    }
+    async prompt(input) {
+      prompts.push(input);
+      return await input;
+    }
+    async reload() {}
+  }
+  const session = new Session(),
+    binding = createSdkHostBinding(session),
+    preparing = session.prompt(preparation.promise);
+  assert.equal(session.isIdle, true);
+  assert.equal((await binding.state()).isIdle, false);
+  assert.deepEqual(await binding.submit({ text: 'must not enter', mode: 'idle_only' }), {
+    status: 'skipped',
+    reason: 'busy',
+  });
+  assert.deepEqual(prompts, [preparation.promise]);
+  for (const mode of ['steer', 'follow_up'])
+    assert.deepEqual(await binding.submit({ text: mode, mode }), {
+      status: 'dispatched',
+      admission: 'unobservable',
+    });
+  preparation.resolve();
+  await preparing;
+  await tick();
+  assert.equal((await binding.state()).isIdle, true);
+  assert.deepEqual(await binding.submit({ text: 'now idle', mode: 'idle_only' }), {
+    status: 'dispatched',
+    admission: 'unobservable',
+  });
+  assert.deepEqual(prompts, [preparation.promise, 'steer', 'follow_up', 'now idle']);
+});
+
 test('RPC uses existing demultiplexed public client and preserves ACK dispositions', async () => {
   const calls = [];
   let disposition = 'handled';

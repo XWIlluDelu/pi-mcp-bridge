@@ -64,14 +64,13 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     session.sessionManager
       ? reloadAdmission(session.constructor)
       : null;
+  const isIdle = () =>
+    session.isIdle && !tracked.submitting && (!admission || admission.idle(session.sessionManager));
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
     ...('sessionName' in session ? { sessionName: session.sessionName ?? null } : {}),
-    isIdle:
-      session.isIdle &&
-      !tracked.submitting &&
-      (!admission || admission.idle(session.sessionManager)),
+    isIdle: isIdle(),
     isStreaming: session.isStreaming,
     isCompacting: session.isCompacting,
     isBashRunning: session.isBashRunning,
@@ -148,10 +147,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
       if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
       beforeDispatch?.();
-      if (
-        mode === 'idle_only' &&
-        (tracked.submitting || !session.isIdle || session.pendingMessageCount > 0)
-      )
+      if (mode === 'idle_only' && (!isIdle() || session.pendingMessageCount > 0))
         return { status: 'skipped', reason: 'busy' };
       // Public prompt() returns the input call's Promise, not an admission
       // receipt. A synchronous throw after entry cannot prove no side effect.
