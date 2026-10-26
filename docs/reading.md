@@ -351,5 +351,6 @@ entries or computing history fingerprints.
 Fork uses a separate [raw snapshot contract](runtime.md#read-and-fork-boundaries).
 Read never falls back to it. Bridge and companion/host read contracts must match;
 missing/mismatched contracts return `OWNER_READ_REFRESH_REQUIRED` with refresh
-guidance. Update the running components at a safe boundary; changing read arguments
-or refreshing the client's schema cannot update an owner.
+guidance. Use [`reload({session_id})`](api.md#reload) at an idle boundary where
+supported; an old owner without that capability needs a native refresh first.
+Changing read arguments or refreshing the client's schema cannot update an owner.

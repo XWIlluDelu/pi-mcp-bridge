@@ -12,7 +12,7 @@ import { reserveOwner, releaseOwner, updateOwner, processIdentity } from '../src
 import { PiRpc } from '../src/rpc.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
 import { readClaim, AttachedRuntime } from '../src/attachments.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 
 test('RPC reservation rejects a different live native ID at the same path before spawning', async (t) => {
   for (const kind of ['tui', 'rpc'])

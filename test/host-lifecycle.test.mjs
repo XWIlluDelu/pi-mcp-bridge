@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
 import { atomicJson } from '../src/storage.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 import {
   reserveOwner,
   releaseOwner,

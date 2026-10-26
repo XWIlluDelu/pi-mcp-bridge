@@ -124,6 +124,6 @@ test('runtime capabilities stay supported across busy and unknown activity obser
     );
     assert.equal(result.state, expected);
     assert.equal(result.pending_messages, count);
-    assert.deepEqual(result.capabilities, { send: true, command: true, stop: true });
+    assert.deepEqual(result.capabilities, { send: true, reload: false, command: true, stop: true });
   }
 });

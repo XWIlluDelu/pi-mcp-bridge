@@ -119,6 +119,96 @@ function request(f, op, body = {}, changes = {}) {
     });
   });
 }
+test('host reload waits for native completion and fences unresolved submissions and new mutations', async (t) => {
+  const f = await fixture(t),
+    submitEntered = gate(),
+    submitRelease = gate(),
+    reloadEntered = gate(),
+    reloadRelease = gate();
+  let reloads = 0;
+  await f.controller.ready({
+    ...f.callbacks,
+    submit: async () => {
+      submitEntered.resolve();
+      await submitRelease.promise;
+      return { status: 'accepted', disposition: 'handled' };
+    },
+    reload: async ({ sessionFile, sessionId, beforeDispatch }) => {
+      assert.equal(sessionFile, f.session.file);
+      assert.equal(sessionId, f.session.header.id);
+      beforeDispatch();
+      reloads++;
+      reloadEntered.resolve();
+      await reloadRelease.promise;
+      return { reloaded: true };
+    },
+  });
+  const runtime = new AttachedRuntime(
+    { attachmentDir: f.attachmentDir },
+    f.session,
+    f.controller.record,
+  );
+  try {
+    const submitting = runtime.send({ text: 'ADMITTED_INPUT' });
+    await submitEntered.promise;
+    await assert.rejects(runtime.reload(), { code: 'RELOAD_BUSY', uncertain: false });
+    assert.equal(reloads, 0);
+    submitRelease.resolve();
+    await submitting;
+    let finished = false;
+    const reloading = runtime.reload().then((value) => {
+      finished = true;
+      return value;
+    });
+    await reloadEntered.promise;
+    assert.equal(finished, false);
+    assert.equal((await runtime.state()).isIdle, false);
+    await assert.rejects(runtime.send({ text: 'MUST_NOT_SEND' }), {
+      code: 'RELOAD_IN_PROGRESS',
+      uncertain: false,
+    });
+    reloadRelease.resolve();
+    assert.deepEqual(await reloading, {
+      status: 'completed',
+      owner_version: READ_CONTRACT,
+      read_compatible: true,
+    });
+    assert.equal(reloads, 1);
+    assert.equal((await runtime.state()).isIdle, true);
+  } finally {
+    submitRelease.resolve();
+    reloadRelease.resolve();
+  }
+});
+
+test('host reload never reports failed native work or a changed session as completed', async (t) => {
+  const f = await fixture(t);
+  let reloads = 0,
+    changed = false;
+  await f.controller.ready({
+    ...f.callbacks,
+    state: () => ({
+      ...f.callbacks.state(),
+      ...(changed ? { sessionId: 'another-native-session' } : {}),
+    }),
+    reload: async ({ beforeDispatch }) => {
+      beforeDispatch();
+      if (++reloads === 1) throw new Error('native reload failed');
+      changed = true;
+      return { reloaded: true };
+    },
+  });
+  const runtime = new AttachedRuntime(
+    { attachmentDir: f.attachmentDir },
+    f.session,
+    f.controller.record,
+  );
+  await assert.rejects(runtime.reload(), { code: 'RELOAD_UNCONFIRMED', uncertain: true });
+  assert.equal(reloads, 1); // No automatic replay after native dispatch.
+  await assert.rejects(runtime.reload(), { code: 'RELOAD_UNCONFIRMED', uncertain: true });
+  assert.equal(reloads, 2);
+});
+
 test('optional host setter verifies actual values while busy and fences unresolved native work', async (t) => {
   const f = await fixture(t),
     entered = gate(),
@@ -389,7 +479,7 @@ test('list observes actual host callback support across IPC, independently of ac
           activity = observed;
           const { status } = await row();
           assert.equal(status.state, expectedState);
-          assert.deepEqual(status.capabilities, expected);
+          assert.deepEqual(status.capabilities, { ...expected, reload: false });
         }
         if (expected.command) {
           assert.equal(
@@ -403,7 +493,7 @@ test('list observes actual host callback support across IPC, independently of ac
           await assert.rejects(bridge.stop({ session_id }), /NOT_FOUND_OR_DENIED/);
           await assert.rejects(bridge.read({ session_id }), /NOT_FOUND_OR_DENIED/);
           assert.deepEqual(calls, { send: 0, bash: 0, stop: 0 });
-          assert.deepEqual((await row()).status.capabilities, expected);
+          assert.deepEqual((await row()).status.capabilities, { ...expected, reload: false });
         }
         // Exercise the advertised paths without granting read.
         Object.assign(bridge.config.defaults, { send: true, command: true, stop: true });

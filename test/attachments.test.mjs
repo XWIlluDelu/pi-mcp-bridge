@@ -30,7 +30,7 @@ import {
   assertNoOtherLiveOwner,
   waitOwnerExit,
 } from '../src/attachments.mjs';
-import attachExtension from '../src/attach-extension.mjs';
+import attachExtension from '../src/companion.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { publicOperationSchemas } from '../src/tool-schemas.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));

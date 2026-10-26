@@ -204,6 +204,46 @@ test('SDK snapshot retains native entries and idle-only busy never dispatches', 
   assert.equal(snapshot.sessionId, idle.sessionId);
 });
 
+test('SDK idle-only skips local input preparation while ordinary delivery remains available', async () => {
+  const preparation = Promise.withResolvers(),
+    prompts = [];
+  class Session {
+    constructor() {
+      Object.assign(this, idle);
+      this.sessionManager = {};
+    }
+    async prompt(input) {
+      prompts.push(input);
+      return await input;
+    }
+    async reload() {}
+  }
+  const session = new Session(),
+    binding = createSdkHostBinding(session),
+    preparing = session.prompt(preparation.promise);
+  assert.equal(session.isIdle, true);
+  assert.equal((await binding.state()).isIdle, false);
+  assert.deepEqual(await binding.submit({ text: 'must not enter', mode: 'idle_only' }), {
+    status: 'skipped',
+    reason: 'busy',
+  });
+  assert.deepEqual(prompts, [preparation.promise]);
+  for (const mode of ['steer', 'follow_up'])
+    assert.deepEqual(await binding.submit({ text: mode, mode }), {
+      status: 'dispatched',
+      admission: 'unobservable',
+    });
+  preparation.resolve();
+  await preparing;
+  await tick();
+  assert.equal((await binding.state()).isIdle, true);
+  assert.deepEqual(await binding.submit({ text: 'now idle', mode: 'idle_only' }), {
+    status: 'dispatched',
+    admission: 'unobservable',
+  });
+  assert.deepEqual(prompts, [preparation.promise, 'steer', 'follow_up', 'now idle']);
+});
+
 test('RPC uses existing demultiplexed public client and preserves ACK dispositions', async () => {
   const calls = [];
   let disposition = 'handled';
@@ -389,4 +429,263 @@ test('SDK handled bash is recorded after stop; only fallback execution rechecks 
       assert.equal(captured, 0);
     }
   }
+});
+
+class ReloadSession {
+  constructor() {
+    Object.assign(this, idle);
+    this.sessionManager = {};
+    this.reloadCalls = 0;
+  }
+  async prompt(work) {
+    return await work;
+  }
+  async executeBash(work) {
+    return await (this.bashWork ?? work);
+  }
+  async reload() {
+    this.reloadCalls++;
+    this.entered?.resolve();
+    await this.reloadWork;
+  }
+}
+
+test('SDK bash preparation and result delivery stay busy for idle-only and reload', async () => {
+  for (const handled of [false, true]) {
+    const preparation = Promise.withResolvers(),
+      execution = Promise.withResolvers(),
+      delivery = Promise.withResolvers(),
+      delivering = Promise.withResolvers(),
+      prompts = [],
+      result = { output: 'fixture', exitCode: 0, cancelled: false, truncated: false },
+      session = new ReloadSession();
+    session.sessionManager.getCwd = () => '/public';
+    session.extensionRunner = { emitUserBash: () => preparation.promise };
+    session.recordBashResult = () => {};
+    session.clearQueue = () => ({});
+    session.abort = async () => {};
+    session.abortBash = () => {};
+    session.bashWork = execution.promise;
+    const prompt = session.prompt.bind(session);
+    session.prompt = (text, options) => {
+      prompts.push([text, options]);
+      return prompt(text, options);
+    };
+    const binding = createSdkHostBinding(session),
+      work = binding.bash({
+        ...idle,
+        command: 'fixture',
+        onResult: async () => {
+          delivering.resolve();
+          await delivery.promise;
+        },
+      });
+    const assertBusy = async () => {
+      assert.equal(session.isIdle, true);
+      assert.equal((await binding.state()).isIdle, false);
+      assert.deepEqual(await binding.submit({ text: 'must not enter', mode: 'idle_only' }), {
+        status: 'skipped',
+        reason: 'busy',
+      });
+      await assert.rejects(
+        binding.reload({ ...idle, beforeDispatch: () => assert.fail('Busy reload dispatched') }),
+        /RELOAD_BUSY/,
+      );
+    };
+    await assertBusy();
+    assert.deepEqual(prompts, []);
+    for (const mode of ['steer', 'follow_up'])
+      assert.deepEqual(await binding.submit({ text: mode, mode }), {
+        status: 'dispatched',
+        admission: 'unobservable',
+      });
+    assert.deepEqual(
+      prompts.map(([text]) => text),
+      ['steer', 'follow_up'],
+    );
+    preparation.resolve(handled ? { result } : {});
+    if (!handled) {
+      await tick();
+      await assertBusy();
+      execution.resolve(result);
+    }
+    await delivering.promise;
+    await assertBusy();
+    delivery.resolve();
+    await work;
+    assert.equal((await binding.state()).isIdle, true);
+    assert.deepEqual(await binding.reload({ ...idle }), { reloaded: true });
+    assert.equal(
+      (await binding.submit({ text: 'now idle', mode: 'idle_only' })).status,
+      'dispatched',
+    );
+  }
+});
+
+test('SDK bash failures release the busy fence after preparation, execution or delivery', async () => {
+  for (const stage of ['preparation', 'execution', 'delivery']) {
+    const failure = new Error(`failed ${stage}`),
+      session = new ReloadSession(),
+      result = { output: '', exitCode: 0, cancelled: false, truncated: false };
+    session.sessionManager.getCwd = () => '/public';
+    session.extensionRunner = {
+      emitUserBash: async () => {
+        if (stage === 'preparation') throw failure;
+        return {};
+      },
+    };
+    session.recordBashResult = () => {};
+    session.clearQueue = () => ({});
+    session.abort = async () => {};
+    session.abortBash = () => {};
+    session.bashWork =
+      stage === 'execution' ? { then: (_resolve, reject) => reject(failure) } : result;
+    const binding = createSdkHostBinding(session);
+    await assert.rejects(
+      binding.bash({
+        ...idle,
+        command: 'fixture',
+        onResult: async () => {
+          if (stage === 'delivery') throw failure;
+        },
+      }),
+      (error) => error === failure,
+    );
+    assert.equal((await binding.state()).isIdle, true);
+    assert.deepEqual(await binding.reload({ ...idle }), { reloaded: true });
+  }
+});
+
+test('SDK reload refuses local input preparation and fences local operations until native completion', async () => {
+  const session = new ReloadSession(),
+    binding = createSdkHostBinding(session),
+    preparation = Promise.withResolvers();
+  const preparing = session.prompt(preparation.promise);
+  assert.equal(session.isIdle, true);
+  assert.equal((await binding.state()).isIdle, false);
+  await assert.rejects(
+    binding.reload({
+      ...idle,
+      beforeDispatch: () => assert.fail('Busy reload must not dispatch'),
+    }),
+    /RELOAD_BUSY/,
+  );
+  assert.equal(session.reloadCalls, 0);
+  preparation.resolve();
+  await preparing;
+
+  const completion = Promise.withResolvers();
+  session.entered = Promise.withResolvers();
+  session.reloadWork = completion.promise;
+  let settled = false;
+  const reloading = binding.reload({ ...idle }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await session.entered.promise;
+  assert.equal(settled, false);
+  assert.equal((await binding.state()).isIdle, false);
+  await assert.rejects(session.prompt('must not run'), /RELOAD_IN_PROGRESS/);
+  await assert.rejects(session.executeBash('must not run'), /RELOAD_IN_PROGRESS/);
+  completion.resolve();
+  assert.deepEqual(await reloading, { reloaded: true });
+  assert.equal((await binding.state()).isIdle, true);
+  assert.equal(await session.prompt('continued'), 'continued');
+});
+
+test('SDK reload clears admission on dispatch rejection, native failure, and identity changes', async () => {
+  const session = new ReloadSession(),
+    binding = createSdkHostBinding(session);
+  await assert.rejects(
+    binding.reload({
+      ...idle,
+      beforeDispatch: () => {
+        throw new Error('PERMISSION_REVOKED');
+      },
+    }),
+    /PERMISSION_REVOKED/,
+  );
+  assert.equal(session.reloadCalls, 0);
+  assert.equal(await session.prompt('still usable'), 'still usable');
+
+  const failure = Promise.withResolvers();
+  session.reloadWork = failure.promise;
+  const failed = binding.reload({ ...idle });
+  failure.reject(new Error('NATIVE_RELOAD_FAILED'));
+  await assert.rejects(failed, /NATIVE_RELOAD_FAILED/);
+  assert.equal((await binding.state()).isIdle, true);
+
+  session.reloadWork = Promise.resolve().then(() => {
+    session.sessionId = 'changed';
+  });
+  await assert.rejects(binding.reload({ ...idle }), /RUNTIME_SESSION_CHANGED/);
+  assert.equal((await binding.state()).isIdle, true);
+
+  // Object-based test substitutes must not install observers on Object.prototype.
+  const unsupported = createSdkHostBinding({ ...sdk(() => {}), reload: async () => {} });
+  assert.equal(unsupported.reload, undefined);
+});
+
+test('RPC reload delegates safe admission and waits host confirmation on the same native session', async () => {
+  const value = { ...idle },
+    completion = Promise.withResolvers(),
+    entered = Promise.withResolvers();
+  let dispatched = 0,
+    settled = false;
+  const client = {
+    getState: async () => value,
+    prompt: () => assert.fail('Reload must not submit a prompt'),
+  };
+  assert.equal(createRpcHostBinding(client).reload, undefined);
+  const binding = createRpcHostBinding(client, {
+    reload: async ({ sessionFile, sessionId, beforeDispatch }) => {
+      assert.deepEqual(
+        { sessionFile, sessionId },
+        {
+          sessionFile: idle.sessionFile,
+          sessionId: idle.sessionId,
+        },
+      );
+      beforeDispatch();
+      entered.resolve();
+      return await completion.promise;
+    },
+  });
+  const work = binding.reload({ ...idle, beforeDispatch: () => dispatched++ }).then((result) => {
+    settled = true;
+    return result;
+  });
+  await entered.promise;
+  assert.equal(dispatched, 1);
+  assert.equal(settled, false);
+  completion.resolve({ reloaded: true });
+  assert.deepEqual(await work, { reloaded: true });
+
+  const switched = createRpcHostBinding(client, {
+    reload: async () => {
+      value.sessionId = 'another';
+      return { reloaded: true };
+    },
+  });
+  await assert.rejects(switched.reload({ ...idle }), /RUNTIME_SESSION_CHANGED/);
+});
+
+test('RPC reload preserves host busy refusal and requires explicit completion', async () => {
+  const client = { getState: async () => idle };
+  const busy = createRpcHostBinding(client, {
+    reload: async () => {
+      throw new Error('RELOAD_BUSY');
+    },
+  });
+  await assert.rejects(
+    busy.reload({
+      ...idle,
+      beforeDispatch: () => assert.fail('Busy reload must not dispatch'),
+    }),
+    /RELOAD_BUSY/,
+  );
+  const unconfirmed = createRpcHostBinding(client, {
+    reload: async () => ({ accepted: true }),
+  });
+  await assert.rejects(unconfirmed.reload({ ...idle }), /RELOAD_UNCONFIRMED/);
 });
