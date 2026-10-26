@@ -6,13 +6,16 @@ import { syncBuiltinESMExports } from 'node:module';
 import { Webhook } from 'standardwebhooks';
 import { Bridge } from '../src/bridge.mjs';
 import { EventSubscriptions } from '../src/events.mjs';
-import { ownerSocket } from '../src/owner-runtime.mjs';
+import { ownerSocket, ownerRequest } from '../src/owner-runtime.mjs';
+import { reserveOwner, updateOwner, releaseOwner } from '../src/attachments.mjs';
+import { SettledObserver } from '../src/settled-observer.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
 import { hash } from '../src/storage.mjs';
 import { CallbackError } from '../src/event-webhook.mjs';
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { SessionManager, fauxAssistantMessage } from './fixtures/pi.mjs';
 
 const secret = 'whsec_' + Buffer.alloc(32, 9).toString('base64');
 const request = (id, delivery = {}) => ({
@@ -380,6 +383,126 @@ test('a retry cannot authorize an old occurrence through a replacement native cw
   assert.equal(attempts[0].data.result.text, 'Review [report](./report.md)');
   assert.equal(f.bridge.events.deliveries.size, 0);
 });
+
+async function settledOwner(f, session) {
+  const dir = f.bridge.pool.attachmentDir;
+  const claim = await reserveOwner(dir, session, 'extension');
+  await updateOwner(dir, session, claim, {
+    phase: 'ready',
+    readContract: READ_CONTRACT,
+    completionSocket: ownerSocket(f.config),
+  });
+  return {
+    observer: new SettledObserver(f.config, claim.generation),
+    release: () => releaseOwner(dir, session, claim),
+  };
+}
+
+test('owner IPC preserves capture identity before the first delivery and ignores native cwd overrides', async (t) => {
+  const f = await fixture(t),
+    project = f.dir + '/original',
+    replacement = f.dir + '/replacement';
+  await fs.mkdir(project);
+  await fs.mkdir(replacement);
+  const made = await savedSession(f.bridge, { project }),
+    session = await f.bridge.session(made.session_id);
+  f.config.defaults = denyAllPermissions();
+  f.config.grants = [{ folder: project, read: true }];
+  await f.call('events/subscribe', request(session.id));
+  const manager = SessionManager.open(session.file, undefined, replacement);
+  const { observer, release } = await settledOwner(f, session);
+  try {
+    assert.equal(manager.getCwd(), replacement);
+    assert.equal(manager.getHeader().cwd, project);
+    observer.start(manager);
+    manager.appendMessage(fauxAssistantMessage('ORIGINAL_RESULT'));
+    const first = observer.capture({ aborted: false }, manager);
+    assert.equal(first.sessionCwdHash, hash(project));
+    const { sessionCwdHash: _, ...missingIdentity } = first;
+    for (const invalid of [
+      missingIdentity,
+      { ...first, sessionCwdHash: 123 },
+      { ...first, sessionCwdHash: 'invalid' },
+      { ...missingIdentity, sessionCwd: project },
+    ])
+      await assert.rejects(ownerRequest(f.config, invalid), /INVALID_OWNER_COMMAND/);
+    await ownerRequest(f.config, first);
+    await Promise.all([...f.bridge.events.deliveries.keys()]);
+    assert.equal(f.sent.filter((item) => item.decoded.name === 'session.settled').length, 1);
+    assert.equal(f.sent.at(-1).decoded.data.result.text, 'ORIGINAL_RESULT');
+
+    observer.start(manager);
+    manager.appendMessage(fauxAssistantMessage('OLD_PROJECT_CAPTURED_RESULT'));
+    const captured = observer.capture({ aborted: false }, manager);
+    const lines = (await fs.readFile(session.file, 'utf8')).trimEnd().split('\n');
+    lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: replacement });
+    await fs.writeFile(session.file, lines.join('\n') + '\n');
+    f.config.grants = [{ folder: replacement, read: true }];
+    const context = await f.bridge.captureRequestContext();
+    assert.throws(() => f.bridge.check('read', session, context), /NOT_FOUND_OR_DENIED/);
+    assert.equal((await f.bridge.events.authorize(session.id)).header.cwd, replacement);
+    await assert.rejects(ownerRequest(f.config, captured), /INVALID_OWNER_COMMAND/);
+    await Promise.all([...f.bridge.events.deliveries.keys()]);
+    assert.equal(f.sent.filter((item) => item.decoded.name === 'session.settled').length, 1);
+    assert.equal(f.bridge.completionSequences.get(session.id).sequence, first.sequence);
+  } finally {
+    await release();
+  }
+});
+
+test('owner IPC fits a long escaped cwd and a full settled result within its unchanged frame limit', async (t) => {
+  const f = await fixture(t);
+  const project = f.dir + '/' + Array(16).fill('\\'.repeat(125)).join('/');
+  await fs.mkdir(project, { recursive: true });
+  assert.ok(Buffer.byteLength(JSON.stringify(project)) > 4000);
+  const made = await savedSession(f.bridge, { project }),
+    session = await f.bridge.session(made.session_id);
+  await f.call('events/subscribe', request(session.id));
+  const manager = SessionManager.open(session.file, undefined, f.dir);
+  const { observer, release } = await settledOwner(f, session);
+  try {
+    observer.start(manager);
+    manager.appendMessage(fauxAssistantMessage('\u0001'.repeat(1500)));
+    const occurrence = observer.capture({ aborted: false }, manager);
+    assert.ok(Buffer.byteLength(JSON.stringify(occurrence.result)) > 4000);
+    assert.equal(occurrence.sessionCwdHash, hash(project));
+    const { sessionCwdHash: _, ...withoutIdentity } = occurrence;
+    assert.ok(
+      Buffer.byteLength(JSON.stringify({ ...withoutIdentity, sessionCwd: project }) + '\n') > 8192,
+      'the raw cwd would overflow the owner control frame',
+    );
+    assert.ok(Buffer.byteLength(JSON.stringify(occurrence) + '\n') <= 8192);
+    assert.deepEqual(await ownerRequest(f.config, occurrence), {});
+    await Promise.all([...f.bridge.events.deliveries.keys()]);
+    assert.deepEqual(f.sent.at(-1).decoded.data.result, occurrence.result);
+  } finally {
+    await release();
+  }
+});
+
+for (const cwd of [undefined, ''])
+  test(`owner IPC distinguishes ${cwd === undefined ? 'missing' : 'empty'} native header cwd`, async (t) => {
+    const f = await fixture(t);
+    const header = { ...f.session.header, cwd };
+    await fs.writeFile(f.session.file, JSON.stringify(header) + '\n');
+    const session = await f.bridge.session(f.session.id);
+    const manager = SessionManager.open(session.file, undefined, f.dir);
+    const { observer, release } = await settledOwner(f, session);
+    try {
+      const occurrence = observer.capture({ aborted: false }, manager);
+      assert.equal(occurrence.sessionCwdHash, hash(cwd ?? null));
+      await assert.rejects(
+        ownerRequest(f.config, {
+          ...occurrence,
+          sessionCwdHash: hash(cwd === undefined ? '' : null),
+        }),
+        /INVALID_OWNER_COMMAND/,
+      );
+      assert.deepEqual(await ownerRequest(f.config, occurrence), {});
+    } finally {
+      await release();
+    }
+  });
 
 test('expired subscription records are pruned before loading active subscriptions', async (t) => {
   const f = await fixture(t);
