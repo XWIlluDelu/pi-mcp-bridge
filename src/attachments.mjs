@@ -432,6 +432,7 @@ export class AttachedRuntime {
       'noColdReacquire',
       'imagesSupported',
       'readContract',
+      'completionSocket',
     ];
     if (
       Object.keys(current).some((key) => !fields.includes(key)) ||

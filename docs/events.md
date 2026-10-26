@@ -7,21 +7,29 @@ subscribe and react in the subscribing chat through outbound signed HTTPS webhoo
 ## Scope and completion meaning
 
 The single event is `session.settled`, filtered by one known `session_id`.
-It observes **Bridge-owned RPC execution**, including owned RPCs placed through
-Herdr. Subscription never starts Pi. An already attached external TUI, RPC or SDK
-owner is rejected with `Unsupported / externalOwner`; execution after a handoff
-to an external owner is outside this event's scope.
+It observes Bridge-owned RPC execution, including Herdr, and ordinary TUI/RPC
+companions loaded with this Bridge's owner profile. The companion derives the
+local notification address from the existing owner configuration. No extra
+notification configuration is needed. Subscription never starts Pi.
+
+SDK host bindings and directory-only (`PI_MCP_ATTACH_DIR`) companions have no
+completion source and reject subscription with `Unsupported / externalOwner`.
+A subscription follows the saved session across supported owners, including a
+native reload or handoff; work under an unsupported owner is not observed.
 
 Pi's native `agent_settled` fires after automatic continuations finish, including
 aborted runs. Settlement describes the session run, not per-prompt success. A
 handled slash command that never starts a run produces no settlement.
 
-The observer captures the leaf and a bounded last assistant response at that
-boundary, before awaiting IPC. The response comes from the same native projection
-as Session Context, restricted to entries after this observed run started.
-Bridge validates the owned writer generation and occurrence sequence before
-scheduling delivery. Pi waits only for bounded local acknowledgement, not HTTPS
-delivery.
+The observer captures the leaf, recorded native project identity and a bounded
+last assistant response at that boundary, before awaiting IPC. The response comes
+from the same native projection as Session Context, restricted to entries after
+this observed run started. Bridge verifies that identity against the saved session,
+along with the registered process, generation and occurrence sequence, before
+scheduling delivery. Once accepted, an occurrence survives normal
+owner exit or switching; delivery still checks current read access. Pi waits at
+most two seconds for local acknowledgement, never for HTTPS delivery. A stopped
+or unreachable Bridge can lose the occurrence without interrupting local Pi work.
 
 Subscribe **before** sending work. Monitoring continues until cancelled or expired.
 
@@ -179,8 +187,9 @@ nonpublic address. Some proxies return synthetic fake-IP addresses, such as
 ## Verify the ChatGPT workflow
 
 Service activation, restart and plugin changes require owner authorization.
-Update Bridge, dependencies and its owned observer together, coordinating any
-interruption of in-flight work.
+Update Bridge and its matching companion/observer together, coordinating any
+interruption of in-flight work. Existing ordinary owners need a safe native
+`/reload` or host-managed reopen to load the updated companion.
 
 1. Refresh/rescan the plugin and confirm that `session.settled` appears.
 2. In the intended Work chat, subscribe to an authorized saved session and ask
