@@ -980,14 +980,14 @@ export class Bridge {
       submissionId,
       created = false;
     const selection = {};
-    const outcome = (send) => {
-      if (submissionId) send = this.submissions.update(submissionId, send) ?? send;
+    const outcome = (result) => {
+      if (submissionId) result = this.submissions.update(submissionId, result) ?? result;
       return {
-        status: send.status,
+        ...(input ? { status: result.status } : result),
         created,
         session_id: child?.id,
         ...(submissionId ? { submission_id: submissionId } : {}),
-        send: { ...selection, ...send },
+        ...(input ? { send: { ...selection, ...result } } : {}),
       };
     };
     try {
@@ -1029,6 +1029,7 @@ export class Bridge {
           await beforeDispatch();
           await persistSession(child);
           created = true;
+          if (!input) return outcome({ status: 'created' });
           submissionId = this.submissions.start(child.id, 'create');
 
           const runtime = await this.pool.resolve(child);
