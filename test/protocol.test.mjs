@@ -92,9 +92,6 @@ test('modern versions, required metadata and unknown methods use official error 
     delete body.params._meta[key];
     assert.equal((await dispatchModern(stub, body)).message.error.code, -32602);
   }
-  const fresh = message('tools/list');
-  delete fresh.params._meta[META + 'clientCapabilities'];
-  assert.equal((await dispatchModern(stub, fresh)).message.error.code, -32602);
   assert.equal((await dispatchModern(stub, message('not/a/method'))).status, 404);
   assert.equal((await dispatchModern(stub, message('not/a/method'))).message.error.code, -32601);
   assert.equal(

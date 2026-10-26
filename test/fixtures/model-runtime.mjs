@@ -91,7 +91,7 @@ export async function idle(runtime) {
       !s.isStreaming &&
       !s.isCompacting &&
       s.pendingMessageCount === 0 &&
-      runtime.settlement.sequence >= runtime.requiredSettlementSequence
+      runtime.settlementSequence >= runtime.requiredSettlementSequence
     );
   });
 }

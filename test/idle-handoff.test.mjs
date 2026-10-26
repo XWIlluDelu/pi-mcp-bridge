@@ -124,6 +124,48 @@ async function fixture(t, source = '') {
 function transfer(f, options) {
   return ownerRequest(f.config, f.request, options);
 }
+
+test(
+  'handoff cancellation after seal finishes exact shutdown without reserving a destination',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+        t,
+        `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+      ),
+      rpc = await f.bridge.pool.resolve(f.session),
+      controller = new AbortController(),
+      seal = AttachedRuntime.prototype.seal;
+    f.cleanup.push(() => f.mark('shutdown-go'));
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      const value = await seal.apply(this, args);
+      if (value.sealed) controller.abort();
+      return value;
+    });
+    let completed = false;
+    const handoff = f.bridge.handoffForLocal(f.request, { signal: controller.signal }).then(
+      () => {
+        completed = true;
+        return null;
+      },
+      (error) => {
+        completed = true;
+        return error;
+      },
+    );
+    await until(() => exists(path.join(f.dir, 'shutdown')));
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(rpc.exitSeal, 'sealed');
+    assert.equal(rpc.child.stdin.writableEnded, true);
+    assert.equal(completed, false);
+    assert.equal((await readClaim(f.config.attachmentDir, f.session)).kind, 'rpc');
+    await f.mark('shutdown-go');
+    assert.match((await handoff).message, /HANDOFF_CANCELLED/);
+    assert.equal(rpc.exited, true);
+    assert.equal(rpc.child.exitCode, 0);
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+  },
+);
 async function cancel(f) {
   return ownerRequest(f.config, { ...f.request, op: 'handoff_cancel' });
 }
@@ -330,7 +372,7 @@ test(
         state.pendingMessageCount === 0 &&
         observed.isIdle &&
         !observed.hasPendingMessages &&
-        rpc.settlement.sequence >= rpc.requiredSettlementSequence
+        rpc.settlementSequence >= rpc.requiredSettlementSequence
       );
     }, 'native settled and queues drained');
     // All queued RPC work is accounted for by ACK and settlement evidence.
@@ -481,7 +523,7 @@ test(
     );
     const rpc = f.bridge.pool.get(f.id),
       old = structuredClone(rpc.ownerRecord);
-    await until(() => rpc.settlement.sequence === 1);
+    await until(() => rpc.settlementSequence === 1);
     assert.equal((await rpc.state()).isStreaming, false);
     assert.ok(rpc.promptAdmission);
     let done = false;
@@ -495,7 +537,7 @@ test(
     assert.equal(await ownerAlive(old.owner), true);
     await f.mark('preflight-go');
     await joined;
-    assert.equal(rpc.settlement.sequence, 2);
+    assert.equal(rpc.settlementSequence, 2);
     assert.equal(rpc.child.exitCode, 0);
     const raw = await fs.readFile(f.session.file, 'utf8');
     assert.ok(raw.includes('HELD_PREFLIGHT'));
@@ -521,7 +563,7 @@ test(
     const rpc = f.bridge.pool.get(f.id);
     await until(() => exists(path.join(f.dir, 'settled-hook')));
     assert.equal((await rpc.state()).isStreaming, false);
-    assert.equal(rpc.settlement.sequence, 0);
+    assert.equal(rpc.settlementSequence, 0);
     let done = false;
     const joined = transfer(f).then((x) => {
       done = true;
@@ -533,7 +575,7 @@ test(
     assert.equal(rpc.gracefulExitPromise, undefined);
     await f.mark('settled-go');
     await joined;
-    assert.equal(rpc.settlement.sequence, 1);
+    assert.equal(rpc.settlementSequence, 1);
     await cancel(f);
   },
 );
@@ -629,7 +671,7 @@ test(
     assert.equal(rpc.gracefulExitPromise, undefined);
     await f.mark('external-go');
     assert.equal((await joining).status, 'reserved');
-    assert.equal(rpc.settlement.sequence, 1);
+    assert.equal(rpc.settlementSequence, 1);
     assert.equal(rpc.child.exitCode, 0);
     assert.equal(rpc.child.signalCode, null);
     await cancel(f);

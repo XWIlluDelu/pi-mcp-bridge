@@ -1,6 +1,6 @@
 // Pi's isIdle excludes asynchronous input preparation and standalone bash.
-// Observe public operation lifetimes and fence new operations only during an
-// explicitly requested reload. State survives extension factory replacement.
+// Observe public operation lifetimes. Reload admission is temporary; an owned
+// runtime's shutdown seal is terminal. State survives factory replacement.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 const key = Symbol.for('pi-mcp-bridge.reload-admission');
@@ -27,13 +27,35 @@ export function reloadAdmission(AgentSession) {
   const { sessions, scope } = shared;
   function state(manager) {
     let value = sessions.get(manager);
-    if (!value) sessions.set(manager, (value = { pending: 0, reload: null, completed: false }));
+    if (!value)
+      sessions.set(
+        manager,
+        (value = { pending: 0, reload: null, completed: false, sealed: false }),
+      );
     return value;
   }
+  const busy = (current, ctx, otherBusy) =>
+    current.reload ||
+    current.pending ||
+    otherBusy ||
+    ctx.isIdle() !== true ||
+    ctx.hasPendingMessages() !== false;
   // Keep wrappers in their original position in Pi's method chain. Reload only
   // replaces the implementation they delegate to, preserving other observers.
   shared.invoke = async (session, name, args, original) => {
     const current = state(session.sessionManager);
+    if (current.sealed) {
+      // Native shutdown hooks may append their final message synchronously.
+      // Preserve only that branch; queued messages and new runs remain closed.
+      if (
+        name === 'sendCustomMessage' &&
+        session.isStreaming === false &&
+        !args[1]?.triggerTurn &&
+        args[1]?.deliverAs !== 'nextTurn'
+      )
+        return original.apply(session, args);
+      throw new Error('RUNTIME_SHUTTING_DOWN');
+    }
     const internal =
       ['prompt', 'sendUserMessage'].includes(name) && current.reload?.command === args[0];
     if (internal) return original.apply(session, args);
@@ -44,6 +66,11 @@ export function reloadAdmission(AgentSession) {
       return await original.apply(session, args);
     } finally {
       current.pending--;
+      if (!current.pending && !current.sealed) {
+        try {
+          current.onIdle?.();
+        } catch {} // Maintenance notification cannot change a native result.
+      }
     }
   };
   if (install)
@@ -55,19 +82,25 @@ export function reloadAdmission(AgentSession) {
       };
     }
   const admission = {
-    idle: (manager) => state(manager).pending === 0 && !state(manager).reload,
+    idle: (manager) =>
+      state(manager).pending === 0 && !state(manager).reload && !state(manager).sealed,
     completed: (manager) => state(manager).completed,
     reloading: (manager) => Boolean(state(manager).reload),
+    sealed: (manager) => state(manager).sealed,
+    setOnIdle(manager, callback) {
+      state(manager).onIdle = callback;
+    },
+    seal(manager, ctx, otherBusy = false) {
+      const current = state(manager);
+      if (current.sealed) return true;
+      if (busy(current, ctx, otherBusy)) return false;
+      current.sealed = true;
+      return true;
+    },
     begin(manager, ctx, otherBusy = false) {
       const current = state(manager);
-      if (
-        current.reload ||
-        current.pending ||
-        otherBusy ||
-        !ctx.isIdle() ||
-        ctx.hasPendingMessages()
-      )
-        throw new Error('RELOAD_BUSY');
+      if (current.sealed) throw new Error('RUNTIME_SHUTTING_DOWN');
+      if (busy(current, ctx, otherBusy)) throw new Error('RELOAD_BUSY');
       const token = randomUUID();
       let started = false;
       const timer = setTimeout(() => {

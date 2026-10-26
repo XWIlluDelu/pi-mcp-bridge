@@ -173,8 +173,8 @@ test(
       const snapshot=await rpc.entries();profile=snapshot.entries.find(e=>e.customType==='profile-probe').data;
       if(owned.generation!==rpc.ownerRecord.generation)throw Error('CLAIM_REPLACED');
       ({disposition}=await rpc.command({type:'prompt',message:'PROFILE_STARTUP_INPUT'}));
-      while(rpc.settlement.sequence===0)await new Promise(resolve=>setTimeout(resolve,10));
-      settlement=rpc.settlement.sequence;
+      while(rpc.settlementSequence===0)await new Promise(resolve=>setTimeout(resolve,10));
+      settlement=rpc.settlementSequence;
       if(await pool.forRead(target)!==rpc)throw Error('RUNTIME_REPLACED');
       pool.config.piExecutable='/nonexistent/native-pi-fixture';
       if(await pool.resolve(target)!==rpc)throw Error('EXISTING_WRITER_NOT_REUSED');

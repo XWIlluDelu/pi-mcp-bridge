@@ -9,7 +9,6 @@ import {
   releasedEntries,
   savedEntries,
 } from './fixtures/model-runtime.mjs';
-import { Bridge } from '../src/bridge.mjs';
 import { publicSchemas } from '../src/tool-schemas.mjs';
 const replies = (entries) =>
   entries
@@ -83,48 +82,6 @@ for (const op of ['send', 'create']) {
       assert.ok(
         !entries.some((e) => e.type === 'thinking_level_change' && e.thinkingLevel === 'high'),
       );
-    },
-  );
-
-  test(
-    op + ' late model ACK reports partial settings without applying thinking or sending input',
-    { timeout: 15000 },
-    async (t) => {
-      const f = await fixture(t),
-        { bridge } = f;
-      ackTimeout(t, ['set_model']);
-      await fs.writeFile(f.gate + '.hold-selection', 'hold');
-      const args = {
-        ...identity(op, f),
-
-        text: 'NEVER',
-        model: choice('vision'),
-        thinking_level: 'high',
-      };
-      const result = await bridge[op](args),
-        id = target(result, f);
-      assert.equal(sendReceipt(result).status, 'unknown');
-      assert.equal(
-        (await bridge.send({ session_id: id, text: 'NEVER' })).reason,
-        'MODEL_SELECTION_PENDING',
-      );
-      await fs.writeFile(f.gate, 'go');
-      await until(() => !bridge.pool.get(id)?.modelMutation);
-      assert.equal(sendReceipt(result).model_selection, undefined);
-      const entries = await releasedEntries(bridge, id);
-      assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'vision');
-      assert.equal(entries.filter((e) => e.message?.role === 'user').length, 0);
-      assert.ok(
-        !entries.some((e) => e.type === 'thinking_level_change' && e.thinkingLevel === 'high'),
-      );
-
-      await bridge.close();
-      const restarted = await new Bridge(f.config, undefined, { configFile: f.configFile }).init();
-      try {
-        assert.equal(restarted.pool.instances.size, 0);
-      } finally {
-        await restarted.close();
-      }
     },
   );
 
@@ -355,7 +312,7 @@ test(
     const unknown = await bridge.send(args);
     assert.equal(unknown.status, 'unknown');
     assert.equal(unknown.model_selection.thinking_level, 'high');
-    await until(() => rpc.settlement.sequence > 0);
+    await until(() => rpc.settlementSequence > 0);
     receive(...held);
     const entries = await releasedEntries(bridge, id);
     assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);

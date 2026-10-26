@@ -30,6 +30,12 @@ import {
   AttachedRuntime,
   AttachmentFailure,
 } from './attachments.mjs';
+const READ_COMMANDS = new Set([
+  'get_state',
+  'get_entries',
+  'get_available_models',
+  'get_available_thinking_levels',
+]);
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) {
     super(code);
@@ -79,12 +85,8 @@ export class PiRpc {
     this.inputActivitySequence = 0;
     this.modelMutation = null;
     this.compactionMutation = null;
-    this.settlement = {
-      generation: this.generation,
-      sequence: 0,
-      observed_at: null,
-      aborted: null,
-    };
+    this.exitSeal = null;
+    this.settlementSequence = 0;
     this.requiredSettlementSequence = 0;
     this.launchSettled = Promise.withResolvers();
   }
@@ -276,15 +278,9 @@ export class PiRpc {
       }
       return;
     }
-    if (event.type === 'agent_start')
-      this.requiredSettlementSequence = this.settlement.sequence + 1;
+    if (event.type === 'agent_start') this.requiredSettlementSequence = this.settlementSequence + 1;
     if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
-      this.settlement = {
-        generation,
-        sequence: this.settlement.sequence + 1,
-        observed_at: new Date().toISOString(),
-        aborted: event.aborted,
-      };
+      this.settlementSequence++;
       this.onIdleCandidate?.();
       return; // Settlement alone never clears an unresolved prompt ACK fence.
     }
@@ -327,7 +323,7 @@ export class PiRpc {
     )
       this.requiredSettlementSequence = Math.max(
         this.requiredSettlementSequence,
-        (req.settlementSequence ?? this.settlement.sequence) + 1,
+        (req.settlementSequence ?? this.settlementSequence) + 1,
       );
     if (
       this.compactionMutation?.id === event.id &&
@@ -339,15 +335,7 @@ export class PiRpc {
     if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation)
       this.promptAdmission = null;
     const notifyIdle = () => {
-      if (
-        ![
-          'get_state',
-          'get_entries',
-          'get_available_models',
-          'get_available_thinking_levels',
-        ].includes(req.commandType)
-      )
-        this.onIdleCandidate?.();
+      if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
     };
     const ui = uiSnapshot(req.uiFacts);
     const result = event.success
@@ -475,21 +463,13 @@ export class PiRpc {
         onLate: onLate && diagnostics.bind(onLate),
         generation,
         commandType: command.type,
-        settlementSequence: this.settlement.sequence,
+        settlementSequence: this.settlementSequence,
         written: false,
         timedOut: false,
         log: diagnostics.capture(),
       };
       const discardRead = () => {
-        if (
-          [
-            'get_state',
-            'get_entries',
-            'get_available_models',
-            'get_available_thinking_levels',
-          ].includes(command.type)
-        )
-          this.pending.delete(id);
+        if (READ_COMMANDS.has(command.type)) this.pending.delete(id);
       };
       req.timer = setTimeout(() => {
         req.timedOut = true;
@@ -529,6 +509,7 @@ export class PiRpc {
     return state;
   }
   async observeRead(read) {
+    if (this.sealPending || this.gracefulExitPromise) throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
     this.activeReads = (this.activeReads ?? 0) + 1;
     try {
       return await read();
@@ -573,16 +554,8 @@ export class PiRpc {
       this.promptAdmission ||
       this.modelMutation ||
       this.compactionMutation ||
-      this.settlement.sequence < this.requiredSettlementSequence ||
-      [...this.pending.values()].some(
-        (r) =>
-          ![
-            'get_state',
-            'get_entries',
-            'get_available_models',
-            'get_available_thinking_levels',
-          ].includes(r.commandType),
-      ),
+      this.settlementSequence < this.requiredSettlementSequence ||
+      [...this.pending.values()].some((r) => !READ_COMMANDS.has(r.commandType)),
     );
   }
   async idleSnapshot() {
@@ -791,33 +764,68 @@ export class PiRpc {
     const child = this.child,
       record = this.ownerRecord,
       exit = this.observeExit();
-    await this.assertProcessIdentity(child, record);
-    // Preserve the last cleaned request before the short-lived child exits.
-    // This precedes the final drain/guard; capture cannot bypass in-flight work.
-    await this.retainObservation?.();
-    await this.drainAcks();
-    signal?.throwIfAborted();
-    if (exit.result || this.exited || !this.alive) throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
-    // Reuse synchronous native activity evidence after the final await. No
-    // callback or asynchronous check may separate this guard from stdin.end().
-    if (this.hasUnsettledWork() || this.activeReads || this.ackTasks.size)
-      throw new RpcFailure('RUNTIME_BUSY');
-    this.gracefulExitPromise = (async () => {
-      // EOF starts shutdown; exact process exit is observed from spawn.
-      this.phase = 'shutdown';
-      child.stdin.end();
-      if (this.interruptShutdown) await this.stop();
-      const result = await exit.promise;
-      await exit.closed; // Drain final UI diagnostics as well as observing exact death.
-      if (await ownerAlive(record.owner)) throw new RpcFailure('OWNER_STILL_ALIVE');
-      this.lines?.close();
-      await releaseOwner(this.config.attachmentDir, this.session, record);
-      this.ownerRecord = null;
-      if (result.code !== 0 || result.signal) throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
-      // UI availability is a shutdown diagnostic, not another writer claim.
-      return this.uiFacts.shutdown.size ? uiSnapshot(this.uiFacts) : {};
-    })();
-    return this.gracefulExitPromise;
+    const previousSeal = this.exitSeal;
+    try {
+      await this.assertProcessIdentity(child, record);
+      // Preserve the last cleaned request before the short-lived child exits.
+      // This precedes the final drain/guard; capture cannot bypass in-flight work.
+      await this.retainObservation?.();
+      await this.drainAcks();
+      signal?.throwIfAborted();
+      if (exit.result || this.exited || !this.alive)
+        throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
+      // Parent observations reject known work early. Only the child's atomic
+      // seal can authorize EOF; activity notifications may still be in flight.
+      if (
+        this.hasUnsettledWork({ includeInputs: !previousSeal }) ||
+        this.activeReads ||
+        this.ackTasks.size
+      )
+        throw new RpcFailure('RUNTIME_BUSY');
+      const sealed = await new AttachedRuntime(this.config, this.session, record).seal(() => {
+        signal?.throwIfAborted();
+        if (
+          this.hasUnsettledWork({ includeInputs: !previousSeal }) ||
+          this.activeReads ||
+          this.ackTasks.size
+        )
+          throw new RpcFailure('RUNTIME_BUSY');
+        // Close read admission across the control request's await. A read
+        // already admitted above keeps this attempt from sealing the writer.
+        this.sealPending = true;
+        // Once written, lost acknowledgment cannot prove that admission remains
+        // open. Keep the exact generation fenced until explicit retry or exit.
+        this.exitSeal = 'unknown';
+      });
+      if (!sealed.sealed) {
+        if (!previousSeal) this.exitSeal = null;
+        throw new RpcFailure('RUNTIME_BUSY', Boolean(previousSeal));
+      }
+      this.exitSeal = 'sealed';
+      this.gracefulExitPromise = (async () => {
+        // Seal is irreversible. A later cancellation suppresses a destination,
+        // not this already committed close. EOF remains the sole shutdown trigger.
+        this.phase = 'shutdown';
+        child.stdin.end();
+        if (this.interruptShutdown) await this.stop();
+        const result = await exit.promise;
+        await exit.closed; // Drain final UI diagnostics as well as observing exact death.
+        if (await ownerAlive(record.owner)) throw new RpcFailure('OWNER_STILL_ALIVE');
+        this.lines?.close();
+        await releaseOwner(this.config.attachmentDir, this.session, record);
+        this.ownerRecord = null;
+        if (result.code !== 0 || result.signal) throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
+        // UI availability is a shutdown diagnostic, not another writer claim.
+        return this.uiFacts.shutdown.size ? uiSnapshot(this.uiFacts) : {};
+      })();
+      return this.gracefulExitPromise;
+    } catch (error) {
+      if (!previousSeal && !error.uncertain && this.exitSeal === 'unknown') this.exitSeal = null;
+      if (this.exitSeal) error.uncertain = true;
+      throw error;
+    } finally {
+      this.sealPending = false;
+    }
   }
   async assertProcessIdentity(child = this.child, record = this.ownerRecord) {
     if (!child || this.exited) return;
@@ -942,7 +950,16 @@ export class RuntimePool {
       runtime.retainObservation = async () => {
         let snapshot;
         try {
-          snapshot = await runtime.read({ session_id: runtime.session.id, view: 'runtime' });
+          // This close attempt already awaits its own capture. Do not report
+          // it as a public read completion and schedule another close attempt.
+          snapshot = await new AttachedRuntime(
+            runtime.config,
+            runtime.session,
+            runtime.ownerRecord,
+            {
+              compatibility: runtime.compatibility,
+            },
+          ).read({ session_id: runtime.session.id, view: 'runtime' });
         } catch {
           // An unavailable observer does not erase a dated request snapshot.
           // Late public reads remain fenced by handoff and the runtime identity.
@@ -1086,7 +1103,7 @@ export class RuntimePool {
           // Do not interrupt active commands/prompts: only a graceful exit which
           // has already started, or starts while admitted tools are draining.
           runtime.interruptShutdown = true;
-          return runtime.gracefulExitPromise ? runtime.stop() : undefined;
+          return runtime.gracefulExitPromise || runtime.exitSeal ? runtime.stop() : undefined;
         }),
     );
   }
