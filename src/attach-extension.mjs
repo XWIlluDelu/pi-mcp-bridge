@@ -509,7 +509,7 @@ export default async function attachExtension(pi) {
                 data = { status: 'skipped', reason: 'busy' };
               else {
                 const options = { expandPromptTemplates: true };
-                if (['default', 'steer'].includes(args.mode)) options.deliverAs = 'steer';
+                if (args.mode === 'steer') options.deliverAs = 'steer';
                 if (args.mode === 'follow_up') options.deliverAs = 'followUp';
                 try {
                   pi.sendUserMessage(

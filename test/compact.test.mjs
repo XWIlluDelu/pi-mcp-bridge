@@ -40,8 +40,7 @@ test('native summarizer completes compact with isolated settings and an offline 
     session_id: f.id,
     instructions: 'NATIVE_COMPACT',
   });
-  assert.equal(result.status, 'accepted', JSON.stringify(result));
-  assert.equal(result.completion, 'completed');
+  assert.equal(result.status, 'completed', JSON.stringify(result));
   await released(f);
   const entries = await savedEntries(f.bridge, f.id);
   const compactions = entries.filter((entry) => entry.type === 'compaction');
@@ -62,8 +61,7 @@ test(
     );
     const args = { session_id: f.id, instructions: 'RETAIN_THE_MARKER' };
     const result = await f.bridge.compact(args);
-    assert.equal(result.status, 'accepted', JSON.stringify(result));
-    assert.equal(result.completion, 'completed');
+    assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.equal(result.interrupt_requested, false);
     assert.ok(!JSON.stringify(result).includes('RETAIN_THE_MARKER'));
     assert.ok(!('summary' in result));
@@ -89,7 +87,7 @@ test(
     assert.equal(refused.reason, 'COMPACT_BUSY');
     assert.equal((await runtime.state()).isStreaming, true);
     const result = await f.bridge.compact({ session_id: f.id, interrupt: true });
-    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.equal(result.interrupt_requested, true);
     await released(f);
     assert.equal(

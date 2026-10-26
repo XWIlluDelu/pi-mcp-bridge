@@ -293,7 +293,7 @@ for (const op of ['send', 'command'])
 
       assert.equal(
         (await f.bridge[op]({ ...args })).status,
-        op === 'send' ? 'started' : 'accepted',
+        op === 'send' ? 'started' : 'completed',
       );
       assert.equal(dispatches, 1);
     });
@@ -379,7 +379,7 @@ for (const op of ['send', 'command'])
 
       assert.equal(
         (await f.bridge[op]({ ...args })).status,
-        op === 'send' ? 'started' : 'accepted',
+        op === 'send' ? 'started' : 'completed',
       );
       assert.equal(dispatches, 1);
     });

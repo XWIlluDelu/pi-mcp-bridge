@@ -88,8 +88,7 @@ for (const route of ['companion', 'binding']) {
         interrupt: true,
         instructions: 'PRIVATE_SUMMARY',
       });
-      assert.equal(result.status, 'accepted', JSON.stringify(result));
-      assert.equal(result.completion, 'completed');
+      assert.equal(result.status, 'completed', JSON.stringify(result));
       assert.equal(result.interrupt_requested, true);
       assert.ok(!JSON.stringify(result).includes('PRIVATE_SUMMARY'));
       await assert.rejects(f.bridge.read(args), /NOT_FOUND_OR_DENIED/);
@@ -230,7 +229,7 @@ test(
     await session.prompt('SECOND_HISTORY '.repeat(200));
     assert.equal((await f.bridge.compact({ session_id: f.id })).reason, 'COMPACT_IDLE_UNCONFIRMED');
     const result = await f.bridge.compact({ session_id: f.id, interrupt: true });
-    assert.equal(result.status, 'accepted', JSON.stringify(result));
+    assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.ok(!JSON.stringify(result).includes('SDK_PRIVATE_SUMMARY'));
     assert.equal(
       session.sessionManager.getEntries().filter((e) => e.type === 'compaction').length,
