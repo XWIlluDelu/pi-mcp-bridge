@@ -1,6 +1,16 @@
 # Public tool API
 
-Inputs are strict objects defined by `src/tool-schemas.mjs`. Examples below are tool arguments, not JSON-RPC envelopes. Tools expose no timeout parameter. Native and owner acknowledgements normally have a five-second budget; companion and host reload confirmation waits up to ten seconds. Owned RPC reload follows normal shutdown and startup, including native lifecycle hooks. These waits do not cancel native execution. Each request uses its [receive-time permission snapshot](configuration.md#request-permission-snapshots); ownership and execution checks remain live.
+Inputs are strict objects defined by [`src/tool-schemas.mjs`](../src/tool-schemas.mjs).
+Examples below are tool arguments; [transports](transports.md) defines their
+JSON-RPC envelopes. For the sequence from finding a session to continuing its
+work, see [the calling workflow](collaboration.md#calling-workflow).
+
+Tools expose no timeout parameter. Native and owner acknowledgements normally
+have a five-second budget; companion and host reload confirmation waits up to ten
+seconds. Owned RPC reload follows normal shutdown and startup, including native
+lifecycle hooks. These waits do not cancel native execution. Each request uses
+its [receive-time permission snapshot](configuration.md#request-permission-snapshots);
+ownership and execution checks remain live.
 
 ## Sessions and mutations
 
@@ -26,6 +36,9 @@ Tool errors return `isError:true` with `{error:{code:…}}` in text and structur
 
 ### List
 
+`list({})` returns `{sessions,next_offset,creatable_projects}`. Optional filters
+and pagination narrow the session rows:
+
 ```json
 { "project": "analysis", "name": "review", "active_after": "2026-10-01T00:00:00Z", "limit": 30 }
 ```
@@ -44,9 +57,16 @@ Status describes the sampled runtime:
 | `unknown`     | Connected, but insufficient evidence to establish idle.   |
 | `unavailable` | Ownership/state could not be safely observed.             |
 
-Status includes observation time, pending-message count where available, and live `model:{provider,id}` / `thinking_level` values or null. Saved and unavailable sessions have null settings. These observations describe session activity, not completion of a particular prompt.
+Status includes `observed_at`, `pending_messages` where available, and live
+`model:{provider,id}` / `thinking_level` values or null. Saved and unavailable
+sessions have null settings. These observations describe session activity, not
+completion of a particular prompt.
 
-Connected runtimes also expose `capabilities:{send,command,stop}`. Values are true, false or null for supported, unsupported or unconfirmed operation paths. Capabilities are independent of grants and current admission state; see the [owner capability table](runtime.md#runtime-capabilities).
+Connected runtimes also expose `status.capabilities:{send,reload,command,stop}`.
+Values are true, false or null for supported, unsupported or unconfirmed operation
+paths. Saved and unavailable rows omit capabilities. Support does not establish
+permission or current admission: an idle-only control still checks live work at
+execution. See the [owner capability table](runtime.md#runtime-capabilities).
 
 `creatable_projects` lists configured destinations with project-level `list` and `create` permission, in configuration order. It includes empty projects and is independent of session filters, pagination and session-specific grants. A known configured destination remains usable with create permission even if it is hidden from this catalog.
 
@@ -70,7 +90,7 @@ request-stage Runtime Context. Adapted results identify `reader.id`. Both tools
 require read permission and never start Pi.
 
 Use `search` to find literal, case-insensitive text across one session's full
-supported source, independently of the earlier brief selection:
+supported source, independently of the earlier browse selection:
 
 ```json
 { "session_id": "ps_…", "query": "retry policy", "content": ["tool", "assistant"] }
@@ -112,7 +132,9 @@ covers retention and authorization.
 ```
 
 `reload` requires `send` and refreshes an active owner's Pi resources. It has no
-interrupt, wait or owner-specific options. It preserves saved history and resets extension-local state. The caller can use it after
+interrupt, wait or owner-specific options. `list.status.capabilities.reload`
+reports owner support. It preserves saved history and resets extension-local
+state. The caller can use it after
 `OWNER_READ_REFRESH_REQUIRED` or after changing the owner's resource settings.
 
 | Result                                          | Meaning                                                                                                                                                        |
@@ -145,7 +167,19 @@ Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 - `idle_only`: skip if busy/pending; a saved session may first cold-start.
 - `follow_up`: use the native follow-up queue while busy.
 
-Bridge waits for native input admission where observable, not model completion. A tracked submission returns `submission_id` and `status`. Native ACKs establish `started`, `queued` or `handled`; `skipped` and `rejected` mean input was not submitted. An external companion/SDK owner that successfully invokes Pi returns `dispatched, admission:"unobservable"`: delivery to the Pi API is confirmed, but input hooks may still transform, handle or reject it. It is unnecessary to read history merely to confirm that dispatch, and it is unsafe to resend it automatically. A synchronous exception or transport uncertainty remains `unknown`. A handled command can still have reported a native extension error. Read [runtime events](reading.md#live-output-and-runtime-extension-events) for owned RPC errors and notifications.
+Bridge waits for native input admission where observable, not model completion.
+A tracked submission returns `submission_id` and `status`. Native ACKs establish
+`started`, `queued` or `handled`; `skipped` and `rejected` mean input was not
+submitted.
+
+An external companion/SDK owner that successfully invokes Pi returns
+`dispatched, admission:"unobservable"`: delivery to the Pi API is confirmed, but
+input hooks may still transform, handle or reject it. It is unnecessary to read
+history merely to confirm that dispatch, and it is unsafe to resend it
+automatically. A synchronous exception or transport uncertainty remains `unknown`.
+A handled command can still have reported a native extension error. Read
+[runtime events](reading.md#live-output-and-runtime-extension-events) for owned
+RPC errors and notifications.
 
 Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
 
@@ -254,7 +288,19 @@ overtake it. Another create call creates another child.
 
 Requires only `delete`. It authorizes interruption of the target writer, including during release or handoff, and moves the native session to private trash while preserving project files. Delete fences new writers until termination and the move finish. A shared host that cannot close only this session returns `DELETE_SHARED_OWNER`; Bridge does not kill its other sessions. See [deletion lifecycle](runtime.md#explicit-deletion) for switching, process termination and partial failures.
 
-Success returns a `restore_token` and project authorization scope. The manifest under `stateDir/trash` records original/trash paths. Restore is an owner operation: inspect the manifest and confirm writers are closed before restoring. Each new delete call is another attempt, not a lookup of the previous result.
+Success returns a `restore_token` and project authorization scope. The session
+moves to `<original-directory>/.pi-mcp-trash/<restore_token>.jsonl`,
+with an authoritative `<restore_token>.restore.json` record in that trash
+directory. `stateDir/trash/<restore_token>.restore.json` is an index copy;
+backing up `stateDir` alone does not preserve deleted session content.
+
+Restore is an owner operation, with no Bridge restore tool or CLI. The record
+contains `original_path`, `trash_path` and `metadata_path`. Confirm writers are
+closed and the original path is vacant before moving the saved file back.
+Recovery records are prepared before the move and retain `phase:"prepared"`
+after success: inspect both file paths rather than treating the record as proof
+that deletion finished. Each new delete call is another attempt, not a lookup of
+the previous result.
 
 ### Batch
 
@@ -282,7 +328,12 @@ To interrupt a running command, send stop separately: a stop behind it in the sa
 { "session_id": "ps_KNOWN_OPTIONAL" }
 ```
 
-Reports noteworthy permission combinations and source rules, deduplicating inherited issues. Healthy configurations return `{"domain":"permissions","status":"ok"}`. `{}` diagnoses defaults and configured projects; a known `session_id` limits diagnosis without exposing native metadata.
+Reports noteworthy permission combinations and source rules, deduplicating
+inherited issues. Healthy configurations return
+`{"domain":"permissions","status":"ok"}`. `{}` diagnoses defaults and configured
+projects; a known `session_id` limits diagnosis without exposing native metadata.
+This checks policy and Bridge configuration, not Pi/model connectivity or whether
+a particular session operation will succeed.
 
 Unscoped health may additionally report:
 

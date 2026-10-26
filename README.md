@@ -15,18 +15,24 @@ See [working with a session](docs/collaboration.md) for the dispatch, observatio
 
 ## Start locally
 
-Requires Linux, Node.js 22.19 or later, and your own Pi installation (tested with Pi 1.4.0). Set `piExecutable` to an absolute Pi CLI path, or let the launch environment's PATH select `pi`. CLI execution and SDK operations use that same installation.
+Requires Linux, Node.js 22.19 or later, and your own Pi installation (tested with Pi 1.4.0). Install and configure Pi first; Bridge uses that installation's CLI, SDK and native authentication. Set `piExecutable` to an absolute Pi CLI path, or let the launch environment's PATH select `pi`.
+
+Get the source and prepare an owner configuration. Use absolute paths below, replacing the private directory with your chosen location:
 
 ```sh
 command -v pi
 pi --version
+git clone https://github.com/XWIlluDelu/pi-mcp-bridge.git
+cd pi-mcp-bridge
 npm ci
 mkdir -p -m 700 /absolute/private/path
 cp deploy/owner.example.json /absolute/private/path/owner.json
 chmod 600 /absolute/private/path/owner.json
 ```
 
-Replace the example paths and grant the operations you need; the example denies all operations. Bridge state and IPC directories must be canonical, user-owned and private. Native session storage has separate [path-integrity requirements](docs/configuration.md#storage-and-project-paths) and supports Pi's ordinary permissions.
+Edit `owner.json` using [configure one project](docs/configuration.md#configure-one-project): select the native session storage and project, then add its permission grant. The example denies all operations until you grant them. That guide also explains how storage paths differ from project paths and which directories must be private.
+
+If the target session is already open in Pi, [load its companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) before remote control. Bridge can resume an inactive saved session itself. Bridge and companion/host components must come from the [same version](docs/architecture.md#component-versions).
 
 For one stdio MCP client:
 
@@ -38,6 +44,16 @@ For one stdio MCP client:
 ```
 
 For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for stdio-only clients. [Transport setup](docs/transports.md) covers tokens, tunnels and protocol versions.
+
+### Verify the first connection
+
+After your MCP client connects, call these tools with the indicated arguments:
+
+1. `health({})` diagnoses the permission configuration and pending restart settings.
+2. `list({})` discovers authorized saved sessions. An empty result can mean no saved sessions or no effective `list` grant; check the configured roots and [permission rules](docs/configuration.md#seven-independent-rights).
+3. `read({session_id:"<ID from list>"})` opens recent history without starting a writer. Use the returned Bridge ID, not the native Pi ID or session filename.
+
+These calls verify access to the configured data. To send work, create a session or follow a result, continue with [working with a session](docs/collaboration.md); the [API](docs/api.md) defines the exact arguments and outcomes.
 
 ## Native Pi integration
 
@@ -53,16 +69,18 @@ The launcher negotiates ownership before opening the session. See [runtime integ
 
 ## Documentation
 
-- [Configuration and permissions](docs/configuration.md)
-- [Public tool API](docs/api.md)
-- [Working with a session](docs/collaboration.md)
-- [Model catalog, thinking and compaction](docs/model-control.md)
-- [Reading, search and reference expansion](docs/reading.md)
-- [Optional compatibility modules](docs/compatibility.md)
-- [Runtime ownership and host interfaces](docs/runtime.md)
-- [MCP protocols and transports](docs/transports.md)
-- [Completion events](docs/events.md)
-- [Architecture and verification](docs/architecture.md)
+| When you need to…                                               | Start here                                                                             |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Choose accessible projects and operations                       | [Configuration and permissions](docs/configuration.md)                                 |
+| Connect one client, share a service or expose a remote endpoint | [MCP transports](docs/transports.md)                                                   |
+| Dispatch work and understand the result                         | [Working with a session](docs/collaboration.md), then the [API reference](docs/api.md) |
+| Find history, expand evidence or choose a context source        | [Reading and search](docs/reading.md)                                                  |
+| Change models, thinking effort or context size                  | [Model control](docs/model-control.md)                                                 |
+| Receive completion notifications                                | [Events](docs/events.md)                                                               |
+| Connect a live Pi owner or integrate an SDK/RPC host            | [Runtime integration](docs/runtime.md)                                                 |
+| Enable an optional plugin reader or input mapping               | [Compatibility modules](docs/compatibility.md)                                         |
+| Investigate a failed request or service operation               | [Diagnostics](docs/configuration.md#diagnostics)                                       |
+| Develop or verify Bridge                                        | [Architecture and verification](docs/architecture.md)                                  |
 
 ## Development
 
@@ -72,4 +90,8 @@ npm run format:check
 npm audit
 ```
 
-Tests include independent modules under `integrations/` and use synthetic providers, temporary session stores and isolated Pi profiles. Native subprocess/PTY tests require Linux utilities including `script`; the service-unit check needs `systemd-analyze`. See [verification](docs/architecture.md#verification) for external Pi selection and optional Herdr tests.
+Tests use synthetic providers, temporary session stores and isolated Pi profiles. See [verification](docs/architecture.md#verification) for required Linux utilities, external Pi selection and optional Herdr tests.
+
+## License
+
+[MIT](LICENSE).

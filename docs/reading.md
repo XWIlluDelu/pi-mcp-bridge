@@ -15,7 +15,8 @@ defines activation and content contracts.
 Native `buildSessionProjection` determines branch ancestry, compaction checkpoints
 and context edits. All effective turns means the retained context at that leaf,
 including active summaries, not the entire raw session log. Reading and searching
-never start Pi, call a model, rerun context hooks or write history.
+require `read` permission and never start Pi, call a model, rerun context hooks or
+write history.
 
 ## Browse, find and expand
 
@@ -54,7 +55,8 @@ operation. A `source_context` link opens a fresh Session Context read at a verif
 historical leaf. It describes that boundary, not an exact reconstruction of an
 extension's source range. Open a source-context reference by itself.
 
-Continue browse, search or expanded content with its cursor:
+Continue browse, search or expanded content by passing its `next_cursor` to
+`read`, even when the first page came from `search`:
 
 ```json
 { "cursor": "<next_cursor>", "max_bytes": 12000 }
@@ -81,6 +83,12 @@ new [permission snapshot](configuration.md#request-permission-snapshots) and
 validates native identity. A cursor or reference does not grant access or cross
 Bridge instances.
 
+`next_cursor:null` ends the selected result's page sequence. It does not mean
+all history was selected or every preview contains its full source; expand a
+shortened item's ref for that content. Increasing `max_bytes` gives the same
+selection more room. To select more turns or content, start a new read with a
+broader `range` or `content`.
+
 ## Turn range and content
 
 `range` only selects input turns. `recent:N` takes the last N and `earliest:N` the
@@ -89,9 +97,11 @@ first N, with overlaps included once; `-1` includes all and `0` none. For exampl
 the range does not enable additional kinds or restore compacted-away history.
 
 Each native user or mapped custom-input message establishes a new turn, including
-steering input. Its text and image blocks remain one input message. A hidden
-input or compacted prefix can leave an empty synthetic boundary rather than a
-recoverable user message.
+steering input. A turn groups that input and its projected responses; paired tool
+results stay with their call even when a steering input intervenes. It need not
+be a completed task or a single model request. Text and image blocks remain one
+input message. A hidden input or compacted prefix can leave an empty synthetic
+boundary rather than a recoverable user message.
 
 | `content` field | Default | Meaning                                                                                                                                                             |
 | --------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -211,8 +221,8 @@ resolved `selection:{range,content}`, source-ordered `items`, `omissions`, `live
 and `next_cursor`. Runtime and reader-only captures have null native selection.
 `presentation:"preview"` identifies navigation rows; `presentation:"source"`
 identifies expanded source units. This is an output description, not an input
-format option. The MCP envelope represents the same result in JSON text `content` and
-`structuredContent`; consume either. `max_bytes` bounds the structured page;
+format option. The MCP envelope represents the same result in JSON text `content`
+and `structuredContent`; consume either. `max_bytes` bounds the structured page;
 the wire budget accounts for both copies.
 
 Reference expansion returns native source units with entry/message/block positions and `prompt_id`. Message data
