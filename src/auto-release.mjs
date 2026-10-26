@@ -7,9 +7,11 @@ export function scheduleAutoRelease(bridge, runtime) {
     bridge.closing ||
     bridge.closePreparation ||
     !runtime.alive ||
-    runtime.exitSeal
+    (runtime.exitSeal && !runtime.autoReleaseTask)
   )
     return;
+  // Preserve completion hints while the current seal awaits its reply. A
+  // definite busy refusal may reopen admission; an unknown result stays fenced.
   runtime.autoReleaseAgain = true;
   if (runtime.autoReleaseTask) return runtime.autoReleaseTask;
   const id = runtime.session.id;
