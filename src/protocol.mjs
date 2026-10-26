@@ -162,6 +162,17 @@ export async function callBridgeTool(
   });
 }
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+export function isRpcRequest(body) {
+  return (
+    object(body) &&
+    body.jsonrpc === '2.0' &&
+    typeof body.method === 'string' &&
+    (body.params === undefined || object(body.params)) &&
+    (body.id === undefined ||
+      (typeof body.id === 'number' && Number.isSafeInteger(body.id)) ||
+      (typeof body.id === 'string' && Buffer.byteLength(body.id) <= 1024))
+  );
+}
 export const modernMessage = (body) =>
   ['protocolVersion', 'clientCapabilities', 'clientInfo'].some(
     (field) => body?.params?._meta?.[META + field] !== undefined,
