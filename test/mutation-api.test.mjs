@@ -116,7 +116,6 @@ test('invalid list filters and missing mutation payloads do not dispatch', async
   for (const args of [{ limit: 0 }, { offset: -1 }, { active_after: 'not-a-date' }, { project: 1 }])
     await assert.rejects(f.bridge.list(args), /INVALID_ARGUMENTS/);
   await assert.rejects(f.bridge.send({ session_id: f.id }), /INVALID_ARGUMENTS/);
-  await assert.rejects(f.bridge.create({ project: f.project }), /INVALID_ARGUMENTS/);
   assert.deepEqual(f.calls, { prompt: 0, command: 0, stop: 0 });
 });
 

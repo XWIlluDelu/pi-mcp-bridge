@@ -74,7 +74,10 @@ export const publicOperationSchemas = {
       fork_from: id.optional(),
     })
     .strict()
-    .refine(hasPrompt, { message: 'Text or images required' }),
+    .refine(
+      (args) => hasPrompt(args) || (args.model === undefined && args.thinking_level === undefined),
+      { message: 'Model and thinking settings require text or images' },
+    ),
   delete: z.object({ session_id: id }).strict(),
   health: z.object({ session_id: id.optional() }).strict(),
 };

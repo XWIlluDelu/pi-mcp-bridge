@@ -10,7 +10,7 @@ const labels = {
   send: 'Send prompt',
   command: 'Execute command',
   stop: 'Stop execution',
-  create: 'Create and send',
+  create: 'Create with optional first prompt',
   delete: 'Delete',
 };
 export default function ownerPermissions(pi) {
