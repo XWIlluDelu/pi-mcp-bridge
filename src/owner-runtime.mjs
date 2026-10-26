@@ -59,6 +59,7 @@ export async function serveOwnerControl(bridge) {
             release: 'releaseForLocal',
             settled: 'settledForLocal',
             input_activity: 'inputActivityForLocal',
+            idle_candidate: 'idleCandidateForLocal',
             reset: 'resetColdResume',
             handoff: 'handoffForLocal',
             handoff_cancel: 'cancelHandoff',

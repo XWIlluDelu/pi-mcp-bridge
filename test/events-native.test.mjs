@@ -10,6 +10,7 @@ import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { hash } from '../src/storage.mjs';
 
 async function until(fn) {
   const end = Date.now() + 12000;
@@ -211,6 +212,7 @@ test(
     const duplicate = {
       op: 'settled',
       session_id: made.session_id,
+      sessionCwdHash: hash(runtime.session.header.cwd ?? null),
       generation: runtime.ownerRecord.generation,
       sequence: 1,
       leafId: first.data.leaf_id,

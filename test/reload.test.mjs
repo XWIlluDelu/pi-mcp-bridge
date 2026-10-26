@@ -7,7 +7,13 @@ import { randomUUID } from 'node:crypto';
 import { fixture, until, savedEntries } from './fixtures/model-runtime.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
 import { atomicJson } from '../src/storage.mjs';
-import { reserveOwner, updateOwner, readClaim, claimFile } from '../src/attachments.mjs';
+import {
+  reserveOwner,
+  updateOwner,
+  readClaim,
+  claimFile,
+  AttachedRuntime,
+} from '../src/attachments.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -65,6 +71,29 @@ test('idle owned reload confirms a fresh worker without sending input or rewriti
       .slice(before.length)
       .every((e) => ['model_change', 'thinking_level_change'].includes(e.type)),
   );
+});
+
+test('reload cancellation after seal closes the old writer without starting a successor', async (t) => {
+  const f = await fixture(t),
+    session = await f.bridge.session(f.id),
+    rpc = await f.bridge.pool.resolve(session),
+    seal = AttachedRuntime.prototype.seal;
+  let starts = 0;
+  const factory = f.bridge.pool.factory;
+  f.bridge.pool.factory = (...args) => {
+    starts++;
+    return factory(...args);
+  };
+  t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+    const result = await seal.apply(this, args);
+    if (result.sealed) f.bridge.handoffs.get(f.id).controller.abort();
+    return result;
+  });
+  assert.equal((await f.bridge.reload({ session_id: f.id })).status, 'unknown');
+  assert.equal(rpc.exited, true);
+  assert.equal(rpc.child.exitCode, 0);
+  assert.equal(starts, 0);
+  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
 });
 
 test('reload refuses input preflight and running work without aborting either', async (t) => {

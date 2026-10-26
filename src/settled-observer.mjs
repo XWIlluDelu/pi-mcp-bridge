@@ -1,5 +1,5 @@
 import { ownerRequest } from './owner-runtime.mjs';
-import { opaqueId } from './storage.mjs';
+import { hash, opaqueId } from './storage.mjs';
 import { captureSettledResult } from './settled-result.mjs';
 
 // Shared native boundary capture for owned RPC and the ordinary companion.
@@ -20,6 +20,7 @@ export class SettledObserver {
     return {
       op: 'settled',
       session_id: opaqueId(manager.getSessionFile() + '\0' + manager.getSessionId()),
+      sessionCwdHash: hash(manager.getHeader().cwd ?? null),
       generation: this.generation,
       sequence: (this.lifecycle.completionSequence = (this.lifecycle.completionSequence ?? 0) + 1),
       leafId: manager.getLeafId(),

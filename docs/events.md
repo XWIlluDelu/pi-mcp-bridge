@@ -39,11 +39,12 @@ Pi's native `agent_settled` fires after automatic continuations finish, includin
 aborted runs. Settlement describes the session run, not per-prompt success. A
 handled slash command that never starts a run produces no settlement.
 
-The observer captures the leaf and a bounded last assistant response at that
-boundary, before awaiting IPC. The response comes from the same native projection
-as Session Context, restricted to entries after this observed run started.
-Bridge verifies the current registered process, session, generation and occurrence
-sequence before scheduling delivery. Once accepted, an occurrence survives normal
+The observer captures the leaf, recorded native project identity and a bounded
+last assistant response at that boundary, before awaiting IPC. The response comes
+from the same native projection as Session Context, restricted to entries after
+this observed run started. Bridge verifies that identity against the saved session,
+along with the registered process, generation and occurrence sequence, before
+scheduling delivery. Once accepted, an occurrence survives normal
 owner exit or switching; delivery still checks current read access. Pi waits at
 most two seconds for local acknowledgement, never for HTTPS delivery. A stopped
 or unreachable Bridge can lose the occurrence without interrupting local Pi work.

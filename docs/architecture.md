@@ -41,8 +41,11 @@ APIs are in [module management](compatibility.md).
 3. **Native outcomes.** External dispatch evidence does not imply native admission.
    Missing ACKs leave outcomes unknown; bounded `submissions.mjs` receipts retain
    matching late ACKs without replay. Shutdown drains received ACK checks and captures.
-4. **Ordered release.** Close admission, cancel when authorized, drain admitted
-   work and captures, then close the writer and release its claim.
+4. **Ordered release.** Close admission, cancel when authorized and drain admitted
+   work and captures. Non-interrupting owned RPC shutdown requires the child to
+   synchronously check idle and seal new business work before EOF; exact exit
+   precedes claim release. An unknown seal acknowledgement retains ownership and
+   admission fences. See the [shutdown contract](runtime.md#shutdown-and-in-flight-acks).
 5. **Native provenance.** Projection order determines prompt ownership and tool
    pairing. Fork uses raw native records rather than the public read projection.
 6. **Frozen, bounded reads.** Cursors retain selected history and identity while

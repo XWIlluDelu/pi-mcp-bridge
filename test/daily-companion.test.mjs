@@ -10,6 +10,7 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { hash } from '../src/storage.mjs';
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn) {
@@ -286,6 +287,7 @@ export default pi=>{
       const duplicate = {
         op: 'settled',
         session_id: saved.id,
+        sessionCwdHash: hash(session.header.cwd ?? null),
         generation: claim.generation,
         // LOCAL_FIRST settled before Bridge startup; this is the next native run.
         sequence: 2,

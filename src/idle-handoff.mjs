@@ -54,15 +54,15 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
       if (runtime) {
         runtime.handoffPending = true;
         try {
-          await runtime.waitForHandoff(signal);
+          if (!runtime.exitSeal) await runtime.waitForHandoff(signal);
           signal?.throwIfAborted();
           if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
-          // Cancellation after EOF cannot undo shutdown. Finish observing the
+          // Cancellation after seal cannot undo shutdown. Finish observing the
           // exact child's normal exit, but never open a cancelled destination.
           exitDetails = await runtime.gracefulExit(signal);
           bridge.pool.instances.delete(session_id);
         } finally {
-          if (!runtime.gracefulExitPromise) runtime.handoffPending = false;
+          if (!runtime.gracefulExitPromise && !runtime.exitSeal) runtime.handoffPending = false;
         }
       }
       signal?.throwIfAborted();

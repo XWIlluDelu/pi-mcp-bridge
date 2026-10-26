@@ -124,6 +124,48 @@ async function fixture(t, source = '') {
 function transfer(f, options) {
   return ownerRequest(f.config, f.request, options);
 }
+
+test(
+  'handoff cancellation after seal finishes exact shutdown without reserving a destination',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+        t,
+        `pi.on('session_shutdown',async()=>{await mark('shutdown');await wait('shutdown-go');});`,
+      ),
+      rpc = await f.bridge.pool.resolve(f.session),
+      controller = new AbortController(),
+      seal = AttachedRuntime.prototype.seal;
+    f.cleanup.push(() => f.mark('shutdown-go'));
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      const value = await seal.apply(this, args);
+      if (value.sealed) controller.abort();
+      return value;
+    });
+    let completed = false;
+    const handoff = f.bridge.handoffForLocal(f.request, { signal: controller.signal }).then(
+      () => {
+        completed = true;
+        return null;
+      },
+      (error) => {
+        completed = true;
+        return error;
+      },
+    );
+    await until(() => exists(path.join(f.dir, 'shutdown')));
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(rpc.exitSeal, 'sealed');
+    assert.equal(rpc.child.stdin.writableEnded, true);
+    assert.equal(completed, false);
+    assert.equal((await readClaim(f.config.attachmentDir, f.session)).kind, 'rpc');
+    await f.mark('shutdown-go');
+    assert.match((await handoff).message, /HANDOFF_CANCELLED/);
+    assert.equal(rpc.exited, true);
+    assert.equal(rpc.child.exitCode, 0);
+    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+  },
+);
 async function cancel(f) {
   return ownerRequest(f.config, { ...f.request, op: 'handoff_cancel' });
 }

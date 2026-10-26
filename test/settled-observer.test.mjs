@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { SessionManager, fauxAssistantMessage } from './fixtures/pi.mjs';
 import { SettledObserver } from '../src/settled-observer.mjs';
 import { ownerSocket } from '../src/owner-runtime.mjs';
+import { hash } from '../src/storage.mjs';
 
 test(
   'settlement freezes its boundary and an unresponsive Bridge does not block later local work',
@@ -46,6 +47,7 @@ test(
     await sending;
     assert.ok(Date.now() - started < 5000, 'The local IPC deadline must bound the wait');
     assert.equal(requests[0].leafId, first.leafId);
+    assert.equal(requests[0].sessionCwdHash, hash(manager.getHeader().cwd));
     assert.equal(requests[0].result.text, 'FIRST_RESULT');
     assert.notEqual(requests[0].leafId, manager.getLeafId());
 

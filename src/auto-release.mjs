@@ -2,7 +2,13 @@ import { diagnostics } from './diagnostics.mjs';
 
 // Event-driven owner maintenance. No delay timer, cold-resume fence or external-owner exit.
 export function scheduleAutoRelease(bridge, runtime) {
-  if (!runtime.autoReleaseWanted || bridge.closing || bridge.closePreparation || !runtime.alive)
+  if (
+    !runtime.autoReleaseWanted ||
+    bridge.closing ||
+    bridge.closePreparation ||
+    !runtime.alive ||
+    runtime.exitSeal
+  )
     return;
   runtime.autoReleaseAgain = true;
   if (runtime.autoReleaseTask) return runtime.autoReleaseTask;
@@ -16,6 +22,7 @@ export function scheduleAutoRelease(bridge, runtime) {
             !bridge.closing &&
             !bridge.closePreparation &&
             runtime.alive &&
+            !runtime.exitSeal &&
             bridge.pool.instances.get(id) === runtime &&
             !bridge.handoffs.has(id) &&
             !bridge.locks.has(`stop:${id}`) &&
@@ -43,7 +50,7 @@ export function scheduleAutoRelease(bridge, runtime) {
             if (!marker.controller.signal.aborted && error.code !== 'RUNTIME_BUSY') throw error;
           } finally {
             if (bridge.handoffs.get(id) === marker) bridge.handoffs.delete(id);
-            if (!runtime.gracefulExitPromise) runtime.handoffPending = false;
+            if (!runtime.gracefulExitPromise && !runtime.exitSeal) runtime.handoffPending = false;
             if (runtime.exited && bridge.pool.instances.get(id) === runtime) {
               bridge.pool.instances.delete(id);
             }
