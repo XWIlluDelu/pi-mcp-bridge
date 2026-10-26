@@ -560,7 +560,7 @@ close path returns `DELETE_SHARED_OWNER` to protect its other sessions.
 ## Read and fork boundaries
 
 Owner reads transfer selected, sanitized snapshots; saved reads need no writer.
-[Reading](reading.md) defines brief/full selection, search, references and frozen capture behavior.
+[Reading](reading.md) defines turn ranges, content selection, search, references and frozen capture behavior.
 
 Fork uses `{sessionFile,sessionId,entries,leafId}` from the cooperating owner's
 `snapshot()` while leaving its writer in place. These raw native records retain
