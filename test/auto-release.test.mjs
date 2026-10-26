@@ -9,7 +9,13 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
-import { ownerAlive, readClaim, processIdentity, reserveOwner } from '../src/attachments.mjs';
+import {
+  ownerAlive,
+  readClaim,
+  processIdentity,
+  reserveOwner,
+  AttachedRuntime,
+} from '../src/attachments.mjs';
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -212,7 +218,7 @@ test(
     assert.equal(made.send.status, 'handled');
     const rpc = f.runtimes[0];
     await released(f, rpc);
-    assert.equal(rpc.settlement.sequence, 0);
+    assert.equal(rpc.settlementSequence, 0);
     const rows = (await fs.readFile(rpc.session.file, 'utf8')).trim().split('\n').map(JSON.parse);
     assert.ok(rows.some((e) => e.customType === 'handled-input'));
   },
@@ -369,7 +375,7 @@ test(
       text: 'SETTLED',
     });
     assert.equal(receipt.status, 'unknown');
-    await until(() => rpc.settlement.sequence > 0);
+    await until(() => rpc.settlementSequence > 0);
     await rpc.autoReleaseTask;
     assert.ok(held);
     assert.ok(rpc.promptAdmission);
@@ -539,7 +545,7 @@ test(
         running = f.bridge.command({ ...args, command: 'printf "NATIVE_OUTPUT"' });
       await checking.promise;
       await f.mark('finish');
-      await until(() => rpc.settlement.sequence > 0);
+      await until(() => rpc.settlementSequence > 0);
       await rpc.autoReleaseTask;
       assert.equal(rpc.child.stdin.writableEnded, false);
       identityGo.resolve();
@@ -907,6 +913,362 @@ const independentWorkSource =
   'return import(' +
   JSON.stringify(new URL('./fixtures/independent-work.mjs', import.meta.url).href) +
   ').then(module=>module.default(pi));';
+
+test(
+  'standalone native bash schedules one new release after busy seal without self-polling',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+      t,
+      `const original=AgentSession.prototype.prompt;let started=false;AgentSession.prototype.prompt=function(...args){if(!started){started=true;const session=this;void wait('native-bash-go').then(()=>session.executeBash('touch '+JSON.stringify(dir+'/native-bash-start')+'; while [ ! -e '+JSON.stringify(dir+'/finish')+' ]; do sleep 0.02; done; printf NATIVE_BASH_DONE'));}return original.apply(this,args);};pi.on('input',()=>({action:'handled'}));`,
+    );
+    const extension = f.dir + '/fixture.mjs';
+    await fs.writeFile(
+      extension,
+      "import {AgentSession} from '@earendil-works/pi-coding-agent';\n" +
+        (await fs.readFile(extension, 'utf8')),
+    );
+    const rpc = await f.bridge.pool.resolve(f.session),
+      seal = AttachedRuntime.prototype.seal,
+      busy = Promise.withResolvers();
+    let calls = 0;
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      calls++;
+      const result = await seal.apply(this, args);
+      if (!result.sealed) busy.resolve();
+      return result;
+    });
+    await rpc.command({ type: 'prompt', message: 'CAPTURE_NATIVE_SESSION' });
+    await f.mark('native-bash-go');
+    try {
+      await until(() => exists(f.dir + '/native-bash-start'));
+      assert.equal((await rpc.idleSnapshot()).status, 'idle');
+      rpc.autoReleaseWanted = true;
+      rpc.onIdleCandidate();
+      await busy.promise;
+      await rpc.autoReleaseTask;
+      assert.equal(calls, 1);
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+      await f.mark('finish');
+      await released(f, rpc);
+      assert.equal(calls, 2);
+      assert.ok(JSON.stringify(await f.rows()).includes('NATIVE_BASH_DONE'));
+    } finally {
+      await f.mark('finish');
+    }
+  },
+);
+
+for (const reply of ['busy', 'unknown'])
+  test(
+    `idle completion during a pending ${reply} seal reply preserves the right release outcome`,
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(
+        t,
+        `const original=AgentSession.prototype.prompt;let started=false;AgentSession.prototype.prompt=function(...args){if(!started){started=true;const session=this;void wait('native-bash-go').then(()=>session.executeBash('touch '+JSON.stringify(dir+'/native-bash-start')+'; while [ ! -e '+JSON.stringify(dir+'/finish')+' ]; do sleep 0.02; done; printf NATIVE_BASH_DONE'));}return original.apply(this,args);};pi.on('input',()=>({action:'handled'}));`,
+      );
+      const extension = f.dir + '/fixture.mjs';
+      await fs.writeFile(
+        extension,
+        "import {AgentSession} from '@earendil-works/pi-coding-agent';\n" +
+          (await fs.readFile(extension, 'utf8')),
+      );
+      const rpc = await f.bridge.pool.resolve(f.session),
+        seal = AttachedRuntime.prototype.seal,
+        candidate = f.bridge.idleCandidateForLocal.bind(f.bridge),
+        initial = Promise.withResolvers(),
+        busy = Promise.withResolvers(),
+        ack = Promise.withResolvers(),
+        completed = Promise.withResolvers();
+      let calls = 0;
+      t.mock.method(f.bridge, 'idleCandidateForLocal', (request) => {
+        const result = candidate(request);
+        if (!calls) initial.resolve();
+        else completed.resolve();
+        return result;
+      });
+      await rpc.command({ type: 'prompt', message: 'CAPTURE_NATIVE_SESSION' });
+      await initial.promise;
+      await until(() => rpc.pendingInputs === 0);
+      t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+        calls++;
+        const result = await seal.apply(this, args);
+        if (!result.sealed) {
+          busy.resolve();
+          await ack.promise;
+          if (reply === 'unknown')
+            throw Object.assign(new Error('LOST_SEAL_REPLY'), { uncertain: true });
+        }
+        return result;
+      });
+      await f.mark('native-bash-go');
+      try {
+        await until(() => exists(f.dir + '/native-bash-start'));
+        assert.equal((await rpc.idleSnapshot()).status, 'idle');
+        rpc.autoReleaseWanted = true;
+        rpc.onIdleCandidate();
+        const releasing = rpc.autoReleaseTask;
+        await busy.promise;
+        assert.equal(rpc.exitSeal, 'unknown');
+        await f.mark('finish');
+        await completed.promise;
+        ack.resolve();
+        await releasing;
+        assert.ok(JSON.stringify(await f.rows()).includes('NATIVE_BASH_DONE'));
+        if (reply === 'busy') {
+          assert.equal(rpc.exited, true, 'the completion must survive the pending busy reply');
+          assert.equal(calls, 2);
+          assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+        } else {
+          assert.equal(rpc.exited, false);
+          assert.equal(rpc.exitSeal, 'unknown');
+          assert.equal(rpc.handoffPending, true);
+          assert.equal(rpc.child.stdin.writableEnded, false);
+          assert.equal(calls, 1, 'a completion hint cannot replay an uncertain seal');
+          assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+          assert.equal(f.bridge.autoReleases.size, 0);
+          assert.equal((await f.bridge.releaseForLocal({ session_id: f.id })).status, 'released');
+          assert.equal(calls, 2);
+        }
+      } finally {
+        ack.resolve();
+        await f.mark('finish');
+      }
+    },
+  );
+
+test(
+  'child seal preserves native input whose activity notification has not arrived',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t, independentWorkSource),
+      rpc = await f.bridge.pool.resolve(f.session),
+      checking = Promise.withResolvers(),
+      continueExit = Promise.withResolvers(),
+      activityReached = Promise.withResolvers(),
+      deliverActivity = Promise.withResolvers();
+    await rpc.command({ type: 'prompt', message: 'FIRST' });
+    await until(() => rpc.settlementSequence === 1 && rpc.pendingInputs === 0);
+    const identity = rpc.assertProcessIdentity.bind(rpc),
+      activity = f.bridge.inputActivityForLocal.bind(f.bridge);
+    let held = false;
+    t.mock.method(rpc, 'assertProcessIdentity', async (...args) => {
+      await identity(...args);
+      if (!held) {
+        held = true;
+        checking.resolve();
+        await continueExit.promise;
+      }
+    });
+    t.mock.method(f.bridge, 'inputActivityForLocal', async (request) => {
+      if (request.pendingInputs > 0) {
+        activityReached.resolve();
+        await deliverActivity.promise;
+      }
+      return activity(request);
+    });
+    const releasing = f.bridge.releaseForLocal({ session_id: f.id });
+    void releasing.catch(() => {});
+    try {
+      await checking.promise;
+      await f.mark('new-run');
+      await until(() => exists(f.dir + '/second-input'));
+      await activityReached.promise;
+      assert.equal(rpc.pendingInputs, 0);
+      continueExit.resolve();
+      await assert.rejects(releasing, { code: 'RUNTIME_BUSY', uncertain: false });
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      assert.equal(rpc.exitSeal, null);
+      assert.equal(rpc.handoffPending, false);
+      assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, false);
+      deliverActivity.resolve();
+      await f.mark('input-go');
+      await until(() => exists(f.dir + '/second-provider'));
+      await f.mark('finish');
+      await until(() => rpc.settlementSequence === 2 && rpc.pendingInputs === 0);
+      assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
+      assert.equal((await f.bridge.releaseForLocal({ session_id: f.id })).status, 'released');
+    } finally {
+      continueExit.resolve();
+      deliverActivity.resolve();
+      await f.mark('input-go');
+      await f.mark('finish');
+      await releasing.catch(() => {});
+    }
+  },
+);
+
+test(
+  'lost seal acknowledgment retains the writer until explicit retry and preserves shutdown records',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(
+        t,
+        `pi.on('input',async event=>{if(event.text==='MUST_NOT_START')await mark('unexpected-input');return {action:'handled'};});pi.on('session_shutdown',async()=>{pi.appendEntry('seal-cleanup',{saved:true});pi.sendMessage({customType:'seal-record',content:'FINAL_RECORD',display:false});pi.sendUserMessage('MUST_NOT_START');await mark('shutdown');await wait('shutdown-go');});`,
+      ),
+      rpc = await f.bridge.pool.resolve(f.session),
+      seal = AttachedRuntime.prototype.seal;
+    let calls = 0;
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      const result = await seal.apply(this, args);
+      if (++calls === 1) throw Object.assign(new Error('LOST_SEAL_ACK'), { uncertain: true });
+      return result;
+    });
+    await assert.rejects(f.bridge.releaseForLocal({ session_id: f.id }), /LOST_SEAL_ACK/);
+    assert.equal(rpc.exitSeal, 'unknown');
+    assert.equal(rpc.gracefulExitPromise, undefined);
+    assert.equal(rpc.child.stdin.writableEnded, false);
+    assert.equal(rpc.handoffPending, true);
+    assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
+    assert.equal(
+      (await new AttachedRuntime(f.config, f.session, rpc.ownerRecord).state()).sealed,
+      true,
+    );
+    const input = await f.bridge.send({ session_id: f.id, text: 'MUST_NOT_START' });
+    assert.equal(input.status, 'rejected');
+    rpc.autoReleaseWanted = true;
+    rpc.onIdleCandidate();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1);
+    assert.equal(f.bridge.autoReleases.size, 0);
+    rpc.pendingInputs = 10; // A stale notification cannot prevent same-generation seal retry.
+    const retry = f.bridge.releaseForLocal({ session_id: f.id });
+    try {
+      await until(() => exists(f.dir + '/shutdown'));
+      assert.equal(calls, 2);
+      assert.equal(rpc.child.stdin.writableEnded, true);
+      assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
+      assert.equal(await exists(f.dir + '/unexpected-input'), false);
+      await f.mark('shutdown-go');
+      assert.equal((await retry).status, 'released');
+      const rows = await f.rows();
+      assert.ok(rows.some((entry) => entry.customType === 'seal-cleanup'));
+      assert.ok(
+        rows.some((entry) => entry.type === 'custom_message' && entry.customType === 'seal-record'),
+      );
+    } finally {
+      await f.mark('shutdown-go');
+      await retry;
+    }
+  },
+);
+
+test(
+  'a read admitted during seal connection setup prevents EOF and finishes normally',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(t),
+      rpc = await f.bridge.pool.resolve(f.session),
+      readReady = Promise.withResolvers(),
+      readGo = Promise.withResolvers(),
+      command = rpc.command.bind(rpc),
+      seal = AttachedRuntime.prototype.seal;
+    let reading;
+    t.mock.method(rpc, 'command', async (...args) => {
+      const result = await command(...args);
+      if (args[0].type === 'get_entries') {
+        readReady.resolve();
+        await readGo.promise;
+      }
+      return result;
+    });
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      reading = rpc.entries();
+      await readReady.promise;
+      return seal.apply(this, args);
+    });
+    try {
+      await assert.rejects(f.bridge.releaseForLocal({ session_id: f.id }), {
+        code: 'RUNTIME_BUSY',
+        uncertain: false,
+      });
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      assert.equal(rpc.exitSeal, null);
+      readGo.resolve();
+      assert.ok(Array.isArray((await reading).entries));
+    } finally {
+      readGo.resolve();
+      await reading;
+    }
+  },
+);
+
+test(
+  'busy after an unknown seal preserves the local pause and permits a later explicit retry',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t, independentWorkSource),
+      rpc = await f.bridge.pool.resolve(f.session),
+      seal = AttachedRuntime.prototype.seal;
+    await rpc.command({ type: 'prompt', message: 'FIRST' });
+    await until(() => rpc.settlementSequence === 1 && rpc.pendingInputs === 0);
+    let first = true;
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (beforeDispatch) {
+      if (first) {
+        first = false;
+        beforeDispatch();
+        // Transport uncertainty includes requests that never reached the child.
+        throw Object.assign(new Error('SEAL_DELIVERY_UNKNOWN'), { uncertain: true });
+      }
+      return seal.call(this, beforeDispatch);
+    });
+    await assert.rejects(f.bridge.releaseForLocal({ session_id: f.id }), /SEAL_DELIVERY_UNKNOWN/);
+    await f.mark('new-run');
+    try {
+      await until(() => exists(f.dir + '/second-input'));
+      await assert.rejects(f.bridge.releaseForLocal({ session_id: f.id }), {
+        code: 'RUNTIME_BUSY',
+        uncertain: true,
+      });
+      assert.equal(rpc.exitSeal, 'unknown');
+      assert.equal(rpc.handoffPending, true);
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
+      await f.mark('input-go');
+      await until(() => exists(f.dir + '/second-provider'));
+      await f.mark('finish');
+      await until(() => rpc.settlementSequence === 2 && rpc.pendingInputs === 0);
+      assert.equal((await f.bridge.releaseForLocal({ session_id: f.id })).status, 'released');
+      assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
+    } finally {
+      await f.mark('input-go');
+      await f.mark('finish');
+    }
+  },
+);
+
+test(
+  'seal handshake refuses new reads until its one EOF is committed',
+  { timeout: 10000 },
+  async (t) => {
+    const f = await fixture(t),
+      rpc = await f.bridge.pool.resolve(f.session),
+      sealed = Promise.withResolvers(),
+      ackGo = Promise.withResolvers(),
+      seal = AttachedRuntime.prototype.seal;
+    t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+      const result = await seal.apply(this, args);
+      sealed.resolve();
+      await ackGo.promise;
+      return result;
+    });
+    const releasing = f.bridge.releaseForLocal({ session_id: f.id });
+    try {
+      await sealed.promise;
+      assert.equal(rpc.sealPending, true);
+      await assert.rejects(rpc.entries(), { code: 'RUNTIME_SHUTTING_DOWN' });
+      assert.equal(rpc.child.stdin.writableEnded, false);
+      ackGo.resolve();
+      assert.equal((await releasing).status, 'released');
+      assert.equal(rpc.exited, true);
+    } finally {
+      ackGo.resolve();
+      await releasing;
+    }
+  },
+);
 for (const window of ['ack', 'identity'])
   test(
     'normal release rechecks native input preflight after the final ' + window + ' await',
@@ -949,7 +1311,7 @@ for (const window of ['ack', 'identity'])
         await f.mark('input-go');
         await until(() => exists(f.dir + '/second-provider'));
         await f.mark('finish');
-        await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
+        await until(() => rpc.settlementSequence === rpc.requiredSettlementSequence);
         assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
         await released(f, rpc);
       } finally {
@@ -968,7 +1330,7 @@ test(
     await f.mark('input-go'); // This case observes the later native run boundary.
     const rpc = await f.bridge.pool.resolve(f.session);
     await rpc.command({ type: 'prompt', message: 'FIRST' });
-    await until(() => rpc.settlement.sequence === 1);
+    await until(() => rpc.settlementSequence === 1);
     const reached = Promise.withResolvers(),
       go = Promise.withResolvers(),
       identity = rpc.assertProcessIdentity.bind(rpc);
@@ -990,7 +1352,7 @@ test(
       await until(
         () =>
           exists(f.dir + '/second-provider') &&
-          rpc.settlement.sequence < rpc.requiredSettlementSequence,
+          rpc.settlementSequence < rpc.requiredSettlementSequence,
       );
       go.resolve();
       await assert.rejects(releasing, /RUNTIME_BUSY/);
@@ -998,7 +1360,7 @@ test(
       assert.equal(f.bridge.handoffs.has(f.id), false);
       assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, false);
       await f.mark('finish');
-      await until(() => rpc.settlement.sequence === rpc.requiredSettlementSequence);
+      await until(() => rpc.settlementSequence === rpc.requiredSettlementSequence);
       assert.ok(JSON.stringify(await f.rows()).includes('SECOND_DONE'));
     } finally {
       go.resolve();

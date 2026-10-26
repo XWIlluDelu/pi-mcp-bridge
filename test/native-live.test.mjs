@@ -138,7 +138,7 @@ test(
     const reading = read();
     await captured.promise;
     await finish(1);
-    await until(() => rpc.settlement.sequence > 0);
+    await until(() => rpc.settlementSequence > 0);
     await bridge.send({ session_id: session.id, text: 'PROMPT_B' });
     const current = await until(preview);
     resume.resolve();

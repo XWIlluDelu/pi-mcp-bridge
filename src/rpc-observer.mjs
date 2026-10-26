@@ -6,6 +6,8 @@ import { opaqueId } from './storage.mjs';
 // CLI class in bundled installations. Importing sdkEntry separately would not.
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { observeRpcInputs } from './rpc-input-activity.mjs';
+import { reloadAdmission } from './reload-admission.mjs';
+import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { ContextObservation } from './context-observation.mjs';
@@ -17,6 +19,7 @@ export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
   if (!value) return;
   const { socket, generation, ownerControl } = JSON.parse(value);
+  const admission = reloadAdmission(sdk.AgentSession);
   // Reuse owner-local IPC; Pi reserves stdout for its own RPC records.
   // Sequence numbers preserve ordering across concurrent notifications/reload.
   const inputActivity = observeRpcInputs(sdk.AgentSession, (manager, activity) => {
@@ -80,72 +83,112 @@ export default async function rpcObserver(pi) {
   pi.on('session_before_fork', () => ({ cancel: true }));
   pi.on('session_start', async (_event, ctx) => {
     context = ctx;
+    admission.setOnIdle(ctx.sessionManager, () => {
+      if (ownerControl)
+        void ownerRequest(
+          ownerControl,
+          {
+            op: 'idle_candidate',
+            session_id: opaqueId(
+              ctx.sessionManager.getSessionFile() + '\0' + ctx.sessionManager.getSessionId(),
+            ),
+            generation,
+          },
+          { signal: AbortSignal.timeout(2000) },
+        ).catch(() => {});
+    });
     observation.reset();
     if (server) return;
     server = net.createServer((connection) => {
       connections.add(connection);
-      let body = '';
+      let body = '',
+        handled = false;
       connection.setEncoding('utf8');
       connection.setTimeout(5000, () => connection.destroy());
       connection.on('error', () => {});
       connection.on('close', () => connections.delete(connection));
       connection.on('data', (chunk) => {
+        if (handled) return;
         body += chunk;
         if (Buffer.byteLength(body) > MAX_ATTACHMENT_REQUEST_BYTES) {
           connection.destroy();
           return;
         }
         if (!body.includes('\n')) return;
-        let result;
+        handled = true;
+        let result, request;
         try {
-          const request = JSON.parse(body.slice(0, body.indexOf('\n')));
+          request = JSON.parse(body.slice(0, body.indexOf('\n')));
           if (
             !context ||
-            !['state', 'read', 'read_features'].includes(request.op) ||
+            !['state', 'read', 'read_features', 'seal'].includes(request.op) ||
             request.generation !== generation ||
             request.file !== context.sessionManager.getSessionFile() ||
             request.sessionId !== context.sessionManager.getSessionId()
           )
             throw new Error('RUNTIME_SESSION_CHANGED');
-          result = {
-            data:
-              request.op === 'read_features'
-                ? {
-                    contract: READ_CONTRACT,
-                    sessionFile: request.file,
-                    sessionId: request.sessionId,
-                    ...nativeReadFeatures(
-                      pi.getAllTools?.(),
-                      pi.getCommands?.(),
-                      context.sessionManager.getLeafId(),
-                    ),
-                  }
-                : request.op === 'state'
+          if (request.op === 'seal') {
+            if (request.version !== packageInfo.version)
+              throw new Error('OWNER_COMPONENT_UPDATE_REQUIRED');
+            if (
+              !request.body ||
+              typeof request.body !== 'object' ||
+              Array.isArray(request.body) ||
+              Object.keys(request.body).length
+            )
+              throw new Error('INVALID_ARGUMENTS');
+            const sealed = admission.seal(context.sessionManager, context);
+            result = { data: sealed ? { sealed: true } : { sealed: false, reason: 'busy' } };
+          } else {
+            result = {
+              data:
+                request.op === 'read_features'
                   ? {
-                      isIdle: context.isIdle(),
-                      hasPendingMessages: context.hasPendingMessages(),
-                      ...inputActivity(context.sessionManager),
-                    }
-                  : {
+                      contract: READ_CONTRACT,
                       sessionFile: request.file,
                       sessionId: request.sessionId,
-                      ...(request.body?.view === 'runtime'
-                        ? observation.read(request.body, context)
-                        : prepareContextRead(
-                            {
-                              entries: context.sessionManager.getEntries(),
-                              leafId: context.sessionManager.getLeafId(),
-                              live: live.snapshot(),
-                            },
-                            request.body,
-                            { ...sdk, readAdapters: request.readAdapters },
-                          )),
-                    },
-          };
+                      ...nativeReadFeatures(
+                        pi.getAllTools?.(),
+                        pi.getCommands?.(),
+                        context.sessionManager.getLeafId(),
+                      ),
+                    }
+                  : request.op === 'state'
+                    ? {
+                        isIdle: context.isIdle(),
+                        hasPendingMessages: context.hasPendingMessages(),
+                        sealed: admission.sealed(context.sessionManager),
+                        ...inputActivity(context.sessionManager),
+                      }
+                    : {
+                        sessionFile: request.file,
+                        sessionId: request.sessionId,
+                        ...(request.body?.view === 'runtime'
+                          ? observation.read(request.body, context)
+                          : prepareContextRead(
+                              {
+                                entries: context.sessionManager.getEntries(),
+                                leafId: context.sessionManager.getLeafId(),
+                                live: live.snapshot(),
+                              },
+                              request.body,
+                              { ...sdk, readAdapters: request.readAdapters },
+                            )),
+                      },
+            };
+          }
         } catch (error) {
           result = { error: error.message };
         }
-        connection.end(JSON.stringify({ generation, ...result }) + '\n');
+        connection.end(
+          JSON.stringify({
+            generation,
+            ...(request?.op === 'seal'
+              ? { version: packageInfo.version, file: request.file, sessionId: request.sessionId }
+              : {}),
+            ...result,
+          }) + '\n',
+        );
       });
     });
     await new Promise((resolve, reject) => {
@@ -155,6 +198,7 @@ export default async function rpcObserver(pi) {
     await fs.chmod(socket, 0o600);
   });
   pi.on('session_shutdown', async () => {
+    if (context) admission.setOnIdle(context.sessionManager, undefined);
     context = null;
     live.reset();
     observation.reset();

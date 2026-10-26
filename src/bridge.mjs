@@ -361,7 +361,8 @@ export class Bridge {
           if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
           if (runtime.attached) return await runtime.reload(checkInput);
           if (!(runtime instanceof PiRpc)) throw new Error('RELOAD_UNSUPPORTED');
-          await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
+          if (!runtime.exitSeal)
+            await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
           checkInput();
           if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
           marker = { kind: 'reload', controller: new AbortController() };
@@ -370,6 +371,7 @@ export class Bridge {
           await runtime.gracefulExit(marker.controller.signal);
           replacementStarted = true;
           this.pool.instances.delete(session.id);
+          marker.controller.signal.throwIfAborted();
           checkInput();
           const replacement = await this.pool.resolve(session);
           markForAutoRelease(replacement);
@@ -379,7 +381,11 @@ export class Bridge {
           if (version !== READ_CONTRACT) throw new Error('RELOAD_UNCONFIRMED');
           return { status: 'completed', owner_version: version, read_compatible: true };
         } catch (error) {
-          const uncertain = error.uncertain || replacementStarted || runtime?.gracefulExitPromise;
+          const uncertain =
+            error.uncertain ||
+            replacementStarted ||
+            runtime?.gracefulExitPromise ||
+            runtime?.exitSeal;
           return {
             status: uncertain ? 'unknown' : 'rejected',
             reason: [
@@ -393,7 +399,8 @@ export class Bridge {
           };
         } finally {
           if (marker && this.handoffs.get(session.id) === marker) this.handoffs.delete(session.id);
-          if (marker && runtime && !runtime.gracefulExitPromise) runtime.handoffPending = false;
+          if (marker && runtime && !runtime.gracefulExitPromise && !runtime.exitSeal)
+            runtime.handoffPending = false;
         }
       });
     });
@@ -1266,6 +1273,18 @@ export class Bridge {
     runtime.observeInputActivity(request);
     return {};
   }
+  idleCandidateForLocal(request) {
+    this.assertOpen();
+    const runtime = this.pool.instances.get(request.session_id);
+    if (
+      !(runtime instanceof PiRpc) ||
+      !runtime.alive ||
+      request.generation !== runtime.ownerRecord?.generation
+    )
+      throw new Error('INVALID_OWNER_COMMAND');
+    runtime.onIdleCandidate?.();
+    return {};
+  }
   async releaseForLocal({ session_id, interrupt = false }) {
     this.assertOpen();
     if (typeof interrupt !== 'boolean') throw new Error('INVALID_OWNER_COMMAND');
@@ -1273,7 +1292,12 @@ export class Bridge {
     // EOF can be held indefinitely by a native shutdown hook. Interrupt must
     // reach that exact closing child without waiting behind its session lane.
     const closing = this.pool.instances.get(session_id);
-    if (interrupt && closing instanceof PiRpc && closing.gracefulExitPromise && !closing.exited) {
+    if (
+      interrupt &&
+      closing instanceof PiRpc &&
+      (closing.gracefulExitPromise || closing.exitSeal) &&
+      !closing.exited
+    ) {
       await closing.assertProcessIdentity();
       await updateOwner(this.pool.attachmentDir, closing.session, closing.ownerRecord, {
         noColdReacquire: true,
@@ -1317,7 +1341,7 @@ export class Bridge {
             if (interrupt) {
               await runtime.state();
               await runtime.assertProcessIdentity();
-            } else await runtime.assertReleasable();
+            } else if (!runtime.exitSeal) await runtime.assertReleasable();
             await runtime.drainAcks();
             release.controller.signal.throwIfAborted();
             await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
@@ -1330,6 +1354,7 @@ export class Bridge {
             if (
               error.code === 'RUNTIME_BUSY' &&
               !runtime.gracefulExitPromise &&
+              !runtime.exitSeal &&
               runtime.ownerRecord &&
               (runtime.ownerRecord.noColdReacquire === true) !== previousNoCold
             )
@@ -1338,7 +1363,7 @@ export class Bridge {
               });
             throw error;
           } finally {
-            if (!runtime.gracefulExitPromise && !runtime.stopPromise)
+            if (!runtime.gracefulExitPromise && !runtime.exitSeal && !runtime.stopPromise)
               runtime.handoffPending = false;
           }
         } else

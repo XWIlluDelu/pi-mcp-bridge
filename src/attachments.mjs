@@ -21,6 +21,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
+import packageInfo from '../package.json' with { type: 'json' };
 export class AttachmentFailure extends Error {
   constructor(code, uncertain = false, options) {
     super(code, options);
@@ -399,11 +400,19 @@ export class AttachedRuntime {
     );
   }
   async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
-    const mutating = ['set_model', 'send', 'stop', 'bash', 'compact', 'reload'].includes(op);
+    const mutating = ['set_model', 'send', 'stop', 'bash', 'compact', 'reload', 'seal'].includes(
+      op,
+    );
+    if (
+      op === 'seal' &&
+      (this.record.kind !== 'rpc' || this.record.readContract !== packageInfo.version)
+    )
+      throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
     const serialized =
       JSON.stringify({
         op,
         body,
+        ...(op === 'seal' ? { version: packageInfo.version } : {}),
         ...(op === 'read' && body.view !== 'runtime'
           ? { readAdapters: this.compatibility?.readInputs.snapshot() ?? [] }
           : {}),
@@ -507,7 +516,55 @@ export class AttachedRuntime {
         if (done) return;
         try {
           const response = JSON.parse(line);
-          if (response.generation !== this.record.generation) throw new Error();
+          if (response.generation !== this.record.generation) {
+            if (op === 'seal')
+              return finish(new AttachmentFailure('RUNTIME_SESSION_CHANGED', written));
+            throw new Error();
+          }
+          if (op === 'seal') {
+            const failed = Object.hasOwn(response, 'error');
+            const fields = [
+              'generation',
+              'version',
+              'file',
+              'sessionId',
+              failed ? 'error' : 'data',
+            ];
+            if (
+              Object.keys(response).length !== fields.length ||
+              fields.some((field) => !Object.hasOwn(response, field)) ||
+              typeof response.version !== 'string'
+            )
+              throw new Error();
+            if (
+              response.file !== this.session.file ||
+              response.sessionId !== this.session.header.id
+            )
+              return finish(new AttachmentFailure('RUNTIME_SESSION_CHANGED', written));
+            if (response.error === 'OWNER_COMPONENT_UPDATE_REQUIRED')
+              return finish(new AttachmentFailure(response.error));
+            if (response.version !== packageInfo.version)
+              return finish(new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED', written));
+            if (failed)
+              return finish(
+                new AttachmentFailure(
+                  knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
+                  !['RUNTIME_SESSION_CHANGED', 'INVALID_ARGUMENTS'].includes(response.error),
+                ),
+              );
+            const data = response.data;
+            if (
+              !data ||
+              typeof data !== 'object' ||
+              Array.isArray(data) ||
+              !(
+                (data.sealed === true && Object.keys(data).length === 1) ||
+                (data.sealed === false && data.reason === 'busy' && Object.keys(data).length === 2)
+              )
+            )
+              throw new Error();
+            return finish(null, data);
+          }
           if (response.partial === true) {
             if (op === 'bash') partial = inlineBashResult(response.data);
             else if (op === 'stop')
@@ -584,6 +641,9 @@ export class AttachedRuntime {
   async start() {
     await this.state();
     return this;
+  }
+  seal(beforeDispatch) {
+    return this.request('seal', {}, 5000, beforeDispatch);
   }
   async state(timeout = 5000) {
     const state = await this.request('state', {}, timeout);

@@ -67,12 +67,14 @@ Saved reads need no writer. Send, command, compact and `set_model` may cold-star
 an RPC; reload, stop, read, search and list do not. Model catalogs are independent of session
 owners. See [native controls](model-control.md) and [read formats](reading.md).
 
-After prompt/control work, an owned RPC normally exits by EOF once ACKs, native
-settlement, drained queues and observed input preparation establish idle.
-In-flight reads, Stop recovery and command-output capture finish first. Missing
-ACKs or unfinished input calls retain ownership. There is no idle timer; later
-work resolves ownership again and may cold-start the saved session. Input arriving
-during EOF waits for that exact exit. Companion and host lifecycles remain local.
+After prompt/control work, an owned RPC normally follows the
+[idle shutdown contract](#shutdown-and-in-flight-acks) before EOF.
+ACKs, native settlement, queues and observed input preparation must establish
+idle; in-flight reads, Stop recovery and command-output capture finish first.
+Missing ACKs or unfinished input calls retain ownership. There is no idle timer;
+later work resolves ownership again and may cold-start the saved session. Bridge
+input arriving during committed shutdown waits for that exact exit. Companion and host
+lifecycles remain local.
 
 Command timeouts retain their pending ACK; late completion reevaluates release.
 Cold `set_model` and completed/refused compaction use the same safe release path;
@@ -108,7 +110,9 @@ and reports its component version. The companion observes public SDK operation
 lifetimes so asynchronous input preparation and standalone bash also block reload;
 new operations are refused while resources are being replaced. A closed
 socket or an input acknowledgement alone is not completion evidence. An owned
-RPC exits normally and starts a fresh worker with current resources. Native
+RPC follows the [idle shutdown contract](#shutdown-and-in-flight-acks), then starts
+a fresh worker with current resources. Lifecycle cancellation after seal dispatch
+does not undo shutdown, but prevents the reload successor from starting. Native
 shutdown/startup hooks are allowed to finish; Bridge does not kill them on a timer.
 
 Reload preserves saved messages and resets extension-local state, including the
@@ -267,8 +271,10 @@ reject. An already-running companion TUI can invoke `/bridge-join` manually.
 
 1. Fence Bridge input and wait for admitted Stop recovery.
 2. Check ACKs, native busy/queue/settlement state and observed input preparation.
-3. Close owned RPC stdin and observe that exact child's normal exit. Handoff
-   sends no process signals; unavailable shutdown UI is a warning after exit.
+3. Complete [idle shutdown](#shutdown-and-in-flight-acks): seal
+   new work in the child, close stdin after confirmation and observe that exact
+   child's normal exit. Handoff sends no process signals; unavailable shutdown
+   UI is a warning after exit.
 4. Reserve the target for the requester before `switchSession()`. The reservation
    identifies a future requester, not a writer.
 5. Under the registry mutex change `reserved` to `opening`, then invoke native
@@ -277,7 +283,8 @@ reject. An already-running companion TUI can invoke `/bridge-join` manually.
    in one transaction.
 
 Owner automation should use this protocol directly. Idle-gated controls and
-local release share its completion checks; reads remain available while waiting.
+local release share its completion checks; reads remain available while waiting
+for idle.
 The owned observer counts outstanding public `prompt`, `steer`, `followUp` and
 `sendCustomMessage` calls by native session manager. This covers input hooks and
 nested asynchronous slash commands, including calls continuing after a parent
@@ -289,9 +296,10 @@ are outside this observation.
 
 The fresh TUI shows wait/failure notifications without mirroring old RPC output.
 Ctrl+Alt+J cancels; unrelated work in the fresh TUI causes join to refuse until
-that work finishes. Cancellation before EOF restores admission; after EOF it
-allows shutdown to finish without opening the destination. Returned cancellation
-before native open removes the reservation and permits an explicit retry.
+that work finishes. Cancellation before seal dispatch restores admission. After
+dispatch it does not withdraw seal confirmation or confirmed shutdown, but
+prevents reserving or opening the destination. Returned cancellation before
+native open removes the reservation and permits an explicit retry.
 A thrown, possibly partial switch retains the requester's claim until exact exit.
 
 A successful switch-away retires the old context's claim; later destination exit
@@ -323,9 +331,10 @@ For deliberate idle release without opening a TUI:
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID
 ```
 
-This fences mutations, proves idle and waits for EOF exit. The pause remains until
-a cooperative join or reset. To authorize interruption of running/unobservable
-preparation work:
+This fences mutations and follows the
+[idle shutdown contract](#shutdown-and-in-flight-acks), including
+EOF and exact exit. The pause remains until a cooperative join or reset. To
+authorize interruption of running/unobservable preparation work:
 
 ```sh
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID --interrupt
@@ -350,9 +359,40 @@ operations may return `BRIDGE_CLOSING`; shutdown never starts replacement work.
 Both per-request MCP and SDK tools participate. Shutdown waits for SIGTERM exit
 without automatic SIGKILL; a process manager's independent stop timeout applies.
 
-Normal auto-release uses only EOF. Its final synchronous activity check follows
-the last ACK/identity await; newly observed work withdraws the temporary handoff
-and waits for later settlement.
+Normal auto-release, idle local release, handoff and owned RPC reload use the
+same non-interrupting shutdown contract. After pending acknowledgements and
+captures drain, Bridge asks the matching child observer to check its actual
+native activity and permanently close admission to new business work. The child
+checks idle and commits this terminal seal synchronously, with no asynchronous
+gap between them. A busy child refuses without sealing; auto-release leaves it
+open and waits for later settlement. Parent-side cached activity alone cannot
+authorize EOF.
+
+The current native idle interface omits queued `deliverAs:"nextTurn"` custom
+messages and a same-file resume in progress. Owned idle shutdown can therefore
+discard that queued context or lose its seal during session replacement. These
+two cases need native queue and lifecycle visibility before this contract can
+protect them.
+
+Already admitted reads finish before sealing. A new capture racing with local
+release, handoff or reload may return `RUNTIME_SHUTTING_DOWN`; retry after that
+lifecycle operation completes. Frozen cursors remain subject to their normal
+identity and permission checks.
+
+Once sealed, the child rejects new business work, including work requested by
+shutdown hooks. Hooks may still record cleanup state without starting new work.
+Bridge sends EOF only after confirming the seal for the same session and owner
+generation, then observes that exact child's normal exit before releasing its
+claim. This path sends no process signals. Sealing does not clear an explicit
+`noColdReacquire` pause.
+
+A lost or uncertain seal acknowledgement preserves the owner, claim and admission
+fence; it is not permission to send EOF or start another writer. An explicit
+shutdown retry can confirm or complete closure of that same generation without
+replaying business input. Lifecycle cancellation after seal dispatch does not
+cancel its confirmation or undo a committed seal. Confirmed shutdown still
+finishes, while cancellation prevents a handoff reservation or reload successor
+from being created. Existing explicit local pauses remain in force.
 
 Headless RPC replies `extension_ui_response {cancelled:true}` to `confirm`,
 `select`, `input` and `editor` dialogs. An admitted send/create reports

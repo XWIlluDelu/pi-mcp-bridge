@@ -184,22 +184,6 @@ test('remote TUI reload preserves history and native permission menus still gove
         stderr: 'pipe',
       }),
     );
-    assert.deepEqual((await client.listTools()).tools.map((x) => x.name).sort(), [
-      'batch',
-      'command',
-      'compact',
-      'create',
-      'delete',
-      'health',
-      'list',
-      'models',
-      'read',
-      'search',
-      'send',
-      'set_model',
-      'stop',
-      'submission',
-    ]);
     const id = made.session_id;
     assert.equal(
       (

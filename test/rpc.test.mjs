@@ -339,15 +339,34 @@ test('write uncertainty retains admission; authoritative rejection or confirmed 
   }
 });
 
-test('silent live child does not retain expired read requests while prompt ACK recovery stays fenced', async () => {
+test('read RPCs neither retain work nor trigger idle release while prompt ACK recovery stays fenced', async () => {
   const rpc = new PiRpc({}, {}),
-    writes = [];
+    writes = [],
+    readTypes = [
+      'get_state',
+      'get_entries',
+      'get_available_models',
+      'get_available_thinking_levels',
+    ];
   rpc.alive = true;
   rpc.child = { stdin: { write: (line) => writes.push(JSON.parse(line)) } };
-  let lateReads = 0;
+  let lateReads = 0,
+    idleCandidates = 0;
+  rpc.onIdleCandidate = () => idleCandidates++;
+  for (const type of readTypes) {
+    const reading = rpc.dispatch({ type }),
+      request = writes.at(-1);
+    assert.equal(rpc.hasUnsettledWork(), false);
+    rpc.receiveResponse(
+      { type: 'response', id: request.id, success: true, data: {} },
+      rpc.generation,
+    );
+    await reading;
+    assert.equal(idleCandidates, 0);
+  }
   for (let i = 0; i < 12; i++) {
     await assert.rejects(
-      rpc.dispatch({ type: i % 2 ? 'get_entries' : 'get_state' }, 1, () => lateReads++),
+      rpc.dispatch({ type: readTypes[i % readTypes.length] }, 1, () => lateReads++),
       { code: 'ACK_TIMEOUT' },
     );
     assert.equal(rpc.pending.size, 0);
@@ -368,14 +387,17 @@ test('silent live child does not retain expired read requests while prompt ACK r
   );
   const prompt = writes.at(-1);
   assert.equal(rpc.pending.size, 1);
+  assert.equal(rpc.hasUnsettledWork(), true);
   for (const failure of ['callback', 'throw']) {
     rpc.child.stdin.write = (_line, cb) => {
       if (failure === 'throw') throw new Error('fixture');
       cb(new Error('fixture'));
     };
-    await assert.rejects(rpc.dispatch({ type: 'get_entries' }, 50), { code: 'WRITE_UNKNOWN' });
-    assert.equal(rpc.pending.size, 1);
-    assert.equal(rpc.promptAdmission.id, prompt.id);
+    for (const type of readTypes) {
+      await assert.rejects(rpc.dispatch({ type }, 50), { code: 'WRITE_UNKNOWN' });
+      assert.equal(rpc.pending.size, 1);
+      assert.equal(rpc.promptAdmission.id, prompt.id);
+    }
   }
   rpc.receiveResponse(
     {
@@ -390,6 +412,7 @@ test('silent live child does not retain expired read requests while prompt ACK r
   assert.equal(latePrompt.ok, true);
   assert.equal(rpc.pending.size, 0);
   assert.equal(rpc.promptAdmission, null);
+  assert.equal(idleCandidates, 1);
 });
 
 test('actual RPC launch rejects null, missing and symlink-replaced cwd without spawning', async (t) => {
