@@ -23,7 +23,7 @@ Authorization requires effective `send`, `command` or `create` on a configured p
 
 The catalog uses the same user Pi installation as CLI execution. A short-lived native `ModelRuntime` helper reads the owner's launch-profile agent directory, inherited environment and existing model/provider/auth configuration and caches. It uses the trusted Bridge cwd, disables network refresh and loads no session, resource or extension factories. Credential and cache stores are read-only, including when files are missing. Callers cannot select a different environment.
 
-Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Failures return `MODEL_CATALOG_UNAVAILABLE`; `PI_MCP_LOG=1` records content-free `catalog_stage` and `catalog_reason` diagnostics.
+Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Pi installation and launch-profile errors retain their own codes; see [native environment](configuration.md#native-environment). Failures running or decoding the catalog helper return `MODEL_CATALOG_UNAVAILABLE`; [Bridge diagnostics](configuration.md#diagnostics) record `catalog_stage` and `catalog_reason` to identify the failing stage without exposing credentials or provider configuration.
 
 An absent catalog entry therefore does not establish that a model is unavailable
 to an already-running owner. Standalone selection resolves the requested model

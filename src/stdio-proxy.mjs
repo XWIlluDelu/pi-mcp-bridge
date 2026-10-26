@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import { loadHttpConfig, TOKEN_HEADER } from './http-server.mjs';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
-import { META, modernMessage, rpcError, MCP_RESPONSE_LIMIT } from './protocol.mjs';
+import { META, modernMessage, isRpcRequest, rpcError, MCP_RESPONSE_LIMIT } from './protocol.mjs';
 
 // Only these exact HTTP rejection pairs prove the backend did not admit work.
 // A status alone, including a server error or timeout, says nothing about execution.
@@ -54,19 +54,7 @@ export function createStdioProxy({
         this.track(this.write(rpcError(null, -32700, 'Parse error')));
         return;
       }
-      if (
-        !body ||
-        Array.isArray(body) ||
-        body.jsonrpc !== '2.0' ||
-        typeof body.method !== 'string' ||
-        (body.params !== undefined &&
-          (!body.params || typeof body.params !== 'object' || Array.isArray(body.params))) ||
-        (body.id !== undefined &&
-          !(
-            (typeof body.id === 'number' && Number.isSafeInteger(body.id)) ||
-            (typeof body.id === 'string' && Buffer.byteLength(body.id) <= 1024)
-          ))
-      ) {
+      if (!isRpcRequest(body)) {
         this.track(this.write(rpcError(null, -32600, 'Invalid request')));
         return;
       }

@@ -669,6 +669,28 @@ test('adapter items expose related memory and source-boundary navigation without
   assert.equal(documents[source.ref].request.session_id, identity.session_id);
 });
 
+test('reader previews stay separate from searchable source text and its truncation', () => {
+  for (const text of [
+    'Full memory evidence',
+    'Background context. '.repeat(100) + 'memory evidence',
+  ]) {
+    const snap = snapshot(
+      [{ type: 'memory', text, preview: 'Preview-only marker', source: { reader_item: 'memory' } }],
+      { view: 'adapted' },
+    );
+    const overview = rows(snap)[0];
+    assert.equal(overview.text, 'Preview-only marker');
+    assert.equal(overview.truncated, undefined);
+    assert.equal(rows(snap, { query: 'Preview-only' }).length, 0);
+    const hits = rows(snap, { query: 'memory evidence' });
+    assert.equal(hits.length, 1);
+    assert.match(hits[0].text, /memory evidence/);
+    assert.doesNotMatch(hits[0].text, /Preview-only/);
+    assert.equal(hits[0].truncated, text.length > 640 ? true : undefined);
+    if (text.length <= 640) assert.equal(hits[0].text, text);
+  }
+});
+
 test('single-page references are retained, expand source content and enforce snapshot identity', () => {
   const cache = new ContextReadCache();
   const snap = snapshot([textUnit('a', 'Full source text', { preview: 'Short' })]);

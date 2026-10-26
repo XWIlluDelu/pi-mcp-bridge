@@ -91,6 +91,13 @@ A successful response identifies the server as `pi-session-bridge` and includes 
 
 The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config and token must be canonical absolute paths to regular files owned by the service user, with no group/other access; symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
 
+The HTTP service and each stdio proxy load the token once at startup. Replacing
+the file does not revoke the token already loaded by a running service or update
+an existing proxy. Changing only the file's contents also does not appear in
+`health.restart_required`. Coordinate a token change with restarting the service
+and its proxies at a safe work boundary, and update the tunnel's injected token
+to match. Then repeat the discovery check above.
+
 Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend accepts only `Host: 127.0.0.1:PORT` and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
 
 Clients/gateways must accept `application/json` and `text/event-stream`; the backend returns ordinary JSON with `Cache-Control: no-store`. There is no MCP session ID, CORS browser access or GET/SSE endpoint. A disconnected client does not stop the shared service.

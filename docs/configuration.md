@@ -59,7 +59,7 @@ canonical paths; there is no caller `principal` field.
 
 | Key                       | Meaning                                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `stateDir`                | Private Bridge state, recoverable trash and service-exclusivity namespace.                                               |
+| `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete) and service-exclusivity namespace.                           |
 | `sessionRoots`            | Nonempty array of absolute native session-storage directories.                                                           |
 | `folders`                 | Configured creation targets, each `{path}` with an absolute project cwd. Inclusion grants no rights.                     |
 | `defaults`                | All seven permission keys, each boolean or `null`; `null` denies.                                                        |
@@ -263,3 +263,28 @@ crashes release them. Edits compare the captured revision before atomic
 replacement. Startup removes only its own stale owner-control socket after
 obtaining service exclusivity. Session writer claims and explicit pauses follow
 the [runtime ownership rules](runtime.md).
+
+## Diagnostics
+
+Set `PI_MCP_LOG=1` in the Bridge process's launch environment before its next
+start. For stdio, add it to the MCP client's environment settings; for HTTP, use
+the service's launch environment. This is a startup setting, not an owner JSON
+field or a hot-update option. Coordinate any restart with active work.
+
+Bridge writes newline-delimited JSON diagnostics to **stderr**; stdio stdout
+remains the MCP stream. Collect stderr through the client or service manager.
+Records identify the process with `run_id` and `pid`, with `event`, operation,
+duration and known error codes where applicable. Use `trace_id` to group related
+stages; a stdio request's permission snapshot and tool execution can have
+different trace IDs. `session_ref` and `mcp_id_ref` are hashed correlation keys, not the
+original IDs. These records contain allowlisted metadata rather than prompts,
+transcripts, credentials or arbitrary native error text. Other native or
+extension output is separate and should be reviewed before sharing logs.
+
+Start with the failed operation's code and related trace stages. Model discovery
+adds [`catalog_stage` and `catalog_reason`](model-control.md#session-independent-model-catalog);
+event delivery has [callback-specific diagnostics](events.md#authorization-storage-and-delivery).
+Output is best effort and drops records if the collector stalls. It is not a
+durable audit trail: a missing record cannot prove that work was not admitted.
+Resolve uncertain submissions through the [submission receipt](api.md#submission-receipt),
+not by retrying based only on logs.
