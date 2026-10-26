@@ -1,3 +1,5 @@
+import { readSource } from './fixtures/read-source.mjs';
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -121,7 +123,7 @@ test('original custom compaction hook preserves native summary, retained boundar
   assert.equal(compactCalls, 1);
   const entry = manager.getEntries().find((e) => e.type === 'compaction');
   assert.equal(entry.fromHook, true);
-  const context = await f.bridge.read({ session_id: f.id, detail: 'full', preset: 'recent' });
+  const context = await readSource(f.bridge, { session_id: f.id, range: { recent: 3 } });
   const parts = context.items.find((x) => x.type === 'summary').parts;
   assert.equal(parts[0].source.entry_id, entry.id);
   assert.equal(parts[0].message.summary, 'PUBLIC_EXTENSION_CHECKPOINT');
@@ -144,7 +146,11 @@ test('display-hidden custom messages remain projected while custom extension sta
       );
     }),
   );
-  const context = await f.bridge.read({ session_id: f.id, detail: 'full', preset: 'full' }),
+  const context = await readSource(f.bridge, {
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    }),
     raw = await loadSavedSession(f.saved);
   assert.ok(
     context.items.some(
@@ -159,7 +165,7 @@ test('display-hidden custom messages remain projected while custom extension sta
   assert.ok(raw.entries.some((x) => x.type === 'custom_message' && x.display === false));
   f.config.grants.push({ session_id: f.id, read: false });
   await assert.rejects(
-    f.bridge.read({ session_id: f.id, detail: 'full', preset: 'full' }),
+    readSource(f.bridge, { session_id: f.id, range: { recent: -1 }, content: ALL_CONTENT }),
     /NOT_FOUND_OR_DENIED/,
   );
 });
@@ -189,7 +195,11 @@ test('request-time filtering differs from saved projection; reads neither replay
     1,
   );
   const fileBefore = await fs.readFile(f.saved.file, 'utf8'),
-    readBefore = await f.bridge.read({ session_id: f.id, detail: 'full', preset: 'full' });
+    readBefore = await readSource(f.bridge, {
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
   assert.ok(JSON.stringify(readBefore).includes('PUBLIC_OLD_PLAN'));
   assert.equal(contextCalls, 0);
   assert.equal(beforeCalls, 0);
@@ -210,7 +220,11 @@ test('request-time filtering differs from saved projection; reads neither replay
   assert.equal(requestMessages[0].content, 'PUBLIC_FORCED_MEMORY');
   const afterPrompt = await fs.readFile(f.saved.file, 'utf8');
   assert.notEqual(afterPrompt, fileBefore);
-  const readAfter = await f.bridge.read({ session_id: f.id, detail: 'full', preset: 'full' });
+  const readAfter = await readSource(f.bridge, {
+    session_id: f.id,
+    range: { recent: -1 },
+    content: ALL_CONTENT,
+  });
   assert.ok(JSON.stringify(readAfter).includes('PUBLIC_OLD_PLAN'));
   assert.ok(!JSON.stringify(readAfter).includes('PUBLIC_FORCED_MEMORY'));
   assert.equal(await fs.readFile(f.saved.file, 'utf8'), afterPrompt);
@@ -297,7 +311,11 @@ test('real nested tool failure remains visible under its successful outer tool i
   assert.equal(raw.isError, false, JSON.stringify(raw));
   assert.equal(raw.nestedCalls.calls[0].status, 'error');
   assert.match(raw.nestedCalls.calls[0].error, /NESTED_REAL_FAILURE/);
-  const read = await f.bridge.read({ session_id: f.id, detail: 'full', preset: 'full' });
+  const read = await readSource(f.bridge, {
+    session_id: f.id,
+    range: { recent: -1 },
+    content: ALL_CONTENT,
+  });
   const outer = read.items.find((u) => u.type === 'tool_result').message;
   assert.equal(outer.isError, false);
   assert.deepEqual(outer.nestedCalls, raw.nestedCalls);

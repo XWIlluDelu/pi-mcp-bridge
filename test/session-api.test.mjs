@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { Bridge } from '../src/bridge.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
+import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { validateOwnerConfig } from '../src/owner-config.mjs';
 import { permitted, permissionWarnings } from '../src/permissions.mjs';
 
@@ -34,6 +35,7 @@ async function fixture(t, defaults = {}) {
   const bridge = await new Bridge(config, async (session) => ({
     alive: true,
     entries: () => loadSavedSession(session),
+    read: async (args) => prepareContextRead(await loadSavedSession(session), args),
     state: async () => ({ isIdle: true, isStreaming: false, pendingMessageCount: 0 }),
     command: async (command) => {
       calls.push({ session: session.id, command });

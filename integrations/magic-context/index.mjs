@@ -5,6 +5,8 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 
+import { contextSelection } from '../../src/read-schema.mjs';
+
 const execFileAsync = promisify(execFile);
 const SCHEMA_VERSION = 95;
 const COLUMNS = {
@@ -283,7 +285,7 @@ export function createMagicContextReader(options) {
         throw fail('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
       validateSession(context);
       const identity = await projectIdentity(context.session.cwd);
-      return withDatabase(database, (db) => {
+      const stored = withDatabase(database, (db) => {
         if (!sessionEvidence(db, context, identity)) throw fail('MAGIC_CONTEXT_SESSION_MISMATCH');
         const capturedAt = Date.now();
         const compartments = db
@@ -304,23 +306,47 @@ export function createMagicContextReader(options) {
            ORDER BY COALESCE(importance, 50) ASC, updated_at ASC, id ASC`,
           )
           .all(identity, capturedAt);
-        const preset = context.request?.preset ?? 'latest';
-        const selectedCompartments =
-          preset === 'full' ? compartments : compartments.slice(preset === 'recent' ? -4 : -2);
-        const selectedMemories =
-          preset === 'full' ? memories : memories.slice(preset === 'recent' ? -5 : -3);
-        return {
-          native: true,
-          coverage: [
-            { type: 'summary', selected: selectedCompartments.length, total: compartments.length },
-            { type: 'memory', selected: selectedMemories.length, total: memories.length },
-          ],
-          items: [
-            ...selectedCompartments.map((row) => compartmentItem(row, capturedAt)),
-            ...selectedMemories.map((row) => memoryItem(row, capturedAt)),
-          ],
-        };
+        return { capturedAt, compartments, memories };
       });
+      const { capturedAt, compartments, memories } = stored;
+      const summaries = compartments.map((row) => compartmentItem(row, capturedAt));
+      // Acquire once after releasing the read transaction. The same native
+      // capture supplies branch facts here and task/progress in the result.
+      const native = await context.nativeRead({
+        entry_ids: [
+          ...new Set(summaries.map((item) => item.source.source_entry_id).filter(Boolean)),
+        ],
+      });
+      for (const item of summaries) {
+        const end = item.source.source_entry_id;
+        item.branch_relation = end ? native.entry_relations[end] : 'unknown';
+      }
+      const { content } = contextSelection(context.request ?? {});
+      const eligible =
+        content.summary === -1
+          ? summaries
+          : summaries.filter((item) => item.branch_relation !== 'off_branch');
+      const last = (items, count) =>
+        count === -1 ? items : count === 0 ? [] : items.slice(-count);
+      const selectedSummaries = last(eligible, content.summary);
+      const selectedMemories = last(memories, content.memory);
+      const excluded = summaries.length - eligible.length;
+      return {
+        native: true,
+        coverage: [
+          {
+            type: 'summary',
+            selected: selectedSummaries.length,
+            total: summaries.length,
+            ...(excluded ? { excluded } : {}),
+          },
+          { type: 'memory', selected: selectedMemories.length, total: memories.length },
+        ],
+        items: [
+          ...selectedSummaries,
+          ...selectedMemories.map((row) => memoryItem(row, capturedAt)),
+        ],
+      };
     },
   };
 }

@@ -1,3 +1,4 @@
+import { readSource } from './fixtures/read-source.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -106,7 +107,7 @@ test('send-only permission cannot disclose metadata or bodies', async (t) => {
   ]);
   assert.deepEqual((await f.bridge.list()).sessions, []);
   assert.deepEqual((await f.bridge.list({ name: 'secret' })).sessions, []);
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(readSource(f.bridge, { session_id: f.id }), /NOT_FOUND_OR_DENIED/);
   const receipt = await f.bridge.send({
     session_id: f.id,
 
@@ -190,13 +191,13 @@ test('context edits and branch selection; raw remains distinct; read does not wr
     },
   ]);
   const before = await fs.readFile(file, 'utf8');
-  const read = await f.bridge.read({ detail: 'full', session_id: f.id });
+  const read = await readSource(f.bridge, { session_id: f.id });
   assert.equal(read.items[0].message.content, 'replacement');
   assert.equal(JSON.stringify(read).includes('original-secret'), false);
   assert.equal(JSON.stringify(read).includes('other-branch'), false);
   assert.equal((await loadSavedSession(await f.bridge.session(f.id))).entries.length, 3);
   await assert.rejects(
-    f.bridge.read({ detail: 'full', session_id: f.id, leaf_id: 'missing' }),
+    readSource(f.bridge, { session_id: f.id, leaf_id: 'missing' }),
     /ENTRY_NOT_FOUND/,
   );
   assert.equal(await fs.readFile(file, 'utf8'), before);
@@ -221,11 +222,10 @@ test('compaction preserves checkpoint and kept context; existing summary only', 
       systemMessage: { role: 'system', content: 'checkpoint' },
     },
   ]);
-  const r = await f.bridge.read({
-    detail: 'full',
+  const r = await readSource(f.bridge, {
     session_id: f.id,
-    preset: 'recent',
-    select: { system: -1 },
+    range: { recent: 3 },
+    content: { system: true },
   });
   assert.equal(r.items[0].message.role, 'system');
   assert.equal(JSON.stringify(r).includes('summarized-old'), false);
@@ -274,7 +274,7 @@ test('summaries follow the selected leaf and exclude superseded checkpoints reta
     },
   ]);
   const before = await fs.readFile(file, 'utf8');
-  const current = await f.bridge.read({ detail: 'full', session_id: f.id, preset: 'recent' });
+  const current = await readSource(f.bridge, { session_id: f.id, range: { recent: 3 } });
   const summaryParts = (read) =>
     read.items.filter((x) => x.type === 'summary').flatMap((x) => x.parts);
   assert.deepEqual(
@@ -283,10 +283,9 @@ test('summaries follow the selected leaf and exclude superseded checkpoints reta
   );
   assert.equal(current.leaf_id, 'later');
   assert.equal(summaryParts(current)[0].message.summary, 'new checkpoint');
-  const earlier = await f.bridge.read({
-    detail: 'full',
+  const earlier = await readSource(f.bridge, {
     session_id: f.id,
-    preset: 'recent',
+    range: { recent: 3 },
     leaf_id: 'b',
   });
   assert.deepEqual(
@@ -294,10 +293,7 @@ test('summaries follow the selected leaf and exclude superseded checkpoints reta
     ['c1'],
   );
   assert.equal(earlier.leaf_id, 'b');
-  assert.deepEqual(
-    (await f.bridge.read({ detail: 'full', session_id: f.id, leaf_id: null })).items,
-    [],
-  );
+  assert.deepEqual((await readSource(f.bridge, { session_id: f.id, leaf_id: null })).items, []);
   const raw = await loadSavedSession(await f.bridge.session(f.id));
   assert.equal(raw.entries.find((e) => e.id === 'c2').firstKeptEntryId, 'c1');
   assert.equal(raw.entries.find((e) => e.id === 'c1').summary, 'old checkpoint');
@@ -322,12 +318,11 @@ test('summaries omit a context-hidden branch summary but retain its original raw
     },
     { type: 'context_edit', id: 'hide', parentId: 'branch', targetId: 'branch', replacement: null },
   ]);
-  const current = await f.bridge.read({ detail: 'full', session_id: f.id, preset: 'recent' });
+  const current = await readSource(f.bridge, { session_id: f.id, range: { recent: 3 } });
   assert.ok(!current.items.some((x) => x.type === 'summary'));
-  const earlier = await f.bridge.read({
-    detail: 'full',
+  const earlier = await readSource(f.bridge, {
     session_id: f.id,
-    preset: 'recent',
+    range: { recent: 3 },
     leaf_id: 'branch',
   });
   assert.equal(
@@ -343,10 +338,10 @@ test('selected context leaf metadata matches projected branch, including empty c
     { type: 'message', id: 'a', parentId: null, message: { role: 'user', content: 'branch-a' } },
     { type: 'message', id: 'b', parentId: null, message: { role: 'user', content: 'branch-b' } },
   ]);
-  const selected = await f.bridge.read({ detail: 'full', session_id: f.id, leaf_id: 'a' });
+  const selected = await readSource(f.bridge, { session_id: f.id, leaf_id: 'a' });
   assert.equal(selected.leaf_id, 'a');
   assert.equal(selected.items[0].message.content, 'branch-a');
-  const empty = await f.bridge.read({ detail: 'full', session_id: f.id, leaf_id: null });
+  const empty = await readSource(f.bridge, { session_id: f.id, leaf_id: null });
   assert.equal(empty.leaf_id, null);
   assert.deepEqual(empty.items, []);
   assert.equal((await loadSavedSession(await f.bridge.session(f.id))).leafId, 'b');
@@ -407,7 +402,7 @@ test('changed native header identity produces a new opaque ID and cannot reuse o
     original.file,
     JSON.stringify({ ...original.header, id: 'replacement-native-id' }) + '\n',
   );
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(readSource(f.bridge, { session_id: f.id }), /NOT_FOUND_OR_DENIED/);
   const rejected = await f.bridge.send({
     session_id: f.id,
 
@@ -464,7 +459,7 @@ test('invalid transcript trees retain identity but content reads reject', async 
     }) + '\n',
   );
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.id);
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /INVALID_SESSION_TREE/);
+  await assert.rejects(readSource(f.bridge, { session_id: f.id }), /INVALID_SESSION_TREE/);
 });
 
 test('oversized entry IDs cannot bypass read response bounds', async (t) => {
@@ -478,7 +473,7 @@ test('oversized entry IDs cannot bypass read response bounds', async (t) => {
     },
   ]);
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.id);
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /INVALID_SESSION_TREE/);
+  await assert.rejects(readSource(f.bridge, { session_id: f.id }), /INVALID_SESSION_TREE/);
 });
 
 test('overlapping bridge state and session storage is rejected', async (t) => {

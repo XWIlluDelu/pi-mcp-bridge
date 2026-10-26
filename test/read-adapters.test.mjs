@@ -77,9 +77,9 @@ test('intercom inputs use native prompt selectors without rewriting message role
     data: { privateState: true },
   });
   const before = structuredClone(entries);
-  const full = prepare(entries, { preset: 'full' });
+  const full = prepare(entries, { range: { recent: -1 }, content: { tool: -1 } });
   assert.equal(full.units.filter((u) => u.type === 'prompt').length, 5);
-  const latest = prepare(entries);
+  const latest = prepare(entries, { range: { recent: 1 } });
   assert.deepEqual(
     latest.units.map((u) => u.source.entry_id),
     ['i3', 'a3', 'notice'],
@@ -92,16 +92,14 @@ test('intercom inputs use native prompt selectors without rewriting message role
   assert.equal(input.source.read_adapter, 'pi-intercom');
   assert.deepEqual(input.message.details, details);
   assert.equal(latest.units[1].prompt_id, 'i3');
-  assert.equal(latest.omissions.prompts, 4);
-  const recent = prepare(entries, { preset: 'recent' });
+  assert.equal(latest.omissions.input, 4);
+  const recent = prepare(entries, {});
   assert.deepEqual(
     recent.units.filter((u) => u.type === 'prompt').map((u) => u.prompt_id),
     ['i1', 'i2', 'i3'],
   );
   assert.deepEqual(
-    prepare(entries, { select: { recent_prompts: 0, earliest_prompts: 1 } }).units.map(
-      (u) => u.source.entry_id,
-    ),
+    prepare(entries, { range: { recent: 0, earliest: 1 } }).units.map((u) => u.source.entry_id),
     ['u', 'a'],
   );
   const native = prepare(entries, {}, []);
@@ -121,7 +119,7 @@ test('custom input mappings retain native context edits, branch boundaries and t
     msg('answer', 'result', 'assistant', [text('latest answer')]),
     { type: 'context_edit', id: 'hide', parentId: 'answer', targetId: 'i2', replacement: null },
   ];
-  const latest = prepare(entries, { select: { tools: -1 } });
+  const latest = prepare(entries, { range: { recent: 1 }, content: { tool: -1 } });
   assert.deepEqual(
     latest.units.map((u) => u.source.entry_id),
     ['i2', 'answer'],
@@ -133,7 +131,7 @@ test('custom input mappings retain native context edits, branch boundaries and t
   assert.equal(boundary.source.read_adapter, intercom.id);
   assert.equal(latest.units[1].prompt_id, boundary.prompt_id);
   assert.ok(!JSON.stringify(latest).includes('HIDDEN_INPUT'));
-  const full = prepare(entries, { preset: 'full' });
+  const full = prepare(entries, { range: { recent: -1 }, content: { tool: -1 } });
   assert.equal(full.units.find((u) => u.type === 'tool_result').prompt_id, 'i1');
   assert.equal(full.units.find((u) => u.type === 'tool_result').pairing, 'paired');
   const early = prepare(entries, { leaf_id: 'call' });

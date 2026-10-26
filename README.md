@@ -4,7 +4,7 @@ Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, w
 
 ## What it does
 
-- List authorized sessions, read useful task overviews, search effective context and expand referenced evidence.
+- List authorized sessions, read recent turns in source order, search effective context and expand referenced messages or evidence.
 - Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
 - Send text and images, run native shell commands, select model/thinking settings, compact context and stop work.
 - Create or fork sessions, and move deleted sessions to recoverable trash while retaining project files.

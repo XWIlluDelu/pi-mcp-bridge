@@ -9,7 +9,7 @@ import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema, searchSchema } from './read-schema.mjs';
+import { readSchema, searchSchema, ALL_CONTENT } from './read-schema.mjs';
 import { publicOperationSchemas } from './tool-schemas.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
@@ -529,9 +529,18 @@ export class Bridge {
   async search(input, options = {}) {
     const parsed = searchSchema.safeParse(input);
     if (!parsed.success) throw new Error('INVALID_SEARCH_ARGUMENTS');
-    const { query, ...args } = parsed.data;
+    const { query, content, ...args } = parsed.data;
+    const selected =
+      content === undefined
+        ? ALL_CONTENT
+        : Object.fromEntries(
+            Object.entries(ALL_CONTENT).map(([kind, value]) => [
+              kind,
+              content.includes(kind) ? value : typeof value === 'boolean' ? false : 0,
+            ]),
+          );
     return this.read(
-      { ...args, detail: 'brief', ...(args.view !== 'runtime' ? { preset: 'full' } : {}) },
+      { ...args, content: selected, ...(args.view !== 'runtime' ? { range: { recent: -1 } } : {}) },
       { ...options, searchQuery: query },
     );
   }
@@ -583,7 +592,7 @@ export class Bridge {
         readPins,
       });
     }
-    args = { ...args, session_id: id, detail: args.detail ?? 'brief' };
+    args = { ...args, session_id: id };
     let runtime = await this.pool.forRead(s);
     while (runtime && this.handoffs.get(id)?.runtime === runtime) {
       await runtime.autoReleaseTask;
@@ -606,10 +615,11 @@ export class Bridge {
             : this.pool.observations.get(s);
       retained = !runtime;
     } else {
-      const nativeRead = () =>
+      const nativeRead = ({ entry_ids } = {}) =>
         this.acquireNativeRead(s, runtime, {
           ...args,
           view: 'session',
+          ...(entry_ids !== undefined ? { entry_ids } : {}),
           ...(searchQuery ? { search_query: searchQuery } : {}),
         });
       const acquire = async () => {
@@ -682,7 +692,6 @@ export class Bridge {
         ...(captured.observation ? { observation: captured.observation } : {}),
         ...(captured.reader ? { reader: captured.reader } : {}),
         request: args,
-        detail: args.detail,
         leaf_id: captured.leaf_id,
         selection: captured.selection,
         omissions: captured.omissions,
@@ -708,25 +717,11 @@ export class Bridge {
       runtimeEvents: events,
       readPins,
     };
-    return args.detail === 'brief'
-      ? this.readCache.navigate(snapshot, args, renderOptions, searchQuery)
-      : this.readCache.render(snapshot, args, renderOptions);
+    return this.readCache.navigate(snapshot, args, renderOptions, searchQuery);
   }
   async acquireNativeRead(session, runtime, args) {
-    if (runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord))
-      return runtime.read(args);
-    if (runtime) {
-      const active = await runtime.entries();
-      if (
-        !active.entries.every((entry) => typeof entry.id === 'string' && entry.id.length <= 128) ||
-        !(
-          active.leafId === null ||
-          (typeof active.leafId === 'string' && active.leafId.length <= 128)
-        )
-      )
-        throw new Error('INVALID_RUNTIME_ENTRIES');
-      session = { ...session, entries: active.entries, leafId: active.leafId, live: active.live };
-    } else session = await loadSavedSession(session, { omitImageData: true, config: this.config });
+    if (runtime) return runtime.read(args);
+    session = await loadSavedSession(session, { omitImageData: true, config: this.config });
     return prepareContextRead(session, args, {
       ...(await nativeSdk(this.config, launchProfile(this.config).env)),
       readAdapters: this.compatibilityServices.readInputs.snapshot(),

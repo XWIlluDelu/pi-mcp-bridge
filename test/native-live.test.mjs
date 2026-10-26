@@ -75,7 +75,7 @@ test(
     assert.deepEqual(busy.capabilities, { send: true, command: true, stop: true });
     assert.equal(live.live.source, 'rpc_message_events');
     assert.equal(live.live.transient, true);
-    assert.ok(!live.items.some((item) => item.type === 'text'));
+    assert.ok(!live.items.some((item) => item.type === 'assistant'));
     assert.ok(Buffer.byteLength(JSON.stringify(live)) <= 4096);
     const historical = await bridge.read({
       session_id: session.id,
@@ -90,7 +90,7 @@ test(
     const final = await bridge.read({ session_id: session.id, max_bytes: 4096 });
     assert.equal(final.live.available, false);
     assert.equal(final.live.reason, 'native_events_unavailable');
-    assert.ok(final.items.some((item) => item.type === 'text'));
+    assert.ok(final.items.some((item) => item.type === 'assistant'));
     const fixed = await bridge.read({
       session_id: session.id,
       leaf_id: live.leaf_id,
@@ -109,7 +109,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const { bridge, session, finish } = await fixture(t);
-    const read = () => bridge.read({ session_id: session.id, detail: 'full', max_bytes: 4096 });
+    const read = () => bridge.read({ session_id: session.id, max_bytes: 4096 });
     const preview = async () => {
       const result = await read();
       return result.live?.items?.some((u) => u.block?.text) ? result : null;
@@ -143,13 +143,13 @@ test(
     const current = await until(preview);
     resume.resolve();
     const earlier = await reading;
-    const oldPrompt = earlier.items.findLast((i) => i.type === 'prompt'),
-      newPrompt = current.items.findLast((i) => i.type === 'prompt');
-    assert.equal(oldPrompt.message.content[0].text, 'PROMPT_A');
+    const oldPrompt = earlier.items.findLast((i) => i.type === 'input'),
+      newPrompt = current.items.findLast((i) => i.type === 'input');
+    assert.equal(oldPrompt.text, 'PROMPT_A');
     assert.deepEqual(earlier.live, first.live);
-    assert.equal(earlier.live.prompt_id, oldPrompt.prompt_id);
-    assert.equal(newPrompt.message.content[0].text, 'PROMPT_B');
-    assert.equal(current.live.prompt_id, newPrompt.prompt_id);
+    assert.equal(earlier.live.prompt_id, oldPrompt.source.entry_id);
+    assert.equal(newPrompt.text, 'PROMPT_B');
+    assert.equal(current.live.prompt_id, newPrompt.source.entry_id);
     assert.notEqual(current.live.prompt_id, earlier.live.prompt_id);
   },
 );

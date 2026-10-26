@@ -83,7 +83,7 @@ Example delivery:
       "session_id": "ps_0123456789abcdef0123456789abcdef",
       "view": "session",
       "leaf_id": "native-entry-id",
-      "preset": "latest"
+      "range": { "recent": 1 }
     }
   },
   "cursor": null

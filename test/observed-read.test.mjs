@@ -1,3 +1,4 @@
+import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -91,7 +92,7 @@ async function pages(bridge, first) {
   const result = [first];
   while (result.at(-1).next_cursor)
     result.push(await bridge.read({ cursor: result.at(-1).next_cursor, max_bytes: 4096 }));
-  return [...result].reverse().flatMap((p) => p.items);
+  return result.flatMap((p) => p.items);
 }
 
 test(
@@ -116,7 +117,11 @@ test(
     assert.ok(!JSON.stringify(units).includes('DROP_FROM_REQUEST'));
     assert.ok(!JSON.stringify(units).includes('LATER_FULL_CONTEXT_HOOK'));
     assert.ok(!JSON.stringify(units).includes('Synthetic response 1.'));
-    const native = await f.bridge.read({ session_id: f.id, preset: 'full' });
+    const native = await f.bridge.read({
+      session_id: f.id,
+      range: { recent: -1 },
+      content: ALL_CONTENT,
+    });
     assert.equal(native.view, 'session');
     assert.ok(JSON.stringify(native).includes('DROP_FROM_REQUEST'));
     assert.ok(JSON.stringify(native).includes('Synthetic response 1.'));
