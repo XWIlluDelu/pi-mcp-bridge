@@ -119,6 +119,18 @@ const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot
 export const documentUnits = docUnits;
 export function documentText(snapshot, doc) {
   const units = docUnits(snapshot, doc);
+  if (units.length && units.every((unit) => unit.message?.role === 'bashExecution')) {
+    // Source parts repeat execution facts so each reference page is readable.
+    // Search one continuous output body, with those facts included only once.
+    const message = {};
+    let output;
+    for (const unit of units) {
+      Object.assign(message, unit.message);
+      if (typeof unit.message.output === 'string') output = (output ?? '') + unit.message.output;
+    }
+    if (output !== undefined) message.output = output;
+    return messageText(message, { metadata: true });
+  }
   let body = '',
     previousBlock;
   for (const unit of units) {

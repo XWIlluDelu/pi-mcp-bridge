@@ -4,6 +4,24 @@ Bridge implements the [OpenAI MCP Events integration](https://developers.openai.
 on MCP `2026-07-28`. ChatGPT Work chats (desktop: Cloud selected) and dots can
 subscribe and react in the subscribing chat through outbound signed HTTPS webhooks.
 
+## Before subscribing
+
+- Connect ChatGPT to the authenticated Bridge endpoint using the
+  [transport setup](transports.md). Events require the `2026-07-28` protocol path;
+  a client that can call tools through an older SDK protocol may not support events.
+- Obtain the target's `session_id` and grant `read`. Sending work separately
+  requires `send`; subscription does not grant execution access. For a new task,
+  `create` without input gives you a saved ID to subscribe to before the first send.
+- Use a supported completion source as described below. An ordinary TUI/RPC
+  companion needs the [owner profile](runtime.md#daily-tui-and-ordinary-rpc-registration),
+  not only an IPC directory.
+- Allow outbound HTTPS from the Bridge host to the ChatGPT-provided callback.
+  An authenticated incoming tunnel does not provide this outbound connection.
+
+The normal order is **subscribe, confirm verification, send, receive, unsubscribe**.
+The [calling workflow](collaboration.md#calling-workflow) explains when the
+settlement excerpt is sufficient and when to read further.
+
 ## Scope and completion meaning
 
 The single event is `session.settled`, filtered by one known `session_id`.
@@ -30,7 +48,8 @@ owner exit or switching; delivery still checks current read access. Pi waits at
 most two seconds for local acknowledgement, never for HTTPS delivery. A stopped
 or unreachable Bridge can lose the occurrence without interrupting local Pi work.
 
-Subscribe **before** sending work. Monitoring continues until cancelled or expired.
+Subscription has no catch-up delivery for work that already settled. Monitoring
+continues until cancelled or expired.
 
 ## Protocol
 
@@ -111,7 +130,9 @@ uploaded or verified from paths in the text.
 
 When more detail is useful, pass `data.read` directly as the `read` tool arguments.
 Its explicit `view:"session"` reads the native boundary even when an enabled
-memory reader handles default reads; MC does not reconstruct historical leaves.
+memory reader handles default reads. For example, the
+[Magic Context reader](../integrations/magic-context/README.md) exposes current
+stored content and does not reconstruct historical leaves.
 The leaf pins that round despite later work. A null leaf denotes an empty branch.
 Deletion or revoked read access can make deeper reading unavailable. The
 subscribing chat's user chooses the reaction; event payloads contain data only.
@@ -144,9 +165,8 @@ Delivery acknowledges HTTP status only. Verification failures return `-32015 Cal
 Each connection resolves DNS anew, rejects nonpublic addresses, pins the validated
 address, and retains hostname-based TLS verification. No redirects are followed.
 Bridge uses native HTTPS without explicit HTTP/SOCKS proxy support; transparent
-TUN routing can provide outbound connectivity. The host needs HTTPS access to
-the ChatGPT-provided callback; the incoming Secure MCP Tunnel does not make
-this outbound request for it.
+TUN routing can provide outbound connectivity. See the [subscription
+prerequisites](#before-subscribing) for the separate incoming and outgoing paths.
 
 Delivery is bounded to ten attempts, with 1/2/4/8/16/30/60/120/120-second
 backoff (361 seconds in total) and ten-second network deadlines per attempt.

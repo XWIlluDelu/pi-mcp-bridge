@@ -7,6 +7,19 @@ native Pi extensions. Core imports only configured module paths; it contains no
 plugin-specific detection or storage code. The modules under `integrations/` are
 independent examples/implementations, not automatically enabled dependencies.
 
+No module is needed for native Session Context or Runtime Context. Enable a
+module when you use the corresponding Pi extension and want its additional
+reading behavior:
+
+| Module        | Adds                                                                                 | Setup and supported scope                                                                      |
+| ------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Intercom      | Input boundaries for `intercom_message`; Herdr daemon environment filtering          | [Intercom configuration](../integrations/intercom/README.md)                                   |
+| Magic Context | Stored session summaries and eligible own-project memories alongside native progress | [Magic Context configuration and schema requirements](../integrations/magic-context/README.md) |
+
+The integration README is authoritative for its external version, storage paths
+and content scope. This page defines shared Bridge configuration and the module
+API; [reading](reading.md) defines caller-facing selection and navigation.
+
 ## Owner configuration
 
 ```json
@@ -25,6 +38,14 @@ The list defaults to empty. Entries accept an absolute ESM `module` path,
 are not imported. Changes require service restart and appear in
 [`health.restart_required`](configuration.md#request-permission-snapshots).
 Duplicate paths and active module IDs reject.
+
+After a planned restart, use `health` to check the active configuration and read
+an authorized session that actually uses the extension. A matching session reader
+returns `view:"adapted"` and `reader.id`; enabling the module alone does not make
+every session match. Input mappings change native turn grouping without selecting
+an adapted reader. Explicit `view:"session"` remains available for native context.
+
+## Module lifecycle
 
 A module exports `{id,start}`. Bridge calls
 `start({id,services,onStop}, options)` once, in configuration order under its

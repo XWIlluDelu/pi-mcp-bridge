@@ -68,6 +68,14 @@ export default function(pi){
     const before = (await client.getEntries()).entries;
     const preflight = client.prompt('HOLD_PREFLIGHT');
     await until(() => exists(f.gate + '.preflight-start'));
+    const skipped = await f.bridge.send({
+      session_id: f.id,
+      text: 'MUST_NOT_ENTER_DURING_PREFLIGHT',
+      mode: 'idle_only',
+    });
+    assert.equal(skipped.status, 'skipped');
+    assert.equal(skipped.reason, 'busy');
+    assert.deepEqual((await client.getEntries()).entries, before);
     const refused = await f.bridge.reload({ session_id: f.id });
     assert.equal(refused.status, 'rejected');
     assert.equal(refused.reason, 'RELOAD_BUSY');

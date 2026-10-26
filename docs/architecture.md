@@ -54,7 +54,9 @@ APIs are in [module management](compatibility.md).
 Run `npm test` and `npm run format:check`. Tests use temporary native stores,
 isolated agent environments and synthetic providers without credentials or paid
 endpoints. CI runs both commands on Node 22 and 26 for `main` pushes and pull
-requests.
+requests. Native subprocess/PTY checks require `script`; the service-unit check
+requires `systemd-analyze`. The test environment must permit Unix sockets and
+preserve the Linux file ownership needed by the storage-integrity checks.
 
 Integration tests exercise submission, late acknowledgement,
 automatic continuation, completion delivery and reading an earlier result after
