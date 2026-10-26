@@ -2,6 +2,7 @@ import {
   boundMessage,
   dispatchModern,
   modernMessage,
+  isRpcRequest,
   rpcError,
   MCP_INPUT_LIMIT,
 } from './protocol.mjs';
@@ -102,20 +103,7 @@ export class BridgeStdioTransport {
       return;
     }
     if (body?.method === 'notifications/cancelled' && !this.sdkInitialized) return;
-    if (
-      !body ||
-      typeof body !== 'object' ||
-      Array.isArray(body) ||
-      body.jsonrpc !== '2.0' ||
-      typeof body.method !== 'string' ||
-      (body.params !== undefined &&
-        (!body.params || typeof body.params !== 'object' || Array.isArray(body.params))) ||
-      (body.id !== undefined &&
-        !(
-          (typeof body.id === 'number' && Number.isSafeInteger(body.id)) ||
-          (typeof body.id === 'string' && Buffer.byteLength(body.id) <= 1024)
-        ))
-    ) {
+    if (!isRpcRequest(body)) {
       this.track(this.write(rpcError(null, -32600, 'Invalid request')));
       return;
     }
