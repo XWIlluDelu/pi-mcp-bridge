@@ -307,6 +307,85 @@ test('search examines full split documents and returns a match outside the norma
 });
 
 for (const view of ['session', 'runtime']) {
+  test(`${view} search rejoins system fields without repeated labels or merged declarations`, () => {
+    const values = Array.from({ length: 5 }, (_, field) =>
+      Array.from(
+        { length: 100 },
+        (_, i) => `Field ${field} entry ${String(i).padStart(4, '0')}: a distinct instruction.`,
+      ).join(' '),
+    );
+    const message = {
+      role: 'system',
+      content: 'System body.',
+      sections: { rules: values[0], additional: values[1] },
+      toolsAdded: values.slice(2, 4).map((description) => ({ name: 'same', description })),
+      toolsRemoved: [{ name: 'same', description: values[4] }],
+    };
+    const request = {
+      session_id: identity.session_id,
+      view,
+      content: ALL_CONTENT,
+      ...(view === 'session' ? { range: { recent: -1 } } : {}),
+    };
+    const capture = (query) => {
+      if (view === 'session')
+        return prepareContextRead(
+          {
+            entries: [{ type: 'message', id: 'system', parentId: null, message }],
+            leafId: 'system',
+          },
+          { ...request, ...(query ? { search_query: query } : {}) },
+          { buildSessionProjection },
+        );
+      const target = { units: [], accountedBytes: 0 };
+      appendUnits(target, { type: 'system', source: { observation_index: 0 }, message });
+      return snapshot(target.units, { view, selection: null, omissions: null });
+    };
+    const captured = capture();
+    const fieldText = (unit) =>
+      Object.values(unit.message?.sections ?? {})[0] ??
+      unit.message?.toolsAdded?.[0]?.description ??
+      unit.message?.toolsRemoved?.[0]?.description;
+    const starts = captured.units.filter((unit) => unit.part === 1 && fieldText(unit));
+    assert.equal(starts.length, values.length, 'the production splitter split every field');
+    for (const [index, value] of values.entries()) {
+      const boundary = fieldText(starts[index]).length;
+      const query = value.slice(boundary - 30, boundary + 30);
+      assert.ok(value.includes(query));
+      assert.ok(!fieldText(starts[index]).includes(query));
+      const cache = new ContextReadCache();
+      const found = cache.navigate(capture(query), request, { identity }, query);
+      assert.equal(found.matches, 1);
+      assert.ok(found.items[0].text.includes(query));
+      const expanded = cache.expand([found.items[0].ref], identity);
+      assert.deepEqual(
+        expanded.units,
+        captured.units.map((unit) => (view === 'runtime' ? { ...unit, prompt_id: null } : unit)),
+        'references retain the captured source',
+      );
+    }
+    const text = documentText(captured, navigationDocuments(captured)[0]);
+    for (const value of values) assert.ok(text.includes(value));
+    assert.equal(text.match(/rules\n/g)?.length, 1);
+    assert.equal(text.match(/additional\n/g)?.length, 1);
+    assert.equal(text.match(/"name":"same"/g)?.length, 3);
+    for (let i = 0; i < values.length - 1; i++)
+      assert.ok(!text.includes(values[i].slice(-30) + values[i + 1].slice(0, 30)));
+    const firstBoundary = fieldText(starts[0]).length;
+    const fabricated =
+      values[0].slice(firstBoundary - 20, firstBoundary) +
+      'rules\n' +
+      values[0].slice(firstBoundary, firstBoundary + 20);
+    assert.equal(rows(captured, { query: fabricated }).length, 0);
+    const missing = {
+      ...captured,
+      units: captured.units.filter((unit) => unit !== starts[0]),
+    };
+    const remaining = missing.units.filter((unit) => unit.message?.sections?.rules);
+    const gapQuery = fieldText(remaining[0]).slice(-30) + fieldText(remaining[1]).slice(0, 30);
+    assert.equal(rows(missing, { query: gapQuery }).length, 0, 'missing part 1 prevents joining');
+  });
+
   test(`${view} search preserves continuous command output and per-part execution state`, () => {
     const output = Array.from(
       { length: 350 },

@@ -352,6 +352,35 @@ test('project-authorized subscriptions survive workspace cleanup but not permiss
   assert.equal(f.bridge.events.records.size, 0);
 });
 
+test('a retry cannot authorize an old occurrence through a replacement native cwd', async (t) => {
+  const f = await fixture(t),
+    project = f.dir + '/original',
+    replacement = f.dir + '/replacement';
+  await fs.mkdir(project);
+  await fs.mkdir(replacement);
+  const made = await savedSession(f.bridge, { project }),
+    session = await f.bridge.session(made.session_id);
+  f.config.defaults = denyAllPermissions();
+  f.config.grants = [{ folder: project, read: true }];
+  await f.call('events/subscribe', request(session.id));
+  const attempts = [];
+  f.bridge.events.post = async (_url, body) => {
+    attempts.push(JSON.parse(body));
+    const lines = (await fs.readFile(session.file, 'utf8')).trimEnd().split('\n');
+    lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: replacement });
+    await fs.writeFile(session.file, lines.join('\n') + '\n');
+    f.config.grants = [{ folder: replacement, read: true }];
+    return { status: 503 };
+  };
+  await f.settle(session);
+  assert.equal((await f.bridge.events.authorize(session.id)).header.cwd, replacement);
+  const context = await f.bridge.captureRequestContext();
+  assert.throws(() => f.bridge.check('read', session, context), /NOT_FOUND_OR_DENIED/);
+  assert.equal(attempts.length, 1, 'new project permission cannot release the old captured result');
+  assert.equal(attempts[0].data.result.text, 'Review [report](./report.md)');
+  assert.equal(f.bridge.events.deliveries.size, 0);
+});
+
 test('expired subscription records are pruned before loading active subscriptions', async (t) => {
   const f = await fixture(t);
   await f.call('events/subscribe', request(f.session.id));
