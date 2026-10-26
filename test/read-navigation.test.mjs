@@ -1028,7 +1028,7 @@ test('Bridge reference expansion rejects a changed native cwd without reacquirin
 
 test('read/search schemas and MCP discovery describe a usable navigation path', () => {
   assert.ok(readSchema.safeParse({ refs: ['opaque-ref'] }).success);
-  assert.ok(!readSchema.safeParse({ refs: ['opaque-ref'], detail: 'full' }).success);
+  assert.ok(!readSchema.safeParse({ refs: ['opaque-ref'], range: { recent: 1 } }).success);
   assert.ok(
     !readSchema.safeParse({ session_id: 's', view: 'runtime', range: { recent: 1 } }).success,
   );

@@ -216,11 +216,11 @@ async function attached(
   };
 }
 
-test('attached reload confirms replacement after a lost ACK and reports an old loaded version honestly', async (t) => {
-  const f = await attached(t, { loseAck: true, version: '0.7.0-dev.2' });
+test('attached reload confirms replacement after a lost ACK and reports a mismatched component version', async (t) => {
+  const f = await attached(t, { loseAck: true, version: '0.0.0' });
   assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
     status: 'completed',
-    owner_version: '0.7.0-dev.2',
+    owner_version: '0.0.0',
     read_compatible: false,
   });
   assert.equal(f.reloads(), 1);
