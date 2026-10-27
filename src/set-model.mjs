@@ -42,7 +42,7 @@ export function createModelSetter({ state, models, setModel, setThinkingLevel })
       const target = model ? (await models()).find((m) => sameModel(m, model)) : null;
       if (model && !target) throw new Error('MODEL_UNAVAILABLE');
       let selected = await checked();
-      if (!selected.model) throw new Error('MODEL_UNAVAILABLE');
+      if (!target && !selected.model) throw new Error('MODEL_UNAVAILABLE');
       let level = thinking_level;
       if (target && !sameModel(selected.model, target)) {
         // Model-only changes keep current effort; the native setter owns clamping.

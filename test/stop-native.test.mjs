@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession, savedEntries } from './fixtures/saved-session.mjs';
@@ -421,6 +422,7 @@ test(
   async (t) => {
     const f = await fixture(t),
       controller = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.bridge.pool.attachmentDir,
         session: f.saved,
       });
@@ -457,6 +459,7 @@ test(
   async (t) => {
     const f = await fixture(t),
       controller = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.bridge.pool.attachmentDir,
         session: f.saved,
       });

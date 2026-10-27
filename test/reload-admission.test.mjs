@@ -187,3 +187,69 @@ test('maintenance callback failures cannot change native operation failures', as
     true,
   );
 });
+
+test('idle compact excludes local preparation and retains an atomic gate through native completion', async () => {
+  class Session {
+    sessionManager = {};
+    async prompt(work) {
+      return await work;
+    }
+    async executeBash(work) {
+      return await work;
+    }
+    async compact(work) {
+      return await work;
+    }
+    async reload() {}
+  }
+  const admission = reloadAdmission(Session),
+    session = new Session(),
+    manager = session.sessionManager;
+  const ctx = { isIdle: () => true, hasPendingMessages: () => false };
+  const preparing = deferred(),
+    prepared = session.prompt(preparing.promise);
+  await assert.rejects(
+    admission.compact(manager, ctx, () => assert.fail('Must not interrupt input')),
+    /COMPACT_BUSY/,
+  );
+  preparing.resolve();
+  await prepared;
+  const finished = deferred(),
+    later = deferred();
+  let delayed;
+  const compacting = admission.compact(manager, ctx, async () => {
+    delayed = later.promise.then(() => session.prompt('stale compact scope'));
+    return await session.compact(finished.promise);
+  });
+  assert.equal(admission.idle(manager), false);
+  assert.equal(admission.reloading(manager), false);
+  assert.equal(admission.seal(manager, ctx), false);
+  assert.throws(() => admission.begin(manager, ctx), /RELOAD_BUSY/);
+  await assert.rejects(session.prompt('new input'), /COMPACTION_PENDING/);
+  await assert.rejects(session.executeBash('new bash'), /COMPACTION_PENDING/);
+  await assert.rejects(
+    admission.compact(manager, ctx, () => {}),
+    /COMPACT_BUSY/,
+  );
+  finished.resolve('compacted');
+  assert.equal(await compacting, 'compacted');
+  assert.equal(admission.idle(manager), true);
+  assert.equal(admission.completed(manager), false, 'compact must not claim a completed reload');
+  const reload = admission.begin(manager, ctx);
+  later.resolve();
+  await assert.rejects(delayed, /RELOAD_IN_PROGRESS/);
+  await reload.run(() => session.reload());
+  await assert.rejects(
+    admission.compact(manager, ctx, () => {
+      throw new Error('failed');
+    }),
+    /failed/,
+  );
+  assert.equal(admission.idle(manager), true);
+  assert.equal(admission.completed(manager), true, 'compact must not clear reload evidence');
+  assert.equal(admission.seal(manager, ctx), true);
+  await assert.rejects(
+    admission.compact(manager, ctx, () => {}),
+    /RUNTIME_SHUTTING_DOWN/,
+  );
+});

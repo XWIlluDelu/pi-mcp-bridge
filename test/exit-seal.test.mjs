@@ -17,7 +17,7 @@ async function fixture(t) {
       phase: 'ready',
       owner: await processIdentity(),
       socket: path.join(dir, 'observer.sock'),
-      readContract: packageInfo.version,
+      bridgeVersion: packageInfo.version,
     },
     requests = [],
     connections = new Set();
@@ -128,7 +128,7 @@ test('seal rejects unsupported owners and cancellation before writing without se
     (error) => error === failure,
   );
   assert.equal(f.requests.length, 0);
-  for (const replacement of [{ kind: 'host' }, { readContract: 'unsupported' }]) {
+  for (const replacement of [{ kind: 'host' }, { bridgeVersion: 'unsupported' }]) {
     const runtime = new AttachedRuntime(f.runtime.config, f.runtime.session, {
       ...f.runtime.record,
       ...replacement,

@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -307,6 +308,7 @@ for (const op of ['send', 'command'])
         finishStop = gate();
       f.config.grants[0].command = true;
       const controller = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.bridge.pool.attachmentDir,
         session: f.saved,
       });
@@ -467,6 +469,7 @@ test('SDK host keeps Stop admission fenced when withdrawal capture fails during 
     cancellation = gate(),
     capturing = gate(),
     controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.bridge.pool.attachmentDir,
       session: f.saved,
     });
@@ -569,6 +572,7 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
 test('generic host IPC and actual MCP return joined editor recovery; missing callback is explicitly unsupported', async (t) => {
   const f = await fixture(t),
     controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.bridge.pool.attachmentDir,
       session: f.saved,
     });

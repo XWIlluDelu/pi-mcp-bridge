@@ -6,12 +6,12 @@ Settings on `send` or `create` instead apply immediately before that call's inpu
 and have stricter idle and validation requirements. [Runtime capabilities](runtime.md#runtime-capabilities)
 describe which owner types support each operation.
 
-| Operation                | Purpose                                        | Owner support                                           | Permission                             |
-| ------------------------ | ---------------------------------------------- | ------------------------------------------------------- | -------------------------------------- |
-| `models`                 | Native configured catalog                      | No session owner needed                                 | Effective execution authorization      |
-| `set_model`              | Change current selection, including while busy | Owned RPC, companion or supported host                  | `send`                                 |
-| `send`/`create` settings | Apply settings before input                    | Proven-idle Bridge-owned RPC                            | `send` / `create`                      |
-| `compact`                | Native context compaction                      | Owned RPC idle; attached owners with explicit interrupt | `send`; interrupt also requires `stop` |
+| Operation                | Purpose                                        | Owner support                                                | Permission                             |
+| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------ | -------------------------------------- |
+| `models`                 | Native configured catalog                      | No session owner needed                                      | Effective execution authorization      |
+| `set_model`              | Change current selection, including while busy | Owned RPC, companion or supported host                       | `send`                                 |
+| `send`/`create` settings | Apply settings before input                    | Proven-idle Bridge-owned RPC                                 | `send` / `create`                      |
+| `compact`                | Native context compaction                      | Owned RPC, companion/SDK idle gate; other hosts as supported | `send`; interrupt also requires `stop` |
 
 ## Session-independent model catalog
 
@@ -53,7 +53,8 @@ Requires `send` and at least one setting. Success returns the actual selection:
 }
 ```
 
-A model-only change preserves the effort current immediately before the switch, overriding target-model and global switch defaults. Pi's native thinking setter applies its compatible fallback if the new model does not support that effort. Explicit thinking also uses native clamping. Thinking-only calls act on the model current at execution. Selection changes session state without sending input, aborting work or changing global defaults.
+A model-only change preserves the effort current immediately before the switch, overriding target-model and global switch defaults. Pi's native thinking setter applies its compatible fallback if the new model does not support that effort. Explicit thinking also uses native clamping. An explicit available model can initialize a session with no current model.
+Thinking-only calls require a current model and act on it at execution. Selection changes session state without sending input, aborting work or changing global defaults.
 
 Busy selection is supported. Issued provider requests keep their captured settings; later provider calls, including continuations and queued input, use the current selection. Bridge serializes its own same-session mutations while independent native actions remain possible. Prompt preflight and concurrent Stop do not block selection. An unresolved setter blocks overlapping settings/input until it settles. Partial changes are not rolled back.
 
@@ -115,7 +116,15 @@ A model step can succeed while thinking remains unapplied. The result stays unkn
 }
 ```
 
-Default compaction requires `send` and proven idle. Owned RPCs can establish idle admission; ordinary companions and supplied SDK/RPC bindings report `COMPACT_BUSY` for observed busy work or `COMPACT_IDLE_UNCONFIRMED` otherwise. Custom hosts with their own admission gate can support idle compact; a missing callback returns `COMPACT_UNSUPPORTED`.
+Default compaction requires `send` and proven idle. Owned RPCs, ordinary companions
+and SDK bindings installed before local input can establish idle admission. The
+companion/SDK gate checks native idle, queued messages and public operation
+lifetimes (including asynchronous input preparation and bash), then excludes new
+local work until native compaction settles. Busy work returns `COMPACT_BUSY`.
+The supplied RPC binding has no gate over its remote writer and still requires
+explicit interrupt: it reports `COMPACT_BUSY` for observed busy work or
+`COMPACT_IDLE_UNCONFIRMED` otherwise. Custom hosts may supply their own atomic
+gate; a missing callback returns `COMPACT_UNSUPPORTED`.
 
 Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
 

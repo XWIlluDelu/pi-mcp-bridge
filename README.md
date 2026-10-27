@@ -32,7 +32,7 @@ chmod 600 /absolute/private/path/owner.json
 
 Edit `owner.json` using [configure one project](docs/configuration.md#configure-one-project): select the native session storage and project, then add its permission grant. The example denies all operations until you grant them. That guide also explains how storage paths differ from project paths and which directories must be private.
 
-If the target session is already open in Pi, [load its companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) before remote control. Bridge can resume an inactive saved session itself. Bridge and companion/host components must come from the [same version](docs/architecture.md#component-versions).
+If the target session is already open in Pi, [load its companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) before remote control. Bridge can resume an inactive saved session itself. Use matching Bridge control components; live reads follow the independent [read contract](docs/architecture.md#component-versions).
 
 For one stdio MCP client:
 

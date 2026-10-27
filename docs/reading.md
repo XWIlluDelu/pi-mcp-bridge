@@ -359,7 +359,10 @@ than unselected history. Continuations use only the cache, without fetching
 entries or computing history fingerprints.
 
 Fork uses a separate [raw snapshot contract](runtime.md#read-and-fork-boundaries).
-Read never falls back to it. Bridge and companion/host read contracts must match;
+Read never falls back to it. Live owners use their bound native projection,
+including historical leaves; changing PATH or a launch configuration does not
+change an already-running reader. Bridge and companion/host read contracts must match
+independently of their product versions;
 missing/mismatched contracts return `OWNER_READ_REFRESH_REQUIRED` with refresh
 guidance. Use [`reload({session_id})`](api.md#reload) at an idle boundary where
 supported; an old owner without that capability needs a native refresh first.

@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -28,6 +29,7 @@ async function fixture(t) {
   const made = await savedSession(bridge),
     saved = await bridge.session(made.session_id);
   const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: bridge.pool.attachmentDir,
     session: saved,
   });

@@ -123,13 +123,29 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
             const before = await state();
             assertIdentity(expected, before);
-            requireInterruptCompaction({ interrupt }, before);
-            beforeDispatch?.();
+            const compact = async () => {
+              beforeDispatch?.();
+              assertIdentity(before, identity(session));
+              try {
+                return await tracked.track(session.compact(instructions));
+              } catch {
+                throw new Error('PI_REJECTED');
+              }
+            };
             let result;
-            try {
-              result = await tracked.track(session.compact(instructions));
-            } catch {
-              throw new Error('PI_REJECTED');
+            if (!interrupt && admission)
+              result = await admission.compact(
+                session.sessionManager,
+                {
+                  isIdle: () => session.isIdle && !session.isBashRunning,
+                  hasPendingMessages: () => session.pendingMessageCount > 0,
+                },
+                compact,
+                tracked.submitting || pendingBashes > 0,
+              );
+            else {
+              requireInterruptCompaction({ interrupt }, before);
+              result = await compact();
             }
             assertIdentity(before, await state());
             return result;

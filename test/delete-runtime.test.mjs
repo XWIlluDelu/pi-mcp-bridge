@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -166,6 +167,7 @@ for (const kind of ['extension', 'rpc', 'host'])
         b = await writer(t);
       if (kind === 'host') {
         const host = await reserveHostSession({
+          buildSessionProjection: hostProjection,
           attachmentDir: f.config.attachmentDir,
           session: target,
           owner: a.owner,
@@ -211,6 +213,7 @@ for (const callback of ['cancel', 'release'])
         a = await writer(t);
       const b = shared ? a : await writer(t);
       const host = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.config.attachmentDir,
         session: target,
         owner: a.owner,
@@ -283,6 +286,7 @@ test('lost release ACK uses confirmed target closure without terminating the sha
   // This case discards a completed ACK; it is not a short-timeout test.
   delete f.config.attachmentExitTimeoutMs;
   const host = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: target,
     owner: a.owner,
@@ -354,6 +358,7 @@ test('a failing host release cannot authorize termination after its binding chan
     target = await f.make(),
     a = await writer(t);
   const host = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: target,
     owner: a.owner,

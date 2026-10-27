@@ -1,9 +1,9 @@
+import packageInfo from '../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import fs from 'node:fs/promises';
 import { publicError } from './errors.mjs';
 import net from 'node:net';
-import { nativeSdk } from './pi-installation.mjs';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
@@ -56,7 +56,13 @@ function receipt(value) {
     return { status: 'rejected', reason: value.reason };
   fail('INVALID_HOST_RECEIPT');
 }
-export async function reserveHostSession({ attachmentDir, session, owner, piExecutable }) {
+export async function reserveHostSession({
+  attachmentDir,
+  session,
+  owner,
+  buildSessionProjection,
+}) {
+  if (typeof buildSessionProjection !== 'function') fail('INVALID_HOST_PROJECTION');
   const target = structuredClone(session);
   owner ??= await processIdentity();
   if (!owner || !(await ownerAlive(owner))) fail('PROCESS_IDENTITY_UNAVAILABLE');
@@ -235,7 +241,6 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
         ...unavailableObservation(args.session_id, 'host_observer_unavailable'),
       };
     else if (['read', 'snapshot'].includes(request.op)) {
-      const sdk = request.op === 'read' ? await nativeSdk({ piExecutable }) : null;
       const observed = await callbacks.snapshot();
       const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
       await assertIdentity(snapshot);
@@ -282,7 +287,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
               live: snapshot.live ?? { available: false, source: 'host_snapshot' },
             },
             args,
-            { ...sdk, readAdapters: request.readAdapters },
+            { buildSessionProjection, readAdapters: request.readAdapters },
           ),
         };
       }
@@ -554,6 +559,7 @@ export async function reserveHostSession({ attachmentDir, session, owner, piExec
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
         imagesSupported: callbacks.supportsImages === true,
+        bridgeVersion: packageInfo.version,
         readContract: READ_CONTRACT,
         reloadSupported: typeof callbacks.reload === 'function',
       });

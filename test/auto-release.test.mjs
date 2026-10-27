@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
@@ -320,6 +321,7 @@ test(
   async (t) => {
     const f = await fixture(t);
     const controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     });
@@ -486,6 +488,7 @@ test(
       args: ['--session', f.session.file, ...f.config.piArgs],
     });
     const controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     });

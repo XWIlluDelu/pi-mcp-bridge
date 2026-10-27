@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -49,7 +50,11 @@ for (const [op, longMetadata] of [
           : null;
         if (fullOutputPath) await fs.writeFile(fullOutputPath, output, { mode: 0o600 });
         let calls = 0;
-        owner = await reserveHostSession({ attachmentDir: bridge.pool.attachmentDir, session });
+        owner = await reserveHostSession({
+          buildSessionProjection: hostProjection,
+          attachmentDir: bridge.pool.attachmentDir,
+          session,
+        });
         await owner.ready({
           state: async () => ({ sessionFile: session.file, sessionId: session.header.id }),
           snapshot: async () => ({

@@ -1,3 +1,4 @@
+import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -56,7 +57,7 @@ test('idle owned reload confirms a fresh worker without sending input or rewriti
   f.bridge.pool.factory = async (...args) => (fresh = await start(...args));
   assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
     status: 'completed',
-    owner_version: READ_CONTRACT,
+    owner_version: packageInfo.version,
     read_compatible: true,
   });
   assert.equal(old.exited, true);
@@ -131,7 +132,8 @@ async function attached(
     supported = true,
     error,
     loseAck = false,
-    version = READ_CONTRACT,
+    version = packageInfo.version,
+    contract = READ_CONTRACT,
     replaceIdentity = false,
     leaveUnchanged = false,
     initializing = false,
@@ -179,7 +181,8 @@ async function attached(
         ...record,
         generation: randomUUID(),
         phase: 'ready',
-        readContract: version,
+        bridgeVersion: version,
+        readContract: contract,
         ...(replaceIdentity ? { sessionId: 'different-native-session' } : {}),
       };
       if (invalidReplacement) await fs.writeFile(claimFile(dir, session), '{');
@@ -194,6 +197,7 @@ async function attached(
     socket: socketPath,
     phase: 'ready',
     mode: 'rpc',
+    bridgeVersion: packageInfo.version,
     readContract: READ_CONTRACT,
     ...(supported ? { reloadSupported: true } : {}),
   });
@@ -216,14 +220,23 @@ async function attached(
   };
 }
 
-test('attached reload confirms replacement after a lost ACK and reports a mismatched component version', async (t) => {
-  const f = await attached(t, { loseAck: true, version: '0.0.0' });
+test('attached reload confirms replacement after a lost ACK and reports an incompatible read contract', async (t) => {
+  const f = await attached(t, { loseAck: true, version: '0.0.0', contract: 'unsupported' });
   assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
     status: 'completed',
     owner_version: '0.0.0',
     read_compatible: false,
   });
   assert.equal(f.reloads(), 1);
+});
+
+test('reload reports product version independently of read compatibility', async (t) => {
+  const f = await attached(t, { version: 'another-product-version' });
+  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
+    status: 'completed',
+    owner_version: 'another-product-version',
+    read_compatible: true,
+  });
 });
 
 test('attached reload does not confuse a different native session with successful refresh', async (t) => {
@@ -283,7 +296,7 @@ test('a newly published owner must finish native initialization before reload co
   f.completeInitialization();
   assert.deepEqual(await work, {
     status: 'completed',
-    owner_version: READ_CONTRACT,
+    owner_version: packageInfo.version,
     read_compatible: true,
   });
 });
