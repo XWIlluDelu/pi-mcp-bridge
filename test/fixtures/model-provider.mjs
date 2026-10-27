@@ -61,6 +61,12 @@ export default function (pi) {
   pi.on('session_start', () => {
     pi.setActiveTools(['model_fixture_tool']);
   });
+  pi.registerCommand('fixture-independent-input', {
+    description: 'Start fixture input outside Bridge admission',
+    handler: async (text) => {
+      pi.sendUserMessage(text);
+    },
+  });
   pi.on('session_shutdown', async () => {
     const gate = process.env.PI_MODEL_GATE;
     if (await exists(gate + '.hold-shutdown')) {

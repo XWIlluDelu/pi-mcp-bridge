@@ -118,9 +118,12 @@ A model step can succeed while thinking remains unapplied. The result stays unkn
 
 Default compaction requires `send` and proven idle. Owned RPCs, ordinary companions
 and SDK bindings installed before local input can establish idle admission. The
-companion/SDK gate checks native idle, queued messages and public operation
+owner-side gate checks native idle, queued messages and public operation
 lifetimes (including asynchronous input preparation and bash), then excludes new
-local work until native compaction settles. Busy work returns `COMPACT_BUSY`.
+local work until native compaction settles. Owned RPC uses its matching observer
+for this atomic admission; a parent-side idle sample alone cannot authorize
+non-interrupting compaction. Input-free model selection remains available.
+Busy work returns `COMPACT_BUSY`.
 The supplied RPC binding has no gate over its remote writer and still requires
 explicit interrupt: it reports `COMPACT_BUSY` for observed busy work or
 `COMPACT_IDLE_UNCONFIRMED` otherwise. Custom hosts may supply their own atomic

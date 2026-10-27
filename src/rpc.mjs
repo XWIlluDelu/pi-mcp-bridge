@@ -173,6 +173,7 @@ export class PiRpc {
       this.alive = false;
       for (const req of this.pending.values()) {
         clearTimeout(req.timer);
+        req.controller?.abort();
         req.reject(
           Object.assign(
             new RpcFailure(this.startFailure?.code ?? 'RUNTIME_DISCONNECTED', req.written),
@@ -288,7 +289,7 @@ export class PiRpc {
     }
     if (event.type !== 'response') return;
     const req = this.pending.get(event.id);
-    if (!req || req.generation !== generation) return;
+    if (!req || req.generation !== generation || req.controller) return;
     // Only the matching prompt ACK is evidence of completed admission. State,
     // timers, unrelated events and malformed responses cannot clear uncertainty.
     if (
@@ -314,31 +315,6 @@ export class PiRpc {
       (event.command !== req.commandType || typeof event.success !== 'boolean')
     )
       return;
-    this.pending.delete(event.id);
-    clearTimeout(req.timer);
-    // A started/queued ACK is admission, never completion. In the supported
-    // owned RPC path its run must subsequently settle, including queued work.
-    if (
-      req.commandType === 'prompt' &&
-      event.success === true &&
-      ['started', 'queued'].includes(event.data?.disposition)
-    )
-      this.requiredSettlementSequence = Math.max(
-        this.requiredSettlementSequence,
-        (req.settlementSequence ?? this.settlementSequence) + 1,
-      );
-    if (
-      this.compactionMutation?.id === event.id &&
-      this.compactionMutation.generation === generation
-    )
-      this.compactionMutation = null;
-    if (this.modelMutation?.id === event.id && this.modelMutation.generation === generation)
-      this.modelMutation = null;
-    if (this.promptAdmission?.id === event.id && this.promptAdmission.generation === generation)
-      this.promptAdmission = null;
-    const notifyIdle = () => {
-      if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
-    };
     const ui = uiSnapshot(req.uiFacts);
     const result = event.success
       ? { ok: true, data: ui.ui ? { ...event.data, ...ui } : event.data }
@@ -350,6 +326,35 @@ export class PiRpc {
             : {}),
           ...ui,
         };
+    this.settleResponse(event.id, generation, result);
+  }
+  settleResponse(id, generation, result) {
+    if (generation !== this.generation) return;
+    const req = this.pending.get(id);
+    if (!req || req.generation !== generation) return;
+    this.pending.delete(id);
+    clearTimeout(req.timer);
+    // A started/queued ACK is admission, never completion. In the supported
+    // owned RPC path its run must subsequently settle, including queued work.
+    if (
+      req.commandType === 'prompt' &&
+      result.ok &&
+      ['started', 'queued'].includes(result.data?.disposition)
+    )
+      this.requiredSettlementSequence = Math.max(
+        this.requiredSettlementSequence,
+        (req.settlementSequence ?? this.settlementSequence) + 1,
+      );
+    if (this.compactionMutation?.id === id && this.compactionMutation.generation === generation)
+      this.compactionMutation = null;
+    if (this.modelMutation?.id === id && this.modelMutation.generation === generation)
+      this.modelMutation = null;
+    if (this.promptAdmission?.id === id && this.promptAdmission.generation === generation)
+      this.promptAdmission = null;
+    const notifyIdle = () => {
+      if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
+    };
+    const ui = uiSnapshot(req.uiFacts);
     if (req.timedOut) {
       req.log?.('rpc.late_ack', {
         op: req.commandType,
@@ -406,7 +411,7 @@ export class PiRpc {
     await beforeDispatch?.();
     let result, rejection;
     try {
-      result = await this.dispatch(command, timeout, late, allowBusySelection);
+      result = await this.dispatch(command, timeout, late, allowBusySelection, beforeDispatch);
     } catch (error) {
       if (error.code !== 'PI_REJECTED') throw error;
       rejection = error;
@@ -423,14 +428,14 @@ export class PiRpc {
     if (rejection) throw rejection;
     return result;
   }
-  dispatch(command, timeout = 5000, onLate, allowBusySelection = false) {
+  dispatch(command, timeout = 5000, onLate, allowBusySelection = false, beforeDispatch) {
     return diagnostics.measure(
       'rpc.command',
       { op: command.type, generation: this.generation },
-      () => this.dispatchRequest(command, timeout, onLate, allowBusySelection),
+      () => this.dispatchRequest(command, timeout, onLate, allowBusySelection, beforeDispatch),
     );
   }
-  dispatchRequest(command, timeout = 5000, onLate, allowBusySelection = false) {
+  dispatchRequest(command, timeout = 5000, onLate, allowBusySelection = false, beforeDispatch) {
     if (this.startFailure) return Promise.reject(this.startFailure);
     if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
     if (this.handoffPending && !['get_state', 'get_entries'].includes(command.type))
@@ -453,7 +458,14 @@ export class PiRpc {
       generation = this.generation;
     if (typeof id !== 'string' || !id.length || id.length > 128 || this.pending.has(id))
       return Promise.reject(new RpcFailure('INVALID_ARGUMENTS'));
-    const serialized = `${JSON.stringify({ ...command, id })}\n`;
+    const { idleOnly, ...nativeCommand } = command;
+    const guardedCompact = command.type === 'compact' && idleOnly === true;
+    if (
+      guardedCompact &&
+      (!this.ownerRecord || this.ownerRecord.bridgeVersion !== packageInfo.version)
+    )
+      return Promise.reject(new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED'));
+    const serialized = `${JSON.stringify({ ...nativeCommand, id })}\n`;
     if (command.type === 'prompt') this.promptAdmission = { id, generation };
     if (['set_model', 'set_thinking_level'].includes(command.type))
       this.modelMutation = { id, generation };
@@ -474,6 +486,11 @@ export class PiRpc {
         if (READ_COMMANDS.has(command.type)) this.pending.delete(id);
       };
       req.timer = setTimeout(() => {
+        if (guardedCompact && !req.written) {
+          this.settleResponse(id, generation, { ok: false, code: 'ACK_TIMEOUT' });
+          req.controller.abort();
+          return;
+        }
         req.timedOut = true;
         discardRead();
         reject(Object.assign(new RpcFailure('ACK_TIMEOUT', req.written), uiSnapshot(req.uiFacts)));
@@ -481,6 +498,40 @@ export class PiRpc {
         // their authoritative late-ACK recovery and admission fence.
       }, timeout);
       this.pending.set(id, req);
+      if (guardedCompact) {
+        req.controller = new AbortController();
+        const transport = new AttachedRuntime(this.config, this.session, this.ownerRecord);
+        void transport
+          .request('compact', { instructions: command.customInstructions ?? '' }, null, undefined, {
+            signal: req.controller.signal,
+            onWrite: () => {
+              // This is Bridge's synchronous input fence. No await may
+              // separate the final Stop/lifecycle check from the actual write.
+              beforeDispatch?.();
+              if (!this.alive || this.handoffPending || this.gracefulExitPromise)
+                throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+              req.written = true;
+            },
+          })
+          .then(
+            (data) => this.settleResponse(id, generation, { ok: true, data }),
+            (error) => {
+              if (!this.pending.has(id)) return;
+              if (error.uncertain) {
+                // Lost control transport is not evidence of native completion.
+                clearTimeout(req.timer);
+                req.timedOut = true;
+                req.reject(new RpcFailure(error.code ?? 'WRITE_UNKNOWN', true));
+              } else
+                this.settleResponse(id, generation, {
+                  ok: false,
+                  code: error.code ?? error.message,
+                  native_reason: error.native_reason,
+                });
+            },
+          );
+        return;
+      }
       req.written = true;
       const writeFailed = () => {
         clearTimeout(req.timer);

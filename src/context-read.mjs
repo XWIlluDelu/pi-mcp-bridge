@@ -3,7 +3,12 @@ import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
-import { fitNavigationRow, unitText } from './read-navigation.mjs';
+import {
+  fitNavigationRow,
+  navigationGroups,
+  navigationDocuments,
+  documentMatches,
+} from './read-navigation.mjs';
 
 // Change only when the live read request/snapshot semantics become incompatible.
 export const READ_CONTRACT = 'pi-bridge-read-v1';
@@ -706,18 +711,18 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
     target = { units: [], accountedBytes: 0 };
   let records = selected.records;
   if (search_query !== undefined) {
-    const query = search_query.toLocaleLowerCase(),
-      matches = new Set(),
-      tools = new Set();
-    for (const record of records) {
-      if (unitText(cleanRecord(record), true).toLocaleLowerCase().includes(query)) {
-        matches.add(record);
-        if (record.tool_id) tools.add(record.tool_id);
-      }
+    const matches = new Set();
+    for (const group of navigationGroups(records)) {
+      // Match the same readable document that navigation will expose, including
+      // adjacent assistant blocks and nested tools. Clean one group at a time;
+      // unmatched history never enters the bounded detached snapshot.
+      const candidate = { units: group.indices.map((index) => cleanRecord(records[index])) };
+      if (
+        navigationDocuments(candidate).some((doc) => documentMatches(candidate, doc, search_query))
+      )
+        for (const index of group.indices) matches.add(records[index]);
     }
-    records = records.filter(
-      (record) => matches.has(record) || (record.tool_id && tools.has(record.tool_id)),
-    );
+    records = records.filter((record) => matches.has(record));
   }
   for (const record of records) appendUnits(target, record);
   return {

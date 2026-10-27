@@ -11,7 +11,7 @@ import { toolDefinitions } from '../src/protocol.mjs';
 import { jsonBytes } from '../src/response-budget.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { buildSessionProjection } from './fixtures/pi.mjs';
+import { buildSessionProjection, SessionManager } from './fixtures/pi.mjs';
 
 const identity = {
   session_id: 'fixture',
@@ -306,6 +306,70 @@ test('search examines full split documents and returns a match outside the norma
   assert.equal(rows(snap, { query: 'needle', content: ['tool'] }).length, 0);
 });
 
+test('native search matches adjacent assistant blocks and expands their complete source document', () => {
+  const manager = SessionManager.inMemory('/synthetic');
+  manager.appendMessage({ role: 'user', content: 'Review the change.', timestamp: 0 });
+  const texts = [
+    'Earlier detail. '.repeat(300) + 'First observation.',
+    'Final recommendation.' + ' Supporting detail.'.repeat(300),
+    'Additional conclusion outside the matching phrase.',
+  ];
+  const entry = manager.appendMessage({
+    role: 'assistant',
+    content: texts.map((text) => ({ type: 'text', text, textSignature: 'PRIVATE_SIGNATURE' })),
+    timestamp: 0,
+  });
+  const data = { entries: manager.getEntries(), leafId: manager.getLeafId() };
+  const request = { ...args, max_bytes: 65536 };
+  const query = 'first observation.\nfinal recommendation.';
+  const captured = prepareContextRead(
+    data,
+    { ...request, search_query: query },
+    {
+      buildSessionProjection,
+    },
+  );
+  const cache = new ContextReadCache();
+  const found = cache.navigate(captured, request, { identity }, query);
+  assert.equal(found.matches, 1);
+  assert.equal(found.items[0].type, 'assistant');
+  assert.match(found.items[0].text, /First observation\.\nFinal recommendation\./);
+  const expanded = cache.expand([found.items[0].ref], identity);
+  for (const [index, text] of texts.entries()) {
+    const parts = expanded.units.filter((unit) => unit.source.block_index === index);
+    assert.ok(parts.every((unit) => unit.source.entry_id === entry));
+    assert.equal(parts.map((unit) => unit.block?.text ?? '').join(''), text);
+  }
+  assert.doesNotMatch(JSON.stringify(expanded), /PRIVATE_SIGNATURE/);
+});
+
+test('native search does not join a phrase across messages or a different content kind', () => {
+  const text = (value) => ({ type: 'text', text: value });
+  for (const boundary of ['message', 'thinking', 'tool']) {
+    const manager = SessionManager.inMemory('/synthetic');
+    manager.appendMessage({ role: 'user', content: 'Review the change.', timestamp: 0 });
+    const first = text('First observation.'),
+      second = text('Final recommendation.');
+    if (boundary === 'message') {
+      manager.appendMessage({ role: 'assistant', content: [first], timestamp: 0 });
+      manager.appendMessage({ role: 'assistant', content: [second], timestamp: 0 });
+    } else {
+      const middle =
+        boundary === 'thinking'
+          ? { type: 'thinking', thinking: 'Check the evidence.' }
+          : { type: 'toolCall', id: 'check', name: 'read', arguments: { path: '/synthetic' } };
+      manager.appendMessage({ role: 'assistant', content: [first, middle, second], timestamp: 0 });
+    }
+    const query = 'First observation.\nFinal recommendation.';
+    const captured = prepareContextRead(
+      { entries: manager.getEntries(), leafId: manager.getLeafId() },
+      { ...args, search_query: query },
+      { buildSessionProjection },
+    );
+    assert.equal(rows(captured, { query }).length, 0, boundary);
+  }
+});
+
 for (const view of ['session', 'runtime']) {
   test(`${view} search rejoins system fields without repeated labels or merged declarations`, () => {
     const values = Array.from({ length: 5 }, (_, field) =>
@@ -573,7 +637,11 @@ test('search filters before bounded capture and retains the complete matching lo
     [{ type: 'text', text: 'needle-verification: permission checks passed.' }],
     { toolCallId: 'target-call', toolName: 'read', isError: false },
   );
-  const data = { header: { id: 'native-fixture' }, entries, leafId: result.id };
+  const answer = add('assistant', [
+    { type: 'text', text: 'First observation.' },
+    { type: 'text', text: 'Final recommendation.' },
+  ]);
+  const data = { header: { id: 'native-fixture' }, entries, leafId: answer.id };
   const request = { session_id: identity.session_id, range: { recent: -1 }, content: ALL_CONTENT };
   const sdk = { buildSessionProjection };
   assert.throws(() => prepareContextRead(data, request, sdk), /READ_SNAPSHOT_TOO_LARGE/);
@@ -592,6 +660,14 @@ test('search filters before bounded capture and retains the complete matching lo
   const hits = rows(found, { query: 'needle-verification' });
   assert.equal(hits.length, 1);
   assert.equal(hits[0].type, 'tool');
+  const query = 'First observation.\nFinal recommendation.';
+  const adjacent = prepareContextRead(data, { ...request, search_query: query }, sdk);
+  assert.deepEqual(
+    adjacent.units.map((unit) => unit.source.entry_id),
+    [answer.id, answer.id],
+  );
+  assert.equal(rows(adjacent, { query }).length, 1);
+  assert.ok(jsonBytes(adjacent) < 4096);
 });
 
 test('runtime tool results retain their role and child navigation when nested calls split before the body', () => {

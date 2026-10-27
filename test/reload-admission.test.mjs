@@ -200,6 +200,12 @@ test('idle compact excludes local preparation and retains an atomic gate through
     async compact(work) {
       return await work;
     }
+    async setModel() {
+      return 'selected';
+    }
+    async cycleModel() {
+      await this.prompt('input from a model hook');
+    }
     async reload() {}
   }
   const admission = reloadAdmission(Session),
@@ -227,6 +233,8 @@ test('idle compact excludes local preparation and retains an atomic gate through
   assert.throws(() => admission.begin(manager, ctx), /RELOAD_BUSY/);
   await assert.rejects(session.prompt('new input'), /COMPACTION_PENDING/);
   await assert.rejects(session.executeBash('new bash'), /COMPACTION_PENDING/);
+  assert.equal(await session.setModel(), 'selected');
+  await assert.rejects(session.cycleModel(), /COMPACTION_PENDING/);
   await assert.rejects(
     admission.compact(manager, ctx, () => {}),
     /COMPACT_BUSY/,

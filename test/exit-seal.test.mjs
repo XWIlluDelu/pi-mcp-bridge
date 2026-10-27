@@ -5,6 +5,7 @@ import path from 'node:path';
 import net from 'node:net';
 import packageInfo from '../package.json' with { type: 'json' };
 import { AttachedRuntime, claimFile, processIdentity } from '../src/attachments.mjs';
+import { PiRpc } from '../src/rpc.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-seal-'),
@@ -27,12 +28,12 @@ async function fixture(t) {
     socket.on('close', () => connections.delete(socket));
     socket.on('error', () => {});
     let buffer = '';
-    socket.on('data', (chunk) => {
+    socket.on('data', async (chunk) => {
       buffer += chunk;
       if (!buffer.includes('\n')) return;
       const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
       requests.push(request);
-      const result = respond(request);
+      const result = await respond(request);
       if (result === null) return socket.destroy();
       socket.end(
         JSON.stringify({
@@ -139,4 +140,132 @@ test('seal rejects unsupported owners and cancellation before writing without se
     });
     assert.equal(f.requests.length, 0);
   }
+});
+
+const ownedRpc = (f) => {
+  const rpc = new PiRpc(f.runtime.config, f.runtime.session);
+  rpc.ownerRecord = f.runtime.record;
+  rpc.alive = true;
+  return rpc;
+};
+const idleCompact = { type: 'compact', customInstructions: '', idleOnly: true };
+const compacted = { firstKeptEntryId: 'kept', tokensBefore: 1000 };
+
+test(
+  'owned compact cancels an expired pre-write request without later dispatch',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t),
+      rpc = ownedRpc(f);
+    const entered = Promise.withResolvers(),
+      resume = Promise.withResolvers();
+    t.after(() => resume.resolve());
+    const request = AttachedRuntime.prototype.request;
+    t.mock.method(
+      AttachedRuntime.prototype,
+      'request',
+      function (op, body, wait, _check, transport) {
+        return request.call(
+          this,
+          op,
+          body,
+          wait,
+          async () => {
+            entered.resolve();
+            await resume.promise;
+          },
+          transport,
+        );
+      },
+    );
+    const pending = rpc.dispatch(idleCompact, 1000);
+    const rejected = assert.rejects(pending, { code: 'ACK_TIMEOUT', uncertain: false });
+    await entered.promise;
+    await rejected;
+    resume.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(f.requests.length, 0);
+    assert.equal(rpc.pending.size, 0);
+    assert.equal(rpc.compactionMutation, null);
+  },
+);
+
+test('owned compact keeps its control connection and fence for a matching late reply', async (t) => {
+  const f = await fixture(t),
+    rpc = ownedRpc(f);
+  const response = Promise.withResolvers(),
+    late = Promise.withResolvers();
+  t.after(() => response.resolve({ data: compacted }));
+  f.respond(() => response.promise);
+  await assert.rejects(
+    rpc.dispatch(idleCompact, 100, (result) => late.resolve(result)),
+    {
+      code: 'ACK_TIMEOUT',
+      uncertain: true,
+    },
+  );
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.requests[0].version, packageInfo.version);
+  assert.equal(rpc.pending.size, 1);
+  assert.ok(rpc.compactionMutation);
+  await rpc.drainAcks(); // Missing replies are not received ACK tasks.
+  response.resolve({ data: compacted });
+  assert.deepEqual(await late.promise, { ok: true, data: compacted });
+  assert.equal(rpc.pending.size, 0);
+  assert.equal(rpc.compactionMutation, null);
+  assert.equal(f.requests.length, 1);
+});
+
+test('owned compact rechecks Stop synchronously at the socket write boundary', async (t) => {
+  const f = await fixture(t),
+    rpc = ownedRpc(f);
+  let stopped = false;
+  const request = AttachedRuntime.prototype.request;
+  t.mock.method(AttachedRuntime.prototype, 'request', function (op, body, wait, check, transport) {
+    return request.call(
+      this,
+      op,
+      body,
+      wait,
+      async () => {
+        await check?.();
+        queueMicrotask(() => {
+          stopped = true;
+        });
+      },
+      transport,
+    );
+  });
+  await assert.rejects(
+    rpc.dispatch(idleCompact, 5000, undefined, false, () => {
+      if (stopped) throw new Error('STOP_IN_PROGRESS');
+    }),
+    { code: 'STOP_IN_PROGRESS', uncertain: false },
+  );
+  assert.equal(stopped, true);
+  assert.equal(f.requests.length, 0);
+  assert.equal(rpc.pending.size, 0);
+  assert.equal(rpc.compactionMutation, null);
+});
+
+test('owned compact validates reply identity and metadata before releasing its fence', async (t) => {
+  const f = await fixture(t);
+  for (const result of [
+    { data: compacted, sessionId: 'another' },
+    { data: compacted, generation: 'another' },
+    { data: compacted, version: 'unsupported' },
+    { data: null },
+    null,
+  ]) {
+    const rpc = ownedRpc(f);
+    f.respond(() => result);
+    await assert.rejects(rpc.dispatch(idleCompact), { uncertain: true });
+    assert.equal(rpc.pending.size, 1);
+    assert.ok(rpc.compactionMutation);
+  }
+  const rpc = ownedRpc(f);
+  f.respond(() => ({ error: 'COMPACT_BUSY' }));
+  await assert.rejects(rpc.dispatch(idleCompact), { code: 'COMPACT_BUSY', uncertain: false });
+  assert.equal(rpc.pending.size, 0);
+  assert.equal(rpc.compactionMutation, null);
 });

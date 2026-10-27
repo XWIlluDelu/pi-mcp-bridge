@@ -17,7 +17,13 @@ export function ackTimeout(t, operations, timeout = 50) {
     AttachedRuntime.prototype,
     'request',
     function (op, body, wait, ...rest) {
-      return request.call(this, op, body, operations.includes(op) ? timeout : wait, ...rest);
+      return request.call(
+        this,
+        op,
+        body,
+        wait !== null && operations.includes(op) ? timeout : wait,
+        ...rest,
+      );
     },
   );
   return () => {
