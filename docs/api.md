@@ -137,16 +137,16 @@ reports owner support. It preserves saved history and resets extension-local
 state. The caller can use it after
 `OWNER_READ_REFRESH_REQUIRED` or after changing the owner's resource settings.
 
-| Result                                          | Meaning                                                                                                                                                        |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `completed`, `owner_version`, `read_compatible` | Native reload finished for the same session. The version identifies the loaded Bridge component; compatibility says whether it matches this Bridge.            |
-| `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                 |
-| `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                            |
-| `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                          |
-| `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh may have started; completion could not be confirmed. Companion and host confirmation waits up to ten seconds. Inspect `list/read` before another call. |
+| Result                                          | Meaning                                                                                                                                                            |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `completed`, `owner_version`, `read_compatible` | Native reload finished for the same session. The version identifies the loaded Bridge component; compatibility says whether its read contract matches this Bridge. |
+| `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                     |
+| `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                                |
+| `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                              |
+| `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh may have started; completion could not be confirmed. Companion and host confirmation waits up to ten seconds. Inspect `list/read` before another call.     |
 
-`read_compatible:false` means native reload completed but the loaded Bridge
-component still differs. Align the configured companion or host binding with
+`read_compatible:false` means native reload completed but the loaded component's
+read contract is still incompatible. Align the configured companion or host binding with
 Bridge before retrying read. Repeated calls perform another reload; they are not
 status lookups.
 

@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -29,7 +30,11 @@ async function attached(t, route) {
     session = await f.bridge.session(f.id);
   let controller;
   if (route === 'binding')
-    controller = await reserveHostSession({ attachmentDir: f.bridge.pool.attachmentDir, session });
+    controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir: f.bridge.pool.attachmentDir,
+      session,
+    });
   const client = new RpcClient({
     cliPath: nativePiCli,
     cwd: f.cwd,
@@ -69,7 +74,8 @@ for (const route of ['companion', 'binding']) {
     async (t) => {
       const f = await attached(t, route),
         args = { session_id: f.id };
-      assert.equal((await f.bridge.compact(args)).reason, 'COMPACT_IDLE_UNCONFIRMED');
+      if (route === 'binding')
+        assert.equal((await f.bridge.compact(args)).reason, 'COMPACT_IDLE_UNCONFIRMED');
       await f.client.prompt('HOLD_MODEL');
       await until(() => exists(f.gate + '.provider-start'));
       assert.equal((await f.bridge.compact(args)).reason, 'COMPACT_BUSY');
@@ -162,6 +168,7 @@ test(
       f = await fixture({ after: (fn) => cleanup.push(fn) }),
       saved = await f.bridge.session(f.id),
       controller = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.bridge.pool.attachmentDir,
         session: saved,
       }),
@@ -227,13 +234,40 @@ test(
     await controller.ready(createSdkHostBinding(session));
     await session.prompt('KEEP_HISTORY '.repeat(200));
     await session.prompt('SECOND_HISTORY '.repeat(200));
-    assert.equal((await f.bridge.compact({ session_id: f.id })).reason, 'COMPACT_IDLE_UNCONFIRMED');
-    const result = await f.bridge.compact({ session_id: f.id, interrupt: true });
+    const result = await f.bridge.compact({ session_id: f.id });
+    assert.equal(result.interrupt_requested, false);
     assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.ok(!JSON.stringify(result).includes('SDK_PRIVATE_SUMMARY'));
     assert.equal(
       session.sessionManager.getEntries().filter((e) => e.type === 'compaction').length,
       1,
     );
+  },
+);
+
+test(
+  'companion idle compact needs only send and fences native input until completion',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await attached(t, 'companion');
+    await fs.writeFile(
+      f.configFile,
+      JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, send: true }] }),
+    );
+    const preflight = f.client.prompt('HOLD_PREFLIGHT');
+    await until(() => exists(f.gate + '.preflight-start'));
+    assert.equal((await f.bridge.compact({ session_id: f.id })).reason, 'COMPACT_BUSY');
+    await fs.writeFile(f.gate + '.preflight-release', 'go');
+    await preflight;
+    const compacting = f.bridge.compact({ session_id: f.id, instructions: 'HOLD_COMPACT' });
+    await until(() => exists(f.gate + '.compact-start'));
+    await assert.rejects(f.client.prompt('MUST_NOT_RUN_DURING_COMPACT'), /COMPACTION_PENDING/);
+    await fs.writeFile(f.gate, 'go');
+    const result = await compacting;
+    assert.equal(result.status, 'completed', JSON.stringify(result));
+    assert.equal(result.interrupt_requested, false);
+    const entries = (await f.client.getEntries()).entries;
+    assert.ok(!JSON.stringify(entries).includes('MUST_NOT_RUN_DURING_COMPACT'));
+    assert.equal(entries.filter((entry) => entry.type === 'compaction').length, 1);
   },
 );

@@ -1,3 +1,5 @@
+import packageInfo from '../package.json' with { type: 'json' };
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -21,8 +23,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
-import attachExtension from '../src/companion.mjs';
-import { READ_CONTRACT } from '../src/context-read.mjs';
+import attachExtension from './fixtures/companion.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => {
@@ -119,6 +120,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     owner = await processIdentity(pid);
   assert.notEqual(pid, process.pid);
   const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: saved,
     owner,
@@ -249,6 +251,7 @@ test('SDK host reload refreshes native resources, preserves history and keeps it
   });
   for (let index = 0; index < saved.length; index++) {
     const controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: saved[index],
     });
@@ -327,7 +330,7 @@ test('SDK host reload refreshes native resources, preserves history and keeps it
   reloadRelease.resolve();
   assert.deepEqual(await reloading, {
     status: 'completed',
-    owner_version: READ_CONTRACT,
+    owner_version: packageInfo.version,
     read_compatible: true,
   });
   assert.deepEqual(loads, [2, 1]);
@@ -381,6 +384,7 @@ test('two official SDK sessions in one host PID release independently without sh
   const hosts = [];
   for (const saved of [savedA, savedB]) {
     const controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: saved,
     });
@@ -545,6 +549,7 @@ test('SDK async input preparation must finish before host release permits a save
   const f = await fixture(t),
     saved = await f.create('sdk-preparation');
   const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: saved,
   });
@@ -717,6 +722,7 @@ for (const hosted of [true, false])
       );
       const controller = hosted
         ? await reserveHostSession({
+            buildSessionProjection: hostProjection,
             attachmentDir: f.config.attachmentDir,
             session: a,
           })

@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './pi.mjs';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { reserveHostSession } from '../../src/host-adapter.mjs';
@@ -19,7 +20,7 @@ const writer = spawn(
   { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], detached: true },
 );
 const owner = await processIdentity(writer.pid),
-  host = await reserveHostSession({ ...config, owner });
+  host = await reserveHostSession({ buildSessionProjection: hostProjection, ...config, owner });
 const opened = new Promise((resolve) => writer.once('message', resolve));
 writer.send(config.session.file);
 await opened;

@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -225,6 +226,7 @@ test('RPC host read routing sees the target session extension through public com
   await native.start();
   await native.getState();
   const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: target,
     owner: await processIdentity(Number(await fs.readFile(pidFile, 'utf8'))),
@@ -490,7 +492,11 @@ test('host session read routing uses current capabilities and refuses changed or
     path.join(f.store, session.header.id + '.json'),
     JSON.stringify([{ id: 'memory', kind: 'memory', text: 'HOST_CONTEXT' }]),
   );
-  const controller = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session });
+  const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
+    attachmentDir: f.config.attachmentDir,
+    session,
+  });
   f.controllers.push(controller);
   let features = {
       available: true,
@@ -542,6 +548,7 @@ test('host session read routing uses current capabilities and refuses changed or
     assert.equal(ctx.owner.available, false);
     const result = await original(ctx);
     const newOwner = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session,
     });
