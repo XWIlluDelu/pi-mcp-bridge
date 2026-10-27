@@ -1,3 +1,4 @@
+import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
 import { resolvePiInstallation } from './pi-installation.mjs';
 import path from 'node:path';
@@ -211,6 +212,7 @@ export class PiRpc {
         await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
           owner,
           phase: 'ready',
+          bridgeVersion: packageInfo.version,
           readContract: READ_CONTRACT,
         });
       }

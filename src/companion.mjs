@@ -1,3 +1,4 @@
+import packageInfo from '../package.json' with { type: 'json' };
 // Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
@@ -13,7 +14,6 @@ import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
-import { nativeSdk } from './pi-installation.mjs';
 import {
   SEND_MODES,
   attachedPromptInput,
@@ -52,9 +52,10 @@ import {
 const replacements = (globalThis[Symbol.for('pi-mcp-bridge.companion-replacements')] ??= new Map());
 const replacementKey = (dir, file) => `${dir}\0${file}`;
 
-export default async function attachExtension(pi, { AgentSession } = {}) {
+export default async function attachExtension(pi, { AgentSession, buildSessionProjection } = {}) {
   const profile = await companionProfile();
   if (!profile) return;
+  if (typeof buildSessionProjection !== 'function') throw new Error('INVALID_HOST_PROJECTION');
   const { dir, file } = profile;
   const admission = AgentSession ? reloadAdmission(AgentSession) : null;
   let active, ownership;
@@ -459,8 +460,6 @@ export default async function attachExtension(pi, { AgentSession } = {}) {
                 ),
               };
             else if (['read', 'snapshot'].includes(request.op)) {
-              const sdk =
-                request.op === 'read' && args.view !== 'runtime' ? await nativeSdk(profile) : null;
               const entries = ctx.sessionManager.getEntries(),
                 leafId = ctx.sessionManager.getLeafId();
               const snapshotJson =
@@ -483,7 +482,7 @@ export default async function attachExtension(pi, { AgentSession } = {}) {
                     : prepareContextRead(
                         { header, entries, leafId, live: runtime.liveMessage.snapshot() },
                         args,
-                        { ...sdk, readAdapters: request.readAdapters },
+                        { buildSessionProjection, readAdapters: request.readAdapters },
                       )),
                 };
               }
@@ -525,28 +524,36 @@ export default async function attachExtension(pi, { AgentSession } = {}) {
               const input = compactInputSchema.safeParse(args);
               if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
               if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
-              requireInterruptCompaction(input.data, {
-                isIdle: ctx.isIdle(),
-                hasPendingMessages: ctx.hasPendingMessages(),
-              });
-              check(request);
-              runtime.compacting = true;
-              socket.setTimeout(0); // Disconnect only suppresses the receipt.
-              try {
-                const value = await trackMutation(
-                  new Promise((resolve, reject) =>
-                    ctx.compact({
-                      customInstructions: input.data.instructions,
-                      onComplete: resolve,
-                      onError: () => reject(new AttachmentFailure('PI_REJECTED')),
-                    }),
-                  ),
-                );
+              const compact = async () => {
                 check(request);
-                data = compactMetadata(value);
-              } finally {
-                runtime.compacting = false;
+                runtime.compacting = true;
+                socket.setTimeout(0); // Disconnect only suppresses the receipt.
+                try {
+                  return await trackMutation(
+                    new Promise((resolve, reject) =>
+                      ctx.compact({
+                        customInstructions: input.data.instructions,
+                        onComplete: resolve,
+                        onError: () => reject(new AttachmentFailure('PI_REJECTED')),
+                      }),
+                    ),
+                  );
+                } finally {
+                  runtime.compacting = false;
+                }
+              };
+              let value;
+              if (!input.data.interrupt && admission)
+                value = await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
+              else {
+                requireInterruptCompaction(input.data, {
+                  isIdle: ctx.isIdle(),
+                  hasPendingMessages: ctx.hasPendingMessages(),
+                });
+                value = await compact();
               }
+              check(request);
+              data = compactMetadata(value);
             } else if (request.op === 'send') {
               if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
               if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
@@ -626,6 +633,7 @@ export default async function attachExtension(pi, { AgentSession } = {}) {
       await updateOwner(dir, session, record, {
         phase: 'ready',
         imagesSupported: true,
+        bridgeVersion: packageInfo.version,
         readContract: READ_CONTRACT,
         reloadSupported: Boolean(admission),
       });

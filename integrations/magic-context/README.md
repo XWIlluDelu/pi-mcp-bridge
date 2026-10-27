@@ -1,8 +1,10 @@
 # Magic Context reader
 
 This is an optional external Bridge module. Bridge core does not import it.
-It reads Magic Context **0.49.20, main SQLite schema 95** (MC reserves migration
-numbers from 10000 for a separate fork lane). It requires Node's built-in
+Its consumed storage contract is based on Magic Context **0.49.20**. Compatibility
+is checked against the queried tables/columns and interpreted row values, not
+MC's global migration number. Unrelated additive migrations do not require a
+reader update. It requires Node's built-in
 `node:sqlite` and the current Bridge item-reader contract.
 
 Enable it explicitly in owner configuration:
@@ -90,8 +92,13 @@ telemetry, embedding, project registration or generation is invoked. It closes
 the connection after each operation, leaving live Magic Context writers alone.
 
 Missing/unreadable databases report `MAGIC_CONTEXT_DATABASE_UNAVAILABLE`.
-Unsupported versions/missing columns report `MAGIC_CONTEXT_SCHEMA_MISMATCH`;
-update the module together with the supported MC schema. Changed identity during
+Missing consumed columns or incompatible row representations report
+`MAGIC_CONTEXT_SCHEMA_MISMATCH`. The reader expects text summaries/memories,
+numeric ordering, integer millisecond timestamps and native boundary identifiers;
+it validates eligible own-project memory expiry before filtering. Unknown rebase
+states remain readable without claiming a native history leaf. Update the module
+when those consumed storage semantics change; migration numbers are not proof
+of either compatibility or incompatibility. Changed identity during
 acquisition reports `MAGIC_CONTEXT_SESSION_MISMATCH`. Bridge wraps module failures
 in its reader error without silently substituting another source.
 

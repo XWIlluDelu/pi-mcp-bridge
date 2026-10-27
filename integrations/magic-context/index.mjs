@@ -4,13 +4,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
+import { z } from 'zod';
 
 import { contextSelection } from '../../src/read-schema.mjs';
 
 const execFileAsync = promisify(execFile);
-const SCHEMA_VERSION = 95;
 const COLUMNS = {
-  schema_migrations: ['version'],
   session_projects: ['session_id', 'harness', 'project_path'],
   session_meta: ['session_id', 'harness', 'counter', 'cached_m0_bytes'],
   compartments: [
@@ -46,6 +45,37 @@ const COLUMNS = {
     'superseded_by_memory_id',
   ],
 };
+// Validate the values we interpret, not MC's unrelated migration history.
+// Unknown rebase states stay readable but never establish a native history leaf.
+const integer = z.number().int().safe();
+const text = z.string().nullable();
+const compartmentSchema = z.object({
+  id: integer,
+  sequence: integer,
+  title: z.string(),
+  content: z.string(),
+  p1: text,
+  p2: text,
+  p3: text,
+  start_message_id: text,
+  end_message_id: text,
+  start_block_index: integer.nullable(),
+  end_block_index: integer.nullable(),
+  rebase_status: z.string(),
+  created_at: integer,
+});
+const memorySchema = z.object({
+  id: integer,
+  category: z.string(),
+  content: z.string(),
+  status: z.enum(['active', 'permanent']),
+  expires_at: integer.nullable(),
+  importance: z.number().finite().nullable(),
+  verification_status: text,
+  updated_at: integer,
+  source_type: text,
+  source_session_id: text,
+});
 
 function fail(code, cause) {
   return new Error(code, cause === undefined ? undefined : { cause });
@@ -75,10 +105,6 @@ function validateSchema(db) {
     );
     if (required.some((name) => !columns.has(name))) throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH');
   }
-  const { version } = db
-    .prepare('SELECT MAX(version) AS version FROM schema_migrations WHERE version < 10000')
-    .get();
-  if (version !== SCHEMA_VERSION) throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH');
 }
 
 function withDatabase(database, read) {
@@ -300,13 +326,27 @@ export function createMagicContextReader(options) {
           .all(context.session.native_id);
         const memories = db
           .prepare(
-            `SELECT id, category, content, status, verification_status, updated_at, source_type, source_session_id
+            `SELECT id, category, content, status, verification_status, updated_at, source_type, source_session_id,
+             expires_at, importance
            FROM memories WHERE project_path = ? AND status IN ('active', 'permanent')
-             AND (expires_at IS NULL OR expires_at > ?) AND superseded_by_memory_id IS NULL
+             AND superseded_by_memory_id IS NULL
            ORDER BY COALESCE(importance, 50) ASC, updated_at ASC, id ASC`,
           )
-          .all(identity, capturedAt);
-        return { capturedAt, compartments, memories };
+          .all(identity);
+        if (
+          compartments.some((row) => !compartmentSchema.safeParse(row).success) ||
+          memories.some((row) => !memorySchema.safeParse(row).success)
+        )
+          throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH');
+        return {
+          capturedAt,
+          compartments,
+          // Validate timestamp types before comparing; SQLite's coercion
+          // must not turn a changed storage representation into active memory.
+          memories: memories.filter(
+            (row) => row.expires_at === null || row.expires_at > capturedAt,
+          ),
+        };
       });
       const { capturedAt, compartments, memories } = stored;
       const summaries = compartments.map((row) => compartmentItem(row, capturedAt));

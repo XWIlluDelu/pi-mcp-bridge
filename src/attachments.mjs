@@ -405,7 +405,7 @@ export class AttachedRuntime {
     );
     if (
       op === 'seal' &&
-      (this.record.kind !== 'rpc' || this.record.readContract !== packageInfo.version)
+      (this.record.kind !== 'rpc' || this.record.bridgeVersion !== packageInfo.version)
     )
       throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
     const serialized =
@@ -441,6 +441,7 @@ export class AttachedRuntime {
       'socket',
       'noColdReacquire',
       'imagesSupported',
+      'bridgeVersion',
       'readContract',
       'completionSocket',
       'reloadSupported',
@@ -757,7 +758,7 @@ export class AttachedRuntime {
       // awaited callback is completion evidence, not a replacement generation.
       return {
         status: 'completed',
-        owner_version: this.record.readContract,
+        owner_version: this.record.bridgeVersion,
         read_compatible: this.record.readContract === READ_CONTRACT,
       };
     }
@@ -788,7 +789,8 @@ export class AttachedRuntime {
         )
           break;
         if (current.generation !== original.generation && current.phase === 'ready') {
-          if (typeof current.readContract !== 'string') break;
+          if (typeof current.bridgeVersion !== 'string' || typeof current.readContract !== 'string')
+            break;
           const replacement = new AttachedRuntime(this.config, this.session, current, {
             compatibility: this.compatibility,
           });
@@ -806,7 +808,7 @@ export class AttachedRuntime {
             if (state.reloadComplete === true)
               return {
                 status: 'completed',
-                owner_version: current.readContract,
+                owner_version: current.bridgeVersion,
                 read_compatible: current.readContract === READ_CONTRACT,
               };
           } catch (error) {

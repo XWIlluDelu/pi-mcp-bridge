@@ -14,7 +14,7 @@ import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
 import { toolDefinitions } from '../../src/protocol.mjs';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
-// The reader's current contract is checked against MC 0.49.20 schema 95.
+// Storage fields are based on MC 0.49.20; migration numbers are not a read contract.
 // Only the tables and columns it queries are needed in these isolated fixtures.
 const schema = `
   CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
@@ -123,22 +123,13 @@ test('explicit database, supported schema, and lifecycle registration are requir
     /MAGIC_CONTEXT_DATABASE_UNAVAILABLE/,
   );
   await assert.rejects(fs.stat(missing), { code: 'ENOENT' });
-  for (const version of [94, 96]) {
+  // Unrelated migrations do not change the reader's consumed storage contract.
+  for (const version of [94, 96, 10001]) {
     f.db.exec(`UPDATE schema_migrations SET version=${version}`);
-    assert.throws(
-      () => createMagicContextReader({ database: f.database }),
-      /MAGIC_CONTEXT_SCHEMA_MISMATCH/,
-    );
+    assert.doesNotThrow(() => createMagicContextReader({ database: f.database }));
   }
-  f.db.exec('UPDATE schema_migrations SET version=95');
-  f.db.exec('INSERT INTO schema_migrations VALUES(10001)');
+  f.db.exec('DROP TABLE schema_migrations');
   assert.doesNotThrow(() => createMagicContextReader({ database: f.database }));
-  f.db.exec('UPDATE schema_migrations SET version=96 WHERE version=95');
-  assert.throws(
-    () => createMagicContextReader({ database: f.database }),
-    /MAGIC_CONTEXT_SCHEMA_MISMATCH/,
-  );
-  f.db.exec('UPDATE schema_migrations SET version=95 WHERE version=96');
   let registered, cleanup;
   module.start(
     {
@@ -582,4 +573,23 @@ test('read-only connections see committed live WAL data and detach each result',
     f.db.prepare('SELECT content FROM memories WHERE id=1').get().content,
     'Changed by live writer',
   );
+});
+
+test('unrelated migrations preserve content while changed consumed representations reject', async (t) => {
+  const f = await fixture(t);
+  f.compartment();
+  f.memory();
+  const reader = createMagicContextReader({ database: f.database });
+  const content = async () =>
+    (await reader.read(f.context)).items.map(({ source: { captured_at, ...source }, ...item }) => ({
+      ...item,
+      source,
+    }));
+  const before = await content();
+  f.db.exec('UPDATE schema_migrations SET version=96; CREATE TABLE unrelated_feature(value TEXT)');
+  assert.deepEqual(await content(), before);
+  f.db.exec("UPDATE memories SET expires_at='2027-01-01T00:00:00Z'");
+  await assert.rejects(reader.read(f.context), /MAGIC_CONTEXT_SCHEMA_MISMATCH/);
+  f.db.exec("UPDATE memories SET expires_at=NULL; UPDATE compartments SET p1=x'0102'");
+  await assert.rejects(reader.read(f.context), /MAGIC_CONTEXT_SCHEMA_MISMATCH/);
 });

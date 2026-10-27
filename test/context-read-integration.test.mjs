@@ -1,3 +1,5 @@
+import { READ_CONTRACT, assertReadSnapshot } from '../src/context-read.mjs';
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
@@ -16,7 +18,7 @@ import { makeServer } from '../src/server.mjs';
 import { assertContextReadResponse, chronological } from './fixtures/read-pages.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { reserveOwner, updateOwner } from '../src/attachments.mjs';
-import attachExtension from '../src/companion.mjs';
+import attachExtension from './fixtures/companion.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -266,6 +268,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
       cleanDisk = await f.source({ max_bytes: 65536 });
     if (kind === 'host') {
       const owner = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.config.attachmentDir,
         session: f.saved,
       });
@@ -311,7 +314,7 @@ test('new companion and host send selected sanitized snapshots on op:read; raw s
     assert.deepEqual(active.items, cleanDisk.items);
     const runtime = await f.bridge.pool.forRead(f.saved),
       captured = await runtime.read({ session_id: f.id });
-    assert.equal(captured.contract, packageInfo.version);
+    assert.equal(captured.contract, READ_CONTRACT);
     assert.ok(Array.isArray(captured.units));
     assert.ok(!JSON.stringify(captured).includes('AAAAAAA'));
     assert.ok(!captured.units.some((unit) => unit.message?.toolsAdded));
@@ -378,6 +381,7 @@ test('optional input mappings agree across saved, owned RPC, companion and host 
       if (kind === 'rpc') await f.bridge.pool.resolve(f.saved);
       else if (kind === 'host') {
         const owner = await reserveHostSession({
+          buildSessionProjection: hostProjection,
           attachmentDir: f.config.attachmentDir,
           session: f.saved,
         });
@@ -504,7 +508,11 @@ test('batch budgets the first render of captured snapshots and preserves cursor 
   const value = paragraphs(160),
     entries = [message('u', null, 'user', 'task'), message('a', 'u', 'assistant', [text(value)])],
     f = await fixture(t, entries),
-    owner = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session: f.saved });
+    owner = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir: f.config.attachmentDir,
+      session: f.saved,
+    });
   f.cleanup.push(() => owner.close());
   let snapshots = 0,
     submissions = 0,
@@ -561,6 +569,7 @@ test('batch budgets the first render of captured snapshots and preserves cursor 
 test('read contract mismatch requests component update without sending an old operation or taking over', async (t) => {
   const f = await fixture(t, [message('u', null, 'user', 'task')]);
   const owner = await reserveHostSession({
+    buildSessionProjection: hostProjection,
     attachmentDir: f.config.attachmentDir,
     session: f.saved,
   });
@@ -576,8 +585,18 @@ test('read contract mismatch requests component update without sending an old op
     submit: () => assert.fail('No prompt during read'),
   });
   const runtime = await f.bridge.pool.forRead(f.saved);
-  assert.equal(runtime.record.readContract, packageInfo.version);
+  assert.equal(runtime.record.readContract, READ_CONTRACT);
+  assert.equal(runtime.record.bridgeVersion, packageInfo.version);
+  await updateOwner(f.config.attachmentDir, f.saved, runtime.record, {
+    bridgeVersion: 'different-product-version',
+  });
   await runtime.readFeatures();
+  const snapshot = await runtime.read({ session_id: f.id });
+  assert.equal(snapshot.contract, READ_CONTRACT);
+  assert.throws(
+    () => assertReadSnapshot({ ...snapshot, contract: 'unsupported' }),
+    /OWNER_READ_REFRESH_REQUIRED/,
+  );
   t.mock.method(runtime, 'request', () => assert.fail('Do not probe an incompatible owner'));
   for (const declared of [undefined, 'not-the-current-read-contract']) {
     runtime.record.readContract = declared;
@@ -588,6 +607,83 @@ test('read contract mismatch requests component update without sending an old op
     /LIVE_OWNER_UNREACHABLE/,
   );
   assert.equal(f.bridge.pool.instances.get(f.id), runtime);
+});
+
+test('live owners use the bound native projection after PATH/config changes, including historical leaves', async (t) => {
+  const entries = [
+    message('u', null, 'user', 'FIRST_TASK'),
+    message('a', 'u', 'assistant', 'FIRST_REPLY'),
+    message('later', 'a', 'user', 'LATER_TASK'),
+  ];
+  for (const kind of ['host', 'companion']) {
+    const f = await fixture(t, entries),
+      leaves = [];
+    const buildSessionProjection = (...args) => {
+      leaves.push(args[1]);
+      return hostProjection(...args);
+    };
+    if (kind === 'host') {
+      const owner = await reserveHostSession({
+        attachmentDir: f.config.attachmentDir,
+        session: f.saved,
+        buildSessionProjection,
+      });
+      f.cleanup.push(() => owner.close());
+      await owner.ready({
+        state: () => ({ sessionFile: f.saved.file, sessionId: f.saved.header.id }),
+        snapshot: () => ({
+          sessionFile: f.saved.file,
+          sessionId: f.saved.header.id,
+          entries,
+          leafId: 'later',
+        }),
+        submit: () => assert.fail('Read must not submit'),
+      });
+    } else {
+      const { default: companion } = await import('../src/companion.mjs');
+      const previous = process.env.PI_MCP_ATTACH_DIR,
+        handlers = {};
+      process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+      await companion(
+        {
+          getThinkingLevel: () => 'off',
+          on: (event, fn) => {
+            handlers[event] = fn;
+          },
+        },
+        { buildSessionProjection },
+      );
+      await handlers.session_start(
+        {},
+        {
+          mode: 'tui',
+          sessionManager: SessionManager.open(f.saved.file),
+          isIdle: () => true,
+          hasPendingMessages: () => false,
+        },
+      );
+      f.cleanup.push(async () => {
+        await handlers.session_shutdown?.({ reason: 'quit' });
+        if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+        else process.env.PI_MCP_ATTACH_DIR = previous;
+      });
+    }
+    const runtime = await f.bridge.pool.forRead(f.saved),
+      previousPath = process.env.PATH;
+    f.bridge.config.piExecutable = path.join(f.dir, 'removed-pi');
+    process.env.PATH = '';
+    try {
+      const current = await runtime.read({ session_id: f.id });
+      const historical = await runtime.read({ session_id: f.id, leaf_id: 'a' });
+      assert.equal(current.leaf_id, 'later');
+      assert.equal(historical.leaf_id, 'a');
+      assert.ok(!JSON.stringify(historical).includes('LATER_TASK'));
+      assert.deepEqual(leaves, ['later', 'a']);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+    }
+  }
 });
 
 test('saved and owned reads omit old image bytes before capture, but raw fork snapshots and later pages retain their native semantics', async (t) => {

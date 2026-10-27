@@ -1,3 +1,4 @@
+import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -7,7 +8,6 @@ import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { launchProfile } from '../src/rpc.mjs';
 import { readClaim } from '../src/attachments.mjs';
-import { READ_CONTRACT } from '../src/context-read.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -88,7 +88,7 @@ export default function(pi){
     await fs.writeFile(f.gate + '.reload-release', 'go');
     assert.deepEqual(await reloading, {
       status: 'completed',
-      owner_version: READ_CONTRACT,
+      owner_version: packageInfo.version,
       read_compatible: true,
     });
     const after = await readClaim(f.bridge.pool.attachmentDir, session);

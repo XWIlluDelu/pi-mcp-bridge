@@ -4,9 +4,9 @@ import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
 import { fitNavigationRow, unitText } from './read-navigation.mjs';
-import packageInfo from '../package.json' with { type: 'json' };
 
-export const READ_CONTRACT = packageInfo.version;
+// Change only when the live read request/snapshot semantics become incompatible.
+export const READ_CONTRACT = 'pi-bridge-read-v1';
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 export const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;

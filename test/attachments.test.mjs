@@ -1,3 +1,4 @@
+import { READ_CONTRACT } from '../src/context-read.mjs';
 import { readSource } from './fixtures/read-source.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -30,7 +31,7 @@ import {
   assertNoOtherLiveOwner,
   waitOwnerExit,
 } from '../src/attachments.mjs';
-import attachExtension from '../src/companion.mjs';
+import attachExtension from './fixtures/companion.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { publicOperationSchemas } from '../src/tool-schemas.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -428,7 +429,7 @@ test('extension confirms public dispatch without claiming admission, and idle in
     await handlers.session_start({ reason: 'reload' }, ctx);
     const refreshed = await readClaim(f.config.attachmentDir, f.session);
     assert.notEqual(refreshed.generation, record.generation);
-    assert.equal(refreshed.readContract, packageInfo.version);
+    assert.equal(refreshed.readContract, READ_CONTRACT);
     assert.equal(refreshed.unsupportedControlMetadata, undefined);
     assert.equal(shutdown, false);
     assert.deepEqual(JSON.parse(await fs.readFile(unrelatedFile, 'utf8')), unrelatedRecord);

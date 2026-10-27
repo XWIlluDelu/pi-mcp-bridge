@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
@@ -125,6 +126,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       });
       if (route === 'sdk-host') {
         controller = await reserveHostSession({
+          buildSessionProjection: hostProjection,
           attachmentDir: config.attachmentDir,
           session: saved,
         });
@@ -227,6 +229,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         if (route !== 'tui-companion') await native.getState();
         if (route === 'rpc-host') {
           controller = await reserveHostSession({
+            buildSessionProjection: hostProjection,
             attachmentDir: config.attachmentDir,
             session: saved,
             owner: await processIdentity(Number(await fs.readFile(pidFile, 'utf8'))),
@@ -327,7 +330,12 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       assert.ok(JSON.stringify(publicRead.items).includes('IMAGE_CONTEXT:'));
       const denied = await call('compact', { session_id: saved.id });
       assert.equal(denied.status, 'rejected');
-      assert.equal(denied.reason, 'COMPACT_IDLE_UNCONFIRMED');
+      // The one-turn image fixture is too small for native compaction. Only
+      // the remote RPC binding lacks the gate needed to attempt idle compact.
+      assert.equal(
+        denied.reason,
+        route === 'rpc-host' ? 'COMPACT_IDLE_UNCONFIRMED' : 'PI_REJECTED',
+      );
       if (route.endsWith('companion')) {
         for (const op of ['command', 'stop']) {
           const denied = await call(op, {
