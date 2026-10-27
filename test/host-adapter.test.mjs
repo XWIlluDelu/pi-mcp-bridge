@@ -1,3 +1,5 @@
+import packageInfo from '../package.json' with { type: 'json' };
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -38,7 +40,11 @@ async function fixture(t) {
   await fs.writeFile(file, JSON.stringify(header) + '\n', { mode: 0o600 });
   const session = { file, header },
     attachmentDir = path.join(dir, 'ipc'),
-    controller = await reserveHostSession({ attachmentDir, session });
+    controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir,
+      session,
+    });
   t.after(async () => {
     await controller.close();
     await fs.rm(dir, { recursive: true, force: true });
@@ -170,7 +176,7 @@ test('host reload waits for native completion and fences unresolved submissions 
     reloadRelease.resolve();
     assert.deepEqual(await reloading, {
       status: 'completed',
-      owner_version: READ_CONTRACT,
+      owner_version: packageInfo.version,
       read_compatible: true,
     });
     assert.equal(reloads, 1);
@@ -869,4 +875,8 @@ test('invalid native control results fail without retry and later valid calls wo
     truncated: false,
   });
   assert.equal((await request(f, 'bash', { command: 'fixture' })).data.output, 'inline only');
+});
+
+test('host reservation requires its runtime projection before acquiring ownership', async () => {
+  await assert.rejects(reserveHostSession({}), /INVALID_HOST_PROJECTION/);
 });

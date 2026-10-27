@@ -377,8 +377,9 @@ export class Bridge {
           markForAutoRelease(replacement);
           if (!(replacement instanceof PiRpc) || replacement === runtime)
             throw new Error('RELOAD_UNCONFIRMED');
-          const version = replacement.ownerRecord?.readContract;
-          if (version !== READ_CONTRACT) throw new Error('RELOAD_UNCONFIRMED');
+          const version = replacement.ownerRecord?.bridgeVersion;
+          if (!version || replacement.ownerRecord?.readContract !== READ_CONTRACT)
+            throw new Error('RELOAD_UNCONFIRMED');
           return { status: 'completed', owner_version: version, read_compatible: true };
         } catch (error) {
           const uncertain =

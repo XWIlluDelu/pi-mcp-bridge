@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,7 +17,7 @@ import {
   RpcClient,
 } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import attachExtension from '../src/companion.mjs';
+import attachExtension from './fixtures/companion.mjs';
 import { claimFile, readClaim } from '../src/attachments.mjs';
 import { pathToFileURL } from 'node:url';
 import { reserveHostSession } from '../src/host-adapter.mjs';
@@ -80,7 +81,11 @@ async function fixture(t, { hosted = false, extension } = {}) {
   const a = await bridge.session((await savedSession(bridge)).session_id),
     b = await bridge.session((await savedSession(bridge)).session_id);
   if (hosted)
-    controller = await reserveHostSession({ attachmentDir: config.attachmentDir, session: a });
+    controller = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir: config.attachmentDir,
+      session: a,
+    });
   const faux = fauxProvider({
     provider: 'bridge-fixture',
     models: [{ id: 'deterministic' }, { id: 'other' }],

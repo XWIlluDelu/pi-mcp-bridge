@@ -1,5 +1,5 @@
 // Pi's isIdle excludes asynchronous input preparation and standalone bash.
-// Observe public operation lifetimes. Reload admission is temporary; an owned
+// Observe public operation lifetimes. Reload/idle compact admission is temporary; an owned
 // runtime's shutdown seal is terminal. State survives factory replacement.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
@@ -30,12 +30,12 @@ export function reloadAdmission(AgentSession) {
     if (!value)
       sessions.set(
         manager,
-        (value = { pending: 0, reload: null, completed: false, sealed: false }),
+        (value = { pending: 0, operation: null, completed: false, sealed: false }),
       );
     return value;
   }
   const busy = (current, ctx, otherBusy) =>
-    current.reload ||
+    current.operation ||
     current.pending ||
     otherBusy ||
     ctx.isIdle() !== true ||
@@ -57,10 +57,14 @@ export function reloadAdmission(AgentSession) {
       throw new Error('RUNTIME_SHUTTING_DOWN');
     }
     const internal =
-      ['prompt', 'sendUserMessage'].includes(name) && current.reload?.command === args[0];
+      ['prompt', 'sendUserMessage'].includes(name) &&
+      current.operation?.kind === 'reload' &&
+      current.operation.command === args[0];
     if (internal) return original.apply(session, args);
-    if (current.reload && scope.getStore() !== current.reload)
-      throw new Error('RELOAD_IN_PROGRESS');
+    if (current.operation && scope.getStore() !== current.operation)
+      throw new Error(
+        current.operation.kind === 'reload' ? 'RELOAD_IN_PROGRESS' : 'COMPACTION_PENDING',
+      );
     current.pending++;
     try {
       return await original.apply(session, args);
@@ -83,9 +87,9 @@ export function reloadAdmission(AgentSession) {
     }
   const admission = {
     idle: (manager) =>
-      state(manager).pending === 0 && !state(manager).reload && !state(manager).sealed,
+      state(manager).pending === 0 && !state(manager).operation && !state(manager).sealed,
     completed: (manager) => state(manager).completed,
-    reloading: (manager) => Boolean(state(manager).reload),
+    reloading: (manager) => state(manager).operation?.kind === 'reload',
     sealed: (manager) => state(manager).sealed,
     setOnIdle(manager, callback) {
       state(manager).onIdle = callback;
@@ -96,6 +100,20 @@ export function reloadAdmission(AgentSession) {
       if (busy(current, ctx, otherBusy)) return false;
       current.sealed = true;
       return true;
+    },
+    async compact(manager, ctx, run, otherBusy = false) {
+      const current = state(manager);
+      if (current.sealed) throw new Error('RUNTIME_SHUTTING_DOWN');
+      if (busy(current, ctx, otherBusy)) throw new Error('COMPACT_BUSY');
+      // Acquire synchronously before Pi's first await, and retain exclusivity
+      // until native completion even if the IPC caller disconnects.
+      const operation = { kind: 'compact' };
+      current.operation = operation;
+      try {
+        return await scope.run(operation, run);
+      } finally {
+        if (current.operation === operation) current.operation = null;
+      }
     },
     begin(manager, ctx, otherBusy = false) {
       const current = state(manager);
@@ -108,14 +126,15 @@ export function reloadAdmission(AgentSession) {
       }, 5000);
       timer.unref();
       const operation = {
+        kind: 'reload',
         token,
         command: `/bridge-reload ${token}`,
         cancel() {
           clearTimeout(timer);
-          if (current.reload === operation) current.reload = null;
+          if (current.operation === operation) current.operation = null;
         },
         async run(reload) {
-          if (started || current.reload !== operation) return;
+          if (started || current.operation !== operation) return;
           started = true;
           clearTimeout(timer);
           try {
@@ -128,7 +147,7 @@ export function reloadAdmission(AgentSession) {
         },
       };
       current.completed = false;
-      current.reload = operation;
+      current.operation = operation;
       return operation;
     },
   };

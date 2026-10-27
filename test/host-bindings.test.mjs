@@ -689,3 +689,75 @@ test('RPC reload preserves host busy refusal and requires explicit completion', 
   });
   await assert.rejects(unconfirmed.reload({ ...idle }), /RELOAD_UNCONFIRMED/);
 });
+
+test('an explicit available model initializes a session without a current model', async () => {
+  for (const kind of ['sdk', 'rpc']) {
+    for (const thinking_level of [undefined, 'high']) {
+      const model = { provider: 'p', id: 'available' };
+      const value = { ...idle, model: null, thinkingLevel: 'off' };
+      const setModel = async (target) => {
+        value.model = target;
+      };
+      const setThinkingLevel = async (level) => {
+        value.thinkingLevel = level;
+      };
+      const binding =
+        kind === 'sdk'
+          ? createSdkHostBinding({
+              ...value,
+              get model() {
+                return value.model;
+              },
+              get thinkingLevel() {
+                return value.thinkingLevel;
+              },
+              modelRuntime: { getAvailableSnapshot: () => [model] },
+              setModel,
+              setThinkingLevel,
+            })
+          : createRpcHostBinding({
+              getState: async () => value,
+              getAvailableModels: async () => [model],
+              setModel: async (provider, id) => setModel({ provider, id }),
+              setThinkingLevel,
+            });
+      await assert.rejects(
+        binding.setModel({ ...idle, thinking_level: 'high' }),
+        /MODEL_UNAVAILABLE/,
+      );
+      await assert.rejects(
+        binding.setModel({ ...idle, model: { provider: 'p', id: 'missing' } }),
+        /MODEL_UNAVAILABLE/,
+      );
+      assert.equal(value.model, null);
+      assert.deepEqual(await binding.setModel({ ...idle, model, thinking_level }), {
+        model,
+        thinking_level: thinking_level ?? 'off',
+      });
+    }
+  }
+});
+
+test('SDK idle compact rechecks identity at native dispatch after the state await', async () => {
+  let calls = 0;
+  class Session {
+    sessionManager = {};
+    sessionFile = idle.sessionFile;
+    sessionId = idle.sessionId;
+    isIdle = true;
+    isStreaming = false;
+    pendingMessageCount = 0;
+    async reload() {}
+    async compact() {
+      calls++;
+    }
+  }
+  const session = new Session(),
+    binding = createSdkHostBinding(session);
+  queueMicrotask(() => {
+    session.sessionId = 'different-session';
+  });
+  await assert.rejects(binding.compact(idle), /RUNTIME_SESSION_CHANGED/);
+  assert.equal(calls, 0);
+  assert.equal((await binding.state()).isIdle, true, 'failed admission releases its gate');
+});

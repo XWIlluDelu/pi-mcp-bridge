@@ -78,7 +78,7 @@ open. Use `/bridge-join` or host coordination for a managed handoff.
 | Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
 | Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
 | Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
-| Manual compact          | Idle by default; explicit interrupt  | Explicit interrupt                                    | Explicit interrupt                      |
+| Manual compact          | Idle by default; explicit interrupt  | Idle with admission gate; explicit interrupt          | SDK idle gate; RPC explicit interrupt   |
 | Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | SDK native reload; RPC host callback    |
 | TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 | Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
@@ -299,8 +299,12 @@ spawn Pi, or take over an RPC client's stdio.
    reservation, then switch to the reserved target.
 2. Open the target through the host's native API. Create the SDK binding before
    admitting local input so its operation observer can track input preparation.
-   Pass `piExecutable` to `reserveHostSession` when the selected Pi installation
-   is not the one resolved from the host's PATH.
+   Pass `buildSessionProjection` from that writer's selected native SDK to
+   `reserveHostSession`. Keep that function bound for the controller lifetime,
+   including historical-leaf reads. An RPC host selects the SDK paired with its
+   worker before reservation; live reads never rediscover Pi through PATH.
+   The native extension loader supplies this same binding to the companion.
+   Missing projection fails before reservation with `INVALID_HOST_PROJECTION`.
 3. Publish with `await controller.ready(binding)` once `state()` and `snapshot()`
    describe the reserved session. Keep the native writer under the host's
    lifecycle control and the controller bound to that session. A session change

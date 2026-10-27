@@ -1,3 +1,4 @@
+import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -11,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
 import { atomicJson } from '../src/storage.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import attachExtension from '../src/companion.mjs';
+import attachExtension from './fixtures/companion.mjs';
 import {
   reserveOwner,
   releaseOwner,
@@ -60,7 +61,11 @@ async function until(fn) {
 
 test('profile companion leaves the same-process host controller and its shutdown lifecycle in charge', async (t) => {
   const f = await fixture(t),
-    host = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session: f.session }),
+    host = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir: f.config.attachmentDir,
+      session: f.session,
+    }),
     id = identity(f.session);
   const prior = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
@@ -112,6 +117,7 @@ test('host close cleans up its listener on registry failure without releasing th
     return listen.call(this, address, ...args);
   });
   const host = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     }),
@@ -168,7 +174,11 @@ test('host close cleans up its listener on registry failure without releasing th
 
 test('deletion blocks reacquisition after host release and continues through the trash move', async (t) => {
   const f = await fixture(t),
-    host = await reserveHostSession({ attachmentDir: f.config.attachmentDir, session: f.session });
+    host = await reserveHostSession({
+      buildSessionProjection: hostProjection,
+      attachmentDir: f.config.attachmentDir,
+      session: f.session,
+    });
   const id = identity(f.session);
   await host.ready({
     state: async () => id,
@@ -204,10 +214,12 @@ for (const failedStage of ['cancel', 'release'])
     const f = await fixture(t),
       sibling = await f.bridge.session((await savedSession(f.bridge)).session_id),
       host = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.config.attachmentDir,
         session: f.session,
       }),
       neighbor = await reserveHostSession({
+        buildSessionProjection: hostProjection,
         attachmentDir: f.config.attachmentDir,
         session: sibling,
       }),
@@ -287,6 +299,7 @@ test('confirmed host deletion removes the local-release pause and late host clos
   const f = await fixture(t);
   await f.bridge.releaseForLocal({ session_id: f.session.id });
   const host = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     }),
@@ -317,6 +330,7 @@ test('host close after release preserves its tombstone and rejects live republis
   const f = await fixture(t);
   await f.bridge.releaseForLocal({ session_id: f.session.id });
   const host = await reserveHostSession({
+      buildSessionProjection: hostProjection,
       attachmentDir: f.config.attachmentDir,
       session: f.session,
     }),
