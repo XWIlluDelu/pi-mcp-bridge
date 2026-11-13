@@ -12,8 +12,10 @@ compatibility uses the explicit current read contract in `src/context-read.mjs`;
 change it only for incompatible read semantics, never for a product release alone.
 Keep control-interface checks independent. Main releases use a plain semantic
 version and a matching Git tag.
-Auto-dev iterations use the next intended release's prerelease suffix, starting
-at `-dev.1` for each release cycle. Remove that suffix when publishing main;
+During rapid development, auto-dev stays on the current `-dev.N` version series.
+Increment N without reusing earlier values in that series, including after a main
+sync. Keep the base version until the user starts a new release series; a bug fix
+does not imply a patch-version bump. Remove the suffix when publishing main;
 do not duplicate the product version in another release counter.
 
 Ownership evidence is separate from control-interface compatibility. Scope
