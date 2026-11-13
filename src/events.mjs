@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
+import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
 import { utf16String } from './schema.mjs';
 import { atomicJson, readPrivateFile, hash } from './storage.mjs';
 import { permitted } from './permissions.mjs';
@@ -64,59 +65,34 @@ const recordSchema = z
   })
   .strict();
 
-export const settledEventDefinition = {
+// Advertised schemas are generated from the same contracts used to validate.
+const payloadSchema = z
+  .object({
+    session_id: z.string(),
+    leaf_id: z.string().nullable(),
+    aborted: z.boolean(),
+    result: settledResultSchema,
+    read: z
+      .object({
+        session_id: z.string(),
+        view: z.literal('session'),
+        leaf_id: z.string().nullable(),
+        range: z.object({ recent: z.literal(1) }).strict(),
+      })
+      .strict(),
+  })
+  .strict();
+function jsonSchema(schema) {
+  const { $schema, ...value } = toJsonSchemaCompat(schema, { pipeStrategy: 'output' });
+  return value;
+}
+const settledEventDefinition = {
   name: NAME,
   description:
     'A saved Pi session finishes a native agent run, including automatic continuations. Supports Bridge-owned RPC and ordinary TUI/RPC companions configured for this Bridge; SDK hosts and registry-only companions are unsupported. This is session-wide settlement, not per-prompt success or process exit. Includes a bounded last assistant response when available; its stop_reason is native termination, not task success. If more detail is useful, call read with the supplied read object to open Session Context at this exact leaf, including when a memory reader is enabled. Subscribe before sending work. No replay.',
   delivery: ['webhook'],
-  inputSchema: {
-    type: 'object',
-    properties: { session_id: { type: 'string', pattern: '^ps_[a-f0-9]{32}$' } },
-    required: ['session_id'],
-    additionalProperties: false,
-  },
-  payloadSchema: {
-    type: 'object',
-    properties: {
-      session_id: { type: 'string' },
-      leaf_id: { type: ['string', 'null'] },
-      aborted: { type: 'boolean' },
-      result: {
-        anyOf: [
-          { type: 'null' },
-          {
-            type: 'object',
-            properties: {
-              entry_id: { type: 'string' },
-              text: { type: 'string' },
-              stop_reason: { type: ['string', 'null'] },
-              truncated: { type: 'boolean' },
-            },
-            required: ['entry_id', 'text', 'stop_reason', 'truncated'],
-            additionalProperties: false,
-          },
-        ],
-      },
-      read: {
-        type: 'object',
-        properties: {
-          session_id: { type: 'string' },
-          view: { const: 'session' },
-          leaf_id: { type: ['string', 'null'] },
-          range: {
-            type: 'object',
-            properties: { recent: { const: 1 } },
-            required: ['recent'],
-            additionalProperties: false,
-          },
-        },
-        required: ['session_id', 'view', 'leaf_id', 'range'],
-        additionalProperties: false,
-      },
-    },
-    required: ['session_id', 'leaf_id', 'aborted', 'result', 'read'],
-    additionalProperties: false,
-  },
+  inputSchema: jsonSchema(argsSchema),
+  payloadSchema: jsonSchema(payloadSchema),
 };
 export class EventError extends Error {
   constructor(code, message, data) {
@@ -369,7 +345,8 @@ export class EventSubscriptions {
         session_id: session.id,
         leaf_id: occurrence.leafId,
         aborted: occurrence.aborted,
-        result: settledResultSchema.parse(occurrence.result),
+        // Validated at the owner control boundary (Bridge.settledForLocal).
+        result: occurrence.result,
         read: {
           session_id: session.id,
           view: 'session',
