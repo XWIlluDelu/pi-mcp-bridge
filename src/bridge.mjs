@@ -8,7 +8,7 @@ import { compactReceipt, nativeCompactReason } from './compact.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { ALL_CONTENT } from './read-schema.mjs';
+import { ALL_CONTENT, DEFAULT_READ_BYTES } from './read-schema.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
 import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
@@ -749,7 +749,7 @@ export class Bridge {
     const events =
       !searchQuery &&
       (runtime?.runtimeEvents ?? this.pool.runtimeEvents.get(id))?.snapshot(
-        Math.min(4096, Math.floor((args.max_bytes ?? 24000) / 4)),
+        Math.min(4096, Math.floor((args.max_bytes ?? DEFAULT_READ_BYTES) / 4)),
       );
     const renderOptions = {
       identity,

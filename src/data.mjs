@@ -256,7 +256,7 @@ export async function discover(config) {
   }
   return found.sort((a, b) => a.id.localeCompare(b.id));
 }
-export const textBoundary = (text, offset) =>
+const textBoundary = (text, offset) =>
   !(
     offset > 0 &&
     offset < text.length &&

@@ -27,6 +27,8 @@ export function contentKind(kind) {
     }[kind] ?? kind;
   return CONTENT_KINDS.includes(mapped) ? mapped : 'native';
 }
+// UTF-8 budget for one structured read page when max_bytes is omitted.
+export const DEFAULT_READ_BYTES = 24000;
 export const DEFAULT_RANGE = Object.freeze({ recent: 3, earliest: 0 });
 export const DEFAULT_CONTENT = Object.freeze({
   input: true,
@@ -50,7 +52,7 @@ export const ALL_CONTENT = Object.freeze({
   command: -1,
   native: true,
 });
-export const rangeSchema = z
+const rangeSchema = z
   .object({
     recent: count
       .describe('Last N input turns; default 3; -1 includes all effective turns.')
@@ -60,7 +62,7 @@ export const rangeSchema = z
       .optional(),
   })
   .strict();
-export const contentSchema = z
+const contentSchema = z
   .object({
     input: z
       .boolean()

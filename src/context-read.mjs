@@ -1,4 +1,4 @@
-import { readSchema, contextSelection } from './read-schema.mjs';
+import { readSchema, contextSelection, DEFAULT_READ_BYTES } from './read-schema.mjs';
 import { jsonBytes, fitsResult } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
@@ -13,7 +13,7 @@ import {
 // Change only when the live read request/snapshot semantics become incompatible.
 export const READ_CONTRACT = 'pi-bridge-read-v1';
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
-export const READ_PAGE_LIMIT = 65536;
+const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;
 
 const take = (values, n, reverse = false) =>
@@ -556,7 +556,7 @@ function* splitMessageBody(record, message, replace) {
   }
   yield record;
 }
-export function* semanticUnits(raw) {
+function* semanticUnits(raw) {
   const record = cleanRecord(raw);
   if (jsonBytes(record) <= UNIT_TARGET) {
     yield record;
@@ -618,7 +618,7 @@ function fitMetadata(unit, fits) {
   }
   return result;
 }
-export function omittedUnit(unit) {
+function omittedUnit(unit) {
   return {
     ...pick(unit, [
       'type',
@@ -740,7 +740,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
   };
 }
 
-export function cleanLive(raw, selection, selected) {
+function cleanLive(raw, selection, selected) {
   if (!raw)
     return {
       available: false,
@@ -907,7 +907,7 @@ export function renderPreparedContextRead(
   { cursor, encode, resultBudget, live, runtimeEvents } = {},
 ) {
   const start = cursor?.offset ?? 0,
-    max = args.max_bytes ?? 24000;
+    max = args.max_bytes ?? DEFAULT_READ_BYTES;
   if (start < 0 || start > snapshot.units.length) throw new Error('INVALID_CURSOR');
   const navigation = Boolean(snapshot.navigation);
   const base = {
