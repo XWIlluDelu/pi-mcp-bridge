@@ -6,6 +6,7 @@ import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-sc
 import { utf16String } from './schema.mjs';
 import { atomicJson, readPrivateFile, hash } from './storage.mjs';
 import { permitted } from './permissions.mjs';
+import { sameSessionIdentity } from './data.mjs';
 import { knownErrorCode } from './errors.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { settledResultSchema } from './settled-result.mjs';
@@ -383,13 +384,7 @@ export class EventSubscriptions {
       // Authorization is refreshed for each outbound attempt, not frozen for a
       // subscription's lifetime. A stale file/header cannot retarget an event.
       try {
-        const current = await this.authorize(session.id);
-        if (
-          current.file !== session.file ||
-          current.header.id !== session.header.id ||
-          current.header.cwd !== session.header.cwd
-        )
-          return;
+        if (!sameSessionIdentity(await this.authorize(session.id), session)) return;
       } catch (error) {
         if (!this.bridge.closing && error.message === 'NOT_FOUND_OR_DENIED')
           await this.change((next) => {

@@ -48,6 +48,11 @@ function validateHeader(header) {
 }
 // Identity discovery never parses transcript bodies. Bound the control header,
 // independently of history size; keep an unavailable cwd separate from identity.
+// A saved session keeps its identity while its canonical file, native ID and
+// recorded cwd are unchanged; any change invalidates operations bound to it.
+export function sameSessionIdentity(a, b) {
+  return a.file === b.file && a.header.id === b.header.id && a.header.cwd === b.header.cwd;
+}
 export async function readSessionIdentity(file) {
   const expected = await assertSingleSessionFile(file);
   const fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);

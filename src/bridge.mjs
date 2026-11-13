@@ -33,6 +33,7 @@ import {
   loadSavedSession,
   validateExecutionCwd,
   assertSingleSessionFile,
+  sameSessionIdentity,
 } from './data.mjs';
 import { atomicJson, assertPrivateDirectory, assertNativeDirectory, hash } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
@@ -815,12 +816,7 @@ export class Bridge {
         if (this.handoffs.has(target.id) && this.handoffs.get(target.id).kind !== 'auto_release')
           throw new Error('HANDOFF_PENDING');
         const current = await this.session(target.id, requestContext);
-        if (
-          current.file !== target.file ||
-          current.header.id !== target.header.id ||
-          current.header.cwd !== target.header.cwd
-        )
-          throw new Error('RUNTIME_SESSION_CHANGED');
+        if (!sameSessionIdentity(current, target)) throw new Error('RUNTIME_SESSION_CHANGED');
         this.check('send', current, requestContext);
       };
       await authorized();
@@ -1124,8 +1120,7 @@ export class Bridge {
         release = await this.pool.stopForDelete(s);
         await this.locked(s.id, async () => {
           const current = await this.session(s.id, requestContext);
-          if (current.file !== s.file || current.header.cwd !== s.header.cwd)
-            throw new Error('RUNTIME_SESSION_CHANGED');
+          if (!sameSessionIdentity(current, s)) throw new Error('RUNTIME_SESSION_CHANGED');
           await trash.move();
         });
       } catch (error) {
