@@ -90,7 +90,7 @@ export function stopReceipt(value) {
     queue_policy: 'withdraw',
   };
 }
-export async function requestRpcStop(client, onWithdraw) {
+export async function requestStop(client, onWithdraw) {
   if (!['clearQueue', 'abort', 'abortBash'].every((name) => typeof client[name] === 'function'))
     throw new Error('STOP_UNSUPPORTED');
   const cleared = client.clearQueue();

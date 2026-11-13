@@ -9,7 +9,7 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
-import { withdrawalCollector, requestRpcStop } from '../src/stop-execution.mjs';
+import { withdrawalCollector, requestStop } from '../src/stop-execution.mjs';
 import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { makeServer } from '../src/server.mjs';
@@ -404,7 +404,7 @@ test('native RPC withdrawal and both cancellation requests are submitted before 
       return Promise.resolve();
     },
   };
-  const stopping = requestRpcStop(client, async (value) => {
+  const stopping = requestStop(client, async (value) => {
     snapshots.push(value);
   });
   assert.deepEqual(calls, ['clear', 'abort', 'bash']);
@@ -417,15 +417,15 @@ test('native RPC withdrawal and both cancellation requests are submitted before 
     ['early', 'during'],
   );
 });
-for (const failure of ['clear', 'capture'])
-  test('RPC Stop drains dispatched cancellations after ' + failure + ' failure', async () => {
+for (const failure of ['clear', 'capture', 'abort'])
+  test('Stop drains dispatched cancellations after ' + failure + ' failure', async () => {
     const abort = gate(),
       bash = gate(),
       failed = gate(),
       error = new Error('WITHDRAWAL_FAILED');
     let settled = false,
       clears = 0;
-    const stopping = requestRpcStop(
+    const stopping = requestStop(
       {
         clearQueue: async () => {
           clears++;
@@ -440,7 +440,7 @@ for (const failure of ['clear', 'capture'])
       },
       async () => {
         failed.resolve();
-        throw error;
+        if (failure === 'capture') throw error;
       },
     );
     const rejected = assert.rejects(stopping, (value) => value === error);
@@ -453,7 +453,9 @@ for (const failure of ['clear', 'capture'])
       await failed.promise;
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(settled, false, 'withdrawal failure must not finish active cancellation');
-      abort.resolve();
+      if (failure === 'abort') abort.reject(error);
+      else if (failure === 'capture') abort.reject(new Error('ABORT_FAILED'));
+      else abort.resolve();
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(settled, false, 'bash cancellation must drain too');
     } finally {
@@ -464,80 +466,87 @@ for (const failure of ['clear', 'capture'])
     assert.equal(clears, 1, 'failure must not replay withdrawal');
   });
 
-test('SDK host keeps Stop admission fenced when withdrawal capture fails during cancellation', async (t) => {
-  const f = await fixture(t),
-    cancellation = gate(),
-    capturing = gate(),
-    controller = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: f.bridge.pool.attachmentDir,
-      session: f.saved,
-    });
-  f.cleanup.push(() => controller.close());
-  const state = {
-    sessionFile: f.saved.file,
-    sessionId: f.saved.header.id,
-    isIdle: true,
-    pendingMessageCount: 0,
-  };
-  let prompts = 0,
-    settled = false;
-  const binding = createSdkHostBinding({
-    ...state,
-    prompt: async () => {
-      prompts++;
-    },
-    clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
-    abort: () => cancellation.promise,
-    abortBash: () => {},
-  });
-  await controller.ready({
-    state: binding.state,
-    snapshot: async () => ({ ...state, entries: [], leafId: null }),
-    submit: binding.submit,
-    stop: (args) =>
-      binding.stop({
-        ...args,
-        onWithdraw: async (value) => {
-          await args.onWithdraw(value);
+for (const failure of ['capture', 'bash'])
+  test(`SDK host keeps Stop admission fenced after ${failure} failure`, async (t) => {
+    const f = await fixture(t),
+      cancellation = gate(),
+      capturing = gate(),
+      controller = await reserveHostSession({
+        buildSessionProjection: hostProjection,
+        attachmentDir: f.bridge.pool.attachmentDir,
+        session: f.saved,
+      });
+    f.cleanup.push(() => controller.close());
+    const state = {
+      sessionFile: f.saved.file,
+      sessionId: f.saved.header.id,
+      isIdle: true,
+      pendingMessageCount: 0,
+    };
+    let prompts = 0,
+      settled = false;
+    const binding = createSdkHostBinding({
+      ...state,
+      prompt: async () => {
+        prompts++;
+      },
+      clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
+      abort: () => cancellation.promise,
+      abortBash: () => {
+        if (failure === 'bash') {
           capturing.resolve();
-          throw new Error('CAPTURE_FAILED');
-        },
-      }),
+          throw new Error('BASH_FAILED');
+        }
+      },
+    });
+    await controller.ready({
+      state: binding.state,
+      snapshot: async () => ({ ...state, entries: [], leafId: null }),
+      submit: binding.submit,
+      stop: (args) =>
+        binding.stop({
+          ...args,
+          onWithdraw: async (value) => {
+            await args.onWithdraw(value);
+            capturing.resolve();
+            if (failure === 'capture') throw new Error('CAPTURE_FAILED');
+          },
+        }),
+    });
+    const stopping = f.bridge.stop({ session_id: f.id }).finally(() => {
+      settled = true;
+    });
+    try {
+      await capturing.promise;
+      await new Promise((resolve) => setImmediate(resolve));
+      const sent = await f.bridge.send({ session_id: f.id, text: 'must not overlap cancellation' });
+      assert.equal(sent.reason, 'STOP_IN_PROGRESS', JSON.stringify(sent));
+      assert.equal(prompts, 0);
+      assert.equal(settled, false);
+    } finally {
+      cancellation.reject(new Error('ABORT_FAILED'));
+      await stopping;
+    }
+    const stopped = await stopping;
+    assert.equal(stopped.status, 'unknown');
+    assert.equal(stopped.withdrawn_text, 'withdrawn');
+    assert.equal(
+      (await f.bridge.send({ session_id: f.id, text: 'after cancellation' })).status,
+      'dispatched',
+    );
+    assert.equal(prompts, 1);
   });
-  const stopping = f.bridge.stop({ session_id: f.id }).finally(() => {
-    settled = true;
-  });
-  try {
-    await capturing.promise;
-    await new Promise((resolve) => setImmediate(resolve));
-    const sent = await f.bridge.send({ session_id: f.id, text: 'must not overlap cancellation' });
-    assert.equal(sent.reason, 'STOP_IN_PROGRESS', JSON.stringify(sent));
-    assert.equal(prompts, 0);
-    assert.equal(settled, false);
-  } finally {
-    cancellation.resolve();
-    await stopping;
-  }
-  const stopped = await stopping;
-  assert.equal(stopped.status, 'unknown');
-  assert.equal(stopped.withdrawn_text, 'withdrawn');
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, text: 'after cancellation' })).status,
-    'dispatched',
-  );
-  assert.equal(prompts, 1);
-});
 
 test('generic public SDK and RPC bindings withdraw and cancel without invoking release', async () => {
   const state = { sessionFile: '/synthetic/session.jsonl', sessionId: 'native' },
     captured = [],
-    calls = [];
+    calls = [],
+    queued = ['queued'];
   const session = {
     ...state,
     clearQueue: () => {
       calls.push('clear');
-      return { steering: ['queued'], followUp: [] };
+      return { steering: queued.splice(0), followUp: [] };
     },
     abort: async () => {
       calls.push('abort');
@@ -563,6 +572,20 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
     rpc.stop({ ...state, sessionId: 'wrong', onWithdraw: async () => {} }),
     /RUNTIME_SESSION_CHANGED/,
   );
+  calls.length = 0;
+  const cancellation = gate();
+  session.abort = () => {
+    calls.push('abort');
+    return cancellation.promise;
+  };
+  const stopping = sdk.stop({ ...state, onWithdraw: async () => {} });
+  assert.deepEqual(calls, ['clear', 'abort', 'bash']);
+  session.sessionId = 'replacement';
+  queued.push('replacement queue');
+  cancellation.resolve();
+  await assert.rejects(stopping, /RUNTIME_SESSION_CHANGED/);
+  assert.deepEqual(calls, ['clear', 'abort', 'bash']);
+  assert.deepEqual(queued, ['replacement queue']);
   delete session.abortBash;
   await assert.rejects(
     createSdkHostBinding(session).stop({ ...state, onWithdraw: async () => {} }),

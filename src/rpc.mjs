@@ -19,7 +19,7 @@ import { nativeCompactReason } from './compact.mjs';
 import { uiFacts, uiSnapshot } from './rpc-ui.mjs';
 import { RuntimeEvents } from './runtime-events.mjs';
 import { limitBashResult } from './bash-execution.mjs';
-import { requestRpcStop, withdrawalCollector } from './stop-execution.mjs';
+import { requestStop, withdrawalCollector } from './stop-execution.mjs';
 import { validatePiRuntime, validateLaunchArgs, readOwnerConfig } from './owner-config.mjs';
 import {
   reserveOwner,
@@ -731,7 +731,7 @@ export class PiRpc {
     }
     const withdrawn = withdrawalCollector(max_chars);
     try {
-      const receipt = await requestRpcStop(
+      const receipt = await requestStop(
         {
           clearQueue: () =>
             this.dispatch({ type: 'clear_queue' }, timeout_ms, async () => {

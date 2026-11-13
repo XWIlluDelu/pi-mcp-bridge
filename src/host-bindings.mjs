@@ -6,7 +6,7 @@ import { nativeBashResult } from './bash-execution.mjs';
 import { SEND_MODES, hasPromptSettings, promptOptions as options } from './prompt-input.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
-import { requestRpcStop, stopReceipt } from './stop-execution.mjs';
+import { requestStop } from './stop-execution.mjs';
 import { reloadAdmission } from './reload-admission.mjs';
 const unknown = () => ({
   status: 'unknown',
@@ -235,24 +235,19 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         throw new Error('STOP_UNSUPPORTED');
       const before = identity(session);
       assertIdentity(expected, before);
-      const withdrawn = session.clearQueue(),
-        cancellation = tracked.track(session.abort());
-      try {
-        session.abortBash();
-        await onWithdraw(withdrawn);
-        await cancellation;
-      } finally {
-        // Keep adapter admission/release fenced even when capture fails first.
-        // allSettled preserves that failure if cancellation also rejects.
-        await Promise.allSettled([cancellation]);
-      }
-      assertIdentity(before, identity(session));
-      await onWithdraw(session.clearQueue());
-      return stopReceipt({
-        status: 'accepted',
-        acknowledgement: 'native_ack',
-        coverage: 'agent_and_bash',
-      });
+      return tracked.track(
+        requestStop(
+          {
+            clearQueue: () => {
+              assertIdentity(before, identity(session));
+              return session.clearQueue();
+            },
+            abort: () => session.abort(),
+            abortBash: async () => session.abortBash(),
+          },
+          onWithdraw,
+        ),
+      );
     },
     ...(tracked.release
       ? {
@@ -401,7 +396,7 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
       const before = await state();
       assertIdentity(expected, before);
       const result = await tracked.track(
-        requestRpcStop(client, async (value) => {
+        requestStop(client, async (value) => {
           assertIdentity(before, await state());
           await onWithdraw(value);
         }),
@@ -412,7 +407,7 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
     ...(tracked.release
       ? {
           cancel: async () => {
-            await requestRpcStop(client, async () => {});
+            await requestStop(client, async () => {});
           },
           release: tracked.release,
         }
