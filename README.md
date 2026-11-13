@@ -15,7 +15,7 @@ See [working with a session](docs/collaboration.md) for the dispatch, observatio
 
 ## Start locally
 
-Requires Linux, Node.js 22.19 or later, and your own Pi installation (tested with Pi 1.4.0). Install and configure Pi first; Bridge uses that installation's CLI, SDK and native authentication. Set `piExecutable` to an absolute Pi CLI path, or let the launch environment's PATH select `pi`.
+Requires Linux, Node.js 22.19 or later, and your own Pi installation. Install and configure Pi first; Bridge uses that installation's CLI, SDK and native authentication. Both npm installations and Pi's official managed installer are supported. Set `piExecutable` to an absolute Pi CLI or managed-launcher path, or let the launch environment's PATH select `pi`. See [native environment](docs/configuration.md#native-environment) for installation selection.
 
 Get the source and prepare an owner configuration. Use absolute paths below, replacing the private directory with your chosen location:
 

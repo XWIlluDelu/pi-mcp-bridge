@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOwnerConfig, validateLaunchArgs } from './owner-config.mjs';
 import { discover, validateExecutionCwd } from './data.mjs';
 import { launchProfile } from './rpc.mjs';
-import { resolvePiInstallation } from './pi-installation.mjs';
+import { resolvePiInstallation, piLaunchEnvironment } from './pi-installation.mjs';
 
 export async function openProfile(configFile, sessionId, hostEnv = process.env) {
   if (!/^ps_[a-f0-9]{32}$/.test(sessionId ?? '')) throw new Error('INVALID_SESSION_ID');
@@ -14,10 +14,11 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   const session = (await discover(config)).find((item) => item.id === sessionId);
   if (!session) throw new Error('SESSION_NOT_FOUND');
   await validateExecutionCwd(session.cwd);
-  const { env, toolArgs } = launchProfile(config, hostEnv);
+  const { env: baseEnv, toolArgs } = launchProfile(config, hostEnv);
+  const executable = await resolvePiInstallation(config, baseEnv);
+  const env = await piLaunchEnvironment(executable, baseEnv, session.cwd);
   env.PI_MCP_OWNER_CONFIG = configFile;
   env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  const executable = await resolvePiInstallation(config, env);
   // --session-dir only chooses storage for the fresh session. Owner piArgs
   // may set that directory, a provider or resources, but may not select or
   // fork any saved session before the safe /bridge-join reservation.

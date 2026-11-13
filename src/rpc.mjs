@@ -1,6 +1,6 @@
 import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
-import { resolvePiInstallation } from './pi-installation.mjs';
+import { resolvePiInstallation, piLaunchEnvironment } from './pi-installation.mjs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { findHerdr } from './herdr-control.mjs';
@@ -102,10 +102,11 @@ export class PiRpc {
     signal?.throwIfAborted();
     validateLaunchArgs(this.config.piArgs);
     await assertSingleSessionFile(this.session.file);
-    const { env, toolArgs } = launchProfile(this.config);
+    const { env: baseEnv, toolArgs } = launchProfile(this.config);
     if (this.config.piRuntime?.agentDir)
       await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
-    const executable = await resolvePiInstallation(this.config, env);
+    const executable = await resolvePiInstallation(this.config, baseEnv);
+    const env = await piLaunchEnvironment(executable, baseEnv, this.session.cwd);
     signal?.throwIfAborted();
     try {
       if (this.config.attachmentDir) {

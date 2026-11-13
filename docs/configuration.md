@@ -66,7 +66,7 @@ canonical paths; there is no caller `principal` field.
 | `grants`                  | Project/session permission overrides.                                                                                    |
 | `attachmentDir`           | Shared private registry directory; defaults to `stateDir/ipc`. Cooperating owners must use the same canonical directory. |
 | `attachmentExitTimeoutMs` | Owner-exit budget, 50–30000 ms, default 5000. Delete uses it as the SIGTERM grace period before SIGKILL.                 |
-| `piExecutable`            | Absolute installed Pi CLI path, including symlinks. Omission selects Pi from the launch environment's PATH.              |
+| `piExecutable`            | Absolute Pi CLI or official managed-launcher path; symlinks accepted. Omission uses the launch PATH.                     |
 | `piArgs`                  | Additional native CLI arguments; incompatible ownership/selection flags reject.                                          |
 | `compatibilityModules`    | Optional trusted plugin integrations; see [module configuration and API](compatibility.md#owner-configuration).          |
 | `herdr`                   | Boolean, default `false`; hot-read when launching a new RPC writer.                                                      |
@@ -107,14 +107,24 @@ A service's PATH may differ from an interactive shell; configure it or set
 `piExecutable` explicitly. Relative PATH entries resolve from the Bridge/launcher
 cwd, not the target project.
 
-The CLI's real path identifies the external Pi package whose declared SDK and
-dependencies supply all native APIs. Bridge has no bundled Pi dependency.
+The selected npm CLI identifies the external Pi package whose declared SDK and
+dependencies supply all native APIs. The official managed installer is also
+supported: Bridge reads its current `releases-v1` installation marker and release
+selection, then binds that release's CLI and SDK together. It launches the selected
+CLI directly, preserving the installer's managed Node PATH and
+`PI_MANAGED_INSTALL_ROOT`; a concurrent update cannot switch that launch to another
+release after SDK resolution. Bridge has no bundled Pi dependency.
 Missing/non-executable selections report `PI_EXECUTABLE_NOT_FOUND` or
-`PI_EXECUTABLE_NOT_EXECUTABLE`; wrappers without an identifiable matching SDK
-report `PI_INSTALLATION_UNAVAILABLE`. An explicit selection does not fall back
+`PI_EXECUTABLE_NOT_EXECUTABLE`; invalid managed metadata, mismatched releases and
+other wrappers without an identifiable matching SDK report
+`PI_INSTALLATION_UNAVAILABLE`. An explicit selection does not fall back
 to PATH. Existing cooperating writers are reused without resolving another
-executable. After replacing Pi, restart Bridge and reopen affected owners at a
-safe boundary so their loaded native modules agree.
+executable.
+
+Managed updates select a new release for subsequent resolutions; existing owners
+continue using their loaded release. After an in-place npm update, restart Bridge
+and reopen affected owners at a safe boundary to replace Node's cached native
+modules.
 
 `piRuntime` accepts:
 

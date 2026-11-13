@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { launchProfile } from './rpc.mjs';
-import { resolvePiInstallation } from './pi-installation.mjs';
+import { resolvePiInstallation, piLaunchEnvironment } from './pi-installation.mjs';
 import { diagnostics } from './diagnostics.mjs';
 
 const execute = promisify(execFile);
@@ -11,8 +11,9 @@ const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.u
 // A separate process gives native configuration its owner-selected environment
 // without temporarily mutating Bridge process.env or sharing provider registries.
 export async function loadModelCatalog(config, { offset, limit }) {
-  const { env } = launchProfile(config);
-  const installation = await resolvePiInstallation(config, env);
+  const { env: baseEnv } = launchProfile(config);
+  const installation = await resolvePiInstallation(config, baseEnv);
+  const env = await piLaunchEnvironment(installation, baseEnv);
   let stage = 'subprocess';
   try {
     const { stdout } = await execute(
