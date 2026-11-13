@@ -69,9 +69,9 @@ export function toolDefinitions() {
     name,
     description: descriptions[name],
     inputSchema: toJsonSchemaCompat(publicSchemas[name], { pipeStrategy: 'input' }),
+    ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
     ...(publicOutputSchemas[name]
       ? {
-          annotations: publicAnnotations[name],
           outputSchema: toJsonSchemaCompat(publicOutputSchemas[name], { pipeStrategy: 'output' }),
         }
       : {}),

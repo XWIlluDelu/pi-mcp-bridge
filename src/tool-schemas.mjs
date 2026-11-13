@@ -164,7 +164,7 @@ export const publicOutputSchemas = {
   }),
 };
 export const publicAnnotations = Object.fromEntries(
-  ['read', 'search', 'submission'].map((name) => [
+  ['list', 'read', 'search', 'models', 'submission', 'health'].map((name) => [
     name,
     { readOnlyHint: true, destructiveHint: false },
   ]),

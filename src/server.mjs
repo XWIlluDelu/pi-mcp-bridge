@@ -16,9 +16,8 @@ export function makeServer(bridge, { execute = (run) => run() } = {}) {
       {
         description: descriptions[name],
         inputSchema: publicSchemas[name],
-        ...(publicOutputSchemas[name]
-          ? { outputSchema: publicOutputSchemas[name], annotations: publicAnnotations[name] }
-          : {}),
+        ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
+        ...(publicOutputSchemas[name] ? { outputSchema: publicOutputSchemas[name] } : {}),
       },
       (args, extra) =>
         callBridgeTool(bridge, name, args, {
