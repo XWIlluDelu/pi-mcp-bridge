@@ -1,7 +1,6 @@
 // Owner-local transfer using the existing session lock and ownership registry.
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { PiRpc } from './rpc.mjs';
 import { atomicJson } from './storage.mjs';
 import {
   ownerAlive,
@@ -49,7 +48,6 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
       if (bridge.pool.starting.has(session_id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
       const runtime = await bridge.pool.forRead(session);
       if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
-      if (runtime && !(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
       let exitDetails = {};
       if (runtime) {
         runtime.handoffPending = true;

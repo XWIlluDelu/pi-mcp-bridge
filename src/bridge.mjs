@@ -352,7 +352,6 @@ export class Bridge {
           runtime = await this.pool.forRead(session);
           if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
           if (runtime.attached) return await runtime.reload(checkInput);
-          if (!(runtime instanceof PiRpc)) throw new Error('RELOAD_UNSUPPORTED');
           if (!runtime.exitSeal)
             await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
           checkInput();
@@ -1270,7 +1269,6 @@ export class Bridge {
         if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
         let exitDetails = {};
         if (runtime) {
-          if (!(runtime instanceof PiRpc)) throw new Error('BRIDGE_OWNED_RUNTIME_REQUIRED');
           runtime.handoffPending = true;
           const previousNoCold = runtime.ownerRecord?.noColdReacquire === true;
           try {
