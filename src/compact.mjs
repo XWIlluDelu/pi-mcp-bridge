@@ -1,8 +1,9 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 export const compactSchema = z
   .object({
-    session_id: z.string().min(1).max(128),
-    instructions: z.string().max(100000).optional(),
+    session_id: utf16String(128).min(1),
+    instructions: utf16String(100000).optional(),
     interrupt: z.boolean().optional(),
   })
   .strict();

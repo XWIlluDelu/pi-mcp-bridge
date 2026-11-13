@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 import { jsonBytes } from './response-budget.mjs';
 
 // Leave room for identity/framing in the owner control channel's 8 KiB request.
@@ -6,9 +7,9 @@ export const SETTLED_RESULT_LIMIT = 4096;
 const MAX_TEXT = 2048;
 export const settledResultSchema = z
   .object({
-    entry_id: z.string().min(1).max(128),
-    text: z.string().max(MAX_TEXT),
-    stop_reason: z.string().min(1).max(64).nullable(),
+    entry_id: utf16String(128).min(1),
+    text: utf16String(MAX_TEXT),
+    stop_reason: utf16String(64).min(1).nullable(),
     truncated: z.boolean(),
   })
   .strict()

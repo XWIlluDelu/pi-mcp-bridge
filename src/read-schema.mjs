@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 
 const count = z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER);
 export const CONTENT_KINDS = Object.freeze([
@@ -110,7 +111,7 @@ export const contentSchema = z
 
 export const readSchema = z
   .object({
-    session_id: z.string().min(1).max(256).optional(),
+    session_id: utf16String(256).min(1).optional(),
     view: z
       .enum(['session', 'runtime'])
       .describe(
@@ -119,10 +120,10 @@ export const readSchema = z
       .optional(),
     range: rangeSchema.optional(),
     content: contentSchema.optional(),
-    leaf_id: z.string().min(1).max(128).nullable().optional(),
-    cursor: z.string().min(1).max(4096).optional(),
+    leaf_id: utf16String(128).min(1).nullable().optional(),
+    cursor: utf16String(4096).min(1).optional(),
     refs: z
-      .array(z.string().min(1).max(4096))
+      .array(utf16String(4096).min(1))
       .min(1)
       .max(8)
       .describe(
@@ -164,12 +165,9 @@ export const readSchema = z
 
 export const searchSchema = z
   .object({
-    session_id: z.string().min(1).max(256),
-    query: z
-      .string()
-      .trim()
+    session_id: utf16String(256).min(1),
+    query: utf16String(2048, { trim: true })
       .min(1)
-      .max(2048)
       .describe(
         'Case-insensitive literal text across the reader’s full effective content, independent of read sampling.',
       ),
@@ -182,7 +180,7 @@ export const searchSchema = z
         'Content kinds to search; omit for all supported kinds. Uses the same names as read.content.',
       )
       .optional(),
-    leaf_id: z.string().min(1).max(128).nullable().optional(),
+    leaf_id: utf16String(128).min(1).nullable().optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),
   })
   .strict()

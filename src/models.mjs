@@ -1,7 +1,8 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 import { resolvePiInstallation, loadPiAi } from './pi-installation.mjs';
 
-const identifier = z.string().min(1).max(256);
+const identifier = utf16String(256).min(1);
 export const modelSelectionSchema = z.object({ provider: identifier, id: identifier }).strict();
 export const thinkingLevelSchema = z.enum([
   'off',

@@ -1,10 +1,11 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 import { readSchema as publicReadSchema, searchSchema } from './read-schema.mjs';
 import { compactSchema } from './compact.mjs';
 import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
 import { modelSelectionSchema, thinkingLevelSchema, modelsSchema } from './models.mjs';
 import { modelSettingsSchema } from './set-model.mjs';
-const id = z.string().min(1).max(128);
+const id = utf16String(128).min(1);
 const executionShape = {
   session_id: id,
   max_chars: z.number().int().min(256).max(32768).optional(),
@@ -13,18 +14,18 @@ export const stopSchema = z.object(executionShape).strict();
 export const bashSchema = z
   .object({
     ...executionShape,
-    command: z.string().min(1).max(100000),
+    command: utf16String(100000).min(1),
   })
   .strict();
 const hasPrompt = (args) => args.text !== undefined || args.images !== undefined;
 // Public contracts also validate direct Bridge calls.
-const directory = z.string().min(1).max(4096);
+const directory = utf16String(4096).min(1);
 const date = z.string().datetime({ offset: true });
 export const publicOperationSchemas = {
   list: z
     .object({
-      project: z.string().max(200).optional(),
-      name: z.string().max(200).optional(),
+      project: utf16String(200).optional(),
+      name: utf16String(200).optional(),
       active_after: date.optional(),
       active_before: date.optional(),
       session_id: id.optional(),
@@ -42,7 +43,7 @@ export const publicOperationSchemas = {
   models: modelsSchema,
   submission: z.object({ session_id: id, submission_id: z.string().uuid() }).strict(),
   set_model: z
-    .object({ session_id: id, ...modelSettingsSchema.innerType().shape })
+    .object({ session_id: id, ...modelSettingsSchema.shape })
     .strict()
     .refine((args) => args.model !== undefined || args.thinking_level !== undefined, {
       message: 'Model or thinking level required',
@@ -54,7 +55,7 @@ export const publicOperationSchemas = {
   send: z
     .object({
       session_id: id,
-      text: z.string().min(1).max(100000).optional(),
+      text: utf16String(100000).min(1).optional(),
       images: imagesSchema.optional(),
       model: modelSelectionSchema.optional(),
       thinking_level: thinkingLevelSchema.optional(),
@@ -67,11 +68,11 @@ export const publicOperationSchemas = {
   create: z
     .object({
       project: directory,
-      text: z.string().min(1).max(100000).optional(),
+      text: utf16String(100000).min(1).optional(),
       images: imagesSchema.optional(),
       model: modelSelectionSchema.optional(),
       thinking_level: thinkingLevelSchema.optional(),
-      name: z.string().min(1).max(200).optional(),
+      name: utf16String(200).min(1).optional(),
       fork_from: id.optional(),
     })
     .strict()
@@ -85,15 +86,16 @@ export const publicOperationSchemas = {
 export const batchOperationSchema = z
   .object({
     op: z.enum(Object.keys(publicOperationSchemas)),
-    args: z.record(z.unknown()),
+    args: z.record(z.string(), z.unknown()),
   })
   .strict();
 export const batchSchema = z
   .object({
     // Describe valid items, but retain malformed ones for per-item errors rather
     // than rejecting valid siblings at the outer MCP validation boundary.
+    // Schema projection calls the catch handler without a parse context.
     operations: z
-      .array(batchOperationSchema.catch(({ input }) => input))
+      .array(batchOperationSchema.catch((context) => context?.input))
       .min(1)
       .max(10),
   })
@@ -130,7 +132,7 @@ const readableResult = z
           title: z.string().optional(),
           text: z.string().optional(),
           truncated: z.boolean().optional(),
-          source: z.record(z.unknown()).optional(),
+          source: z.record(z.string(), z.unknown()).optional(),
           branch_relation: z.enum(['on_branch', 'off_branch', 'unknown']).optional(),
           related: z.array(z.object({ relation: z.string(), ref: z.string() })).optional(),
         })

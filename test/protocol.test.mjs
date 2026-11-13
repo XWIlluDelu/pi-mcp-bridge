@@ -12,8 +12,12 @@ import {
   toolDefinitions,
   validateModernHeaders,
   isRpcRequest,
+  callBridgeTool,
 } from '../src/protocol.mjs';
 import { BridgeStdioTransport } from '../src/protocol-stdio.mjs';
+import { publicSchemas } from '../src/tool-schemas.mjs';
+import { CONTENT_KINDS } from '../src/read-schema.mjs';
+import { MAX_IMAGES } from '../src/prompt-input.mjs';
 
 const meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
 const message = (method, params = {}, id = 1) => ({
@@ -28,6 +32,50 @@ const deferred = () => {
   const promise = new Promise((r) => (resolve = r));
   return { promise, resolve };
 };
+
+test('oversized input collections reject before inspecting elements or admitting work', async () => {
+  const bridge = { captureRequestContext: () => assert.fail('Invalid request reached admission') };
+  for (const [name, field, limit, identity] of [
+    ['batch', 'operations', 10, {}],
+    ['read', 'refs', 8, { session_id: 'fixture' }],
+    ['search', 'content', CONTENT_KINDS.length, { session_id: 'fixture', query: 'needle' }],
+    ['send', 'images', MAX_IMAGES, { session_id: 'fixture' }],
+    ['create', 'images', MAX_IMAGES, { project: '/fixture' }],
+  ]) {
+    const values = new Array(limit + 1);
+    Object.defineProperty(values, 0, {
+      get: () => assert.fail(`${name} inspected an element of an oversized collection`),
+    });
+    const args = { ...identity, [field]: values };
+    const parsed = publicSchemas[name].safeParse(args);
+    assert.equal(parsed.success, false);
+    assert.equal(parsed.error.issues.length, 1);
+    assert.equal(parsed.error.issues[0].code, 'too_big');
+    assert.deepEqual(parsed.error.issues[0].path, [field]);
+    const result = await callBridgeTool(bridge, name, args);
+    assert.equal(result.structuredContent.error.code, 'INVALID_ARGUMENTS');
+  }
+});
+
+test('public text limits retain UTF-16 units and trim search before validation', () => {
+  for (const [name, field, limit, identity] of [
+    ['search', 'query', 2048, { session_id: 'fixture' }],
+    ['send', 'text', 100000, { session_id: 'fixture' }],
+    ['compact', 'instructions', 100000, { session_id: 'fixture' }],
+  ]) {
+    const text = '😀'.repeat(limit / 2);
+    assert.equal(publicSchemas[name].safeParse({ ...identity, [field]: text }).success, true);
+    assert.equal(
+      publicSchemas[name].safeParse({ ...identity, [field]: text + 'a' }).success,
+      false,
+    );
+  }
+  assert.equal(
+    publicSchemas.search.parse({ session_id: 'fixture', query: ' '.repeat(2048) + 'needle ' })
+      .query,
+    'needle',
+  );
+});
 
 test('transport request envelopes allow notifications and enforce parameter and ID boundaries', () => {
   const request = { jsonrpc: '2.0', method: 'ping' };

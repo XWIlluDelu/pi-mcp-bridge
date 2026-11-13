@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 import { atomicJson, readPrivateFile, hash } from './storage.mjs';
 import { permitted } from './permissions.mjs';
 import { knownErrorCode } from './errors.mjs';
@@ -29,8 +30,8 @@ const argsSchema = z.object({ session_id: z.string().regex(/^ps_[a-f0-9]{32}$/) 
 const deliverySchema = z
   .object({
     mode: z.string(),
-    url: z.string().max(4096),
-    secret: z.string().max(100),
+    url: utf16String(4096),
+    secret: utf16String(100),
   })
   .strict();
 const subscribeSchema = z

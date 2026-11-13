@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { utf16String } from './schema.mjs';
 import { modelSelectionSchema, thinkingLevelSchema, sameModel } from './models.mjs';
 export const hasPromptSettings = (input) =>
   input.model !== undefined || input.thinking_level !== undefined;
@@ -6,6 +7,7 @@ export const hasPromptSettings = (input) =>
 // Fit a complete base64 prompt (including text/JSON overhead) into the existing
 // 8 MiB MCP/IPC request bound. No URL fetching or local-path access is implied.
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_IMAGES = 32;
 export const SEND_MODES = ['steer', 'follow_up', 'idle_only'];
 // Native slash dispatch precedes input events. Owner-local control must be
 // refused at remote admission, including Pi's command collision suffixes.
@@ -52,8 +54,9 @@ const imageSchema = z
 export const imagesSchema = z
   .array(imageSchema)
   .min(1)
+  .max(MAX_IMAGES)
   .describe(
-    'Native Pi image blocks: PNG/JPEG/GIF/WebP, one or more images, at most 5 MiB decoded bytes in total. Native Pi extensions and the final provider handle image input.',
+    'Native Pi image blocks: PNG/JPEG/GIF/WebP, 1–32 images, at most 5 MiB decoded bytes in total. Native Pi extensions and the final provider handle image input.',
   )
   .superRefine((images, ctx) => {
     if (
@@ -66,7 +69,7 @@ export const imagesSchema = z
       });
   });
 const promptSchema = z.object({
-  text: z.string().min(1).max(100000).optional(),
+  text: utf16String(100000).min(1).optional(),
   images: imagesSchema.optional(),
   model: modelSelectionSchema.optional(),
   thinking_level: thinkingLevelSchema.optional(),

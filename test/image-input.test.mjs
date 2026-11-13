@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { imagesSchema, promptInput, MAX_IMAGE_BYTES } from '../src/prompt-input.mjs';
+import { imagesSchema, promptInput, MAX_IMAGE_BYTES, MAX_IMAGES } from '../src/prompt-input.mjs';
 import { publicSchemas } from '../src/tool-schemas.mjs';
 import { toolDefinitions, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { Bridge } from '../src/bridge.mjs';
@@ -44,10 +44,11 @@ test('image schemas expose native blocks and reject malformed, mislabeled and ov
     images: [image],
   });
   assert.equal(promptInput({}), undefined);
-  for (const count of [5, 33, 100])
+  for (const count of [1, MAX_IMAGES])
     assert.equal(imagesSchema.safeParse(Array(count).fill(image)).success, true);
   const invalid = [
     [],
+    Array(MAX_IMAGES + 1).fill(image),
     [{ ...image, data: 'data:image/png;base64,' + image.data }],
     [{ ...image, data: image.data + '\n' }],
     [{ ...image, data: 'not base64' }],
@@ -220,7 +221,7 @@ test(
         session_id: made.session_id,
 
         text: mode,
-        images: mode === 'follow_up' ? Array(40).fill(image) : [image],
+        images: mode === 'follow_up' ? Array(MAX_IMAGES).fill(image) : [image],
         mode,
       };
       const sent = await call('send', args);

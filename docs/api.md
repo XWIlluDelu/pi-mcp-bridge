@@ -210,7 +210,7 @@ Use `list({session_id})` for current activity and `read({session_id})` for curre
 For create, replace `session_id` with the configured absolute `project`. Image-only input is supported; Bridge adds `[Image attachment]` as neutral queue text.
 
 - MIME types: PNG, JPEG, GIF and WebP. `data` must be canonical base64 without whitespace or a `data:` prefix; URLs, paths and attachment IDs are not fetched.
-- There is no fixed image-count cap. Total decoded size is at most 5 MiB per send/create, within the shared 8 MiB serialized request limit. Native provider limits also apply.
+- Each send/create accepts up to 32 images and at most 5 MiB of decoded image data, within the shared 8 MiB serialized request limit. The count bound limits validation work independently of byte size. Native provider limits also apply.
 - Bridge validates bytes and format signatures, then forwards native image blocks. Pi extensions and provider conversion retain their normal decoding, resizing and transformation behavior; image support is determined after native input processing.
 - Owners must advertise image support or the whole submission returns `IMAGE_INPUT_UNSUPPORTED`. See [image-capable owners](runtime.md#image-capable-owners).
 
