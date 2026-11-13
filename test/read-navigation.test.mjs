@@ -12,6 +12,7 @@ import { jsonBytes } from '../src/response-budget.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { buildSessionProjection, SessionManager } from './fixtures/pi.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
 const identity = {
   session_id: 'fixture',
@@ -987,10 +988,10 @@ async function bridgeFixture(t) {
 
 test('Bridge search finds older effective content, expands frozen evidence and rechecks current permission', async (t) => {
   const f = await bridgeFixture(t);
-  await assert.rejects(
-    f.bridge.read({ session_id: f.id, search_query: 'unique middle decision' }),
-    /INVALID_READ_ARGUMENTS/,
-  );
+  await assertInvalidArguments(f.bridge, 'read', {
+    session_id: f.id,
+    search_query: 'unique middle decision',
+  });
   assert.equal(f.acquisitions(), 0, 'internal predicates are rejected before source acquisition');
   const brief = await f.bridge.read({ session_id: f.id, range: { recent: 1 } });
   assert.doesNotMatch(JSON.stringify(brief.items), /unique middle decision/);

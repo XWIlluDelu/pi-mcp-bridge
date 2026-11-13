@@ -2,23 +2,24 @@ import { z } from 'zod';
 import { utf16String } from './schema.mjs';
 import { readSchema as publicReadSchema, searchSchema } from './read-schema.mjs';
 import { compactSchema } from './compact.mjs';
-import { SEND_MODES, imagesSchema } from './prompt-input.mjs';
-import { modelSelectionSchema, thinkingLevelSchema, modelsSchema } from './models.mjs';
+import { SEND_MODES, promptSchema } from './prompt-input.mjs';
+import { modelsSchema } from './models.mjs';
 import { modelSettingsSchema } from './set-model.mjs';
 const id = utf16String(128).min(1);
 const executionShape = {
   session_id: id,
   max_chars: z.number().int().min(256).max(32768).optional(),
 };
-export const stopSchema = z.object(executionShape).strict();
-export const bashSchema = z
+const stopSchema = z.object(executionShape).strict();
+const bashSchema = z
   .object({
     ...executionShape,
     command: utf16String(100000).min(1),
   })
   .strict();
 const hasPrompt = (args) => args.text !== undefined || args.images !== undefined;
-// Public contracts also validate direct Bridge calls.
+// The MCP tool boundary and batch planning validate against these schemas once;
+// Bridge operation methods receive parsed arguments.
 const directory = utf16String(4096).min(1);
 const date = z.string().datetime({ offset: true });
 export const publicOperationSchemas = {
@@ -42,36 +43,23 @@ export const publicOperationSchemas = {
     ),
   models: modelsSchema,
   submission: z.object({ session_id: id, submission_id: z.string().uuid() }).strict(),
-  set_model: z
-    .object({ session_id: id, ...modelSettingsSchema.shape })
-    .strict()
-    .refine((args) => args.model !== undefined || args.thinking_level !== undefined, {
-      message: 'Model or thinking level required',
-    }),
+  set_model: modelSettingsSchema.safeExtend({ session_id: id }),
   compact: compactSchema,
   reload: z.object({ session_id: id }).strict(),
   read: publicReadSchema,
   search: searchSchema,
-  send: z
-    .object({
+  send: promptSchema
+    .extend({
       session_id: id,
-      text: utf16String(100000).min(1).optional(),
-      images: imagesSchema.optional(),
-      model: modelSelectionSchema.optional(),
-      thinking_level: thinkingLevelSchema.optional(),
       mode: z.enum(SEND_MODES).optional(),
     })
     .strict()
     .refine(hasPrompt, { message: 'Text or images required' }),
   command: bashSchema,
   stop: stopSchema,
-  create: z
-    .object({
+  create: promptSchema
+    .extend({
       project: directory,
-      text: utf16String(100000).min(1).optional(),
-      images: imagesSchema.optional(),
-      model: modelSelectionSchema.optional(),
-      thinking_level: thinkingLevelSchema.optional(),
       name: utf16String(200).min(1).optional(),
       fork_from: id.optional(),
     })
@@ -89,7 +77,7 @@ export const batchOperationSchema = z
     args: z.record(z.string(), z.unknown()),
   })
   .strict();
-export const batchSchema = z
+const batchSchema = z
   .object({
     // Describe valid items, but retain malformed ones for per-item errors rather
     // than rejecting valid siblings at the outer MCP validation boundary.

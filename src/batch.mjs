@@ -1,20 +1,13 @@
-import { batchSchema, batchOperationSchema, publicOperationSchemas } from './tool-schemas.mjs';
+import { batchOperationSchema, publicOperationSchemas } from './tool-schemas.mjs';
 import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
 import { publicError } from './errors.mjs';
 
-export const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
+const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
 const envelope = (results) => ({
   status: 'processed',
   response_max_bytes: BATCH_RESPONSE_LIMIT,
   results,
 });
-
-export function preflightBatch(input) {
-  const parsed = batchSchema.safeParse(input);
-  if (!parsed.success)
-    return { error: { status: 'rejected', error: { code: 'INVALID_BATCH' }, results: [] } };
-  return { operations: parsed.data.operations };
-}
 
 function planBatch(operations) {
   const frame = envelope(operations.map(() => null)),
@@ -72,9 +65,9 @@ function fitQuery(op, result, args, budget) {
   throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
 }
 
-export async function executeBatch(bridge, input, { requestContext } = {}) {
-  const { operations, error } = preflightBatch(input);
-  if (error) return error;
+// Callers validate the outer batch shape; malformed items are retained for
+// per-item errors and validated here against their own operation schema.
+export async function executeBatch(bridge, { operations }, { requestContext } = {}) {
   const plan = planBatch(operations);
   requestContext ??= bridge.captureRequestContext?.();
   void requestContext?.catch?.(() => {});

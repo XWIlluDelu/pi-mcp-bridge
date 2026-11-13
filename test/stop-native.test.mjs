@@ -23,6 +23,7 @@ import { readClaim, processIdentity } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
 async function until(fn) {
   const end = Date.now() + 10000;
@@ -223,7 +224,7 @@ async function exerciseBash(f, native) {
   assert.ok(text.startsWith(first.output));
   assert.ok(JSON.stringify({ output: first.output }).length <= 512);
   assert.equal(first.next_cursor, undefined);
-  await assert.rejects(f.bridge.command({ session_id: id, cursor: '' }), /INVALID_ARGUMENTS/);
+  await assertInvalidArguments(f.bridge, 'command', { session_id: id, cursor: '' });
 
   rule.command = false;
   await assert.rejects(f.bridge.command({ session_id: id, command }), /NOT_FOUND_OR_DENIED/);

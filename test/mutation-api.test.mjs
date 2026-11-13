@@ -11,6 +11,7 @@ import { withdrawalCollector } from '../src/stop-execution.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { MCP_RESPONSE_LIMIT, toolResultBytes, TOOL_RESULT_LIMIT } from '../src/response-budget.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
 function admissionReceipt(result, ids) {
   const { submission_id, ...receipt } = result;
@@ -114,8 +115,8 @@ test('launch failures preserve public codes through MCP and batch without exposi
 test('invalid list filters and missing mutation payloads do not dispatch', async (t) => {
   const f = await fixture(t);
   for (const args of [{ limit: 0 }, { offset: -1 }, { active_after: 'not-a-date' }, { project: 1 }])
-    await assert.rejects(f.bridge.list(args), /INVALID_ARGUMENTS/);
-  await assert.rejects(f.bridge.send({ session_id: f.id }), /INVALID_ARGUMENTS/);
+    await assertInvalidArguments(f.bridge, 'list', args);
+  await assertInvalidArguments(f.bridge, 'send', { session_id: f.id });
   assert.deepEqual(f.calls, { prompt: 0, command: 0, stop: 0 });
 });
 

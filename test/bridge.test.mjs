@@ -14,6 +14,7 @@ import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
 import { readClaim, reserveOwner } from '../src/attachments.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('listing respects the latest native title including an explicit clear', async (t) => {
@@ -155,10 +156,7 @@ test('idle_only skips busy while native and strategy modes retain Pi semantics',
     f.runtime.calls.map((c) => c.streamingBehavior),
     ['steer', 'followUp'],
   );
-  await assert.rejects(
-    f.bridge.send({ session_id: f.id, text: 'x', mode: 'unknown' }),
-    /INVALID_ARGUMENTS/,
-  );
+  await assertInvalidArguments(f.bridge, 'send', { session_id: f.id, text: 'x', mode: 'unknown' });
   assert.equal(f.runtime.calls.length, 2);
 });
 

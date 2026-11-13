@@ -1,8 +1,14 @@
 import { Bridge } from '../src/bridge.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { executeBatch, preflightBatch } from '../src/batch.mjs';
-import { toolDefinitions, dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
+import { executeBatch } from '../src/batch.mjs';
+import {
+  callBridgeTool,
+  toolDefinitions,
+  dispatchModern,
+  META,
+  MODERN_VERSION,
+} from '../src/protocol.mjs';
 import { makeServer } from '../src/server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -145,7 +151,8 @@ test('outer size/shape bounds reject before any operation but bad item args do n
     { operations: Array.from({ length: 11 }, () => send('a', 'x')) },
     { operations: [send('a', 'x')], extra: true },
   ]) {
-    assert.equal((await executeBatch(bridge, input)).status, 'rejected');
+    const refused = await callBridgeTool(bridge, 'batch', input);
+    assert.equal(refused.structuredContent.error.code, 'INVALID_ARGUMENTS');
     assert.equal(calls, 0);
   }
   const result = await executeBatch(bridge, {
@@ -156,7 +163,6 @@ test('outer size/shape bounds reject before any operation but bad item args do n
   });
   assert.equal(result.results[0].error.code, 'INVALID_OPERATION');
   assert.equal(calls, 1);
-  assert.ok(preflightBatch({ operations: [null] }).operations);
 });
 test('fork shares its source lane; list and health do not add mutation permissions', async () => {
   const events = [],

@@ -68,7 +68,7 @@ export const imagesSchema = z
         message: 'Images exceed 5 MiB total decoded bytes',
       });
   });
-const promptSchema = z.object({
+export const promptSchema = z.object({
   text: utf16String(100000).min(1).optional(),
   images: imagesSchema.optional(),
   model: modelSelectionSchema.optional(),

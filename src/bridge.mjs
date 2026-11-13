@@ -5,18 +5,15 @@ import { settledResultSchema } from './settled-result.mjs';
 import { publicError } from './errors.mjs';
 import path from 'node:path';
 import { compactReceipt, nativeCompactReason } from './compact.mjs';
-import { modelsSchema } from './models.mjs';
 import { modelSettings } from './set-model.mjs';
 import { loadModelCatalog } from './model-catalog.mjs';
 import { randomUUID } from 'node:crypto';
-import { readSchema, searchSchema, ALL_CONTENT } from './read-schema.mjs';
-import { publicOperationSchemas } from './tool-schemas.mjs';
+import { ALL_CONTENT } from './read-schema.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
 import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
 import {
-  SEND_MODES,
   promptInput,
   hasPromptSettings,
   assertPromptSelection,
@@ -250,7 +247,6 @@ export class Bridge {
     if (!allowed) throw new Error('NOT_FOUND_OR_DENIED');
   }
   async models(args = {}, { requestContext } = {}) {
-    if (!modelsSchema.safeParse(args).success) throw new Error('INVALID_MODELS_ARGUMENTS');
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const policy = requestContext.permissions;
@@ -275,14 +271,12 @@ export class Bridge {
     return loadModelCatalog(this.config, args);
   }
   set_model(args, options) {
-    return this.#mutation('set_model', args, options, this.#setModel);
+    return this.#mutation(args, options, this.#setModel);
   }
   send(args, options) {
-    return this.#mutation('send', args, options, this.#send);
+    return this.#mutation(args, options, this.#send);
   }
   async submission(args, { requestContext } = {}) {
-    if (!publicOperationSchemas.submission.safeParse(args).success)
-      throw new Error('INVALID_ARGUMENTS');
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const session = await this.session(args.session_id, requestContext);
@@ -301,32 +295,30 @@ export class Bridge {
     return record;
   }
   create(args, options) {
-    return this.#mutation('create', args, options, this.#create);
+    return this.#mutation(args, options, this.#create);
   }
   command(args, options) {
-    return this.#mutation('command', args, options, this.#command);
+    return this.#mutation(args, options, this.#command);
   }
   stop(args, options) {
-    return this.#mutation('stop', args, options, this.#stop);
+    return this.#mutation(args, options, this.#stop);
   }
   reload(args, options) {
-    return this.#mutation('reload', args, options, this.#reload);
+    return this.#mutation(args, options, this.#reload);
   }
   compact(args, options) {
-    return this.#mutation('compact', args, options, this.#compact);
+    return this.#mutation(args, options, this.#compact);
   }
   delete(args, options) {
-    return this.#mutation('delete', args, options, this.#delete);
+    return this.#mutation(args, options, this.#delete);
   }
 
-  async #mutation(op, input, options, action) {
-    const parsed = publicOperationSchemas[op].safeParse(input);
-    if (!parsed.success) throw new Error('INVALID_ARGUMENTS');
+  async #mutation(args, options, action) {
     this.assertOpen();
     let releaseCandidate;
     const work = (async () => {
       try {
-        return await action.call(this, parsed.data, {
+        return await action.call(this, args, {
           ...options,
           markForAutoRelease: (runtime) => {
             if (runtime instanceof PiRpc) releaseCandidate = runtime;
@@ -417,12 +409,7 @@ export class Bridge {
       return this.mutationLock(session.id, 'send', requestContext, async () => {
         try {
           let runtime = await this.pool.forRead(session);
-          if (!runtime) {
-            await validateExecutionCwd(session.cwd);
-            await loadSavedSession(session, { config: this.config });
-            checkInput();
-            runtime = await this.pool.resolve(session);
-          }
+          runtime ??= await this.#coldStart(session, checkInput);
           markForAutoRelease(runtime);
           if (!runtime.attached && !body.interrupt)
             await runtime.assertIdle({
@@ -460,9 +447,6 @@ export class Bridge {
     });
   }
   async list(args = {}, { requestContext } = {}) {
-    const parsed = publicOperationSchemas.list.safeParse(args);
-    if (!parsed.success) throw new Error('INVALID_ARGUMENTS');
-    args = parsed.data;
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const sessions = args.session_id
@@ -570,8 +554,7 @@ export class Bridge {
         .map(({ path }) => path),
     };
   }
-  async health(args = {}, { requestContext } = {}) {
-    const { session_id } = publicOperationSchemas.health.parse(args);
+  async health({ session_id } = {}, { requestContext } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     // Diagnose only the requested session, without its metadata or source paths.
@@ -596,10 +579,7 @@ export class Bridge {
       ...(this.events.storeError ? { events: this.events.health() } : {}),
     };
   }
-  async search(input, options = {}) {
-    const parsed = searchSchema.safeParse(input);
-    if (!parsed.success) throw new Error('INVALID_SEARCH_ARGUMENTS');
-    const { query, content, ...args } = parsed.data;
+  async search({ query, content, ...args }, options = {}) {
     const selected =
       content === undefined
         ? ALL_CONTENT
@@ -615,9 +595,6 @@ export class Bridge {
     );
   }
   async read(args, { requestContext, resultBudget, readPins, searchQuery } = {}) {
-    const parsed = readSchema.safeParse(args);
-    if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
-    args = parsed.data;
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     // Routing metadata only. Cached content is accessed after authorization and
@@ -663,14 +640,8 @@ export class Bridge {
       });
     }
     args = { ...args, session_id: id };
-    let runtime = await this.pool.forRead(s);
-    while (runtime && this.handoffs.get(id)?.runtime === runtime) {
-      await runtime.autoReleaseTask;
-      this.assertOpen();
-      s = await this.session(id, requestContext);
-      this.check('read', s, requestContext);
-      runtime = await this.pool.forRead(s);
-    }
+    let runtime;
+    ({ session: s, runtime } = await this.#readableOwner(s, requestContext));
     diagnostics.emit('read.source', {
       kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
     });
@@ -789,6 +760,43 @@ export class Bridge {
     };
     return this.readCache.navigate(snapshot, args, renderOptions, searchQuery);
   }
+  // A read-only operation waits for an admitted auto-release to finish, then
+  // reselects the current owner under the same request policy.
+  async #readableOwner(session, requestContext) {
+    let runtime = await this.pool.forRead(session);
+    while (runtime && this.handoffs.get(session.id)?.runtime === runtime) {
+      await runtime.autoReleaseTask;
+      this.assertOpen();
+      session = await this.session(session.id, requestContext);
+      this.check('read', session, requestContext);
+      runtime = await this.pool.forRead(session);
+    }
+    return { session, runtime };
+  }
+  // Existing owners remain usable without their original cwd; only a new
+  // writer needs a validated directory and a valid saved transcript.
+  async #coldStart(session, beforeResolve = () => {}) {
+    await validateExecutionCwd(session.cwd);
+    await loadSavedSession(session, { config: this.config });
+    await beforeResolve();
+    return this.pool.resolve(session);
+  }
+  // One native prompt on an owned RPC; a late ACK updates the same receipt.
+  #ownedPrompt(runtime, { input, mode, submissionId, selection, authorize }) {
+    return runtime.command(
+      {
+        id: submissionId,
+        type: 'prompt',
+        message: input.text,
+        ...(input.images ? { images: input.images } : {}),
+        // Native admission must also refuse a hook that turns busy after selection.
+        ...promptOptions(hasPromptSettings(input) ? 'idle_only' : mode),
+      },
+      undefined,
+      (late) => this.submissions.update(submissionId, promptResult(late)),
+      () => beforePromptDispatch(runtime, input, selection, authorize),
+    );
+  }
   async acquireNativeRead(session, runtime, args) {
     if (runtime) return runtime.read(args);
     session = await loadSavedSession(session, { omitImageData: true, config: this.config });
@@ -819,10 +827,7 @@ export class Bridge {
       await authorized();
       runtime = await this.pool.forRead(target);
       if (!runtime) {
-        await validateExecutionCwd(target.cwd);
-        await loadSavedSession(target, { config: this.config });
-        await authorized();
-        runtime = await this.pool.resolve(target);
+        runtime = await this.#coldStart(target, authorized);
         markForAutoRelease(runtime);
       }
       await authorized();
@@ -836,12 +841,10 @@ export class Bridge {
     });
   }
   async #send(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
-    if (!SEND_MODES.includes(args.mode ?? 'steer')) throw new Error('INVALID_ARGUMENTS');
     return this.withInput(args.session_id, pendingInput, async (beforeDispatch) => {
       requestContext = await (requestContext ?? this.captureRequestContext());
       this.assertOpen();
-      const input = promptInput(args);
-      const body = input === undefined ? undefined : { ...input, mode: args.mode ?? 'steer' };
+      const body = { ...promptInput(args), mode: args.mode ?? 'steer' };
       let target;
       try {
         target = await this.session(args.session_id, requestContext);
@@ -869,14 +872,9 @@ export class Bridge {
           beforeDispatch();
           const s = await this.session(args.session_id, requestContext);
           this.check('send', s, requestContext);
-          // Existing owners remain readable/controllable independently of whether
-          // their original working directory still exists. Only a new execution
-          // needs a validated directory and a valid saved transcript.
           runtime = await this.pool.forRead(s);
           if (!runtime) {
-            await validateExecutionCwd(s.cwd);
-            await loadSavedSession(s, { config: this.config });
-            runtime = await this.pool.resolve(s);
+            runtime = await this.#coldStart(s);
             markForAutoRelease(runtime);
           }
           const authorized = beforeDispatch;
@@ -893,18 +891,7 @@ export class Bridge {
               return outcome({ ...selection, status: 'skipped', reason: 'busy' });
             if (idle.status !== 'idle') throw new Error('MODEL_SELECTION_IDLE_UNCONFIRMED');
           }
-          if (hasPromptSettings(body)) {
-            const actual = await runtime.selectModel(body.model, {
-              thinkingLevel: body.thinking_level,
-              idle: true,
-              beforeDispatch: authorized,
-            });
-            selection.model_selection = {
-              model: actual.model,
-              thinking_level: actual.thinking_level,
-            };
-            await authorized();
-          }
+          await selectPromptModel(runtime, body, selection, authorized);
           if (body.mode === 'idle_only') {
             const idle = await runtime.idleSnapshot();
             if (idle.status === 'busy')
@@ -912,20 +899,15 @@ export class Bridge {
             if (idle.status !== 'idle') throw new Error('RUNTIME_IDLE_UNCONFIRMED');
           }
           await authorized();
-          const command = {
-            id: submissionId,
-            type: 'prompt',
-            message: body.text,
-            ...(body.images ? { images: body.images } : {}),
-            // Native admission must also refuse a hook that turns busy after selection.
-            ...promptOptions(hasPromptSettings(body) ? 'idle_only' : body.mode),
-          };
-          const late = (result) => this.submissions.update(submissionId, promptResult(result));
           if (!runtime.modelMutation && !runtime.compactionMutation && !runtime.promptAdmission)
             markForAutoRelease(runtime);
-          const result = await runtime.command(command, undefined, late, () =>
-            beforePromptDispatch(runtime, body, selection, authorized),
-          );
+          const result = await this.#ownedPrompt(runtime, {
+            input: body,
+            mode: body.mode,
+            submissionId,
+            selection,
+            authorize: authorized,
+          });
           return outcome({ ...selection, ...promptResult({ ok: true, data: result }) });
         } catch (e) {
           return outcome({
@@ -960,15 +942,9 @@ export class Bridge {
               if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
             };
             await beforeDispatch();
-            let runtime = await this.pool.forRead(session);
-            if (!runtime) {
-              await validateExecutionCwd(session.cwd);
-              await loadSavedSession(session, { config: this.config });
-              runtime = await this.pool.resolve(session);
-            }
+            const runtime = (await this.pool.forRead(session)) ?? (await this.#coldStart(session));
             markForAutoRelease(runtime);
             await beforeDispatch();
-            if (typeof runtime.executeBash !== 'function') throw new Error('BASH_UNSUPPORTED');
             generation = runtime.generation ?? runtime.record?.generation ?? null;
             output = inlineBashResult(await runtime.executeBash({ ...args, beforeDispatch }));
             return { status: 'completed', generation };
@@ -1008,7 +984,6 @@ export class Bridge {
           const runtime = await this.pool.forRead(session);
           this.assertOpen();
           if (!runtime) return { status: 'skipped', reason: 'not_running' };
-          if (typeof runtime.stopExecution !== 'function') throw new Error('STOP_UNSUPPORTED');
           generation = runtime.generation ?? runtime.record?.generation ?? null;
           if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
           const result = await runtime.stopExecution(args);
@@ -1061,19 +1036,11 @@ export class Bridge {
       if (args.fork_from) {
         parent = await this.session(args.fork_from, requestContext);
         this.check('read', parent, requestContext);
-        let runtime = await this.pool.forRead(parent);
-        while (runtime && this.handoffs.get(parent.id)?.runtime === runtime) {
-          await runtime.autoReleaseTask;
-          this.assertOpen();
-          parent = await this.session(args.fork_from, requestContext);
-          this.check('read', parent, requestContext);
-          runtime = await this.pool.forRead(parent);
-        }
-        if (runtime?.attached) {
-          if (typeof runtime.snapshot !== 'function') throw new Error('SNAPSHOT_UNSUPPORTED');
-          snapshot = await runtime.snapshot();
-        } else
-          snapshot = runtime
+        let runtime;
+        ({ session: parent, runtime } = await this.#readableOwner(parent, requestContext));
+        snapshot = runtime?.attached
+          ? await runtime.snapshot()
+          : runtime
             ? await runtime.entries()
             : await loadSavedSession(parent, { config: this.config });
       }
@@ -1101,31 +1068,14 @@ export class Bridge {
           markForAutoRelease(runtime);
           await beforeDispatch();
           if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
-          if (hasPromptSettings(input)) {
-            const actual = await runtime.selectModel(input.model, {
-              thinkingLevel: input.thinking_level,
-              idle: true,
-              beforeDispatch,
-            });
-            selection.model_selection = {
-              model: actual.model,
-              thinking_level: actual.thinking_level,
-            };
-            await beforeDispatch();
-          }
-          const onLate = (result) => this.submissions.update(submissionId, promptResult(result));
-          const result = await runtime.command(
-            {
-              id: submissionId,
-              type: 'prompt',
-              message: input.text,
-              ...(input.images ? { images: input.images } : {}),
-              ...promptOptions(hasPromptSettings(input) ? 'idle_only' : 'steer'),
-            },
-            undefined,
-            onLate,
-            () => beforePromptDispatch(runtime, input, selection, beforeDispatch),
-          );
+          await selectPromptModel(runtime, input, selection, beforeDispatch);
+          const result = await this.#ownedPrompt(runtime, {
+            input,
+            mode: 'steer',
+            submissionId,
+            selection,
+            authorize: beforeDispatch,
+          });
           return outcome(promptResult({ ok: true, data: result }));
         }),
       );
@@ -1398,7 +1348,7 @@ export class Bridge {
     // work finishes, queued mutations cannot start another writer.
     this.closing = true;
     return (this.closePreparation ??= Promise.all([
-      this.pool.prepareClose?.(),
+      this.pool.prepareClose(),
       this.ownerControl?.close(),
       this.events.close(),
     ]));
@@ -1411,7 +1361,7 @@ export class Bridge {
       await this.prepareClose();
       this.completionSequences.clear();
       while (this.pendingMutations.size) await Promise.allSettled([...this.pendingMutations]);
-      await this.pool.drainAcks?.();
+      await this.pool.drainAcks();
       await this.pool.close();
       await Promise.allSettled([...this.autoReleases]);
       // Modules remain active until writers, ACKs and release captures drain.
@@ -1426,6 +1376,17 @@ export class Bridge {
     })();
     return this.closePromise;
   }
+}
+// Prompt settings apply on a proven-idle owned RPC before its input.
+async function selectPromptModel(runtime, input, selection, authorize) {
+  if (!hasPromptSettings(input)) return;
+  const actual = await runtime.selectModel(input.model, {
+    thinkingLevel: input.thinking_level,
+    idle: true,
+    beforeDispatch: authorize,
+  });
+  selection.model_selection = { model: actual.model, thinking_level: actual.thinking_level };
+  await authorize();
 }
 async function beforePromptDispatch(runtime, input, selection, authorize) {
   if (hasPromptSettings(input)) {

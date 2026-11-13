@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
+import { nativeReadFeatures } from '../src/read-features.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -56,6 +57,7 @@ async function fixture(t) {
   let acquisitions = 0;
   bridge.pool.forRead = async () => ({
     generation: 'fixture',
+    readFeatures: async () => nativeReadFeatures([], [], 'a'),
     read: async (args) => {
       acquisitions++;
       return prepareContextRead({ entries, leafId: 'a' }, args);

@@ -9,9 +9,7 @@ export function nativeReadFeatures(allTools, commands, leafId) {
   });
 }
 export async function ownerReadFeatures(runtime) {
-  return typeof runtime?.readFeatures === 'function'
-    ? runtime.readFeatures()
-    : nativeReadFeatures(undefined, undefined, null);
+  return runtime ? runtime.readFeatures() : nativeReadFeatures(undefined, undefined, null);
 }
 export function assertReadFeatures(value) {
   if (

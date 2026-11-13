@@ -20,13 +20,6 @@ export async function assertThinkingLevel(model, level, config) {
   if (!getSupportedThinkingLevels(model).includes(level))
     throw new Error('THINKING_LEVEL_UNSUPPORTED');
 }
-export function modelSetting(model, level) {
-  const identity = modelSelectionSchema.parse({ provider: model?.provider, id: model?.id });
-  return {
-    model: identity,
-    thinking_level: thinkingLevelSchema.safeParse(level).success ? level : null,
-  };
-}
 export const modelsSchema = z
   .object({
     offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),

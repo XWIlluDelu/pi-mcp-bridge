@@ -15,6 +15,7 @@ import { createStdioProxy } from '../src/stdio-proxy.mjs';
 import { PassThrough } from 'node:stream';
 import { executeBatch } from '../src/batch.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -307,7 +308,7 @@ test('set_model validates selection settings before starting a runtime', async (
     { thinking_level: 'high', text: 'not a prompt' },
   ]) {
     assert.equal(publicSchemas.set_model.safeParse({ session_id: id, ...extra }).success, false);
-    await assert.rejects(bridge.set_model({ session_id: id, ...extra }), /INVALID_ARGUMENTS/);
+    await assertInvalidArguments(bridge, 'set_model', { session_id: id, ...extra });
   }
   assert.equal(bridge.pool.instances.size, 0);
   const batch = await executeBatch(bridge, {

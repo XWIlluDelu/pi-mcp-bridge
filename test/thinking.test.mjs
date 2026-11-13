@@ -10,6 +10,7 @@ import {
   savedEntries,
 } from './fixtures/model-runtime.mjs';
 import { publicSchemas } from '../src/tool-schemas.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 const replies = (entries) =>
   entries
     .filter((e) => e.message?.role === 'assistant')
@@ -277,10 +278,7 @@ test('settings alone require a prompt and never start a writer', async (t) => {
   const f = await fixture(t),
     { bridge, id } = f;
   for (const op of ['send', 'create'])
-    await assert.rejects(
-      bridge[op]({ ...identity(op, f), thinking_level: 'off' }),
-      /INVALID_ARGUMENTS/,
-    );
+    await assertInvalidArguments(bridge, op, { ...identity(op, f), thinking_level: 'off' });
   assert.equal(bridge.pool.instances.size, 0);
 });
 

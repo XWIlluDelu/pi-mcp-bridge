@@ -9,7 +9,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { RetainedObservations } from './context-observation.mjs';
-import { sameModel, assertThinkingLevel, modelSetting } from './models.mjs';
+import { sameModel, assertThinkingLevel } from './models.mjs';
+import { modelSettings } from './set-model.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
@@ -690,7 +691,7 @@ export class PiRpc {
       )
         throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     }
-    return modelSetting(selected.model, selected.thinkingLevel);
+    return modelSettings({ model: selected.model, thinking_level: selected.thinkingLevel });
   }
   async executeBash({ command, timeout_ms = 5000, max_chars, beforeDispatch }) {
     this.activeBashes++;

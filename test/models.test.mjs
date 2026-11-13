@@ -10,6 +10,7 @@ import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { fixture, choice, savedEntries, releasedEntries } from './fixtures/model-runtime.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
 test('model metadata allowlist preserves unknown, native unsupported and thinking levels without configuration', () => {
   const secret = {
@@ -237,9 +238,6 @@ test(
     );
 
     assert.equal((await bridge.sessions()).length, 2);
-    await assert.rejects(
-      bridge.send({ session_id: id, model: choice('vision') }),
-      /INVALID_ARGUMENTS/,
-    );
+    await assertInvalidArguments(bridge, 'send', { session_id: id, model: choice('vision') });
   },
 );

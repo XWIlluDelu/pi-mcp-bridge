@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { callBridgeTool } from '../src/protocol.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import {
   AttachedRuntime,
@@ -379,14 +380,11 @@ test('extension confirms public dispatch without claiming admission, and idle in
       throw new Error('oversized requests must not connect');
     });
     try {
-      await assert.rejects(
-        f.bridge.send({
-          ...escaped,
-
-          text: '\0'.repeat(200000),
-        }),
-        /INVALID_ARGUMENTS/,
-      );
+      const oversized = await callBridgeTool(f.bridge, 'send', {
+        ...escaped,
+        text: '\0'.repeat(200000),
+      });
+      assert.equal(oversized.structuredContent.error.code, 'INVALID_ARGUMENTS');
       await assert.rejects(
         runtime.send({ ...escaped, text: '\0'.repeat(2 * 1024 * 1024) }),
         /ATTACHMENT_REQUEST_TOO_LARGE/,
@@ -533,7 +531,8 @@ test('same session continues headless after actual TUI exit with history, grants
   assert.equal(await ownerAlive(claim.owner), false);
   const restarted = await new Bridge(f.config).init();
   try {
-    await assert.rejects(restarted.send({ session_id: f.id }), /INVALID_ARGUMENTS/);
+    const invalid = await callBridgeTool(restarted, 'send', { session_id: f.id });
+    assert.equal(invalid.structuredContent.error.code, 'INVALID_ARGUMENTS');
     assert.equal(restarted.pool.instances.size, 0);
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     const read = await loadSavedSession(await restarted.session(f.id));

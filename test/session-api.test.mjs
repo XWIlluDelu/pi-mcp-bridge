@@ -10,6 +10,7 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { validateOwnerConfig } from '../src/owner-config.mjs';
 import { permitted, permissionWarnings } from '../src/permissions.mjs';
+import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 async function fixture(t, defaults = {}) {
@@ -234,7 +235,7 @@ test('empty creation needs only create permission and does not start a writer or
     'NOT_FOUND_OR_DENIED',
   );
   for (const settings of [{ model: { provider: 'test', id: 'model' } }, { thinking_level: 'high' }])
-    await assert.rejects(f.bridge.create({ project: f.project, ...settings }), /INVALID_ARGUMENTS/);
+    await assertInvalidArguments(f.bridge, 'create', { project: f.project, ...settings });
   f.config.defaults.create = false;
   assert.equal((await f.bridge.create({ project: f.project })).reason, 'NOT_FOUND_OR_DENIED');
   assert.equal((await f.bridge.sessions()).length, 1);
