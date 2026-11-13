@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
+import { sdkSession } from './fixtures/sdk-session.mjs';
 
 const idle = {
   sessionFile: '/public/session.jsonl',
@@ -11,14 +12,14 @@ const idle = {
   pendingMessageCount: 0,
 };
 function sdk(prompt) {
-  return {
+  return sdkSession({
     ...idle,
     prompt,
     sessionManager: {
       getEntries: () => [{ id: 'entry', type: 'message' }],
       getLeafId: () => 'entry',
     },
-  };
+  });
 }
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -69,7 +70,7 @@ test('RPC read features use registered extension commands and reject identity ch
 });
 
 test('SDK/RPC bindings expose only model identity and a valid native thinking level in state', async () => {
-  const value = {
+  const value = sdkSession({
     ...idle,
     model: {
       provider: 'p',
@@ -79,7 +80,7 @@ test('SDK/RPC bindings expose only model identity and a valid native thinking le
       baseUrl: 'SECRET',
     },
     thinkingLevel: 'max',
-  };
+  });
   for (const binding of [
     createSdkHostBinding(value),
     createRpcHostBinding({ getState: async () => value }),
@@ -105,7 +106,7 @@ test('native setter identity changes block the second step and overlapping sette
   const gate = Promise.withResolvers(),
     entered = Promise.withResolvers();
   let thinkingCalls = 0;
-  const value = {
+  const value = sdkSession({
     ...idle,
     model: { provider: 'p', id: 'a' },
     thinkingLevel: 'off',
@@ -119,7 +120,7 @@ test('native setter identity changes block the second step and overlapping sette
     setThinkingLevel: () => {
       thinkingCalls++;
     },
-  };
+  });
   const binding = createSdkHostBinding(value);
   const selection = binding.setModel({
     ...idle,
@@ -359,12 +360,14 @@ test('release requires explicit host confirmation and waits tracked dispatched w
 test('host bindings reject prompt settings before any native submission', async () => {
   for (const make of [createSdkHostBinding, createRpcHostBinding]) {
     let submitted = 0;
-    const binding = make({
-      ...sdk(() => {
-        submitted++;
+    const binding = make(
+      sdkSession({
+        ...sdk(() => {
+          submitted++;
+        }),
+        getState: async () => idle,
       }),
-      getState: async () => idle,
-    });
+    );
     for (const settings of [
       { model: { provider: 'p', id: 'm' } },
       { thinking_level: 'off' },
@@ -389,7 +392,7 @@ test('SDK handled bash is recorded after stop; only fallback execution rechecks 
       cancelled: false,
       truncated: false,
     };
-    const session = {
+    const session = sdkSession({
       sessionFile: '/synthetic/native.jsonl',
       sessionId: 'native',
       sessionManager: { getCwd: () => '/synthetic' },
@@ -406,7 +409,7 @@ test('SDK handled bash is recorded after stop; only fallback execution rechecks 
         recorded++;
       },
       executeBash: () => assert.fail('stop forbids fallback execution'),
-    };
+    });
     const work = createSdkHostBinding(session).bash({
       command: 'fixture',
       sessionFile: session.sessionFile,
@@ -621,9 +624,11 @@ test('SDK reload clears admission on dispatch rejection, native failure, and ide
   await assert.rejects(binding.reload({ ...idle }), /RUNTIME_SESSION_CHANGED/);
   assert.equal((await binding.state()).isIdle, true);
 
-  // Object-based test substitutes must not install observers on Object.prototype.
-  const unsupported = createSdkHostBinding({ ...sdk(() => {}), reload: async () => {} });
-  assert.equal(unsupported.reload, undefined);
+  // Plain objects are not AgentSession instances; never patch Object.prototype.
+  assert.throws(
+    () => createSdkHostBinding({ ...idle, sessionManager: {} }),
+    /INVALID_HOST_SESSION/,
+  );
 });
 
 test('RPC reload delegates safe admission and waits host confirmation on the same native session', async () => {
@@ -703,18 +708,20 @@ test('an explicit available model initializes a session without a current model'
       };
       const binding =
         kind === 'sdk'
-          ? createSdkHostBinding({
-              ...value,
-              get model() {
-                return value.model;
-              },
-              get thinkingLevel() {
-                return value.thinkingLevel;
-              },
-              modelRuntime: { getAvailableSnapshot: () => [model] },
-              setModel,
-              setThinkingLevel,
-            })
+          ? createSdkHostBinding(
+              sdkSession({
+                ...value,
+                get model() {
+                  return value.model;
+                },
+                get thinkingLevel() {
+                  return value.thinkingLevel;
+                },
+                modelRuntime: { getAvailableSnapshot: () => [model] },
+                setModel,
+                setThinkingLevel,
+              }),
+            )
           : createRpcHostBinding({
               getState: async () => value,
               getAvailableModels: async () => [model],

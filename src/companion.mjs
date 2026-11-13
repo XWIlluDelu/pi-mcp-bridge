@@ -3,7 +3,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
 import { publicError } from './errors.mjs';
-import { compactInputSchema, compactMetadata, requireInterruptCompaction } from './compact.mjs';
+import { compactInputSchema, compactMetadata } from './compact.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import net from 'node:net';
@@ -55,20 +55,19 @@ const replacementKey = (dir, file) => `${dir}\0${file}`;
 export default async function attachExtension(pi, { AgentSession, buildSessionProjection } = {}) {
   const profile = await companionProfile();
   if (!profile) return;
-  if (typeof buildSessionProjection !== 'function') throw new Error('INVALID_HOST_PROJECTION');
+  if (typeof buildSessionProjection !== 'function' || typeof AgentSession !== 'function')
+    throw new Error('INVALID_HOST_PROJECTION');
   const { dir, file } = profile;
-  const admission = AgentSession ? reloadAdmission(AgentSession) : null;
+  const admission = reloadAdmission(AgentSession);
   let active, ownership;
-  if (admission)
-    pi.registerCommand('bridge-reload', {
-      description: 'Internal Bridge reload dispatch; use /reload for local reloads',
-      handler: async (token, ctx) => {
-        const operation = active?.reload;
-        if (!operation || token !== operation.token || active.manager !== ctx.sessionManager)
-          return;
-        await operation.run(() => ctx.reload());
-      },
-    });
+  pi.registerCommand('bridge-reload', {
+    description: 'Internal Bridge reload dispatch; use /reload for local reloads',
+    handler: async (token, ctx) => {
+      const operation = active?.reload;
+      if (!operation || token !== operation.token || active.manager !== ctx.sessionManager) return;
+      await operation.run(() => ctx.reload());
+    },
+  });
   joinExtension(pi, { dir, file });
   pi.on('session_before_switch', async (event, ctx) => {
     if (
@@ -365,8 +364,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       };
       active = runtime;
       const activity = () => ({
-        idle:
-          ctx.isIdle() && runtime.mutations.size === 0 && (!admission || admission.idle(manager)),
+        idle: ctx.isIdle() && runtime.mutations.size === 0 && admission.idle(manager),
         pending_messages: ctx.hasPendingMessages(),
       });
       async function trackMutation(operation) {
@@ -433,7 +431,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             let data;
             const args = request.body ?? {};
             if (
-              admission?.reloading(manager) &&
+              admission.reloading(manager) &&
               !['state', 'read', 'read_features', 'snapshot'].includes(request.op)
             )
               throw new AttachmentFailure('RELOAD_IN_PROGRESS');
@@ -441,12 +439,12 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               data = {
                 sessionFile: file,
                 sessionId: header.id,
-                sessionName: ctx.sessionManager.getSessionName?.() ?? null,
+                sessionName: ctx.sessionManager.getSessionName() ?? null,
                 ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
                 isStreaming: !ctx.isIdle(),
                 generation: record.generation,
                 activity: activity(),
-                reloadComplete: admission?.completed(manager) ?? false,
+                reloadComplete: admission.completed(manager),
               };
             else if (request.op === 'read_features')
               data = {
@@ -454,8 +452,8 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                 sessionFile: file,
                 sessionId: header.id,
                 ...nativeReadFeatures(
-                  pi.getAllTools?.(),
-                  pi.getCommands?.(),
+                  pi.getAllTools(),
+                  pi.getCommands(),
                   ctx.sessionManager.getLeafId(),
                 ),
               };
@@ -487,7 +485,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                 };
               }
             } else if (request.op === 'reload') {
-              if (!admission) throw new AttachmentFailure('RELOAD_UNSUPPORTED');
               if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
               const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
               runtime.reload = operation;
@@ -506,8 +503,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               );
               return;
             } else if (request.op === 'set_model') {
-              if (typeof pi.setModel !== 'function' || typeof pi.setThinkingLevel !== 'function')
-                throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
               data = await trackMutation(
                 setModel({
                   model: args.model,
@@ -519,8 +514,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               );
               check(request);
             } else if (request.op === 'compact') {
-              if (typeof ctx.compact !== 'function')
-                throw new AttachmentFailure('COMPACT_UNSUPPORTED');
               const input = compactInputSchema.safeParse(args);
               if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
               if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
@@ -542,16 +535,9 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                   runtime.compacting = false;
                 }
               };
-              let value;
-              if (!input.data.interrupt && admission)
-                value = await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
-              else {
-                requireInterruptCompaction(input.data, {
-                  isIdle: ctx.isIdle(),
-                  hasPendingMessages: ctx.hasPendingMessages(),
-                });
-                value = await compact();
-              }
+              const value = input.data.interrupt
+                ? await compact()
+                : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
               check(request);
               data = compactMetadata(value);
             } else if (request.op === 'send') {
@@ -635,7 +621,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
         imagesSupported: true,
         bridgeVersion: packageInfo.version,
         readContract: READ_CONTRACT,
-        reloadSupported: Boolean(admission),
+        reloadSupported: true,
       });
     } catch (error) {
       // Pi catches hook errors. A TUI can request graceful exit; an externally

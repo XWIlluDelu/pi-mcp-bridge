@@ -297,8 +297,10 @@ spawn Pi, or take over an RPC client's stdio.
    for an RPC child; the default identity is the current process, suitable for an
    in-process SDK writer. A separate RPC child can start without a session before
    reservation, then switch to the reserved target.
-2. Open the target through the host's native API. Create the SDK binding before
-   admitting local input so its operation observer can track input preparation.
+2. Open the target through the host's native API. Pass its `AgentSession`
+   instance to `createSdkHostBinding` before admitting local input, so the
+   operation observer installed on that class can track input preparation.
+   Other objects reject with `INVALID_HOST_SESSION`.
    Pass `buildSessionProjection` from that writer's selected native SDK to
    `reserveHostSession`. Keep that function bound for the controller lifetime,
    including historical-leaf reads. An RPC host selects the SDK paired with its

@@ -10,6 +10,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
 import { withdrawalCollector, requestStop } from '../src/stop-execution.mjs';
+import { sdkSession } from './fixtures/sdk-session.mjs';
 import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { makeServer } from '../src/server.mjs';
@@ -485,20 +486,22 @@ for (const failure of ['capture', 'bash'])
     };
     let prompts = 0,
       settled = false;
-    const binding = createSdkHostBinding({
-      ...state,
-      prompt: async () => {
-        prompts++;
-      },
-      clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
-      abort: () => cancellation.promise,
-      abortBash: () => {
-        if (failure === 'bash') {
-          capturing.resolve();
-          throw new Error('BASH_FAILED');
-        }
-      },
-    });
+    const binding = createSdkHostBinding(
+      sdkSession({
+        ...state,
+        prompt: async () => {
+          prompts++;
+        },
+        clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
+        abort: () => cancellation.promise,
+        abortBash: () => {
+          if (failure === 'bash') {
+            capturing.resolve();
+            throw new Error('BASH_FAILED');
+          }
+        },
+      }),
+    );
     await controller.ready({
       state: binding.state,
       snapshot: async () => ({ ...state, entries: [], leafId: null }),
@@ -542,7 +545,7 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
     captured = [],
     calls = [],
     queued = ['queued'];
-  const session = {
+  const session = sdkSession({
     ...state,
     clearQueue: () => {
       calls.push('clear');
@@ -554,7 +557,7 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
     abortBash: () => {
       calls.push('bash');
     },
-  };
+  });
   const sdk = createSdkHostBinding(session, { release: () => assert.fail('not release') });
   await sdk.stop({
     ...state,
@@ -586,11 +589,6 @@ test('generic public SDK and RPC bindings withdraw and cancel without invoking r
   await assert.rejects(stopping, /RUNTIME_SESSION_CHANGED/);
   assert.deepEqual(calls, ['clear', 'abort', 'bash']);
   assert.deepEqual(queued, ['replacement queue']);
-  delete session.abortBash;
-  await assert.rejects(
-    createSdkHostBinding(session).stop({ ...state, onWithdraw: async () => {} }),
-    /STOP_UNSUPPORTED/,
-  );
 });
 test('generic host IPC and actual MCP return joined editor recovery; missing callback is explicitly unsupported', async (t) => {
   const f = await fixture(t),

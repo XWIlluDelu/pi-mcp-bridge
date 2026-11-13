@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { SessionManager } from './fixtures/pi.mjs';
+import { AgentSession, SessionManager } from './fixtures/pi.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Bridge } from '../src/bridge.mjs';
@@ -647,11 +647,14 @@ test('live owners use the bound native projection after PATH/config changes, inc
       await companion(
         {
           getThinkingLevel: () => 'off',
+          getAllTools: () => [],
+          getCommands: () => [],
+          registerCommand: () => {},
           on: (event, fn) => {
             handlers[event] = fn;
           },
         },
-        { buildSessionProjection },
+        { AgentSession, buildSessionProjection },
       );
       await handlers.session_start(
         {},

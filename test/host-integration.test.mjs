@@ -23,6 +23,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { processIdentity, readClaim } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
+import { sdkSession } from './fixtures/sdk-session.mjs';
 import attachExtension from './fixtures/companion.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -610,7 +611,7 @@ test('SDK async input preparation must finish before host release permits a save
   // public prompt promise: streaming flags alone cannot account for preparation.
   const pending = new Set();
   let accepting = true;
-  const hostSession = {
+  const hostSession = sdkSession({
     get sessionFile() {
       return session.sessionFile;
     },
@@ -642,7 +643,7 @@ test('SDK async input preparation must finish before host release permits a save
       );
       return work;
     },
-  };
+  });
   f.cleanups.unshift(async () => {
     gate.resolve();
     await Promise.allSettled([...pending]);

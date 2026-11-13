@@ -3,7 +3,7 @@
 import { requireInterruptCompaction } from './compact.mjs';
 import { nativeReadFeatures } from './read-features.mjs';
 import { nativeBashResult } from './bash-execution.mjs';
-import { SEND_MODES, hasPromptSettings, promptOptions as options } from './prompt-input.mjs';
+import { hasPromptSettings, promptOptions as options } from './prompt-input.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import { requestStop } from './stop-execution.mjs';
@@ -57,19 +57,21 @@ function tracker(release, onError) {
 export function createSdkHostBinding(session, { release, onError } = {}) {
   const tracked = tracker(release, onError);
   let pendingBashes = 0;
-  // Install before the host admits local work: public operation lifetimes also
-  // cover input preparation, which Pi's isIdle does not include.
-  const admission =
-    session.constructor !== Object &&
-    typeof session.constructor?.prototype?.reload === 'function' &&
-    session.sessionManager
-      ? reloadAdmission(session.constructor)
-      : null;
+  // Pi's AgentSession methods live on its class prototype. Install the
+  // admission observer there before the host admits local work: operation
+  // lifetimes also cover input preparation, which Pi's isIdle does not include.
+  if (Object.getPrototypeOf(session) === Object.prototype || !session.sessionManager)
+    throw new Error('INVALID_HOST_SESSION');
+  const admission = reloadAdmission(session.constructor);
+  const nativeActivity = {
+    isIdle: () => session.isIdle && !session.isBashRunning,
+    hasPendingMessages: () => session.pendingMessageCount > 0,
+  };
   const isIdle = () =>
     session.isIdle &&
     !pendingBashes &&
     !tracked.submitting &&
-    (!admission || admission.idle(session.sessionManager));
+    admission.idle(session.sessionManager);
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
@@ -84,9 +86,9 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     state,
     readFeatures: () =>
       nativeReadFeatures(
-        session.getAllTools?.(),
-        session.extensionRunner?.getRegisteredCommands?.(),
-        session.sessionManager?.getLeafId?.(),
+        session.getAllTools(),
+        session.extensionRunner.getRegisteredCommands(),
+        session.sessionManager.getLeafId(),
       ),
     snapshot: async () => {
       const before = identity(session);
@@ -96,76 +98,55 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       return { ...before, entries, leafId };
     },
     supportsImages: true,
-    reload: admission
-      ? async ({ beforeDispatch, ...expected }) => {
-          const before = identity(session);
-          assertIdentity(expected, before);
-          const operation = admission.begin(
+    reload: async ({ beforeDispatch, ...expected }) => {
+      const before = identity(session);
+      assertIdentity(expected, before);
+      const operation = admission.begin(
+        session.sessionManager,
+        nativeActivity,
+        tracked.submitting || pendingBashes > 0,
+      );
+      try {
+        beforeDispatch?.();
+        await operation.run(() => tracked.track(session.reload()));
+        assertIdentity(before, identity(session));
+        return { reloaded: true };
+      } finally {
+        operation.cancel();
+      }
+    },
+    compact: async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
+      const before = await state();
+      assertIdentity(expected, before);
+      const compact = async () => {
+        beforeDispatch?.();
+        assertIdentity(before, identity(session));
+        try {
+          return await tracked.track(session.compact(instructions));
+        } catch {
+          throw new Error('PI_REJECTED');
+        }
+      };
+      const result = interrupt
+        ? await compact()
+        : await admission.compact(
             session.sessionManager,
-            {
-              isIdle: () => session.isIdle && !session.isBashRunning,
-              hasPendingMessages: () => session.pendingMessageCount > 0,
-            },
+            nativeActivity,
+            compact,
             tracked.submitting || pendingBashes > 0,
           );
-          try {
-            beforeDispatch?.();
-            await operation.run(() => tracked.track(session.reload()));
-            assertIdentity(before, identity(session));
-            return { reloaded: true };
-          } finally {
-            operation.cancel();
-          }
-        }
-      : undefined,
-    compact:
-      typeof session.compact === 'function'
-        ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
-            const before = await state();
-            assertIdentity(expected, before);
-            const compact = async () => {
-              beforeDispatch?.();
-              assertIdentity(before, identity(session));
-              try {
-                return await tracked.track(session.compact(instructions));
-              } catch {
-                throw new Error('PI_REJECTED');
-              }
-            };
-            let result;
-            if (!interrupt && admission)
-              result = await admission.compact(
-                session.sessionManager,
-                {
-                  isIdle: () => session.isIdle && !session.isBashRunning,
-                  hasPendingMessages: () => session.pendingMessageCount > 0,
-                },
-                compact,
-                tracked.submitting || pendingBashes > 0,
-              );
-            else {
-              requireInterruptCompaction({ interrupt }, before);
-              result = await compact();
-            }
-            assertIdentity(before, await state());
-            return result;
-          }
-        : undefined,
-    setModel:
-      typeof session.modelRuntime?.getAvailableSnapshot === 'function' &&
-      typeof session.setModel === 'function' &&
-      typeof session.setThinkingLevel === 'function'
-        ? createModelSetter({
-            state,
-            models: () => session.modelRuntime.getAvailableSnapshot(),
-            setModel: (model) => tracked.track(session.setModel(model)),
-            setThinkingLevel: (level) => session.setThinkingLevel(level),
-          })
-        : undefined,
+      assertIdentity(before, await state());
+      return result;
+    },
+    setModel: createModelSetter({
+      state,
+      models: () => session.modelRuntime.getAvailableSnapshot(),
+      setModel: (model) => tracked.track(session.setModel(model)),
+      setThinkingLevel: (level) => session.setThinkingLevel(level),
+    }),
     submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
-      if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
       beforeDispatch?.();
       if (mode === 'idle_only' && (!isIdle() || session.pendingMessageCount > 0))
         return { status: 'skipped', reason: 'busy' };
@@ -185,14 +166,6 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       return { status: 'dispatched', admission: 'unobservable' };
     },
     bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
-      if (
-        typeof onResult !== 'function' ||
-        !['executeBash', 'recordBashResult', 'clearQueue', 'abort', 'abortBash'].every(
-          (name) => typeof session[name] === 'function',
-        ) ||
-        typeof session.extensionRunner?.emitUserBash !== 'function'
-      )
-        throw new Error('BASH_UNSUPPORTED');
       const before = identity(session);
       assertIdentity(expected, before);
       beforeDispatch?.();
@@ -227,12 +200,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         pendingBashes--;
       }
     },
-    stop: async ({ onWithdraw, ...expected } = {}) => {
-      if (
-        typeof onWithdraw !== 'function' ||
-        !['clearQueue', 'abort', 'abortBash'].every((name) => typeof session[name] === 'function')
-      )
-        throw new Error('STOP_UNSUPPORTED');
+    stop: async ({ onWithdraw, ...expected }) => {
       const before = identity(session);
       assertIdentity(expected, before);
       return tracked.track(
@@ -251,18 +219,12 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     },
     ...(tracked.release
       ? {
-          ...(['clearQueue', 'abort', 'abortBash'].every(
-            (name) => typeof session[name] === 'function',
-          )
-            ? {
-                cancel: async () => {
-                  session.clearQueue();
-                  const cancellation = session.abort();
-                  session.abortBash();
-                  await cancellation;
-                },
-              }
-            : {}),
+          cancel: async () => {
+            session.clearQueue();
+            const cancellation = session.abort();
+            session.abortBash();
+            await cancellation;
+          },
           release: tracked.release,
         }
       : {}),
@@ -322,23 +284,20 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
             return { reloaded: true };
           }
         : undefined,
-    compact:
-      typeof client.compact === 'function'
-        ? async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
-            const before = await state();
-            assertIdentity(expected, before);
-            requireInterruptCompaction({ interrupt }, before);
-            beforeDispatch?.();
-            let result;
-            try {
-              result = await tracked.track(client.compact(instructions));
-            } catch {
-              throw new Error('HOST_COMPACT_UNCERTAIN');
-            }
-            assertIdentity(before, await state());
-            return result;
-          }
-        : undefined,
+    compact: async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
+      const before = await state();
+      assertIdentity(expected, before);
+      requireInterruptCompaction({ interrupt }, before);
+      beforeDispatch?.();
+      let result;
+      try {
+        result = await tracked.track(client.compact(instructions));
+      } catch {
+        throw new Error('HOST_COMPACT_UNCERTAIN');
+      }
+      assertIdentity(before, await state());
+      return result;
+    },
     setModel: ['getAvailableModels', 'setModel', 'setThinkingLevel'].every(
       (name) => typeof client[name] === 'function',
     )
@@ -352,7 +311,6 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
     submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
-      if (!SEND_MODES.includes(mode)) throw new Error('INVALID_HOST_SUBMISSION');
       if (mode === 'idle_only') {
         const observed = await state();
         if (observed.isStreaming || observed.isCompacting || observed.pendingMessageCount > 0)
@@ -372,13 +330,6 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
       }
     },
     bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
-      if (
-        typeof onResult !== 'function' ||
-        !['bash', 'clearQueue', 'abort', 'abortBash'].every(
-          (name) => typeof client[name] === 'function',
-        )
-      )
-        throw new Error('BASH_UNSUPPORTED');
       const before = await state();
       assertIdentity(expected, before);
       beforeDispatch?.();
@@ -388,11 +339,6 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
       return nativeBashResult(result);
     },
     stop: async ({ onWithdraw, ...expected } = {}) => {
-      if (
-        typeof onWithdraw !== 'function' ||
-        !['clearQueue', 'abort', 'abortBash'].every((name) => typeof client[name] === 'function')
-      )
-        throw new Error('STOP_UNSUPPORTED');
       const before = await state();
       assertIdentity(expected, before);
       const result = await tracked.track(
