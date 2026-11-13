@@ -58,12 +58,8 @@ function runtimeCapabilities(runtime, state) {
       stop: host ? state.capabilities.stop : false,
     };
   }
-  return {
-    send: typeof runtime.command === 'function',
-    reload: runtime.ownerRecord?.kind === 'rpc',
-    command: typeof runtime.executeBash === 'function',
-    stop: typeof runtime.stopExecution === 'function',
-  };
+  // Bridge-owned RPC implements every control natively.
+  return { send: true, reload: true, command: true, stop: true };
 }
 
 export async function runtimeMetadata(pool, session) {
@@ -80,13 +76,14 @@ export async function runtimeMetadata(pool, session) {
           thinking_level: null,
         },
       };
-    const state = await runtime.state();
+    const snapshot = runtime.attached ? null : await runtime.idleSnapshot();
+    const state = snapshot ? snapshot.state : await runtime.state();
     const selection = modelState(state);
     const pending = state.pendingMessageCount ?? state.activity?.pending_message_count;
     const count = Number.isSafeInteger(pending) && pending >= 0 ? pending : null;
     const busy =
-      runtime.promptAdmission ||
-      runtime.hasUnsettledWork?.() ||
+      snapshot?.status === 'busy' ||
+      (!runtime.attached && runtime.hasUnsettledWork()) ||
       state.isBashRunning === true ||
       state.isStreaming ||
       state.isCompacting ||
@@ -97,8 +94,11 @@ export async function runtimeMetadata(pool, session) {
       state.activity?.compacting === true ||
       state.activity?.pending_messages === true ||
       count > 0;
-    // Native RPC get_state alone does not prove idle during input preparation.
-    const idle = (state.isIdle === true || state.activity?.idle === true) && !busy;
+    // Owned RPC snapshots include child admission; get_state alone misses input preparation.
+    const idle =
+      (snapshot
+        ? snapshot.status === 'idle'
+        : state.isIdle === true || state.activity?.idle === true) && !busy;
     return {
       ...(Object.hasOwn(state, 'sessionName') || runtime.ownerRecord?.kind === 'rpc'
         ? { name: typeof state.sessionName === 'string' ? state.sessionName.trim() || null : null }

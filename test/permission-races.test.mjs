@@ -8,6 +8,7 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { releasedEntries, fixture as nativeFixture } from './fixtures/model-runtime.mjs';
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 for (const operation of ['send', 'create', 'command'])
   test(
     operation + ' retains admission permissions through slow native identity observation',
@@ -169,7 +170,7 @@ async function fixture(t) {
   const configFile = path.join(dir, 'config.json');
   await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
   const calls = [],
-    runtime = {
+    runtime = ownedRuntime({
       alive: true,
       state: async () => ({ isIdle: true }),
       command: async (c) => {
@@ -177,7 +178,7 @@ async function fixture(t) {
         return { disposition: 'started' };
       },
       stop: async () => {},
-    };
+    });
   const bridge = await new Bridge(config, async () => runtime, { configFile }).init();
   t.after(async () => {
     await bridge.close();

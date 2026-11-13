@@ -5,7 +5,6 @@ import { opaqueId } from './storage.mjs';
 // Pi's extension loader supplies its own public exports, including the actual
 // CLI class in bundled installations. Importing sdkEntry separately would not.
 import * as sdk from '@earendil-works/pi-coding-agent';
-import { observeRpcInputs } from './rpc-input-activity.mjs';
 import { reloadAdmission } from './reload-admission.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
@@ -22,21 +21,6 @@ export default async function rpcObserver(pi) {
   if (!value) return;
   const { socket, generation, ownerControl } = JSON.parse(value);
   const admission = reloadAdmission(sdk.AgentSession);
-  // Reuse owner-local IPC; Pi reserves stdout for its own RPC records.
-  // Sequence numbers preserve ordering across concurrent notifications/reload.
-  const inputActivity = observeRpcInputs(sdk.AgentSession, (manager, activity) => {
-    if (ownerControl)
-      void ownerRequest(
-        ownerControl,
-        {
-          op: 'input_activity',
-          session_id: opaqueId(manager.getSessionFile() + '\0' + manager.getSessionId()),
-          generation,
-          ...activity,
-        },
-        { signal: AbortSignal.timeout(2000) },
-      ).catch(() => {}); // A later idle check can read authoritative child state.
-  });
   let server, context;
   const connections = new Set();
   const live = new LiveMessageObserver('rpc_message_events');
@@ -178,10 +162,9 @@ export default async function rpcObserver(pi) {
                     }
                   : request.op === 'state'
                     ? {
-                        isIdle: context.isIdle(),
+                        isIdle: context.isIdle() && admission.idle(context.sessionManager),
                         hasPendingMessages: context.hasPendingMessages(),
                         sealed: admission.sealed(context.sessionManager),
-                        ...inputActivity(context.sessionManager),
                       }
                     : {
                         sessionFile: request.file,

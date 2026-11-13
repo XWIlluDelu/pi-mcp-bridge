@@ -76,10 +76,12 @@ test('terminal seal observes local preparation and notifies maintenance after al
     promptGate = deferred(),
     bashGate = deferred(),
     ctx = { isIdle: () => true, hasPendingMessages: () => false };
-  let notifications = 0;
-  admission.setOnIdle(manager, () => notifications++);
+  let notifications = 0,
+    retiredNotifications = 0;
+  admission.setOnIdle(manager, () => retiredNotifications++);
   const prompting = session.prompt(promptGate.promise),
     bashing = session.executeBash(bashGate.promise);
+  reloadAdmission(Session).setOnIdle(manager, () => notifications++);
   assert.equal(admission.seal(manager, ctx), false);
   promptGate.resolve('input finished');
   assert.equal(await prompting, 'input finished');
@@ -88,6 +90,7 @@ test('terminal seal observes local preparation and notifies maintenance after al
   bashGate.resolve('bash finished');
   assert.equal(await bashing, 'bash finished');
   assert.equal(notifications, 1);
+  assert.equal(retiredNotifications, 0);
   for (const [nativeIdle, queued, otherBusy] of [
     [false, false, false],
     [true, true, false],

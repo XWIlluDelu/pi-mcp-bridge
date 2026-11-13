@@ -49,6 +49,9 @@ test('title cache has a fixed retention bound and never retains history', async 
   assert.equal(JSON.stringify([...cache]).includes('NOT_A_TITLE'), false);
 });
 
+// An ordinary companion: its state reply is the only activity evidence.
+const companion = (state) => ({ attached: true, record: { kind: 'extension' }, state });
+
 test('list model/thinking metadata comes only from live state, independently of idle certainty', async () => {
   const model = {
     provider: 'p',
@@ -58,8 +61,8 @@ test('list model/thinking metadata comes only from live state, independently of 
     baseUrl: 'SECRET',
   };
   for (const [runtime, expectedState] of [
-    [{ state: async () => ({ model, thinkingLevel: 'xhigh', isIdle: true }) }, 'idle'],
-    [{ state: async () => ({ model, thinkingLevel: 'xhigh' }) }, 'unknown'],
+    [companion(async () => ({ model, thinkingLevel: 'xhigh', isIdle: true })), 'idle'],
+    [companion(async () => ({ model, thinkingLevel: 'xhigh' })), 'unknown'],
     [
       {
         attached: true,
@@ -75,19 +78,53 @@ test('list model/thinking metadata comes only from live state, independently of 
     assert.equal(status.thinking_level, 'xhigh');
     assert.ok(!JSON.stringify(status).includes('SECRET'));
   }
+  for (const [activity, expectedState] of [
+    ['busy', 'busy'],
+    ['idle', 'idle'],
+    ['unconfirmed', 'unknown'],
+  ]) {
+    let stateReads = 0,
+      snapshotReads = 0;
+    const runtime = {
+      ownerRecord: { kind: 'rpc' },
+      async state() {
+        stateReads++;
+        return {
+          model,
+          thinkingLevel: 'xhigh',
+          sessionName: ' live name ',
+          isStreaming: false,
+          isCompacting: false,
+          pendingMessageCount: 0,
+        };
+      },
+      hasUnsettledWork: () => false,
+      async idleSnapshot() {
+        snapshotReads++;
+        return { state: await this.state(), status: activity };
+      },
+    };
+    const result = await runtimeMetadata({ forRead: async () => runtime }, {});
+    assert.equal(snapshotReads, 1);
+    assert.equal(stateReads, 1);
+    assert.equal(result.name, 'live name');
+    assert.equal(result.status.state, expectedState);
+    assert.equal(result.status.pending_messages, 0);
+    assert.deepEqual(result.status.model, { provider: 'p', id: 'm' });
+    assert.equal(result.status.thinking_level, 'xhigh');
+    assert.ok(!JSON.stringify(result).includes('SECRET'));
+  }
   for (const [runtime, expectedState] of [
     [null, 'saved'],
     [
-      {
-        state: async () => {
-          throw Error('UNREACHABLE');
-        },
-      },
+      companion(async () => {
+        throw Error('UNREACHABLE');
+      }),
       'unavailable',
     ],
-    [{ state: async () => ({}) }, 'unknown'],
+    [companion(async () => ({})), 'unknown'],
     [
-      { state: async () => ({ model: { provider: 1, id: 'm' }, thinkingLevel: 'invalid' }) },
+      companion(async () => ({ model: { provider: 1, id: 'm' }, thinkingLevel: 'invalid' })),
       'unknown',
     ],
   ]) {
@@ -112,18 +149,16 @@ test('runtime capabilities stay supported across busy and unknown activity obser
     [{ isStreaming: false, pendingMessageCount: -1 }, 'unknown', null],
   ]) {
     const { status: result } = await runtimeMetadata(
-      {
-        forRead: async () => ({
-          state: async () => state,
-          command() {},
-          executeBash() {},
-          stopExecution() {},
-        }),
-      },
+      { forRead: async () => companion(async () => state) },
       {},
     );
     assert.equal(result.state, expected);
     assert.equal(result.pending_messages, count);
-    assert.deepEqual(result.capabilities, { send: true, reload: false, command: true, stop: true });
+    assert.deepEqual(result.capabilities, {
+      send: true,
+      reload: false,
+      command: false,
+      stop: false,
+    });
   }
 });

@@ -375,8 +375,6 @@ test(
         rpc.settlementSequence >= rpc.requiredSettlementSequence
       );
     }, 'native settled and queues drained');
-    // All queued RPC work is accounted for by ACK and settlement evidence.
-    assert.equal((await observer.state()).pendingInputs, 0);
     // The immediate owner release must use the same completed-work evidence.
     await rpc.assertReleasable();
     const result = await transfer(f);
@@ -742,7 +740,7 @@ test(
     assert.equal(rpc.promptAdmission, null);
     assert.equal((await rpc.state()).isStreaming, false);
     const observer = new AttachedRuntime(f.config, f.session, rpc.ownerRecord);
-    assert.equal((await observer.state()).pendingInputs, 1);
+    assert.equal((await observer.state()).isIdle, false);
     const joining = transfer(f);
     void joining.catch(() => {});
     await until(() => f.bridge.handoffs.has(f.id));

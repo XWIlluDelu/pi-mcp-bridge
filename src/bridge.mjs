@@ -906,15 +906,10 @@ export class Bridge {
             await authorized();
           }
           if (body.mode === 'idle_only') {
-            const state = await runtime.state();
-            if (
-              runtime.promptAdmission ||
-              state.isStreaming ||
-              state.isCompacting ||
-              state.isIdle === false ||
-              state.pendingMessageCount > 0
-            )
+            const idle = await runtime.idleSnapshot();
+            if (idle.status === 'busy')
               return outcome({ ...selection, status: 'skipped', reason: 'busy' });
+            if (idle.status !== 'idle') throw new Error('RUNTIME_IDLE_UNCONFIRMED');
           }
           await authorized();
           const command = {
@@ -1263,20 +1258,6 @@ export class Bridge {
   }
   cancelHandoff(request) {
     return cancelHandoff(this, request);
-  }
-  inputActivityForLocal(request) {
-    this.assertOpen();
-    const runtime =
-      this.pool.instances.get(request.session_id) ??
-      this.pool.starting.get(request.session_id)?.runtime;
-    if (
-      !(runtime instanceof PiRpc) ||
-      !runtime.alive ||
-      request.generation !== runtime.ownerRecord?.generation
-    )
-      throw new Error('INVALID_OWNER_COMMAND');
-    runtime.observeInputActivity(request);
-    return {};
   }
   idleCandidateForLocal(request) {
     this.assertOpen();

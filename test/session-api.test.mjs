@@ -10,6 +10,7 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { validateOwnerConfig } from '../src/owner-config.mjs';
 import { permitted, permissionWarnings } from '../src/permissions.mjs';
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 async function fixture(t, defaults = {}) {
   const dir = await fs.mkdtemp('/tmp/pi-session-api-'),
@@ -32,28 +33,30 @@ async function fixture(t, defaults = {}) {
     },
   };
   const calls = [];
-  const bridge = await new Bridge(config, async (session) => ({
-    alive: true,
-    entries: () => loadSavedSession(session),
-    read: async (args) => prepareContextRead(await loadSavedSession(session), args),
-    state: async () => ({ isIdle: true, isStreaming: false, pendingMessageCount: 0 }),
-    command: async (command) => {
-      calls.push({ session: session.id, command });
-      const saved = await loadSavedSession(session);
-      await fs.appendFile(
-        session.file,
-        JSON.stringify({
-          type: 'message',
-          id: randomUUID(),
-          parentId: saved.leafId,
-          timestamp: new Date().toISOString(),
-          message: { role: 'user', content: command.message },
-        }) + '\n',
-      );
-      return { disposition: 'started' };
-    },
-    stop: async () => {},
-  })).init();
+  const bridge = await new Bridge(config, async (session) =>
+    ownedRuntime({
+      alive: true,
+      entries: () => loadSavedSession(session),
+      read: async (args) => prepareContextRead(await loadSavedSession(session), args),
+      state: async () => ({ isIdle: true, isStreaming: false, pendingMessageCount: 0 }),
+      command: async (command) => {
+        calls.push({ session: session.id, command });
+        const saved = await loadSavedSession(session);
+        await fs.appendFile(
+          session.file,
+          JSON.stringify({
+            type: 'message',
+            id: randomUUID(),
+            parentId: saved.leafId,
+            timestamp: new Date().toISOString(),
+            message: { role: 'user', content: command.message },
+          }) + '\n',
+        );
+        return { disposition: 'started' };
+      },
+      stop: async () => {},
+    }),
+  ).init();
   t.after(async () => {
     await bridge.close();
     await fs.rm(dir, { recursive: true, force: true });

@@ -14,6 +14,7 @@ import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
 import { readClaim, reserveOwner } from '../src/attachments.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('listing respects the latest native title including an explicit clear', async (t) => {
   const f = await fixture(t),
@@ -48,6 +49,11 @@ async function fixture(t, grants, factory) {
     calls: [],
     resumes: 0,
     state: async () => ({ isStreaming: false, isCompacting: false }),
+    hasUnsettledWork: () => false,
+    idleSnapshot: async function () {
+      const state = await this.state();
+      return { state, status: state.isStreaming ? 'busy' : 'idle' };
+    },
     command: async function (c) {
       this.calls.push(c);
       return { disposition: 'started' };
@@ -730,16 +736,19 @@ test(
     t.after(() => gates.forEach((g) => g.resolve()));
     for (const [index, session] of sessions.entries()) {
       await fs.utimes(session.file, 10000 - index, 10000 - index);
-      f.bridge.pool.instances.set(session.id, {
-        alive: true,
-        state: async () => {
-          entered.push(index);
-          if (entered.length === 4) started.resolve();
-          await gates[index].promise;
-          return { sessionName: 'needle ' + index };
-        },
-        stop: async () => {},
-      });
+      f.bridge.pool.instances.set(
+        session.id,
+        ownedRuntime({
+          alive: true,
+          state: async () => {
+            entered.push(index);
+            if (entered.length === 4) started.resolve();
+            await gates[index].promise;
+            return { sessionName: 'needle ' + index };
+          },
+          stop: async () => {},
+        }),
+      );
     }
     const listing = f.bridge.list({ name: 'needle', offset: 1, limit: 1 });
     await started.promise;

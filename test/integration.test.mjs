@@ -127,6 +127,7 @@ test('real Pi SDK with faux provider sends, persists, reads and resumes (no real
     return {
       alive: true,
       state: async () => ({ isStreaming: session.isStreaming, isCompacting: session.isCompacting }),
+      idleSnapshot: async () => ({ status: session.isIdle ? 'idle' : 'busy' }),
       entries: async () => ({ entries: manager.getEntries(), leafId: manager.getLeafId() }),
       read: async (args) =>
         prepareContextRead(

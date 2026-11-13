@@ -82,8 +82,6 @@ export class PiRpc {
     this.generation = randomUUID();
     this.runtimeEvents = new RuntimeEvents(this.generation);
     this.promptAdmission = null;
-    this.pendingInputs = 0;
-    this.inputActivitySequence = 0;
     this.modelMutation = null;
     this.compactionMutation = null;
     this.exitSeal = null;
@@ -589,24 +587,9 @@ export class PiRpc {
   entries() {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
   }
-  observeInputActivity({ pendingInputs, sequence }) {
-    if (
-      !Number.isSafeInteger(pendingInputs) ||
-      pendingInputs < 0 ||
-      !Number.isSafeInteger(sequence) ||
-      sequence < 0
-    )
-      throw new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
-    if (sequence > this.inputActivitySequence) {
-      this.inputActivitySequence = sequence;
-      this.pendingInputs = pendingInputs;
-      if (!pendingInputs) this.onIdleCandidate?.();
-    }
-  }
-  hasUnsettledWork({ includeInputs = true } = {}) {
+  hasUnsettledWork() {
     return Boolean(
       this.activeBashes > 0 ||
-      (includeInputs && this.pendingInputs > 0) ||
       this.promptAdmission ||
       this.modelMutation ||
       this.compactionMutation ||
@@ -617,7 +600,7 @@ export class PiRpc {
   async idleSnapshot() {
     const state = await this.state();
     if (
-      this.hasUnsettledWork({ includeInputs: false }) ||
+      this.hasUnsettledWork() ||
       state.isStreaming === true ||
       state.isCompacting === true ||
       state.pendingMessageCount > 0
@@ -631,19 +614,13 @@ export class PiRpc {
     )
       return { state, status: 'unconfirmed' };
     const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
-    this.observeInputActivity(observed);
     if (
       observed.isIdle === false ||
       observed.hasPendingMessages === true ||
-      observed.pendingInputs > 0 ||
       this.hasUnsettledWork()
     )
       return { state, status: 'busy' };
-    if (
-      observed.pendingInputs !== 0 ||
-      observed.isIdle !== true ||
-      observed.hasPendingMessages !== false
-    )
+    if (observed.isIdle !== true || observed.hasPendingMessages !== false)
       return { state, status: 'unconfirmed' };
     return { state, status: 'idle' };
   }
@@ -830,21 +807,13 @@ export class PiRpc {
       signal?.throwIfAborted();
       if (exit.result || this.exited || !this.alive)
         throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
-      // Parent observations reject known work early. Only the child's atomic
-      // seal can authorize EOF; activity notifications may still be in flight.
-      if (
-        this.hasUnsettledWork({ includeInputs: !previousSeal }) ||
-        this.activeReads ||
-        this.ackTasks.size
-      )
+      // Parent observations reject known work early. The child's atomic seal
+      // also excludes native work started since the last idle observation.
+      if (this.hasUnsettledWork() || this.activeReads || this.ackTasks.size)
         throw new RpcFailure('RUNTIME_BUSY');
       const sealed = await new AttachedRuntime(this.config, this.session, record).seal(() => {
         signal?.throwIfAborted();
-        if (
-          this.hasUnsettledWork({ includeInputs: !previousSeal }) ||
-          this.activeReads ||
-          this.ackTasks.size
-        )
+        if (this.hasUnsettledWork() || this.activeReads || this.ackTasks.size)
           throw new RpcFailure('RUNTIME_BUSY');
         // Close read admission across the control request's await. A read
         // already admitted above keeps this attempt from sealing the writer.
