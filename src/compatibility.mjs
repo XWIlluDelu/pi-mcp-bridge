@@ -37,9 +37,9 @@ export class CompatibilityModules {
     return (this.startPromise ??= this.activate());
   }
   async activate() {
+    // Entries were validated with the owner configuration (Bridge.init).
     const loaded = [],
       ids = new Set();
-    validateCompatibilityModules(this.entries);
     for (const entry of this.entries) {
       if (entry.enabled === false) continue; // Disabled code is not imported.
       let module;

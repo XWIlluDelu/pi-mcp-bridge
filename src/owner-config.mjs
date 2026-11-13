@@ -123,7 +123,7 @@ export function validateOwnerConfig(config) {
   }
   return config;
 }
-export function validatePermissionValues(values, scopeKeys = []) {
+function validatePermissionValues(values, scopeKeys = []) {
   if (
     !object(values) ||
     Object.keys(values).some((key) => !ACTIONS.includes(key) && !scopeKeys.includes(key))

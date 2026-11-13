@@ -197,9 +197,10 @@ async function projectIdentity(cwd) {
 }
 
 function liveEvidence(owner) {
-  if (owner?.available !== true) return false;
   return (
-    (owner.commands ?? []).includes('ctx-status') && (owner.commands ?? []).includes('ctx-recomp')
+    owner.available &&
+    owner.commands.includes('ctx-status') &&
+    owner.commands.includes('ctx-recomp')
   );
 }
 
@@ -287,14 +288,8 @@ function memoryItem(row, capturedAt) {
 export function createMagicContextReader(options) {
   const database = validateOptions(options);
   withDatabase(database, () => {});
-  function validateSession(context) {
-    if (typeof context?.session?.native_id !== 'string' || !context.session.native_id) {
-      throw fail('MAGIC_CONTEXT_INVALID_SESSION');
-    }
-  }
   return {
     async matches(context) {
-      validateSession(context);
       const candidate = withDatabase(database, (db) =>
         Boolean(
           db
@@ -307,9 +302,8 @@ export function createMagicContextReader(options) {
       return withDatabase(database, (db) => sessionEvidence(db, context, identity));
     },
     async read(context) {
-      if (context.request?.leaf_id !== undefined)
+      if (context.request.leaf_id !== undefined)
         throw fail('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
-      validateSession(context);
       const identity = await projectIdentity(context.session.cwd);
       const stored = withDatabase(database, (db) => {
         if (!sessionEvidence(db, context, identity)) throw fail('MAGIC_CONTEXT_SESSION_MISMATCH');
@@ -361,7 +355,7 @@ export function createMagicContextReader(options) {
         const end = item.source.source_entry_id;
         item.branch_relation = end ? native.entry_relations[end] : 'unknown';
       }
-      const { content } = contextSelection(context.request ?? {});
+      const { content } = contextSelection(context.request);
       const eligible =
         content.summary === -1
           ? summaries
