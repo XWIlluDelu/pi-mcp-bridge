@@ -8,7 +8,8 @@ import { Bridge } from '../../src/bridge.mjs';
 import { PiRpc } from '../../src/rpc.mjs';
 import { CallbackError } from '../../src/event-webhook.mjs';
 import { META, MODERN_VERSION } from '../../src/protocol.mjs';
-import { createHttpService, TOKEN_HEADER } from '../../src/http-server.mjs';
+import { createHttpService } from '../../src/http-server.mjs';
+import { TOKEN_HEADER } from '../../src/http-config.mjs';
 import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
 const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'PRIVATE_PATH-')),
   cwd = path.join(dir, 'project');

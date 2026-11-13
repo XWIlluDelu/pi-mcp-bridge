@@ -7,13 +7,9 @@ import { publicError } from './errors.mjs';
 import { EventError } from './events.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
-export const SUPPORTED_VERSIONS = [
-  MODERN_VERSION,
-  '2025-11-25',
-  '2025-06-18',
-  '2025-03-26',
-  '2024-11-05',
-];
+// Earlier session-based versions are served by the pinned MCP SDK server.
+export const SDK_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const SUPPORTED_VERSIONS = [MODERN_VERSION, ...SDK_VERSIONS];
 export const SERVER_INFO = { name: 'pi-session-bridge', version: packageInfo.version };
 export const META = 'io.modelcontextprotocol/';
 import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
@@ -79,7 +75,7 @@ export function toolDefinitions() {
       : {}),
   }));
 }
-export function toolError(code, extra = {}) {
+function toolError(code, extra = {}) {
   const result = {
     error: {
       code,
@@ -189,7 +185,7 @@ function complete(result) {
     _meta: { ...result._meta, [META + 'serverInfo']: SERVER_INFO },
   };
 }
-export function unsupportedVersion(id, requested) {
+function unsupportedVersion(id, requested) {
   return rpcError(id, -32022, 'Unsupported protocol version', {
     supported: SUPPORTED_VERSIONS,
     requested,

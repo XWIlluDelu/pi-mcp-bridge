@@ -154,7 +154,7 @@ HTTP requests also require:
 | `Mcp-Method`           | The body's method                                                             |
 | `Mcp-Name`             | `params.name` for tools/call and prompts/get; `params.uri` for resources/read |
 
-Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020 HeaderMismatch`.
+Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020` with message `Header mismatch`.
 
 Unsupported versions return HTTP 400 / `-32022` with `data.supported` and `data.requested`; missing metadata returns 400 / `-32602`; unknown methods return 404 / `-32601`. See the [message schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2026-07-28/schema.ts) and [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) / [HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) bindings.
 

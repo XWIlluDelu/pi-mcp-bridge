@@ -7,7 +7,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { validateOwnerConfig, readOwnerConfig } from '../src/owner-config.mjs';
-import { loadHttpConfig } from '../src/http-server.mjs';
+import { loadHttpConfig } from '../src/http-config.mjs';
 import { Bridge } from '../src/bridge.mjs';
 
 async function fixture(t) {

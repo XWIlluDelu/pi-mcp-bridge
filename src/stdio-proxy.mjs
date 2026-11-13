@@ -1,22 +1,7 @@
 import { pathToFileURL } from 'node:url';
-import { loadHttpConfig, TOKEN_HEADER } from './http-server.mjs';
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
 import { META, modernMessage, isRpcRequest, rpcError, MCP_RESPONSE_LIMIT } from './protocol.mjs';
-
-// Only these exact HTTP rejection pairs prove the backend did not admit work.
-// A status alone, including a server error or timeout, says nothing about execution.
-const beforeAdmissionRejections = new Map([
-  ['INVALID_JSON_OBJECT', 400],
-  ['UNAUTHORIZED', 401],
-  ['INVALID_HOST', 403],
-  ['ORIGIN_DENIED', 403],
-  ['NOT_FOUND', 404],
-  ['METHOD_NOT_ALLOWED', 405],
-  ['BODY_TOO_LARGE', 413],
-  ['UNSUPPORTED_CONTENT_TYPE', 415],
-  ['SERVICE_STOPPING', 503],
-  ['SERVICE_BUSY', 503],
-]);
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
 // queue or automatic retries live here. HTTP authentication stays owner-local.
@@ -39,7 +24,7 @@ export function createStdioProxy({
     target.password
   )
     throw new Error('INVALID_PROXY_URL');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
+  assertBackendToken(token);
   const controllers = new Map();
   const encode = (value) =>
     /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && !value.startsWith('=?base64?')
@@ -121,8 +106,8 @@ export function createStdioProxy({
             typeof result === 'object' &&
             !Array.isArray(result) &&
             Object.keys(result).length === 1 &&
-            beforeAdmissionRejections.has(result.error) &&
-            beforeAdmissionRejections.get(result.error) === response.status
+            Object.hasOwn(NOT_ADMITTED, result.error) &&
+            NOT_ADMITTED[result.error] === response.status
           ) {
             await this.write(
               rpcError(body.id, -32000, result.error, {

@@ -8,7 +8,8 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { executeBatch } from '../src/batch.mjs';
-import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
+import { createHttpService } from '../src/http-server.mjs';
+import { TOKEN_HEADER } from '../src/http-config.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import {
   ownerAlive,

@@ -10,7 +10,8 @@ import {
 } from './fixtures/model-runtime.mjs';
 import { publicSchemas } from '../src/tool-schemas.mjs';
 import { callBridgeTool, META, MODERN_VERSION } from '../src/protocol.mjs';
-import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
+import { createHttpService } from '../src/http-server.mjs';
+import { TOKEN_HEADER } from '../src/http-config.mjs';
 import { createStdioProxy } from '../src/stdio-proxy.mjs';
 import { PassThrough } from 'node:stream';
 import { executeBatch } from '../src/batch.mjs';

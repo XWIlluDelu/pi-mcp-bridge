@@ -9,7 +9,8 @@ import { imagesSchema, promptInput, MAX_IMAGE_BYTES, MAX_IMAGES } from '../src/p
 import { publicSchemas } from '../src/tool-schemas.mjs';
 import { toolDefinitions, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { createHttpService, TOKEN_HEADER } from '../src/http-server.mjs';
+import { createHttpService } from '../src/http-server.mjs';
+import { TOKEN_HEADER } from '../src/http-config.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';

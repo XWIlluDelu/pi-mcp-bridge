@@ -1,7 +1,5 @@
 import http from 'node:http';
 import { publicError } from './errors.mjs';
-import fs from 'node:fs/promises';
-import path from 'node:path';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -9,29 +7,18 @@ import { Bridge } from './bridge.mjs';
 import { makeServer } from './server.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import {
-  SUPPORTED_VERSIONS,
+  SDK_VERSIONS,
   modernMessage,
   isRpcRequest,
   dispatchModern,
   validateModernHeaders,
   boundMessage,
   rpcError,
+  MCP_INPUT_LIMIT,
 } from './protocol.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
-import { readPrivateFile } from './storage.mjs';
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
 
-export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
-export const TOKEN_HEADER = 'x-pi-bridge-token';
 const digest = (value) => createHash('sha256').update(value).digest();
-
-export async function loadHttpConfig(file) {
-  const { config } = await readOwnerConfig(file);
-  const settings = config.http;
-  if (!settings) throw new Error('INVALID_HTTP_CONFIG');
-  const token = (await readPrivateFile(settings.tokenFile, 257)).text.replace(/\n$/, '');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
-  return { config, token, port: settings.port };
-}
 
 function headers(req, name) {
   const values = [];
@@ -39,6 +26,7 @@ function headers(req, name) {
     if (req.rawHeaders[i].toLowerCase() === name) values.push(req.rawHeaders[i + 1]);
   return values;
 }
+const refuse = (res, code) => reject(res, NOT_ADMITTED[code], code);
 function reject(res, status, code) {
   if (res.destroyed || res.writableEnded) return;
   diagnostics.emit('http.rejected', { http_status: status });
@@ -84,10 +72,10 @@ async function parseBody(req) {
     };
     const data = (chunk) => {
       size += chunk.length;
-      if (size > HTTP_BODY_LIMIT) {
+      if (size > MCP_INPUT_LIMIT) {
         cleanup();
         req.pause();
-        reject(Object.assign(new Error('BODY_TOO_LARGE'), { status: 413 }));
+        reject(new Error('BODY_TOO_LARGE'));
       } else chunks.push(chunk);
     };
     req.on('data', data);
@@ -101,7 +89,7 @@ async function parseBody(req) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
     return value;
   } catch {
-    throw Object.assign(new Error('INVALID_JSON_OBJECT'), { status: 400 });
+    throw new Error('INVALID_JSON_OBJECT');
   }
 }
 
@@ -110,7 +98,7 @@ async function parseBody(req) {
 export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
   if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 300000)
     throw new Error('INVALID_WAIT_TIMEOUT');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
+  assertBackendToken(token);
   const tokenDigest = digest(token),
     operations = new Set(),
     requests = new Set();
@@ -140,25 +128,25 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
   listener.maxConnections = 32;
   async function handle(req, res) {
     const host = headers(req, 'host');
-    if (host.length !== 1 || host[0] !== expectedHost) return reject(res, 403, 'INVALID_HOST');
-    if (headers(req, 'origin').length) return reject(res, 403, 'ORIGIN_DENIED');
+    if (host.length !== 1 || host[0] !== expectedHost) return refuse(res, 'INVALID_HOST');
+    if (headers(req, 'origin').length) return refuse(res, 'ORIGIN_DENIED');
     const credentials = headers(req, TOKEN_HEADER);
     if (credentials.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
-      return reject(res, 401, 'UNAUTHORIZED');
-    if (req.url !== '/mcp') return reject(res, 404, 'NOT_FOUND');
-    if (req.method !== 'POST') return reject(res, 405, 'METHOD_NOT_ALLOWED');
-    if (stopping) return reject(res, 503, 'SERVICE_STOPPING');
-    if (requests.size >= 16) return reject(res, 503, 'SERVICE_BUSY');
+      return refuse(res, 'UNAUTHORIZED');
+    if (req.url !== '/mcp') return refuse(res, 'NOT_FOUND');
+    if (req.method !== 'POST') return refuse(res, 'METHOD_NOT_ALLOWED');
+    if (stopping) return refuse(res, 'SERVICE_STOPPING');
+    if (requests.size >= 16) return refuse(res, 'SERVICE_BUSY');
     const contentType = headers(req, 'content-type');
     if (
       contentType.length !== 1 ||
       !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType[0]) ||
       headers(req, 'content-encoding').length
     )
-      return reject(res, 415, 'UNSUPPORTED_CONTENT_TYPE');
+      return refuse(res, 'UNSUPPORTED_CONTENT_TYPE');
     const length = req.headers['content-length'];
-    if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > HTTP_BODY_LIMIT))
-      return reject(res, 413, 'BODY_TOO_LARGE');
+    if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > MCP_INPUT_LIMIT))
+      return refuse(res, 'BODY_TOO_LARGE');
     const record = {
       req,
       res,
@@ -175,8 +163,15 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       void record.server?.close().catch(() => {});
       release();
     });
+    let body;
     try {
-      const body = await parseBody(req);
+      body = await parseBody(req);
+    } catch (error) {
+      // Upload/parse failures happen before admission; others stay unknown.
+      if (Object.hasOwn(NOT_ADMITTED, error.message)) return refuse(res, error.message);
+      return reject(res, 500, 'REQUEST_FAILED');
+    }
+    try {
       if (record.disconnected) return;
       diagnostics.emit('http.request', { method: body.method });
       if (!isRpcRequest(body))
@@ -196,7 +191,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       deadline.unref();
       res.once('close', () => clearTimeout(deadline));
       res.once('finish', () => clearTimeout(deadline));
-      if (stopping) return reject(res, 503, 'SERVICE_STOPPING');
+      if (stopping) return refuse(res, 'SERVICE_STOPPING');
       const execute = (run) => {
         if (stopping || record.disconnected) throw new Error('REQUEST_NOT_ADMITTED');
         // Track the entire tool (including every batch item). Transport close
@@ -215,8 +210,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       };
       const versions = headers(req, 'mcp-protocol-version');
       const modern =
-        modernMessage(body) ||
-        versions.some((version) => !SUPPORTED_VERSIONS.slice(1).includes(version));
+        modernMessage(body) || versions.some((version) => !SDK_VERSIONS.includes(version));
       if (modern) {
         const mismatch = validateModernHeaders(body, (name) => headers(req, name));
         if (mismatch) return jsonResponse(res, 400, mismatch);
@@ -244,8 +238,8 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       }
       res.setHeader('Cache-Control', 'no-store');
       await transport.handleRequest(req, res, body);
-    } catch (error) {
-      reject(res, error.status ?? 500, error.status ? error.message : 'REQUEST_FAILED');
+    } catch {
+      reject(res, 500, 'REQUEST_FAILED');
     }
   }
   return {

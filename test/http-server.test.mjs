@@ -8,17 +8,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import {
-  createHttpService,
-  loadHttpConfig,
-  HTTP_BODY_LIMIT,
-  TOKEN_HEADER,
-} from '../src/http-server.mjs';
+import { createHttpService } from '../src/http-server.mjs';
+import { loadHttpConfig, TOKEN_HEADER } from '../src/http-config.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { META, MODERN_VERSION, MCP_RESPONSE_LIMIT } from '../src/protocol.mjs';
+import { META, MODERN_VERSION, MCP_RESPONSE_LIMIT, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const token = 'synthetic-http-test-token-never-a-real-credential';
@@ -293,19 +289,19 @@ test('HTTP bounds declared and chunked bodies and accepts ten maximally escaped 
   const f = await fixture(t);
   assert.equal(
     (
-      await request(f.url, '', { headers: { 'Content-Length': String(HTTP_BODY_LIMIT + 1) } })
+      await request(f.url, '', { headers: { 'Content-Length': String(MCP_INPUT_LIMIT + 1) } })
         .response
     ).status,
     413,
   );
   assert.equal(
-    (await request(f.url, ' '.repeat(HTTP_BODY_LIMIT + 1), { chunked: true }).response).status,
+    (await request(f.url, ' '.repeat(MCP_INPUT_LIMIT + 1), { chunked: true }).response).status,
     413,
   );
   assert.equal(
     (
       await request(f.url, '', {
-        headers: { 'Content-Length': String(HTTP_BODY_LIMIT + 1), [TOKEN_HEADER]: 'wrong' },
+        headers: { 'Content-Length': String(MCP_INPUT_LIMIT + 1), [TOKEN_HEADER]: 'wrong' },
       }).response
     ).status,
     401,
