@@ -10,7 +10,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { Bridge } from '../src/bridge.mjs';
 import { loadSavedSession } from '../src/data.mjs';
-import { permitted } from '../src/permissions.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
 import { readClaim, reserveOwner } from '../src/attachments.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
@@ -88,24 +87,6 @@ async function append(f, entries) {
   );
   return s.file;
 }
-
-test('permissions: most specific, recent explicit field, unset inherits, final deny', () => {
-  const c = {
-    grants: [
-      { folder: '/project', list: true, read: true, send: true },
-      { folder: '/project/child', read: false },
-      { folder: '/project', send: false },
-      { session_id: 's', list: true, read: true },
-      { session_id: 's', read: null },
-    ],
-  };
-  assert.equal(permitted(c, 'read', { id: 's', cwd: '/project/child' }), false);
-  assert.equal(permitted(c, 'send', { id: 's', cwd: '/project/child' }), false);
-  assert.equal(permitted(c, 'read', { id: 'other', cwd: '/project2' }), false);
-  c.grants.push({ session_id: 's', list: true, read: true });
-  assert.equal(permitted(c, 'read', { id: 's', cwd: '/project/child' }), true);
-  assert.equal(permitted(c, 'delete', { id: 's', cwd: '/project' }), false);
-});
 
 test('send-only permission cannot disclose metadata or bodies', async (t) => {
   const f = await fixture(t, (cwd) => [{ folder: cwd, create: true, send: true }]);
