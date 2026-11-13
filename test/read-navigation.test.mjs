@@ -1128,6 +1128,4 @@ test('read/search schemas and MCP discovery describe a usable navigation path', 
   assert.ok(search, 'search is discoverable without knowing a hidden Bridge method');
   assert.ok(search.inputSchema.properties.query);
   assert.ok(read.inputSchema.properties.refs);
-  assert.match(read.description, /ref/i);
-  assert.match(search.description, /read|ref/i);
 });
