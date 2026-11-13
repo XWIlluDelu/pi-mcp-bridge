@@ -37,7 +37,8 @@ Find literal text across the reader's full supported source:
 ```
 
 Search is case-insensitive literal matching, independent of browse counts and
-preview lengths. Its optional `content` array uses the same kind names as
+preview lengths. It also matches previews a session reader stores separately,
+such as a shorter summary tier, and then shows that preview. Its optional `content` array uses the same kind names as
 `read.content`; it restricts kinds, not their counts. Search returns `query`,
 `matches`, snippets and refs. It searches one authorized session, not other
 sessions, hidden raw history or content the source never captured.

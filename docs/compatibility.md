@@ -134,7 +134,7 @@ it. Turn range must not silently change the reader's background-content selectio
 | `kind`            | Content kind, up to 64 characters; use the shared content names where applicable.       |
 | `text`            | Full readable text for literal search and reference expansion.                          |
 | `title`           | Optional short label.                                                                   |
-| `preview`         | Optional concise overview; a preview never replaces searchable full text.               |
+| `preview`         | Optional concise overview shown in browse rows. Search matches it as well as `text`.    |
 | `source`          | Optional bounded provenance object, at most 8192 encoded bytes.                         |
 | `related`         | Optional array of up to 32 `{id,relation}` links to items in the same result.           |
 | `branch_relation` | Optional `on_branch`, `off_branch`, or `unknown` for the item's native source boundary. |
@@ -185,7 +185,7 @@ coordinates and uses `branch_relation` where that distinction helps reading;
 Bridge preserves the marker in brief rows even if other provenance is shortened.
 
 Bridge sanitizes and segments item text, creates previews, searches the full
-captured text and expands opaque references. Reader item order is preserved;
+captured text and reader previews, and expands opaque references. Reader item order is preserved;
 appended native units retain their own effective source order. Public reader results use
 `view:"adapted"`, `reader.id` and `source.reader_item`; native units retain native
 locators. When `native:true`, `selection` and `omissions.selection` describe only

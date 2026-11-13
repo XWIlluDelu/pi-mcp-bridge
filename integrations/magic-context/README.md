@@ -1,9 +1,9 @@
 # Magic Context reader
 
 This is an optional external Bridge module. Bridge core does not import it.
-Its consumed storage contract is based on Magic Context **0.49.20**. Compatibility
-is checked against the queried tables/columns and interpreted row values, not
-MC's global migration number. Unrelated additive migrations do not require a
+Its consumed storage contract is based on Magic Context **0.49.20** and has been
+verified against an installed 0.49.43 store. Compatibility is checked against the
+queried tables/columns and interpreted row values, not MC's global migration number. Unrelated additive migrations do not require a
 reader update. It requires Node's built-in
 `node:sqlite` and the current Bridge item-reader contract.
 

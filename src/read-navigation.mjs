@@ -105,16 +105,6 @@ function assistantFailure(units) {
     ? `assistant ${message.stopReason ?? 'error'}${message.errorMessage ? ': ' + message.errorMessage : ''}`
     : '';
 }
-export function unitText(unit, metadata = false) {
-  // Acquisition searches complete records. Document titles carry tool names;
-  // repeating them in split bodies would break continuous output phrases.
-  const names = metadata
-    ? [unit.message?.toolName, ...(unit.parts ?? []).map((part) => part.message?.toolName)]
-    : [];
-  return [...names, assistantFailure([unit]), unitBodyText(unit, metadata)]
-    .filter(Boolean)
-    .join('\n');
-}
 const docUnits = (snapshot, doc) => doc.units ?? doc.indices.map((i) => snapshot.units[i]);
 export const documentUnits = docUnits;
 
@@ -347,10 +337,9 @@ function toolPreview(units) {
   };
 }
 
-export function navigationDocuments(snapshot) {
-  const runtime = snapshot.view === 'runtime';
-  const units = runtime ? runtimeUnits(snapshot) : snapshot.units;
-  const content = snapshot.request?.content;
+// Acquisition and navigation share message/kind runs and logical tool pairs.
+// Grouping holds source indexes only, before any selected content is copied.
+export function navigationGroups(units, content) {
   const enabled = (kind) =>
     !content || Array.isArray(content)
       ? !content?.length || content.includes(kind)
@@ -413,24 +402,32 @@ export function navigationDocuments(snapshot) {
         prompt_id: unit.prompt_id,
         message,
         indices: [],
-        ...(runtime ? { units: [] } : {}),
       });
     const doc = grouped.get(id);
     doc.indices.push(i);
-    if (runtime) doc.units.push(unit);
   }
-  const docs = [...grouped.values()].sort((a, b) => {
+  return [...grouped.values()].sort((a, b) => {
     const bodyIndex = (doc) =>
       doc.indices.find((i) => !['message_metadata', 'nested_call'].includes(units[i].type)) ??
       doc.indices[0];
     return bodyIndex(a) - bodyIndex(b);
   });
+}
+
+export function navigationDocuments(snapshot) {
+  const runtime = snapshot.view === 'runtime';
+  const units = runtime ? runtimeUnits(snapshot) : snapshot.units;
+  const docs = navigationGroups(units, snapshot.request?.content);
+  if (runtime) for (const doc of docs) doc.units = doc.indices.map((index) => units[index]);
   for (const doc of [...docs]) {
     const values = docUnits(snapshot, doc);
     const body =
       values.find((u) => !['message_metadata', 'nested_call'].includes(u.type)) ?? values[0];
     doc.title = body.title;
     doc.preview = body.preview;
+    // A reader preview can be separately stored wording (for example, a shorter
+    // summary tier). Search it with the item so visible rows remain findable.
+    doc.readerPreview = body.preview;
     doc.related = body.related;
     doc.branch_relation = body.branch_relation;
     if (body.provenance) doc.source = { ...doc.source, ...body.provenance };
@@ -480,17 +477,30 @@ export function navigationDocuments(snapshot) {
   return docs;
 }
 
+const includesQuery = (text, query) => text.toLocaleLowerCase().includes(query.toLocaleLowerCase());
+
+export function documentMatches(snapshot, doc, query) {
+  return includesQuery(
+    `${doc.title ?? ''}\n${doc.readerPreview ?? ''}\n${documentText(snapshot, doc)}`,
+    query,
+  );
+}
+
+// A match found only in a reader preview is shown from that preview.
+function searchedText(snapshot, doc, query) {
+  const text = documentText(snapshot, doc);
+  return doc.readerPreview && !includesQuery(text, query) && includesQuery(doc.readerPreview, query)
+    ? doc.readerPreview
+    : text;
+}
+
 export function navigationRows(snapshot, documents, ref, { query, content } = {}) {
   const matching = documents
     .map((doc, index) => ({ doc, index }))
     .filter(
       ({ doc }) =>
         (!content?.length || content.includes(contentKind(doc.kind))) &&
-        (query
-          ? `${doc.title ?? ''}\n${documentText(snapshot, doc)}`
-              .toLocaleLowerCase()
-              .includes(query.toLocaleLowerCase())
-          : doc.parent === undefined),
+        (query ? documentMatches(snapshot, doc, query) : doc.parent === undefined),
     );
   const parents = new Set(matching.map(({ doc }) => doc.parent).filter((x) => x !== undefined));
   const selected = matching.filter(({ index }) => !query || !parents.has(index));
@@ -529,7 +539,7 @@ export function navigationRows(snapshot, documents, ref, { query, content } = {}
       doc.prompt_id != null &&
       latest.get(doc.prompt_id) === doc.message;
     const full = compact(
-      query ? documentText(snapshot, doc) : (doc.preview ?? documentText(snapshot, doc)),
+      query ? searchedText(snapshot, doc, query) : (doc.preview ?? documentText(snapshot, doc)),
     );
     let text;
     if (query) text = excerpt(full, 640, query);
