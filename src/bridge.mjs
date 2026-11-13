@@ -435,7 +435,11 @@ export class Bridge {
           const result = runtime.attached
             ? await runtime.compact(body, undefined, authorized)
             : await runtime.command(
-                { type: 'compact', customInstructions: body.instructions },
+                {
+                  type: 'compact',
+                  customInstructions: body.instructions,
+                  idleOnly: !body.interrupt,
+                },
                 undefined,
                 late,
                 authorized,

@@ -4,7 +4,7 @@
 
 `package.json` defines the Bridge product version reported by MCP and owner
 `bridgeVersion`. Control operations retain their required matching-component
-checks (including owned shutdown sealing). Live reading instead checks the
+checks (including owned shutdown sealing and idle compaction). Live reading instead checks the
 explicit `READ_CONTRACT` in `context-read.mjs`, published as owner `readContract`
 and snapshot `contract`. Product releases alone do not change this contract.
 A missing or incompatible read contract returns `OWNER_READ_REFRESH_REQUIRED`

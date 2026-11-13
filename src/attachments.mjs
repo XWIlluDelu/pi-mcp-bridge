@@ -6,6 +6,7 @@ import { readLfLines } from './lf-lines.mjs';
 import { assertReadSnapshot, READ_CONTRACT } from './context-read.mjs';
 import { stopReceipt, inlineWithdrawal } from './stop-execution.mjs';
 import { inlineBashResult } from './bash-execution.mjs';
+import { compactMetadata, nativeCompactReason } from './compact.mjs';
 import { hasPromptSettings } from './prompt-input.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { knownErrorCode } from './errors.mjs';
@@ -394,17 +395,19 @@ export class AttachedRuntime {
     this.alive = true;
     this.attached = true;
   }
-  async request(op, body = {}, timeout = 5000, beforeDispatch) {
+  async request(op, body = {}, timeout = 5000, beforeDispatch, transport) {
     return diagnostics.measure('attached.request', { op, generation: this.record.generation }, () =>
-      this.requestOnce(op, body, timeout, beforeDispatch),
+      this.requestOnce(op, body, timeout, beforeDispatch, transport),
     );
   }
-  async requestOnce(op, body = {}, timeout = 5000, beforeDispatch) {
+  async requestOnce(op, body = {}, timeout = 5000, beforeDispatch, { signal, onWrite } = {}) {
+    signal?.throwIfAborted();
+    const ownedControl = op === 'seal' || (op === 'compact' && this.record.kind === 'rpc');
     const mutating = ['set_model', 'send', 'stop', 'bash', 'compact', 'reload', 'seal'].includes(
       op,
     );
     if (
-      op === 'seal' &&
+      ownedControl &&
       (this.record.kind !== 'rpc' || this.record.bridgeVersion !== packageInfo.version)
     )
       throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
@@ -412,7 +415,7 @@ export class AttachedRuntime {
       JSON.stringify({
         op,
         body,
-        ...(op === 'seal' ? { version: packageInfo.version } : {}),
+        ...(ownedControl ? { version: packageInfo.version } : {}),
         ...(op === 'read' && body.view !== 'runtime'
           ? { readAdapters: this.compatibility?.readInputs.snapshot() ?? [] }
           : {}),
@@ -459,6 +462,7 @@ export class AttachedRuntime {
       throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
     if (current.phase !== 'ready' && !closingHost)
       throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+    signal?.throwIfAborted();
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(this.record.socket);
       let bytes = 0,
@@ -470,15 +474,24 @@ export class AttachedRuntime {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
         lines?.close();
         socket.destroy();
         if (error && partial !== undefined) error.result = partial;
         error ? reject(error) : resolve(value);
       };
-      const timer = setTimeout(
-        () => finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
-        timeout,
-      );
+      // Owned compaction has one timer/late-ACK ledger in PiRpc. Its transport
+      // remains open after that caller times out, until a reply or exact exit.
+      const timer =
+        timeout === null
+          ? undefined
+          : setTimeout(
+              () => finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
+              timeout,
+            );
+      const abort = () =>
+        finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating));
+      signal?.addEventListener('abort', abort, { once: true });
       socket.on('error', () =>
         finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
       );
@@ -488,13 +501,18 @@ export class AttachedRuntime {
       socket.on('connect', async () => {
         try {
           await beforeDispatch?.();
+          if (done) return;
+          onWrite?.();
         } catch (error) {
           finish(error);
           return;
         }
-        if (done) return;
         written = true;
-        socket.write(serialized);
+        try {
+          socket.write(serialized);
+        } catch {
+          finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', mutating));
+        }
       });
       socket.on('data', (chunk) => {
         bytes += chunk.length;
@@ -518,11 +536,11 @@ export class AttachedRuntime {
         try {
           const response = JSON.parse(line);
           if (response.generation !== this.record.generation) {
-            if (op === 'seal')
+            if (ownedControl)
               return finish(new AttachmentFailure('RUNTIME_SESSION_CHANGED', written));
             throw new Error();
           }
-          if (op === 'seal') {
+          if (ownedControl) {
             const failed = Object.hasOwn(response, 'error');
             const fields = [
               'generation',
@@ -530,6 +548,9 @@ export class AttachedRuntime {
               'file',
               'sessionId',
               failed ? 'error' : 'data',
+              ...(op === 'compact' && response.native_reason !== undefined
+                ? ['native_reason']
+                : []),
             ];
             if (
               Object.keys(response).length !== fields.length ||
@@ -546,6 +567,24 @@ export class AttachedRuntime {
               return finish(new AttachmentFailure(response.error));
             if (response.version !== packageInfo.version)
               return finish(new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED', written));
+            if (op === 'compact') {
+              if (failed)
+                return finish(
+                  Object.assign(
+                    new AttachmentFailure(
+                      knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
+                      ![
+                        'COMPACT_BUSY',
+                        'PI_REJECTED',
+                        'INVALID_ARGUMENTS',
+                        'RUNTIME_SHUTTING_DOWN',
+                      ].includes(response.error),
+                    ),
+                    { native_reason: nativeCompactReason(response.native_reason) },
+                  ),
+                );
+              return finish(null, compactMetadata(response.data));
+            }
             if (failed)
               return finish(
                 new AttachmentFailure(

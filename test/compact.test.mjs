@@ -147,6 +147,49 @@ test(
   },
 );
 
+for (const [text, marker] of [
+  ['HOLD_MODEL', '.provider-start'],
+  ['HOLD_PREFLIGHT', '.preflight-start'],
+])
+  test(
+    `owned idle compact refuses extension ${text} started after the idle snapshot`,
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(t);
+      await populate(f);
+      await fs.writeFile(
+        f.configFile,
+        JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, send: true }] }),
+      );
+      const runtime = await f.bridge.pool.resolve(await f.bridge.session(f.id));
+      const assertIdle = runtime.assertIdle.bind(runtime);
+      t.mock.method(runtime, 'assertIdle', async (options) => {
+        const result = await assertIdle(options);
+        const admitted = await runtime.command({
+          type: 'prompt',
+          message: `/fixture-independent-input ${text}`,
+        });
+        assert.equal(admitted.disposition, 'handled');
+        await until(() => exists(f.gate + marker));
+        return result;
+      });
+      const result = await f.bridge.compact({ session_id: f.id });
+      assert.equal(result.status, 'rejected', JSON.stringify(result));
+      assert.equal(result.reason, 'COMPACT_BUSY');
+      assert.equal(result.native_effects, 'none');
+      assert.equal(await exists(f.gate + '.provider-aborted'), false);
+      if (text === 'HOLD_MODEL') assert.equal((await runtime.state()).isStreaming, true);
+      assert.equal(
+        (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
+        0,
+      );
+      t.mock.restoreAll();
+      await fs.writeFile(f.gate, 'go');
+      await fs.writeFile(f.gate + '.preflight-release', 'go');
+      await released(f);
+    },
+  );
+
 test(
   'native stop cancels a held cold compact without generating a summary',
   { timeout: 15000 },

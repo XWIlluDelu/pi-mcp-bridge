@@ -61,7 +61,11 @@ export function reloadAdmission(AgentSession) {
       current.operation?.kind === 'reload' &&
       current.operation.command === args[0];
     if (internal) return original.apply(session, args);
-    if (current.operation && scope.getStore() !== current.operation)
+    // Input-free model changes remain available during compaction. Their hooks
+    // keep the caller's scope, so they cannot start work through this gate.
+    const settings =
+      current.operation?.kind === 'compact' && ['setModel', 'cycleModel'].includes(name);
+    if (current.operation && scope.getStore() !== current.operation && !settings)
       throw new Error(
         current.operation.kind === 'reload' ? 'RELOAD_IN_PROGRESS' : 'COMPACTION_PENDING',
       );

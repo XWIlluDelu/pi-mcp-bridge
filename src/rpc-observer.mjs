@@ -15,6 +15,8 @@ import { nativeReadFeatures } from './read-features.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { SettledObserver } from './settled-observer.mjs';
 import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import { compactInputSchema, compactMetadata, nativeCompactReason } from './compact.mjs';
+import { publicError } from './errors.mjs';
 export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
   if (!value) return;
@@ -107,7 +109,7 @@ export default async function rpcObserver(pi) {
       connection.setTimeout(5000, () => connection.destroy());
       connection.on('error', () => {});
       connection.on('close', () => connections.delete(connection));
-      connection.on('data', (chunk) => {
+      connection.on('data', async (chunk) => {
         if (handled) return;
         body += chunk;
         if (Buffer.byteLength(body) > MAX_ATTACHMENT_REQUEST_BYTES) {
@@ -121,15 +123,36 @@ export default async function rpcObserver(pi) {
           request = JSON.parse(body.slice(0, body.indexOf('\n')));
           if (
             !context ||
-            !['state', 'read', 'read_features', 'seal'].includes(request.op) ||
+            !['state', 'read', 'read_features', 'seal', 'compact'].includes(request.op) ||
             request.generation !== generation ||
             request.file !== context.sessionManager.getSessionFile() ||
             request.sessionId !== context.sessionManager.getSessionId()
           )
             throw new Error('RUNTIME_SESSION_CHANGED');
-          if (request.op === 'seal') {
+          if (['seal', 'compact'].includes(request.op)) {
             if (request.version !== packageInfo.version)
               throw new Error('OWNER_COMPONENT_UPDATE_REQUIRED');
+          }
+          if (request.op === 'compact') {
+            const input = compactInputSchema.safeParse(request.body);
+            if (!input.success || input.data.interrupt) throw new Error('INVALID_ARGUMENTS');
+            const value = await admission.compact(context.sessionManager, context, () => {
+              connection.setTimeout(0);
+              return new Promise((resolve, reject) =>
+                context.compact({
+                  customInstructions: input.data.instructions,
+                  onComplete: resolve,
+                  onError: (error) =>
+                    reject(
+                      Object.assign(new Error('PI_REJECTED'), {
+                        native_reason: nativeCompactReason(error.message),
+                      }),
+                    ),
+                }),
+              );
+            });
+            result = { data: compactMetadata(value) };
+          } else if (request.op === 'seal') {
             if (
               !request.body ||
               typeof request.body !== 'object' ||
@@ -178,12 +201,18 @@ export default async function rpcObserver(pi) {
             };
           }
         } catch (error) {
-          result = { error: error.message };
+          result =
+            request?.op === 'compact'
+              ? {
+                  error: publicError(error),
+                  ...(error.native_reason ? { native_reason: error.native_reason } : {}),
+                }
+              : { error: error.message };
         }
         connection.end(
           JSON.stringify({
             generation,
-            ...(request?.op === 'seal'
+            ...(['seal', 'compact'].includes(request?.op)
               ? { version: packageInfo.version, file: request.file, sessionId: request.sessionId }
               : {}),
             ...result,
