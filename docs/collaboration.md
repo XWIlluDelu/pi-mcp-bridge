@@ -83,6 +83,5 @@ The design draws on native operation/result correlation in
 [Codex App Server](https://github.com/openai/codex/blob/970111f6cb62cc02fe36a82ea7d71b37a2889c97/codex-rs/app-server/src/request_processors/turn_processor.rs#L661)
 and [Grok Build's completion mapping](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/turn_completion.rs#L1),
 and on Grok's separation of [client-facing session records](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/export.rs#L1)
-from model input. Reviewed with Pi 1.4.0 on 2026-10-24, these references informed
-Bridge's separate admission receipts, settlement results and context views. Pi's
-native evidence defines the implemented boundaries described above.
+from model input. They informed Bridge's separate admission receipts, settlement
+results and context views; Pi's native evidence defines the implemented boundaries.

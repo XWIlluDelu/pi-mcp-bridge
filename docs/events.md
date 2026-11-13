@@ -206,7 +206,6 @@ nonpublic address. Some proxies return synthetic fake-IP addresses, such as
 
 ## Verify the ChatGPT workflow
 
-Service activation, restart and plugin changes require owner authorization.
 Update Bridge and its matching companion/observer together, coordinating any
 interruption of in-flight work. Supported idle owners can use
 [`reload({session_id})`](api.md#reload); owners without that capability need a
@@ -223,7 +222,3 @@ native `/reload` or host-managed reopen to load the updated companion.
    receipt; the chat reaction is asynchronous.
 4. Cancel monitoring and confirm unsubscribe. Remove temporary probes and
    diagnostic settings.
-
-Local tests cover native Pi settlement with a synthetic provider, authenticated
-MCP subscription, signed receiver validation and leaf-pinned result retrieval.
-The workflow above also verifies delivery to ChatGPT and its reaction.

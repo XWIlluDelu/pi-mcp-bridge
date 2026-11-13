@@ -50,8 +50,6 @@ independent of `range`, which controls only the appended native input turns:
 
 `0` omits that kind. `summary:-1` includes all stored session summaries, including
 other-branch history; `memory:-1` includes all eligible own-project memories.
-Search acquires all supported items of its requested kinds, independently of
-browse defaults. Changing the page budget does not widen selection.
 
 For a positive summary count, filtering happens before taking the last N items.
 Each summary carries `branch_relation`: `on_branch`, `off_branch`, or `unknown`.
@@ -60,12 +58,10 @@ apply. Compaction does not discard ancestors for this check. Missing entries,
 unresolved MC boundaries and incomplete ancestry stay unknown; unknown summaries
 remain eligible. Project memories are not filtered by the session branch.
 
-`coverage` reports `{type,selected,total}` for summaries and memories before
-search-result filtering and pagination. Totals count this session's compartments
-with content and the own-project memories eligible below. MC's empty boundary
-markers do not consume summary slots. Summary coverage adds `excluded` when
-branch filtering removes stored summaries. Use a larger content count or `-1`
-for a fresh broader capture; cursor pages traverse only the acquired items.
+`coverage` totals count this session's compartments with content and the
+own-project memories eligible below. MC's empty boundary markers do not consume
+summary slots. Summary coverage adds `excluded` when branch filtering removes
+stored summaries.
 
 - Compartments contain their P1/full stored summary as `text`, P2 (or P3) as
   `preview`, title and a historical native leaf when the ending entry is real.
@@ -77,7 +73,7 @@ for a fresh broader capture; cursor pages traverse only the acquired items.
 - Memories include only active/permanent, unexpired, non-superseded rows belonging
   to the verified **own project**. The reader selects by importance and update time, then preserves the selected
   store order through forward pagination. Workspace
-  shares, notes, primers, docs, profiles and vectors are outside this first reader's
+  shares, notes, primers, docs, profiles and vectors are outside this reader's
   coverage. `source.scope` records `own_project`.
 - Memory provenance identifies its origin session/type and verification state.
   It does not invent an exact source message from a session-level relationship.
@@ -96,9 +92,7 @@ Missing consumed columns or incompatible row representations report
 `MAGIC_CONTEXT_SCHEMA_MISMATCH`. The reader expects text summaries/memories,
 numeric ordering, integer millisecond timestamps and native boundary identifiers;
 it validates eligible own-project memory expiry before filtering. Unknown rebase
-states remain readable without claiming a native history leaf. Update the module
-when those consumed storage semantics change; migration numbers are not proof
-of either compatibility or incompatibility. Changed identity during
+states remain readable without claiming a native history leaf. Changed identity during
 acquisition reports `MAGIC_CONTEXT_SESSION_MISMATCH`. Bridge wraps module failures
 in its reader error without silently substituting another source.
 
@@ -108,13 +102,8 @@ in its reader error without silently substituting another source.
 node --test integrations/magic-context/index.test.mjs
 ```
 
-The isolated SQLite fixtures cover current schema checks, session/project/harness
-matching, background registration without activation, memory visibility,
-content limits and coverage, previews and reference content, source limitations, Git
-identity and absence of DB writes. Branch fixtures use native Pi projection to
-check filtering before limits, compaction ancestry, unknown boundaries, retained
-historical search/source refs, and reuse of one capture for native progress.
-They do not read the user's actual memory database.
+The tests use isolated SQLite fixtures and native Pi projection; they do not read
+the user's actual memory database.
 
 Source basis: [Magic Context 0.49.20](https://github.com/cortexkit/magic-context/tree/08d2615c2aff05fd62823c195ab0ffd479d7a8e5),
 especially `packages/plugin/src/features/magic-context/compartment-storage.ts`,

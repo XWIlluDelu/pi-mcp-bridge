@@ -72,46 +72,21 @@ execution. See the [owner capability table](runtime.md#runtime-capabilities).
 
 ### Read and search
 
-```json
-{ "session_id": "ps_…", "max_bytes": 24000 }
-```
+Both tools require read permission and never start Pi. `read` accepts one of:
 
-`read` selects the last three input turns by default and returns content in source
-order. `range:{recent:N,earliest:N}` selects turns; `recent:-1` includes all
-effective turns. `content` independently controls input visibility and message or
-tool counts. Defaults include all assistant text, the latest thinking message and
-one logical tool operation per turn. Tools are short navigation; refs expand the
-captured source. Each turn’s latest assistant text receives priority within the
-page budget without changing display order.
+- `{session_id, range?, content?, view?, leaf_id?, max_bytes?}` to browse; the
+  default is the last three input turns in source order.
+- `{refs, max_bytes?}` to expand up to eight refs from one result.
+- `{cursor, max_bytes?}` to continue a read or search page.
 
-Omit `view` to use a matching configured reader or native projection. Explicit
-`view:"session"` selects Session Context; `view:"runtime"` selects a captured
-request-stage Runtime Context. Adapted results identify `reader.id`. Both tools
-require read permission and never start Pi.
+`search({session_id, query, content?, view?, leaf_id?, max_bytes?})` finds
+case-insensitive literal text across the session's full supported source. Omit
+`view` for the session's default source: native context or, when a configured
+reader applies, `view:"adapted"` with stored summaries/memories and
+`reader.coverage`.
 
-Use `search` to find literal, case-insensitive text across one session's full
-supported source, independently of the earlier browse selection:
-
-```json
-{ "session_id": "ps_…", "query": "retry policy", "content": ["tool", "assistant"] }
-```
-
-Expand useful result references with `read`:
-
-```json
-{ "refs": ["<item.ref>", "<related.ref>"], "max_bytes": 12000 }
-```
-
-Continue either tool's result through `read`, optionally changing the byte budget:
-
-```json
-{ "cursor": "<next_cursor>", "max_bytes": 12000 }
-```
-
-[Reading a Pi session](reading.md) defines source boundaries, selection, reference
-combinations and Runtime restrictions. Its [continuation contract](reading.md#capacity-and-continuation)
-describes page order. The [frozen snapshot contract](reading.md#frozen-bounded-snapshots)
-covers retention and authorization.
+[Reading a Pi session](reading.md) defines defaults, selection, search,
+references, continuation and frozen snapshots.
 
 ### Models
 

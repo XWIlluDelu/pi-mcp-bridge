@@ -29,7 +29,8 @@ but unreachable owner still blocks cold startup.
 Registry transactions use a short kernel-owned mutex derived from the canonical
 private IPC directory. All cooperating processes must share this directory and
 Linux PID/network namespaces. Process death releases the mutex; writer claims
-separately require exact exit or completed native replacement evidence. Ownership
+separately require exact process exit, completed native replacement or a host's
+confirmed session-local writer closure. Ownership
 is checked independently of endpoint compatibility: damaged fields for a known
 different path do not block the target, ambiguous scope does, and obsolete control
 metadata cannot revive an exited writer.
@@ -135,9 +136,7 @@ lifetimes so asynchronous input preparation and standalone bash also block reloa
 new operations are refused while resources are being replaced. A closed
 socket or an input acknowledgement alone is not completion evidence. An owned
 RPC follows the [idle shutdown contract](#shutdown-and-in-flight-acks), then starts
-a fresh worker with current resources. Lifecycle cancellation after seal dispatch
-does not undo shutdown, but prevents the reload successor from starting. Native
-shutdown/startup hooks are allowed to finish; Bridge does not kill them on a timer.
+a fresh worker with current resources.
 
 Reload preserves saved messages and resets extension-local state, including the
 previous Runtime Context capture. It reads the owner's configured resources;
@@ -165,11 +164,6 @@ Resolve only after that reload finishes, preserving the current writer and nativ
 session identity. The adapter fences its own mutations while waiting. A command
 ACK is not completion; an exception after dispatch is an unknown outcome. Missing
 a callback is reported by `list.status.capabilities.reload:false`.
-
-Inspire currently owns ordinary Pi RPC workers that load the companion, so it
-uses the companion path directly. Bridge reload runs inside that worker; it does
-not restart Inspire or replace the worker. Inspire's local `/reload` action is a
-separate host-managed worker reopen.
 
 ## Model settings and compaction
 
@@ -371,10 +365,10 @@ are outside this observation.
 
 The fresh TUI shows wait/failure notifications without mirroring old RPC output.
 Ctrl+Alt+J cancels; unrelated work in the fresh TUI causes join to refuse until
-that work finishes. Cancellation before seal dispatch restores admission. After
-dispatch it does not withdraw seal confirmation or confirmed shutdown, but
-prevents reserving or opening the destination. Returned cancellation before
-native open removes the reservation and permits an explicit retry.
+that work finishes. Cancellation before seal dispatch restores admission; later
+cancellation follows the [shutdown contract](#shutdown-and-in-flight-acks).
+Returned cancellation before native open removes the reservation and permits an
+explicit retry.
 A thrown, possibly partial switch retains the requester's claim until exact exit.
 
 A successful switch-away retires the old context's claim; later destination exit
@@ -467,7 +461,7 @@ shutdown retry can confirm or complete closure of that same generation without
 replaying business input. Lifecycle cancellation after seal dispatch does not
 cancel its confirmation or undo a committed seal. Confirmed shutdown still
 finishes, while cancellation prevents a handoff reservation or reload successor
-from being created. Existing explicit local pauses remain in force.
+from being created.
 
 Headless RPC replies `extension_ui_response {cancelled:true}` to `confirm`,
 `select`, `input` and `editor` dialogs. An admitted send/create reports

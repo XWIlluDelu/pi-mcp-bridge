@@ -10,8 +10,6 @@ and snapshot `contract`. Product releases alone do not change this contract.
 A missing or incompatible read contract returns `OWNER_READ_REFRESH_REQUIRED`
 without taking over the writer; update the owner at a safe native lifecycle
 boundary. This is one current read format, with no old-format translation.
-Introducing this contract requires one coordinated component update from older
-releases that published their product version as the read contract.
 
 Native history projection and raw fork snapshots remain supported independently
 of the Bridge control version. [AGENTS.md](../AGENTS.md) defines release,
@@ -19,16 +17,16 @@ development and production-operation rules.
 
 ## Components
 
-| Area                           | Modules and responsibility                                                                                                                                                                                                                                                                                     |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Protocol                       | `protocol.mjs` and `tool-schemas.mjs` define tools and dispatch. `server.mjs`, `protocol-stdio.mjs` and `http-server.mjs` provide MCP transports; `stdio-proxy.mjs` forwards to one service.                                                                                                                   |
-| Authorization and admission    | `bridge.mjs` composes request snapshots, permissions, session lanes and lifecycle fences. `permissions.mjs` resolves rights; `owner-config.mjs` validates and edits policy. `submissions.mjs` retains admission receipts.                                                                                      |
-| Native data and reading        | `data.mjs` validates session identity and storage. `context-read.mjs` projects, selects and sanitizes; `read-navigation.mjs` builds previews and search; `read-cache.mjs` manages frozen pages and references. `session-metadata.mjs` caches bounded titles.                                                   |
-| Plugin integration             | `compatibility.mjs` owns module lifecycle. `compatibility-services.mjs` exposes independent input-mapping, session-reader and daemon-environment capabilities; `session-readers.mjs` routes session-local context.                                                                                             |
-| Runtime ownership              | `rpc.mjs` owns child lifecycle and ACK tracking. `attachments.mjs` coordinates claims and IPC; `attach-extension.mjs` and `host-adapter.mjs` connect cooperating owners. `herdr-rpc-transport.mjs` supplies optional process placement.                                                                        |
-| Native controls                | `pi-installation.mjs` selects one external CLI/SDK installation. `model-catalog.mjs`, `set-model.mjs`, `compact.mjs` and `stop-execution.mjs` implement native controls.                                                                                                                                       |
-| Creation, deletion and handoff | `create-session.mjs` publishes native sessions; `trash.mjs` performs recoverable moves. `owner-runtime.mjs`, `idle-handoff.mjs`, `join-extension.mjs` and `open.mjs` coordinate local entry and release.                                                                                                       |
-| Observation and events         | `context-observation.mjs` retains request-stage context; `live-message.mjs` and `runtime-events.mjs` bound transient observations. `settled-result.mjs` captures completion excerpts; `events.mjs` and `event-webhook.mjs` deliver notifications. `diagnostics.mjs` emits privacy-filtered operational events. |
+| Area                           | Modules and responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Protocol                       | `protocol.mjs` and `tool-schemas.mjs` define tools, validate arguments once and dispatch; `batch.mjs` schedules per-session lanes and `response-budget.mjs` accounts for the duplicated wire result. `server.mjs`, `protocol-stdio.mjs` and `http-server.mjs` provide transports; `stdio-proxy.mjs` forwards to one service. Service and proxy share configuration, token validation and the not-admitted rejection table in `http-config.mjs`.                                                                                         |
+| Authorization and admission    | `bridge.mjs` composes request snapshots, permissions, session lanes and lifecycle fences. `permissions.mjs` resolves rights; `owner-config.mjs` validates and edits policy. `submissions.mjs` retains admission receipts.                                                                                                                                                                                                                                                                                                               |
+| Native data and reading        | `data.mjs` validates session identity and storage. `context-read.mjs` projects, selects and sanitizes; `read-navigation.mjs` builds previews and search; `read-cache.mjs` manages frozen pages and references. `session-metadata.mjs` caches bounded titles.                                                                                                                                                                                                                                                                            |
+| Plugin integration             | `compatibility.mjs` owns module lifecycle. `compatibility-services.mjs` exposes independent input-mapping, session-reader and daemon-environment capabilities; `session-readers.mjs` routes session-local context.                                                                                                                                                                                                                                                                                                                      |
+| Runtime ownership              | `rpc.mjs` owns child lifecycle and ACK tracking; `rpc-observer.mjs` runs inside that child to report activity and commit the shutdown seal. `attachments.mjs` coordinates claims and IPC; `companion.mjs` (loaded by `attach-extension.mjs`) and `host-adapter.mjs` with `host-bindings.mjs` connect cooperating owners through the shared endpoint framing in `attachment-protocol.mjs`. `reload-admission.mjs` observes native operation lifetimes for idle admission. `herdr-rpc-transport.mjs` supplies optional process placement. |
+| Native controls                | `pi-installation.mjs` selects one external CLI/SDK installation. `model-catalog.mjs`, `set-model.mjs`, `compact.mjs` and `stop-execution.mjs` implement native controls.                                                                                                                                                                                                                                                                                                                                                                |
+| Creation, deletion and handoff | `create-session.mjs` publishes native sessions; `trash.mjs` performs recoverable moves. `owner-runtime.mjs`, `idle-handoff.mjs`, `join-extension.mjs` and `open.mjs` coordinate local entry and release.                                                                                                                                                                                                                                                                                                                                |
+| Observation and events         | `context-observation.mjs` retains request-stage context; `live-message.mjs` and `runtime-events.mjs` bound transient observations. `settled-result.mjs` captures completion excerpts; `events.mjs` and `event-webhook.mjs` deliver notifications. `diagnostics.mjs` emits privacy-filtered operational events.                                                                                                                                                                                                                          |
 
 ## API distinctions
 
@@ -39,8 +37,9 @@ APIs are in [module management](compatibility.md).
 
 ## Invariants
 
-1. **One writer.** A live or uncertain owner blocks another writer. Only exact
-   process exit or completed native replacement ends its ephemeral claim.
+1. **One writer.** A live or uncertain owner blocks another writer. A claim ends
+   after exact process exit, completed native replacement or confirmed
+   session-local writer closure by its host.
 2. **Request authorization.** One receive-time policy snapshot governs an
    operation, including batch items and fork checks. Identity, Stop and lifecycle
    fences remain live throughout execution.
@@ -67,11 +66,7 @@ requests. Native subprocess/PTY checks require `script`; the service-unit check
 requires `systemd-analyze`. The test environment must permit Unix sockets and
 preserve the Linux file ownership needed by the storage-integrity checks.
 
-Integration tests exercise submission, late acknowledgement,
-automatic continuation, completion delivery and reading an earlier result after
-later work. Reader tests cover selection, search and reference expansion across
-Session Context, Runtime Context and isolated extension stores. Module tests live
-beside their implementations under `integrations/`.
+Module tests live beside their implementations under `integrations/`.
 
 Pi is an external test dependency. Tests use PATH or an explicit installation:
 

@@ -101,7 +101,7 @@ Settings and input are separate native commands. Bridge rechecks identity, admis
 
 Explicit settings add `model_selection:{model:{provider,id},thinking_level}` only after native verification. These values may accompany a later prompt failure; they do not bind later provider calls. Global defaults are unchanged.
 
-## Prompt settings timeout
+### Prompt settings timeout
 
 Native requests retain their internal five-second acknowledgement budget; there is no tool timeout parameter. A timed-out setter blocks further input until its acknowledgement arrives and identity is validated. It never causes the pending prompt or another setting to be dispatched later.
 
