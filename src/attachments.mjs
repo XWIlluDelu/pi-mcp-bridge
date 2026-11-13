@@ -386,6 +386,40 @@ async function terminateOwnerForDelete(config, session, record) {
   });
   await releaseOwner(config.attachmentDir, session, record);
 }
+// Owner refusals that prove the operation took no effect. Any other error
+// after a mutating request was written leaves its outcome uncertain.
+const DEFINITE_REFUSALS = {
+  reload: ['RELOAD_BUSY', 'RELOAD_IN_PROGRESS', 'RELOAD_UNSUPPORTED'],
+  compact: [
+    'COMPACT_UNSUPPORTED',
+    'COMPACT_IDLE_UNCONFIRMED',
+    'COMPACT_BUSY',
+    'COMPACTION_PENDING',
+    'PI_REJECTED',
+    'INVALID_ARGUMENTS',
+  ],
+  set_model: [
+    'MODEL_SELECTION_UNSUPPORTED',
+    'MODEL_SELECTION_PENDING',
+    'MODEL_UNAVAILABLE',
+    'INVALID_ARGUMENTS',
+  ],
+  send: [
+    'MODEL_SELECTION_UNSUPPORTED',
+    'COMPACTION_PENDING',
+    'MODEL_SELECTION_PENDING',
+    'MODEL_UNAVAILABLE',
+    'THINKING_LEVEL_UNSUPPORTED',
+    'THINKING_SUPPORT_UNKNOWN',
+    'IMAGE_INPUT_UNSUPPORTED',
+    'INVALID_PROMPT_INPUT',
+    'INVALID_ATTACHED_SEND',
+  ],
+  bash: ['BASH_UNSUPPORTED'],
+  stop: ['STOP_UNSUPPORTED'],
+};
+// Another admitted operation holds the owner; nothing was dispatched.
+const BUSY_REFUSALS = ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS', 'RELOAD_IN_PROGRESS'];
 export class AttachedRuntime {
   constructor(config, session, record, { compatibility } = {}) {
     this.compatibility = compatibility;
@@ -612,58 +646,13 @@ export class AttachedRuntime {
             else throw new Error();
             return;
           }
-          if (
-            op === 'reload' &&
-            ['RELOAD_BUSY', 'RELOAD_IN_PROGRESS', 'RELOAD_UNSUPPORTED'].includes(response.error)
-          )
-            return finish(new AttachmentFailure(response.error));
-          if (
-            op === 'compact' &&
-            [
-              'COMPACT_UNSUPPORTED',
-              'COMPACT_IDLE_UNCONFIRMED',
-              'COMPACT_BUSY',
-              'COMPACTION_PENDING',
-              'PI_REJECTED',
-              'INVALID_ARGUMENTS',
-            ].includes(response.error)
-          )
-            return finish(new AttachmentFailure(response.error));
           if (op === 'compact' && response.error === 'HOST_COMPACT_UNCERTAIN')
             return finish(new AttachmentFailure(response.error, true));
-          if (op === 'set_model' && response.error === 'MODEL_SELECTION_UNSUPPORTED')
-            return finish(new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED'));
           if (
-            op === 'set_model' &&
-            ['MODEL_SELECTION_PENDING', 'MODEL_UNAVAILABLE', 'INVALID_ARGUMENTS'].includes(
-              response.error,
-            )
+            DEFINITE_REFUSALS[op]?.includes(response.error) ||
+            (mutating && BUSY_REFUSALS.includes(response.error))
           )
             return finish(new AttachmentFailure(response.error));
-          if (
-            op === 'send' &&
-            [
-              'MODEL_SELECTION_UNSUPPORTED',
-              'COMPACTION_PENDING',
-              'MODEL_SELECTION_PENDING',
-              'MODEL_UNAVAILABLE',
-              'THINKING_LEVEL_UNSUPPORTED',
-              'THINKING_SUPPORT_UNKNOWN',
-              'IMAGE_INPUT_UNSUPPORTED',
-              'INVALID_PROMPT_INPUT',
-              'INVALID_ATTACHED_SEND',
-            ].includes(response.error)
-          )
-            return finish(new AttachmentFailure(response.error));
-          if (
-            mutating &&
-            ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS', 'RELOAD_IN_PROGRESS'].includes(response.error)
-          )
-            return finish(new AttachmentFailure(response.error));
-          if (op === 'bash' && response.error === 'BASH_UNSUPPORTED')
-            return finish(new AttachmentFailure('BASH_UNSUPPORTED'));
-          if (op === 'stop' && response.error === 'STOP_UNSUPPORTED')
-            return finish(new AttachmentFailure('STOP_UNSUPPORTED'));
           if (response.error)
             return finish(
               new AttachmentFailure(

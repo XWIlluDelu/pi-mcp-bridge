@@ -6,7 +6,6 @@ import { publicError } from './errors.mjs';
 import { compactInputSchema, compactMetadata } from './compact.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
-import net from 'node:net';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -21,8 +20,9 @@ import {
   hasPromptSettings,
 } from './prompt-input.mjs';
 import {
-  MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
+  attachmentServer,
+  listenPrivate,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
 import {
@@ -401,220 +401,191 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
         setModel: (model) => pi.setModel(model),
         setThinkingLevel: (level) => pi.setThinkingLevel(level),
       });
-      const server = net.createServer((socket) => {
-        if (connections.size >= 16) {
-          socket.destroy();
-          return;
-        }
-        connections.add(socket);
-        socket.setEncoding('utf8');
-        socket.setTimeout(5000, () => socket.destroy());
-        socket.on('error', () => {});
-        socket.on('close', () => connections.delete(socket));
-        let buffer = '',
-          handled = false;
-        socket.on('data', async (chunk) => {
-          if (handled) return;
-          buffer += chunk;
-          if (Buffer.byteLength(buffer) > MAX_ATTACHMENT_REQUEST_BYTES) {
-            socket.destroy();
-            return;
-          }
-          const end = buffer.indexOf('\n');
-          if (end < 0) return;
-          handled = true;
-          try {
-            const request = JSON.parse(buffer.slice(0, end));
-            check(request);
-            await validateStorage(runtime);
-            check(request);
-            let data;
-            const args = request.body ?? {};
+      const server = attachmentServer(connections, async (line, socket) => {
+        try {
+          const request = JSON.parse(line);
+          check(request);
+          await validateStorage(runtime);
+          check(request);
+          let data;
+          const args = request.body ?? {};
+          if (
+            admission.reloading(manager) &&
+            !['state', 'read', 'read_features', 'snapshot'].includes(request.op)
+          )
+            throw new AttachmentFailure('RELOAD_IN_PROGRESS');
+          if (request.op === 'state')
+            data = {
+              sessionFile: file,
+              sessionId: header.id,
+              sessionName: ctx.sessionManager.getSessionName() ?? null,
+              ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
+              isStreaming: !ctx.isIdle(),
+              generation: record.generation,
+              activity: activity(),
+              reloadComplete: admission.completed(manager),
+            };
+          else if (request.op === 'read_features')
+            data = {
+              contract: READ_CONTRACT,
+              sessionFile: file,
+              sessionId: header.id,
+              ...nativeReadFeatures(
+                pi.getAllTools(),
+                pi.getCommands(),
+                ctx.sessionManager.getLeafId(),
+              ),
+            };
+          else if (['read', 'snapshot'].includes(request.op)) {
+            const entries = ctx.sessionManager.getEntries(),
+              leafId = ctx.sessionManager.getLeafId();
+            const snapshotJson =
+              request.op === 'snapshot'
+                ? JSON.stringify({ entries, leaf: leafId, generation: record.generation })
+                : null;
             if (
-              admission.reloading(manager) &&
-              !['state', 'read', 'read_features', 'snapshot'].includes(request.op)
+              request.op === 'snapshot' &&
+              Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
             )
-              throw new AttachmentFailure('RELOAD_IN_PROGRESS');
-            if (request.op === 'state')
+              throw new AttachmentFailure('SESSION_TOO_LARGE');
+            if (request.op === 'snapshot')
+              data = { sessionFile: file, sessionId: header.id, entries, leafId };
+            else {
               data = {
                 sessionFile: file,
                 sessionId: header.id,
-                sessionName: ctx.sessionManager.getSessionName() ?? null,
-                ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
-                isStreaming: !ctx.isIdle(),
-                generation: record.generation,
-                activity: activity(),
-                reloadComplete: admission.completed(manager),
+                ...(args.view === 'runtime'
+                  ? runtime.observation.read(args, ctx)
+                  : prepareContextRead(
+                      { header, entries, leafId, live: runtime.liveMessage.snapshot() },
+                      args,
+                      { buildSessionProjection, readAdapters: request.readAdapters },
+                    )),
               };
-            else if (request.op === 'read_features')
-              data = {
-                contract: READ_CONTRACT,
-                sessionFile: file,
-                sessionId: header.id,
-                ...nativeReadFeatures(
-                  pi.getAllTools(),
-                  pi.getCommands(),
-                  ctx.sessionManager.getLeafId(),
-                ),
-              };
-            else if (['read', 'snapshot'].includes(request.op)) {
-              const entries = ctx.sessionManager.getEntries(),
-                leafId = ctx.sessionManager.getLeafId();
-              const snapshotJson =
-                request.op === 'snapshot'
-                  ? JSON.stringify({ entries, leaf: leafId, generation: record.generation })
-                  : null;
-              if (
-                request.op === 'snapshot' &&
-                Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
-              )
-                throw new AttachmentFailure('SESSION_TOO_LARGE');
-              if (request.op === 'snapshot')
-                data = { sessionFile: file, sessionId: header.id, entries, leafId };
-              else {
-                data = {
-                  sessionFile: file,
-                  sessionId: header.id,
-                  ...(args.view === 'runtime'
-                    ? runtime.observation.read(args, ctx)
-                    : prepareContextRead(
-                        { header, entries, leafId, live: runtime.liveMessage.snapshot() },
-                        args,
-                        { buildSessionProjection, readAdapters: request.readAdapters },
-                      )),
-                };
-              }
-            } else if (request.op === 'reload') {
-              if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
-              const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
-              runtime.reload = operation;
-              // Native reload closes this socket and drains ordinary mutations.
-              // Flush admission first; never add reload itself to that drain set.
-              socket.end(
-                JSON.stringify({ generation: record.generation, data: { reloading: true } }) + '\n',
-                () => {
-                  try {
-                    check(request);
-                    pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
-                  } catch {
-                    operation.cancel();
-                  }
-                },
-              );
-              return;
-            } else if (request.op === 'set_model') {
-              data = await trackMutation(
-                setModel({
-                  model: args.model,
-                  thinking_level: args.thinking_level,
-                  sessionFile: file,
-                  sessionId: header.id,
-                  beforeDispatch: () => check(request),
-                }),
-              );
-              check(request);
-            } else if (request.op === 'compact') {
-              const input = compactInputSchema.safeParse(args);
-              if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
-              if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
-              const compact = async () => {
-                check(request);
-                runtime.compacting = true;
-                socket.setTimeout(0); // Disconnect only suppresses the receipt.
-                try {
-                  return await trackMutation(
-                    new Promise((resolve, reject) =>
-                      ctx.compact({
-                        customInstructions: input.data.instructions,
-                        onComplete: resolve,
-                        onError: () => reject(new AttachmentFailure('PI_REJECTED')),
-                      }),
-                    ),
-                  );
-                } finally {
-                  runtime.compacting = false;
-                }
-              };
-              const value = input.data.interrupt
-                ? await compact()
-                : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
-              check(request);
-              data = compactMetadata(value);
-            } else if (request.op === 'send') {
-              if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
-              if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
-              const input = attachedPromptInput(args);
-              if (hasPromptSettings(input))
-                throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
-              if (!SEND_MODES.includes(args.mode))
-                throw new AttachmentFailure('INVALID_ATTACHED_SEND');
-              const rejection = remotePromptRejection(input.text),
-                currentActivity = activity();
-              if (rejection) data = rejection;
-              else if (
-                args.mode === 'idle_only' &&
-                (!currentActivity.idle || currentActivity.pending_messages)
-              )
-                data = { status: 'skipped', reason: 'busy' };
-              else {
-                const options = { expandPromptTemplates: true };
-                if (args.mode === 'steer') options.deliverAs = 'steer';
-                if (args.mode === 'follow_up') options.deliverAs = 'followUp';
-                try {
-                  pi.sendUserMessage(
-                    input.images
-                      ? [
-                          ...(input.text ? [{ type: 'text', text: input.text }] : []),
-                          ...input.images,
-                        ]
-                      : input.text,
-                    options,
-                  );
-                  // The public API confirms invocation, not native admission or
-                  // completion. A later input handler may transform or handle it.
-                  data = { status: 'dispatched', admission: 'unobservable' };
-                } catch {
-                  // Entering native dispatch can have side effects before a throw.
-                  data = { status: 'unknown', reason: 'PI_ACCEPTANCE_UNOBSERVABLE' };
-                }
-              }
-            } else if (request.op === 'bash') {
-              throw new AttachmentFailure('BASH_UNSUPPORTED');
-            } else if (request.op === 'stop') {
-              // TUI ctx.abort + getEditorText can recover joined text (including
-              // prior draft), but no public context API aborts independent bash.
-              // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
-              throw new AttachmentFailure('STOP_UNSUPPORTED');
-            } else if (request.op === 'shutdown') {
-              if (ctx.mode === 'rpc') throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
-              data = { shutdown: 'requested' };
-              socket.end(JSON.stringify({ generation: record.generation, data }) + '\n', () => {
+            }
+          } else if (request.op === 'reload') {
+            if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
+            const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
+            runtime.reload = operation;
+            // Native reload closes this socket and drains ordinary mutations.
+            // Flush admission first; never add reload itself to that drain set.
+            socket.end(
+              JSON.stringify({ generation: record.generation, data: { reloading: true } }) + '\n',
+              () => {
                 try {
                   check(request);
-                  ctx.shutdown();
+                  pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
                 } catch {
-                  /* Reload/replacement may invalidate the captured context before the flush callback. */
+                  operation.cancel();
                 }
-              });
-              return;
-            } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
-            socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
-          } catch (error) {
-            socket.end(
-              JSON.stringify({
-                generation: record.generation,
-                error: publicError(error, 'ATTACHED_OPERATION_FAILED'),
-              }) + '\n',
+              },
             );
-          }
-        });
+            return;
+          } else if (request.op === 'set_model') {
+            data = await trackMutation(
+              setModel({
+                model: args.model,
+                thinking_level: args.thinking_level,
+                sessionFile: file,
+                sessionId: header.id,
+                beforeDispatch: () => check(request),
+              }),
+            );
+            check(request);
+          } else if (request.op === 'compact') {
+            const input = compactInputSchema.safeParse(args);
+            if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
+            if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
+            const compact = async () => {
+              check(request);
+              runtime.compacting = true;
+              socket.setTimeout(0); // Disconnect only suppresses the receipt.
+              try {
+                return await trackMutation(
+                  new Promise((resolve, reject) =>
+                    ctx.compact({
+                      customInstructions: input.data.instructions,
+                      onComplete: resolve,
+                      onError: () => reject(new AttachmentFailure('PI_REJECTED')),
+                    }),
+                  ),
+                );
+              } finally {
+                runtime.compacting = false;
+              }
+            };
+            const value = input.data.interrupt
+              ? await compact()
+              : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
+            check(request);
+            data = compactMetadata(value);
+          } else if (request.op === 'send') {
+            if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
+            if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
+            const input = attachedPromptInput(args);
+            if (hasPromptSettings(input))
+              throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
+            if (!SEND_MODES.includes(args.mode))
+              throw new AttachmentFailure('INVALID_ATTACHED_SEND');
+            const rejection = remotePromptRejection(input.text),
+              currentActivity = activity();
+            if (rejection) data = rejection;
+            else if (
+              args.mode === 'idle_only' &&
+              (!currentActivity.idle || currentActivity.pending_messages)
+            )
+              data = { status: 'skipped', reason: 'busy' };
+            else {
+              const options = { expandPromptTemplates: true };
+              if (args.mode === 'steer') options.deliverAs = 'steer';
+              if (args.mode === 'follow_up') options.deliverAs = 'followUp';
+              try {
+                pi.sendUserMessage(
+                  input.images
+                    ? [...(input.text ? [{ type: 'text', text: input.text }] : []), ...input.images]
+                    : input.text,
+                  options,
+                );
+                // The public API confirms invocation, not native admission or
+                // completion. A later input handler may transform or handle it.
+                data = { status: 'dispatched', admission: 'unobservable' };
+              } catch {
+                // Entering native dispatch can have side effects before a throw.
+                data = { status: 'unknown', reason: 'PI_ACCEPTANCE_UNOBSERVABLE' };
+              }
+            }
+          } else if (request.op === 'bash') {
+            throw new AttachmentFailure('BASH_UNSUPPORTED');
+          } else if (request.op === 'stop') {
+            // TUI ctx.abort + getEditorText can recover joined text (including
+            // prior draft), but no public context API aborts independent bash.
+            // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
+            throw new AttachmentFailure('STOP_UNSUPPORTED');
+          } else if (request.op === 'shutdown') {
+            if (ctx.mode === 'rpc') throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
+            data = { shutdown: 'requested' };
+            socket.end(JSON.stringify({ generation: record.generation, data }) + '\n', () => {
+              try {
+                check(request);
+                ctx.shutdown();
+              } catch {
+                /* Reload/replacement may invalidate the captured context before the flush callback. */
+              }
+            });
+            return;
+          } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
+          socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
+        } catch (error) {
+          socket.end(
+            JSON.stringify({
+              generation: record.generation,
+              error: publicError(error, 'ATTACHED_OPERATION_FAILED'),
+            }) + '\n',
+          );
+        }
       });
       runtime.server = server;
-      await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(record.socket, resolve);
-      });
-      await fs.chmod(record.socket, 0o600);
+      await listenPrivate(server, record.socket);
       runtime.ready = true;
       await updateOwner(dir, session, record, {
         phase: 'ready',

@@ -1,9 +1,7 @@
 import packageInfo from '../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
-import fs from 'node:fs/promises';
 import { publicError } from './errors.mjs';
-import net from 'node:net';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
@@ -21,8 +19,9 @@ import { modelSettingsSchema, modelSettings } from './set-model.mjs';
 import { limitBashResult } from './bash-execution.mjs';
 import { stopReceipt, withdrawalCollector } from './stop-execution.mjs';
 import {
-  MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
+  attachmentServer,
+  listenPrivate,
 } from './attachment-protocol.mjs';
 import {
   reserveOwner,
@@ -488,72 +487,43 @@ export async function reserveHostSession({
     try {
       await state();
       if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
-      server = net.createServer((socket) => {
-        if (sockets.size >= 16) {
-          socket.destroy();
-          return;
-        }
-        sockets.add(socket);
-        socket.setEncoding('utf8');
-        socket.setTimeout(5000, () => socket.destroy());
-        socket.on('error', () => {});
-        socket.on('close', () => sockets.delete(socket));
-        let buffer = '',
-          handled = false;
-        socket.on('data', (chunk) => {
-          if (handled) return;
-          buffer += chunk;
-          if (Buffer.byteLength(buffer) > MAX_ATTACHMENT_REQUEST_BYTES) {
-            socket.destroy();
-            return;
-          }
-          const end = buffer.indexOf('\n');
-          if (end < 0) return;
-          handled = true;
-          const task = (async () => {
-            try {
-              const request = JSON.parse(buffer.slice(0, end));
-              validateRequest(request);
-              if (
-                ['stop', 'bash'].includes(request.op) &&
-                Number.isInteger(request.body?.timeout_ms)
-              )
-                socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
-              if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
-              let data;
-              if (request.op === 'release') data = await release();
-              else {
-                const operation = operate(request, (data) => {
-                  if (!socket.destroyed && !socket.writableEnded)
-                    socket.write(
-                      JSON.stringify({ generation: record.generation, partial: true, data }) + '\n',
-                    );
-                });
-                operations.add(operation);
-                try {
-                  data = await operation;
-                } finally {
-                  operations.delete(operation);
-                }
+      server = attachmentServer(sockets, (line, socket) => {
+        const task = (async () => {
+          try {
+            const request = JSON.parse(line);
+            validateRequest(request);
+            if (['stop', 'bash'].includes(request.op) && Number.isInteger(request.body?.timeout_ms))
+              socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
+            if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
+            let data;
+            if (request.op === 'release') data = await release();
+            else {
+              const operation = operate(request, (data) => {
+                if (!socket.destroyed && !socket.writableEnded)
+                  socket.write(
+                    JSON.stringify({ generation: record.generation, partial: true, data }) + '\n',
+                  );
+              });
+              operations.add(operation);
+              try {
+                data = await operation;
+              } finally {
+                operations.delete(operation);
               }
-              socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
-            } catch (error) {
-              socket.end(
-                JSON.stringify({
-                  generation: record.generation,
-                  error: publicError(error, 'HOST_OPERATION_FAILED'),
-                }) + '\n',
-              );
             }
-          })();
-          task.catch(() => socket.destroy());
-        });
+            socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
+          } catch (error) {
+            socket.end(
+              JSON.stringify({
+                generation: record.generation,
+                error: publicError(error, 'HOST_OPERATION_FAILED'),
+              }) + '\n',
+            );
+          }
+        })();
+        task.catch(() => socket.destroy());
       });
-      await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(record.socket, resolve);
-      });
-      await fs.chmod(record.socket, 0o600);
+      await listenPrivate(server, record.socket);
       await state();
       if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
       await updateOwner(attachmentDir, target, record, {
