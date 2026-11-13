@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
@@ -34,15 +35,6 @@ const deferred = () => {
   });
   return { promise, resolve };
 };
-async function until(fn) {
-  const end = Date.now() + 12000;
-  while (Date.now() < end) {
-    const result = await fn();
-    if (result) return result;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  throw new Error('HOST_FIXTURE_TIMEOUT');
-}
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-host-')),
     cwd = path.join(dir, 'project');

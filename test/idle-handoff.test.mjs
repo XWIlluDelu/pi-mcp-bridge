@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -27,14 +28,6 @@ import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import joinExtension from '../src/join-extension.mjs';
 const base = path.resolve('.'),
   delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn, label = 'fixture condition', ms = 15000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    if (await fn()) return;
-    await delay(20);
-  }
-  throw new Error('Timed out: ' + label);
-}
 async function exists(file) {
   try {
     await fs.stat(file);
@@ -695,8 +688,7 @@ test(
 
       text: 'DIALOGS',
     });
-    assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
-    assert.equal(sent.status, 'handled');
+    assert.equal(sent.status, 'handled', JSON.stringify(sent));
     assert.equal(sent.reason, 'EXTENSION_UI_CANCEL_SENT');
     assert.equal(sent.ui, undefined);
     await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);

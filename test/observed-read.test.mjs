@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,14 +13,6 @@ import { readClaim } from '../src/attachments.mjs';
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { ContextObservation } from '../src/context-observation.mjs';
 
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn) {
-  for (let i = 0; i < 1000; i++) {
-    if (await fn()) return;
-    await delay(10);
-  }
-  throw Error('OBSERVED_TEST_TIMEOUT');
-}
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-observed-'),
     cwd = dir + '/project';

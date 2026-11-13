@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -25,15 +26,6 @@ import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
-async function until(fn) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    const result = await fn();
-    if (result) return result;
-    await delay(10);
-  }
-  throw new Error('STOP_NATIVE_FIXTURE_TIMEOUT');
-}
 async function fixture(t, owned = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-stop-native-')),
     cwd = path.join(dir, 'project');

@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,16 +13,6 @@ import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { hash } from '../src/storage.mjs';
 
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn) {
-  const end = Date.now() + 12000;
-  while (Date.now() < end) {
-    const v = await fn();
-    if (v) return v;
-    await delay(20);
-  }
-  throw Error('DAILY_COMPANION_TIMEOUT');
-}
 const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
 const exists = (file) =>
   fs.stat(file).then(

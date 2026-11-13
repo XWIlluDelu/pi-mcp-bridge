@@ -1,8 +1,8 @@
+import { until } from './fixtures/until.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { Webhook } from 'standardwebhooks';
 import { Bridge } from '../src/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
@@ -12,16 +12,6 @@ import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { hash } from '../src/storage.mjs';
-
-async function until(fn) {
-  const end = Date.now() + 12000;
-  while (Date.now() < end) {
-    const result = await fn();
-    if (result) return result;
-    await delay(10);
-  }
-  throw new Error('EVENT_COMPLETION_TIMEOUT');
-}
 
 test(
   'authenticated MCP subscription reports the final automatic continuation once, then reads that exact result after a later round',

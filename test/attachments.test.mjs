@@ -499,8 +499,7 @@ test('same session continues headless after actual TUI exit with history, grants
     text: 'PUBLIC_HEADLESS_CONTINUATION',
     mode: 'idle_only',
   });
-  assert.ok(['started', 'queued', 'handled'].includes(second.status), JSON.stringify(second));
-  assert.equal(second.status, 'started');
+  assert.equal(second.status, 'started', JSON.stringify(second));
   const claim = await readClaim(f.config.attachmentDir, f.session);
   assert.equal(claim.kind, 'rpc');
   assert.equal(claim.sessionId, f.session.header.id);

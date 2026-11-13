@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { nativeInstallation } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
@@ -10,16 +11,6 @@ import { openProfile } from '../src/open.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 
 const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(fn, label) {
-  const end = Date.now() + 12000;
-  while (Date.now() < end) {
-    if (await fn()) return;
-    await delay(20);
-  }
-  throw new Error('Native open timed out: ' + label);
-}
-
 test(
   'native --session-dir create releases, then the same launcher configuration joins safely and resumes headlessly',
   { timeout: 25000 },

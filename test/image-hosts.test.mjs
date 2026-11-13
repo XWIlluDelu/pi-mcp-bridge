@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -26,16 +27,6 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 import { imageReply, imageInputExtension } from './fixtures/image-provider.mjs';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(check) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    const v = await check();
-    if (v) return v;
-    await pause(10);
-  }
-  throw Error('IMAGE_HOST_TIMEOUT');
-}
-
 function tuiClient({ cwd, env, args, saved, config }) {
   let child, record;
   const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";

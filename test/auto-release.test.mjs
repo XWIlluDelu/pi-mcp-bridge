@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
@@ -25,13 +26,6 @@ import { RpcClient } from './fixtures/pi.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/host-bindings.mjs';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn) {
-  for (let i = 0; i < 1000; i++) {
-    if (await fn()) return;
-    await delay(10);
-  }
-  throw Error('AUTO_RELEASE_TEST_TIMEOUT');
-}
 const exists = (file) =>
   fs.stat(file).then(
     () => true,

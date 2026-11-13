@@ -194,22 +194,27 @@ test('shutdown preparation reports failed SIGTERM and explicit stop can retry wi
   assert.deepEqual(signals, ['SIGTERM', 'SIGTERM']);
   assert.equal(rpc.exited, true);
 });
-test('owner termination waits for exit without timer-based SIGKILL', async () => {
+test('owner termination waits for exit without timer-based SIGKILL', async (t) => {
   const rpc = new PiRpc({}, {}),
     child = new EventEmitter(),
-    signals = [];
+    signals = [],
+    terminated = Promise.withResolvers();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   rpc.child = child;
   rpc.assertProcessIdentity = async () => {}; // Synthetic child.
   rpc.alive = true;
   child.kill = (signal) => {
     signals.push(signal);
+    terminated.resolve();
     return true;
   };
   let stopped = false;
   const stopping = rpc.stop().then(() => {
     stopped = true;
   });
-  await new Promise((resolve) => setTimeout(resolve, 1650));
+  await terminated.promise;
+  t.mock.timers.runAll();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(signals, ['SIGTERM']);
   assert.equal(stopped, false);
   child.emit('exit', 0);

@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
@@ -26,14 +27,6 @@ import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 
-async function until(check) {
-  const end = Date.now() + 8000;
-  while (Date.now() < end) {
-    if (await check()) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error('COMPANION_LIFECYCLE_TIMEOUT');
-}
 async function fixture(t, { hosted = false, extension } = {}) {
   const dir = await fs.mkdtemp('/tmp/pi-companion-life-'),
     cwd = path.join(dir, 'project');

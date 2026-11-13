@@ -1,17 +1,11 @@
+import { until } from './until.mjs';
+export { until };
 import { denyAllPermissions } from './permissions.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../../src/bridge.mjs';
 import { isolatedRuntime } from './isolated-runtime.mjs';
 import { savedSession, savedEntries } from './saved-session.mjs';
-const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-export async function until(fn) {
-  for (let i = 0; i < 1000; i++) {
-    if (await fn()) return;
-    await pause(10);
-  }
-  throw Error('MODEL_TEST_TIMEOUT');
-}
 export const choice = (id) => ({ provider: 'model-fixture', id });
 export { savedEntries } from './saved-session.mjs';
 export async function releasedEntries(bridge, id) {

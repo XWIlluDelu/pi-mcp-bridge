@@ -9,7 +9,7 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs integrations/*/*.test.mjs",
+    "test": "node --import ./test/fixtures/pi-installation.mjs --test test/*.test.mjs integrations/*/*.test.mjs",
     "start": "node src/server.mjs",
     "start:http": "node src/http-server.mjs",
     "format": "prettier --write .github src test integrations deploy docs README.md package.json",

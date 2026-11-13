@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,14 +10,6 @@ import { pngImage } from './fixtures/image-input.mjs';
 import { savedEntries } from './fixtures/saved-session.mjs';
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(check) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    if (await check()) return;
-    await pause(10);
-  }
-  throw Error('IMAGE_QUEUE_TIMEOUT');
-}
 test(
   'busy steering and follow-up retain images; idle-only skips and restart replays without work',
   { timeout: 20000 },
@@ -68,15 +61,13 @@ test(
       images: [follow],
     };
     const queued = await bridge.send(args);
-    assert.ok(['started', 'queued', 'handled'].includes(queued.status), JSON.stringify(queued));
-    assert.equal(queued.status, 'queued');
+    assert.equal(queued.status, 'queued', JSON.stringify(queued));
     const steering = await bridge.send({
       session_id: made.session_id,
 
       images: [steer],
     });
-    assert.ok(['started', 'queued', 'handled'].includes(steering.status), JSON.stringify(steering));
-    assert.equal(steering.status, 'queued');
+    assert.equal(steering.status, 'queued', JSON.stringify(steering));
     assert.equal(
       (
         await bridge.send({

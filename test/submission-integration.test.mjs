@@ -1,8 +1,8 @@
+import { until } from './fixtures/until.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { Bridge } from '../src/bridge.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { Submissions } from '../src/submissions.mjs';
@@ -11,16 +11,6 @@ import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { aiEntry } from './fixtures/pi.mjs';
-
-async function until(check) {
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
-    const value = await check();
-    if (value) return value;
-    await delay(10);
-  }
-  throw new Error('SUBMISSION_TEST_TIMEOUT');
-}
 
 async function fixture(t, { native = false, disposition = 'handled', holdProvider = false } = {}) {
   const dir = await fs.mkdtemp('/tmp/pi-submissions-');

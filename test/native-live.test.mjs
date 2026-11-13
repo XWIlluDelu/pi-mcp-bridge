@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -6,17 +7,6 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(fn) {
-  const end = Date.now() + 8000;
-  while (Date.now() < end) {
-    const result = await fn();
-    if (result) return result;
-    await delay(10);
-  }
-  throw new Error('NATIVE_LIVE_TIMEOUT');
-}
-
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-native-live-'),
     cwd = path.join(dir, 'project');

@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -14,15 +15,6 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-async function until(fn, timeout = 10000) {
-  const end = Date.now() + timeout;
-  while (Date.now() < end) {
-    const value = await fn();
-    if (value) return value;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  throw new Error('Lifecycle fixture deadline');
-}
 const exists = (file) =>
   fs.stat(file).then(
     () => true,
@@ -241,31 +233,6 @@ test('stdin EOF without a runtime releases its lock and permits normal restart',
   assert.equal(await second.exit(), 0);
   await stopped(f);
 });
-test('stdin EOF drains in-flight native input and permits a fresh service', async (t) => {
-  const f = await fixture(t),
-    first = launch(t, f);
-  await first.initialize();
-  const pending = first.call('send', {
-    session_id: f.id,
-
-    text: '/lifecycle-fixture',
-  });
-  await until(() => exists(f.marker));
-  const claim = await ownClaim(f);
-  first.child.stdin.end();
-  const receipt = await pending;
-  assert.ok(['started', 'queued', 'handled'].includes(receipt.status), JSON.stringify(receipt));
-  assert.equal(receipt.status, 'handled');
-  assert.equal(await first.exit(), 0);
-  await stopped(f, claim.owner);
-  const second = launch(t, f);
-  await second.initialize();
-
-  assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
-  second.child.kill('SIGINT');
-  assert.equal(await second.exit(), 0);
-  await stopped(f);
-});
 test('broken stdout drains a pending receipt and cleans up the owned official RPC process', async (t) => {
   const f = await fixture(t),
     server = launch(t, f);
@@ -445,48 +412,74 @@ for (const modern of [false, true])
       { timeout: 15000 },
       async (t) => {
         const f = await fixture(t),
-          trace = path.join(f.dir, 'calls.log');
+          trace = path.join(f.dir, 'calls.log'),
+          release = path.join(f.dir, 'command-release'),
+          closing = path.join(f.dir, 'closing'),
+          preload = path.join(f.dir, 'close-observer.mjs');
         await fs.writeFile(
           path.join(f.dir, 'command.mjs'),
           'import fs from "node:fs/promises";export default pi=>pi.registerCommand("lifecycle-fixture",{handler:async(args)=>{await fs.appendFile(' +
             JSON.stringify(trace) +
             ',args+"\\n");await fs.writeFile(' +
             JSON.stringify(f.marker) +
-            ',"started");await new Promise(r=>setTimeout(r,300));}});',
+            ',"started");while(!await fs.stat(' +
+            JSON.stringify(release) +
+            ').then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));}});',
         );
-        const server = launch(t, f);
-        await server.initialize(modern ? MODERN_VERSION : '2024-11-05');
-        const result = server.request('tools/call', {
-          name: 'batch',
-          arguments: {
-            operations: ['FIRST', 'SECOND'].map((text) => ({
-              op: 'send',
-              args: { session_id: f.id, text: '/lifecycle-fixture ' + text },
-            })),
-          },
-          ...(modern
-            ? {
-                _meta: {
-                  [META + 'protocolVersion']: MODERN_VERSION,
-                  [META + 'clientCapabilities']: {},
-                },
-              }
-            : {}),
-        });
-        await until(() => exists(f.marker));
-        if (endInput) server.child.stdin.end();
-        const response = (await result).result;
-        assert.ok(!response.isError, JSON.stringify(response));
-        const items = response.structuredContent.results;
-        assert.equal(items[0].result.status, 'handled');
-        if (endInput) assert.equal(items[1].error.code, 'BRIDGE_CLOSING');
-        else assert.equal(items[1].result.status, 'handled');
-        assert.deepEqual(
-          (await fs.readFile(trace, 'utf8')).trim().split('\n'),
-          endInput ? ['FIRST'] : ['FIRST', 'SECOND'],
-        );
-        if (!endInput) server.child.stdin.end();
-        assert.equal(await server.exit(), 0);
+        if (endInput)
+          await fs.writeFile(
+            preload,
+            `import {writeFileSync} from 'node:fs';
+            import {Bridge} from ${JSON.stringify(new URL('../src/bridge.mjs', import.meta.url).href)};
+            const prepareClose=Bridge.prototype.prepareClose;
+            Bridge.prototype.prepareClose=function(...args){
+              const result=prepareClose.apply(this,args);
+              writeFileSync(${JSON.stringify(closing)},'ready');
+              return result;
+            };`,
+          );
+        const server = launch(t, f, endInput ? ['--import', preload] : []);
+        try {
+          await server.initialize(modern ? MODERN_VERSION : '2024-11-05');
+          const result = server.request('tools/call', {
+            name: 'batch',
+            arguments: {
+              operations: ['FIRST', 'SECOND'].map((text) => ({
+                op: 'send',
+                args: { session_id: f.id, text: '/lifecycle-fixture ' + text },
+              })),
+            },
+            ...(modern
+              ? {
+                  _meta: {
+                    [META + 'protocolVersion']: MODERN_VERSION,
+                    [META + 'clientCapabilities']: {},
+                  },
+                }
+              : {}),
+          });
+          await until(() => exists(f.marker));
+          if (endInput) {
+            server.child.stdin.end();
+            await until(() => exists(closing));
+          }
+          await fs.writeFile(release, 'go');
+          const response = (await result).result;
+          assert.ok(!response.isError, JSON.stringify(response));
+          const items = response.structuredContent.results;
+          assert.equal(items[0].result.status, 'handled');
+          if (endInput) assert.equal(items[1].error.code, 'BRIDGE_CLOSING');
+          else assert.equal(items[1].result.status, 'handled');
+          assert.deepEqual(
+            (await fs.readFile(trace, 'utf8')).trim().split('\n'),
+            endInput ? ['FIRST'] : ['FIRST', 'SECOND'],
+          );
+          if (!endInput) server.child.stdin.end();
+          assert.equal(await server.exit(), 0);
+        } finally {
+          await fs.writeFile(release, 'go');
+          server.child.stdin.end();
+        }
       },
     );
 

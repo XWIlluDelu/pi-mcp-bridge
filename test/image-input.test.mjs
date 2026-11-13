@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { readSource } from './fixtures/read-source.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -17,15 +18,6 @@ import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 import { savedEntries } from './fixtures/saved-session.mjs';
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(check) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    const value = await check();
-    if (value) return value;
-    await pause(10);
-  }
-  throw Error('IMAGE_TEST_TIMEOUT');
-}
 const parseEvidence = (text) => JSON.parse(text.slice('IMAGE_CONTEXT:'.length));
 const lastText = (entries) =>
   entries

@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -15,14 +16,6 @@ import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(fn, label) {
-  const deadline = Date.now() + 12000;
-  while (Date.now() < deadline) {
-    if (await fn()) return;
-    await delay(25);
-  }
-  throw new Error('Deadline: ' + label);
-}
 test('remote TUI reload preserves history and native permission menus still govern MCP operations', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-ui-'));
   const cwd = path.join(dir, 'project'),

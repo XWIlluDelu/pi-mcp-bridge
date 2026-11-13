@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -15,14 +16,6 @@ import { RpcFailure } from '../src/rpc.mjs';
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
-async function until(fn) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    if (await fn()) return;
-    await new Promise((r) => setTimeout(r, 15));
-  }
-  throw new Error('FIXTURE_TIMEOUT');
-}
 async function fixture(t, extraArgs = []) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-handoff-')),
     cwd = path.join(dir, 'project');

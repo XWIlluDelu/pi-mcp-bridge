@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -49,16 +50,6 @@ async function fixture(t) {
   return { dir, config, bridge, session, spawns: () => spawns };
 }
 const identity = (session) => ({ sessionFile: session.file, sessionId: session.header.id });
-async function until(fn) {
-  const end = Date.now() + 10000;
-  while (Date.now() < end) {
-    const value = await fn();
-    if (value) return value;
-    await new Promise((r) => setTimeout(r, 20));
-  }
-  throw Error('FIXTURE_TIMEOUT');
-}
-
 test('profile companion leaves the same-process host controller and its shutdown lifecycle in charge', async (t) => {
   const f = await fixture(t),
     host = await reserveHostSession({

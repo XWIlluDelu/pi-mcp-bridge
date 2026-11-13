@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -5,22 +6,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { RpcClient } from './fixtures/pi.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Bridge } from '../src/bridge.mjs';
 import { AttachedRuntime, readClaim, ownerAlive } from '../src/attachments.mjs';
 
-async function until(check) {
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
-    const value = await check();
-    if (value) return value;
-    await delay(10);
-  }
-  throw new Error('COMPANION_FIXTURE_TIMEOUT');
-}
 const text = (entry) =>
   entry.type === 'message' && entry.message?.role === 'user'
     ? typeof entry.message.content === 'string'

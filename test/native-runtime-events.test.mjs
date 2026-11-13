@@ -1,3 +1,4 @@
+import { until } from './fixtures/until.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -9,13 +10,6 @@ import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { assertContextReadResponse } from './fixtures/read-pages.mjs';
 
-async function until(fn) {
-  for (let i = 0; i < 500; i++) {
-    if (await fn()) return;
-    await delay(10);
-  }
-  throw new Error('NATIVE_EVENT_TEST_TIMEOUT');
-}
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-native-events-'),
     cwd = path.join(dir, 'project');
@@ -70,8 +64,7 @@ test(
 
       text: '/audit-fail',
     });
-    assert.ok(['started', 'queued', 'handled'].includes(sent.status), JSON.stringify(sent));
-    assert.equal(sent.status, 'handled');
+    assert.equal(sent.status, 'handled', JSON.stringify(sent));
     assert.equal(sent.completion, undefined);
 
     assert.equal(sent.runtime_events, undefined);

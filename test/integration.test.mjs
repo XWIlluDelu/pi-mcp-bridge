@@ -280,8 +280,7 @@ test('MCP -> official Pi RPC -> faux provider: auto-resume, default steering, qu
     const made = await call('create', { project: f.cwd, text: 'hello' });
     const session_id = made.session_id;
     const first = made.send;
-    assert.ok(['started', 'queued', 'handled'].includes(first.status), JSON.stringify(first));
-    assert.equal(first.status, 'started');
+    assert.equal(first.status, 'started', JSON.stringify(first));
     const skipped = await call('send', {
       session_id,
 
@@ -420,8 +419,7 @@ export default function(pi){
         text: 'normal ' + mode,
         mode,
       });
-      assert.ok(['started', 'queued', 'handled'].includes(receipt.status), JSON.stringify(receipt));
-      assert.equal(receipt.status, 'queued');
+      assert.equal(receipt.status, 'queued', JSON.stringify(receipt));
     }
     assert.equal(
       (await bridge.send({ session_id, text: 'busy check', mode: 'idle_only' })).reason,
@@ -456,8 +454,7 @@ export default function(pi){
 
       text: 'fresh runtime',
     });
-    assert.ok(['started', 'queued', 'handled'].includes(next.status), JSON.stringify(next));
-    assert.equal(next.status, 'started');
+    assert.equal(next.status, 'started', JSON.stringify(next));
     assert.notEqual(bridge.pool.get(session_id).generation, oldGeneration);
   } finally {
     await bridge.close();
