@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { appendUnits, READ_CONTRACT, READ_SNAPSHOT_LIMIT } from './context-read.mjs';
 import { jsonBytes } from './response-budget.mjs';
 import { sessionEntryIndex } from './data.mjs';
+import { runtimeUnits } from './read-navigation.mjs';
 import { readSchema } from './read-schema.mjs';
 
 export function unavailableObservation(sessionId, reason, captureSequence = 0) {
@@ -87,6 +88,9 @@ export class ContextObservation {
           }[message.role] ?? 'native';
         appendUnits(target, { type, source: { observation_index: index }, message });
       }
+      const units = runtimeUnits(target.units);
+      if (jsonBytes(units) * 4 + units.length * 256 > READ_SNAPSHOT_LIMIT)
+        throw new Error('READ_SNAPSHOT_TOO_LARGE');
       this.latest = {
         contract: READ_CONTRACT,
         view: 'runtime',
@@ -95,7 +99,7 @@ export class ContextObservation {
         leaf_id: leaf,
         selection: null,
         omissions: null,
-        units: target.units,
+        units,
         observation: {
           available: true,
           id: randomUUID(),

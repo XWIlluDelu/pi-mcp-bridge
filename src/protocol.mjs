@@ -45,23 +45,7 @@ export const descriptions = {
   health:
     'Diagnose the permission configuration; a healthy setup returns a short ok. Optional session_id limits the diagnosis to that session. Unscoped calls also report settings awaiting restart and unavailable event storage. Changes nothing.',
 };
-export const toolNames = [
-  'list',
-  'read',
-  'search',
-  'models',
-  'set_model',
-  'compact',
-  'reload',
-  'send',
-  'submission',
-  'command',
-  'stop',
-  'create',
-  'delete',
-  'batch',
-  'health',
-];
+export const toolNames = Object.keys(descriptions);
 export function toolDefinitions() {
   return toolNames.map((name) => ({
     name,
@@ -99,12 +83,7 @@ function toolError(code, extra = {}) {
     structuredContent: result,
   };
 }
-export async function callBridgeTool(
-  bridge,
-  name,
-  input,
-  { requestId, execute = (run) => run() } = {},
-) {
+export async function callBridgeTool(bridge, name, input, options) {
   const schema = Object.hasOwn(publicSchemas, name) ? publicSchemas[name] : null;
   if (!schema) return toolError('UNKNOWN_TOOL');
   const parsed = schema.safeParse(input ?? {});
@@ -114,7 +93,14 @@ export async function callBridgeTool(
         .map((issue) => ({ path: issue.path, message: issue.message }))
         .slice(0, 12),
     });
-  const args = parsed.data;
+  return executeBridgeTool(bridge, name, parsed.data, options);
+}
+export function executeBridgeTool(
+  bridge,
+  name,
+  args,
+  { requestId, execute = (run) => run() } = {},
+) {
   // Start at the authoritative receive boundary, not when a delayed executor runs.
   const context = bridge.captureRequestContext?.();
   // A delayed/rejected executor must not leave an early policy failure unhandled.

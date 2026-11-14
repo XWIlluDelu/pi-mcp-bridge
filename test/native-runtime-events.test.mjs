@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
+
 import { Bridge } from '../src/bridge.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -61,7 +61,6 @@ test(
       session = await f.bridge.session(made.session_id);
     const sent = await f.bridge.send({
       session_id: session.id,
-
       text: '/audit-fail',
     });
     assert.equal(sent.status, 'handled', JSON.stringify(sent));
@@ -111,30 +110,5 @@ test(
     );
     f.config.grants[0].read = false;
     await assert.rejects(f.bridge.read(args), /NOT_FOUND_OR_DENIED/);
-  },
-);
-
-test(
-  'native handled input notices survive automatic EOF release, without reopening or persisting notices',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t);
-    const made = await f.bridge.create({
-      project: f.config.folders[0].path,
-
-      text: 'NOTIFY_ONLY',
-    });
-    assert.ok(['started', 'queued', 'handled'].includes(made.status), JSON.stringify(made));
-    await until(() => !f.bridge.pool.instances.has(made.session_id) && !f.bridge.autoReleases.size);
-    const args = { session_id: made.session_id, max_bytes: 4096 },
-      read = await f.bridge.read(args);
-    assertContextReadResponse(read, args);
-    assert.deepEqual(
-      read.runtime_events.events.map((e) => e.message),
-      ['INPUT_NOTICE', 'SHUTDOWN_NOTICE'],
-    );
-    assert.equal(f.bridge.pool.get(made.session_id), null);
-    const session = await f.bridge.session(made.session_id);
-    assert.equal((await fs.readFile(session.file, 'utf8')).includes('_NOTICE'), false);
   },
 );

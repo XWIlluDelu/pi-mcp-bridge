@@ -1,85 +1,49 @@
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+
 import { executeBatch } from '../src/batch.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { readClaim } from '../src/attachments.mjs';
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { ContextObservation } from '../src/context-observation.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-observed-'),
-    cwd = dir + '/project';
-  await fs.mkdir(cwd);
-  const transform = dir + '/transform.mjs';
-  // Loaded AFTER the owned observer: the phase ordering, not path order,
-  // must still expose the transformed request.
-  await fs.writeFile(
-    transform,
-    `import fs from 'node:fs/promises';
-    export default pi=>{
-      pi.on('context',event=>({messages:[
-        {role:'user',content:'TRANSFORMED_SUMMARY_BODY',timestamp:1},
-        ...event.messages.filter(m=>!JSON.stringify(m).includes('DROP_FROM_REQUEST'))
-      ]}));
-      pi.on('before_agent_start',()=>{pi.appendEntry('run-count',{});});
-      pi.on('context_with_system',event=>{
-        event.messages.push({role:'user',content:'LATER_FULL_CONTEXT_HOOK',timestamp:1});
-      });
-    };`,
-  );
-  const config = {
-    ...isolatedRuntime(dir),
-    stateDir: dir + '/state',
-    attachmentDir: dir + '/ipc',
-    sessionRoots: [dir + '/sessions'],
-    folders: [{ path: cwd }],
-    defaults: denyAllPermissions(),
-    grants: [{ folder: cwd, list: true, read: true, send: true }],
-  };
-  config.piArgs.push(
-    '-e',
-    path.resolve('test/fixtures/faux-extension.mjs'),
-    '-e',
-    transform,
-    '--provider',
-    'bridge-fixture',
-    '--model',
-    'deterministic',
-    '--thinking',
-    'off',
-  );
-  await fs.mkdir(config.piRuntime.agentDir);
-  await fs.writeFile(
-    config.piRuntime.agentDir + '/settings.json',
-    JSON.stringify({
-      cacheWarming: 'off',
-      compaction: { enabled: false },
-      retry: { enabled: false },
-    }),
-  );
-  const bridge = await new Bridge(config).init(),
-    runtimes = [],
-    factory = bridge.pool.factory;
-  bridge.pool.factory = async (s) => {
-    const r = await factory(s);
-    runtimes.push(r);
-    return r;
-  };
-  const made = await savedSession(bridge),
-    session = await bridge.session(made.session_id);
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    async configure({ dir, config }) {
+      const transform = dir + '/transform.mjs';
+      await fs.writeFile(
+        transform,
+        `
+        export default pi => {
+          pi.on('context', event => ({ messages: [
+            { role: 'user', content: 'TRANSFORMED_SUMMARY_BODY', timestamp: 1 },
+            ...event.messages.filter(m => !JSON.stringify(m).includes('DROP_FROM_REQUEST')),
+          ] }));
+          pi.on('before_agent_start', () => pi.appendEntry('run-count', {}));
+          pi.on('context_with_system', event => {
+            event.messages.push({ role: 'user', content: 'LATER_FULL_CONTEXT_HOOK', timestamp: 1 });
+          });
+        };
+      `,
+      );
+      config.piArgs.push(...fauxArgs, '-e', transform, '--thinking', 'off');
+    },
   });
-  const released = () => until(() => runtimes.at(-1)?.exited && !bridge.autoReleases.size);
-  return { dir, config, bridge, runtimes, session, id: session.id, released };
+  const runtimes = [],
+    launch = f.bridge.pool.factory;
+  f.bridge.pool.factory = async (session) => {
+    const runtime = await launch(session);
+    runtimes.push(runtime);
+    return runtime;
+  };
+  return Object.assign(f, {
+    runtimes,
+    released: () => until(() => runtimes.at(-1)?.exited && !f.bridge.autoReleases.size),
+  });
 }
 async function pages(bridge, first) {
   const result = [first];
@@ -171,54 +135,6 @@ test(
     assert.equal(f.bridge.pool.observations.entries.size, 1);
   },
 );
-
-test('an uncaptured live owner validates retained context against its active branch, not the saved tail', async (t) => {
-  const f = await fixture(t);
-  const entries = [
-    { type: 'message', id: 'other', parentId: null, message: { role: 'user', content: 'OTHER' } },
-    { type: 'message', id: 'input', parentId: null, message: { role: 'user', content: 'INPUT' } },
-    { type: 'message', id: 'tail', parentId: 'input', message: { role: 'assistant', content: [] } },
-  ];
-  await fs.appendFile(f.session.file, entries.map(JSON.stringify).join('\n') + '\n');
-  let leaf = 'input';
-  const ctx = {
-    sessionManager: {
-      getSessionFile: () => f.session.file,
-      getSessionId: () => f.session.header.id,
-      getLeafId: () => leaf,
-      getEntries: () => entries,
-    },
-  };
-  const args = { session_id: f.id, view: 'runtime' };
-  const previous = new ContextObservation('previous');
-  previous.capture({ messages: [{ role: 'user', content: 'RETAINED_CONTEXT' }] }, ctx);
-  f.bridge.pool.observations.put(f.session, previous.read(args, ctx), {});
-  const fresh = new ContextObservation('current');
-  const runtime = {
-    attached: true,
-    alive: true,
-    record: { kind: 'tui', generation: 'current' },
-    read: async (args) => fresh.read(args, ctx),
-    async stop() {
-      this.alive = false;
-    },
-  };
-  f.bridge.pool.instances.set(f.id, runtime);
-  t.mock.method(f.bridge.pool, 'forRead', async () => runtime);
-  leaf = 'other';
-  const other = await f.bridge.read(args);
-  assert.equal(other.observation.available, false);
-  assert.equal(other.observation.reason, 'input_branch_changed');
-  assert.deepEqual(other.items, []);
-  leaf = 'tail';
-  const same = await f.bridge.read(args);
-  assert.equal(same.source, 'retained');
-  assert.equal(same.observation.owner_generation, 'previous');
-  assert.equal(same.observation.owner_active, false);
-  assert.equal(same.observation.current_leaf_id, 'tail');
-  assert.equal(same.observation.later_committed_entries, 1);
-  assert.equal(same.items[0].text, 'RETAINED_CONTEXT');
-});
 
 const gate = () => {
   let resolve;

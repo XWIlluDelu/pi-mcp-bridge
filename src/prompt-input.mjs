@@ -74,19 +74,8 @@ export const promptSchema = z.object({
   model: modelSelectionSchema.optional(),
   thinking_level: thinkingLevelSchema.optional(),
 });
-export function promptInput(args) {
-  const parsed = promptSchema.safeParse({
-    text: args.text,
-    images: args.images,
-    model: args.model,
-    thinking_level: args.thinking_level,
-  });
-  if (!parsed.success) throw new Error('INVALID_PROMPT_INPUT');
-  const { text, images, model, thinking_level } = parsed.data;
-  if (text === undefined && images === undefined) {
-    if (hasPromptSettings(parsed.data)) throw new Error('MODEL_REQUIRES_PROMPT');
-    return undefined;
-  }
+export function promptInput({ text, images, model, thinking_level }) {
+  if (text === undefined && images === undefined) return undefined;
   // Native queues remove consumed entries only for nonempty message text.
   // Give image-only prompts a neutral label so completed steering/follow-up
   // input cannot leave a phantom pending queue that blocks idle handoff.
@@ -98,9 +87,13 @@ export function promptInput(args) {
   };
 }
 export function attachedPromptInput(args) {
-  const input = promptInput(args);
+  const parsed = promptSchema.safeParse(args);
+  if (!parsed.success) throw new Error('INVALID_PROMPT_INPUT');
+  const input = promptInput(parsed.data);
   if (!input) throw new Error('INVALID_ATTACHED_SEND');
-  return input;
+  if (hasPromptSettings(input)) throw new Error('MODEL_SELECTION_UNSUPPORTED');
+  if (!SEND_MODES.includes(args.mode)) throw new Error('INVALID_ATTACHED_SEND');
+  return { ...input, mode: args.mode };
 }
 export function assertPromptSelection(input, state) {
   if (input.model && !sameModel(input.model, state.model))

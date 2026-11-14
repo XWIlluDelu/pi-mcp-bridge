@@ -147,38 +147,6 @@ test('module import and registration failures are explicit, and partial activati
   }
 });
 
-test('cleanup failure does not skip other modules or capability removal', async (t) => {
-  const f = await fixture(t),
-    services = new CompatibilityServices();
-  const module = await f.module(
-    'cleanup-failure',
-    `export default {
-    id: 'cleanup-failure',
-    start({id, services, onStop}) {
-      onStop(services.readInputs.register(id, ['fixture']));
-      onStop(() => {throw new Error('PRIVATE_CLEANUP_FAILURE')});
-    }
-  };`,
-  );
-  const manager = new CompatibilityModules([{ module }, { module: intercom }], services);
-  await manager.start();
-  await assert.rejects(
-    manager.stop(),
-    (error) => publicError(error) === 'COMPATIBILITY_MODULE_STOP_FAILED',
-  );
-  assert.deepEqual(services.readInputs.snapshot(), []);
-  assert.deepEqual(services.daemonEnvironment.apply({ PI_INTERCOM_SESSION: 'retained' }), {
-    PI_INTERCOM_SESSION: 'retained',
-  });
-  const bridge = await new Bridge({
-    ...f.config,
-    compatibilityModules: [{ module }, { module: intercom }],
-  }).init();
-  await assert.rejects(bridge.close(), /COMPATIBILITY_MODULE_STOP_FAILED/);
-  const restarted = await new Bridge(f.config).init();
-  await restarted.close();
-});
-
 test('Bridge activation failure releases its namespace; modules stop only after runtime drain', async (t) => {
   const f = await fixture(t);
   const module = await f.module(

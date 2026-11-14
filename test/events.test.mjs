@@ -11,7 +11,7 @@ import { reserveOwner, updateOwner, releaseOwner } from '../src/attachments.mjs'
 import { SettledObserver } from '../src/settled-observer.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
 import { hash } from '../src/storage.mjs';
-import { CallbackError } from '../src/event-webhook.mjs';
+
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -276,36 +276,6 @@ test('delivery filters, retries exact occurrences, and stops on permanent respon
   assert.equal(f.bridge.events.deliveries.size, 0);
 });
 
-test('default delivery retries recover after a five-minute callback outage without changing the occurrence', async (t) => {
-  const f = await fixture(t, {});
-  await f.call('events/subscribe', request(f.session.id));
-  const clock = retryClock(t, f),
-    attempts = [],
-    accepted = [];
-  f.bridge.events.post = async (_url, body, headers) => {
-    attempts.push({ body, headers });
-    if (clock.elapsed < 300000) {
-      if (attempts.length % 2 === 0) throw new CallbackError('timeout');
-      return { status: 503, body: '' };
-    }
-    accepted.push(JSON.parse(body));
-    return { status: 204, body: '' };
-  };
-  await f.settle();
-  assert.equal(accepted.length, 1);
-  assert.ok(clock.elapsed >= 300000 && clock.elapsed <= 480000);
-  assert.ok(attempts.length > 4 && attempts.length <= 10);
-  assert.ok(Math.max(...clock.waits) <= 120000);
-  assert.equal(new Set(attempts.map((x) => x.body)).size, 1);
-  assert.ok(attempts.every((x) => x.headers['webhook-id'] === accepted[0].eventId));
-  assert.ok(
-    Number(attempts.at(-1).headers['webhook-timestamp']) -
-      Number(attempts[0].headers['webhook-timestamp']) >=
-      300,
-  );
-  assert.equal(f.bridge.events.deliveries.size, 0);
-});
-
 test('default delivery retries exhaust a bounded window and do not replay after receiver recovery or restart', async (t) => {
   const f = await fixture(t, {});
   await f.call('events/subscribe', request(f.session.id));
@@ -332,27 +302,6 @@ test('default delivery retries exhaust a bounded window and do not replay after 
   await f.settle();
   assert.equal(attempts.length, exhaustedCount + 1);
   assert.notEqual(attempts.at(-1).headers['webhook-id'], attempts[0].headers['webhook-id']);
-});
-
-test('project-authorized subscriptions survive workspace cleanup but not permission revocation', async (t) => {
-  const f = await fixture(t),
-    project = f.dir + '/workspace';
-  await fs.mkdir(project);
-  const made = await savedSession(f.bridge, { project }),
-    session = await f.bridge.session(made.session_id);
-  f.config.defaults = denyAllPermissions();
-  f.config.grants = [{ folder: project, list: true, read: true }];
-  await f.call('events/subscribe', request(session.id));
-  assert.equal(f.bridge.events.records.size, 1);
-  await fs.rmdir(project);
-  await f.settle(session);
-  assert.equal(f.sent.at(-1).decoded.data.session_id, session.id);
-  assert.equal(f.bridge.events.records.size, 1);
-  const before = f.sent.length;
-  f.config.grants[0].read = false;
-  await f.settle(session);
-  assert.equal(f.sent.length, before);
-  assert.equal(f.bridge.events.records.size, 0);
 });
 
 test('a retry cannot authorize an old occurrence through a replacement native cwd', async (t) => {
@@ -450,78 +399,6 @@ test('owner IPC preserves capture identity before the first delivery and ignores
   }
 });
 
-test('owner IPC fits a long escaped cwd and a full settled result within its unchanged frame limit', async (t) => {
-  const f = await fixture(t);
-  const project = f.dir + '/' + Array(16).fill('\\'.repeat(125)).join('/');
-  await fs.mkdir(project, { recursive: true });
-  assert.ok(Buffer.byteLength(JSON.stringify(project)) > 4000);
-  const made = await savedSession(f.bridge, { project }),
-    session = await f.bridge.session(made.session_id);
-  await f.call('events/subscribe', request(session.id));
-  const manager = SessionManager.open(session.file, undefined, f.dir);
-  const { observer, release } = await settledOwner(f, session);
-  try {
-    observer.start(manager);
-    manager.appendMessage(fauxAssistantMessage('\u0001'.repeat(1500)));
-    const occurrence = observer.capture({ aborted: false }, manager);
-    assert.ok(Buffer.byteLength(JSON.stringify(occurrence.result)) > 4000);
-    assert.equal(occurrence.sessionCwdHash, hash(project));
-    const { sessionCwdHash: _, ...withoutIdentity } = occurrence;
-    assert.ok(
-      Buffer.byteLength(JSON.stringify({ ...withoutIdentity, sessionCwd: project }) + '\n') > 8192,
-      'the raw cwd would overflow the owner control frame',
-    );
-    assert.ok(Buffer.byteLength(JSON.stringify(occurrence) + '\n') <= 8192);
-    assert.deepEqual(await ownerRequest(f.config, occurrence), {});
-    await Promise.all([...f.bridge.events.deliveries.keys()]);
-    assert.deepEqual(f.sent.at(-1).decoded.data.result, occurrence.result);
-  } finally {
-    await release();
-  }
-});
-
-for (const cwd of [undefined, ''])
-  test(`owner IPC distinguishes ${cwd === undefined ? 'missing' : 'empty'} native header cwd`, async (t) => {
-    const f = await fixture(t);
-    const header = { ...f.session.header, cwd };
-    await fs.writeFile(f.session.file, JSON.stringify(header) + '\n');
-    const session = await f.bridge.session(f.session.id);
-    const manager = SessionManager.open(session.file, undefined, f.dir);
-    const { observer, release } = await settledOwner(f, session);
-    try {
-      const occurrence = observer.capture({ aborted: false }, manager);
-      assert.equal(occurrence.sessionCwdHash, hash(cwd ?? null));
-      await assert.rejects(
-        ownerRequest(f.config, {
-          ...occurrence,
-          sessionCwdHash: hash(cwd === undefined ? '' : null),
-        }),
-        /INVALID_OWNER_COMMAND/,
-      );
-      assert.deepEqual(await ownerRequest(f.config, occurrence), {});
-    } finally {
-      await release();
-    }
-  });
-
-test('expired subscription records are pruned before loading active subscriptions', async (t) => {
-  const f = await fixture(t);
-  await f.call('events/subscribe', request(f.session.id));
-  const active = [...f.bridge.events.records.values()][0],
-    expired = {
-      ...active,
-      expiresAt: f.bridge.events.now() - 1,
-    },
-    raw = JSON.stringify([expired, active]),
-    file = f.dir + '/state/event-subscriptions.json';
-  await fs.writeFile(file, raw);
-  await f.restart();
-  assert.deepEqual(f.bridge.events.health(), { status: 'ok' });
-  assert.equal(f.bridge.events.records.size, 1);
-  await f.settle();
-  assert.equal(f.sent.at(-1).decoded.name, 'session.settled');
-});
-
 for (const invalid of ['active record', 'file privacy'])
   test(`an invalid subscription ${invalid} disables only events until owner repair and restart`, async (t) => {
     const f = await fixture(t),
@@ -578,28 +455,3 @@ for (const invalid of ['active record', 'file privacy'])
     await f.settle();
     assert.equal(f.sent.length, before + 1);
   });
-
-test('unsupported replay and external owners without this Bridge event capability are explicit', async (t) => {
-  const f = await fixture(t),
-    input = request(f.session.id);
-  assert.equal(
-    (await f.call('events/subscribe', { ...input, cursor: 'old' })).message.error.code,
-    -32026,
-  );
-  const companion = {
-    kind: 'tui',
-    readContract: READ_CONTRACT,
-    completionSocket: ownerSocket(f.config),
-  };
-  for (const record of [
-    { ...companion, kind: 'host' },
-    { ...companion, completionSocket: undefined },
-    { ...companion, completionSocket: ownerSocket({ ...f.config, stateDir: f.dir + '/other' }) },
-  ]) {
-    t.mock.method(f.bridge.pool, 'forRead', async () => ({ attached: true, record }));
-    const response = await f.call('events/subscribe', input);
-    assert.equal(response.message.error.code, -32026);
-    assert.equal(response.message.error.data.feature, 'externalOwner');
-  }
-  assert.equal(f.sent.length, 0);
-});

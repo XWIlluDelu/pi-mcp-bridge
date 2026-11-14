@@ -5,23 +5,23 @@ import { publicError } from './errors.mjs';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
 import { compactInputSchema, compactMetadata } from './compact.mjs';
-import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { READ_CONTRACT } from './context-read.mjs';
 import { assertReadFeatures } from './read-features.mjs';
 import { unavailableObservation } from './context-observation.mjs';
-import {
-  SEND_MODES,
-  attachedPromptInput,
-  hasPromptSettings,
-  remotePromptRejection,
-} from './prompt-input.mjs';
+import { attachedPromptInput, remotePromptRejection } from './prompt-input.mjs';
 import { modelState, sameModel } from './models.mjs';
 import { modelSettingsSchema, modelSettings } from './set-model.mjs';
 import { limitBashResult } from './bash-execution.mjs';
 import { stopReceipt, withdrawalCollector } from './stop-execution.mjs';
 import {
-  MAX_ATTACHMENT_SNAPSHOT_BYTES,
   attachmentServer,
   listenPrivate,
+  ownerEnvelope,
+  ownerIdentity,
+  ownerReadFeatures,
+  ownerRead,
+  ownerSnapshot,
+  parseOwnerRequest,
 } from './attachment-protocol.mjs';
 import {
   reserveOwner,
@@ -227,16 +227,10 @@ export async function reserveHostSession({
         ? assertReadFeatures(await callbacks.readFeatures())
         : { available: false, tools: [], commands: [], leaf_id: null };
       await assertIdentity();
-      data = {
-        contract: READ_CONTRACT,
-        sessionFile: target.file,
-        sessionId: target.header.id,
-        ...features,
-      };
+      data = ownerReadFeatures(record, features);
     } else if (request.op === 'read' && args.view === 'runtime')
       data = {
-        sessionFile: target.file,
-        sessionId: target.header.id,
+        ...ownerIdentity(record),
         ...unavailableObservation(args.session_id, 'host_observer_unavailable'),
       };
     else if (['read', 'snapshot'].includes(request.op)) {
@@ -254,42 +248,18 @@ export async function reserveHostSession({
         )
       )
         fail('INVALID_HOST_SNAPSHOT');
-      const snapshotJson =
+      data =
         request.op === 'snapshot'
-          ? JSON.stringify({
-              entries: snapshot.entries,
-              leaf: snapshot.leafId,
-              generation: record.generation,
-            })
-          : null;
-      if (
-        request.op === 'snapshot' &&
-        Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
-      )
-        fail('SESSION_TOO_LARGE');
-      if (request.op === 'snapshot')
-        data = {
-          sessionFile: target.file,
-          sessionId: target.header.id,
-          entries: snapshot.entries,
-          leafId: snapshot.leafId,
-        };
-      else {
-        data = {
-          sessionFile: target.file,
-          sessionId: target.header.id,
-          ...prepareContextRead(
-            {
-              header: target.header,
-              entries: snapshot.entries,
-              leafId: snapshot.leafId,
-              live: snapshot.live ?? { available: false, source: 'host_snapshot' },
-            },
-            args,
-            { buildSessionProjection, readAdapters: request.readAdapters },
-          ),
-        };
-      }
+          ? ownerSnapshot(record, snapshot)
+          : ownerRead(
+              record,
+              {
+                ...snapshot,
+                live: snapshot.live ?? { available: false, source: 'host_snapshot' },
+              },
+              args,
+              { buildSessionProjection, readAdapters: request.readAdapters },
+            );
     } else if (request.op === 'reload') {
       if (typeof callbacks.reload !== 'function') fail('RELOAD_UNSUPPORTED');
       if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
@@ -377,8 +347,6 @@ export async function reserveHostSession({
       if (settingModel) fail('MODEL_SELECTION_PENDING');
       beforeDispatch();
       const input = attachedPromptInput(args);
-      if (hasPromptSettings(input)) fail('MODEL_SELECTION_UNSUPPORTED');
-      if (!SEND_MODES.includes(args.mode)) fail('INVALID_ATTACHED_SEND');
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
@@ -386,7 +354,7 @@ export async function reserveHostSession({
       try {
         data =
           remotePromptRejection(input.text) ??
-          receipt(await callbacks.submit({ ...input, mode: args.mode, beforeDispatch }));
+          receipt(await callbacks.submit({ ...input, beforeDispatch }));
       } finally {
         submitting--;
       }
@@ -487,41 +455,30 @@ export async function reserveHostSession({
     try {
       await state();
       if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
-      server = attachmentServer(sockets, (line, socket) => {
-        const task = (async () => {
-          try {
-            const request = JSON.parse(line);
-            validateRequest(request);
-            if (['stop', 'bash'].includes(request.op) && Number.isInteger(request.body?.timeout_ms))
-              socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
-            if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
-            let data;
-            if (request.op === 'release') data = await release();
-            else {
-              const operation = operate(request, (data) => {
-                if (!socket.destroyed && !socket.writableEnded)
-                  socket.write(
-                    JSON.stringify({ generation: record.generation, partial: true, data }) + '\n',
-                  );
-              });
-              operations.add(operation);
-              try {
-                data = await operation;
-              } finally {
-                operations.delete(operation);
-              }
+      server = attachmentServer(sockets, async (line, socket) => {
+        try {
+          const request = parseOwnerRequest(line, validateRequest);
+          if (['stop', 'bash'].includes(request.op) && Number.isInteger(request.body?.timeout_ms))
+            socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
+          if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
+          let data;
+          if (request.op === 'release') data = await release();
+          else {
+            const operation = operate(request, (data) => {
+              if (!socket.destroyed && !socket.writableEnded)
+                socket.write(ownerEnvelope(record, { partial: true, data }));
+            });
+            operations.add(operation);
+            try {
+              data = await operation;
+            } finally {
+              operations.delete(operation);
             }
-            socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
-          } catch (error) {
-            socket.end(
-              JSON.stringify({
-                generation: record.generation,
-                error: publicError(error, 'HOST_OPERATION_FAILED'),
-              }) + '\n',
-            );
           }
-        })();
-        task.catch(() => socket.destroy());
+          socket.end(ownerEnvelope(record, { data }));
+        } catch (error) {
+          socket.end(ownerEnvelope(record, { error: publicError(error, 'HOST_OPERATION_FAILED') }));
+        }
       });
       await listenPrivate(server, record.socket);
       await state();

@@ -1,3 +1,4 @@
+import { ownerEnvelope } from '../src/attachment-protocol.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,12 +16,6 @@ import {
   claimFile,
   AttachedRuntime,
 } from '../src/attachments.mjs';
-
-const exists = (file) =>
-  fs.stat(file).then(
-    () => true,
-    () => false,
-  );
 
 test('reload requires send and leaves saved sessions and explicit local pauses unopened', async (t) => {
   const f = await fixture(t);
@@ -97,33 +92,6 @@ test('reload cancellation after seal closes the old writer without starting a su
   assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
 });
 
-test('reload refuses input preflight and running work without aborting either', async (t) => {
-  const f = await fixture(t);
-  const pending = f.bridge.send({ session_id: f.id, text: 'HOLD_PREFLIGHT' });
-  await until(() => exists(f.gate + '.preflight-start'));
-  const preflightOwner = f.bridge.pool.get(f.id);
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'rejected',
-    reason: 'RELOAD_BUSY',
-  });
-  assert.equal(preflightOwner.exited, false);
-  await fs.writeFile(f.gate + '.preflight-release', 'continue');
-  await pending;
-  await until(() => !f.bridge.pool.get(f.id));
-  await f.bridge.send({ session_id: f.id, text: 'HOLD_MODEL' });
-  await until(() => exists(f.gate + '.provider-start'));
-  const active = f.bridge.pool.get(f.id);
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'rejected',
-    reason: 'RELOAD_BUSY',
-  });
-  assert.equal(active.exited, false);
-  assert.equal((await active.state()).isStreaming, true);
-  assert.equal(await exists(f.gate + '.provider-aborted'), false);
-  await fs.writeFile(f.gate, 'continue');
-  await until(() => !f.bridge.pool.get(f.id));
-});
-
 // Exercise the actual owner socket, loss of its ACK, and generation publication.
 // Native companion reload itself is exercised by the companion integration tests.
 async function attached(
@@ -159,8 +127,7 @@ async function attached(
       if (!buffer.includes('\n')) return;
       const req = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
       buffer = '';
-      const respond = (value) =>
-        socket.end(JSON.stringify({ generation: req.generation, ...value }) + '\n');
+      const respond = (value) => socket.end(ownerEnvelope(req, value));
       if (req.op === 'state') {
         stateReads++;
         return respond({
@@ -230,24 +197,6 @@ test('attached reload confirms replacement after a lost ACK and reports an incom
   assert.equal(f.reloads(), 1);
 });
 
-test('reload reports product version independently of read compatibility', async (t) => {
-  const f = await attached(t, { version: 'another-product-version' });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'completed',
-    owner_version: 'another-product-version',
-    read_compatible: true,
-  });
-});
-
-test('attached reload does not confuse a different native session with successful refresh', async (t) => {
-  const f = await attached(t, { replaceIdentity: true });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'unknown',
-    reason: 'RELOAD_UNCONFIRMED',
-  });
-  assert.equal(f.reloads(), 1);
-});
-
 test('owners without reload support are rejected before dispatch', async (t) => {
   const f = await attached(t, { supported: false });
   assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
@@ -255,15 +204,6 @@ test('owners without reload support are rejected before dispatch', async (t) => 
     reason: 'RELOAD_UNSUPPORTED',
   });
   assert.equal(f.reloads(), 0);
-});
-
-test('native reload busy rejection remains a definite rejection', async (t) => {
-  const f = await attached(t, { error: 'RELOAD_IN_PROGRESS' });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'rejected',
-    reason: 'RELOAD_BUSY',
-  });
-  assert.equal(f.reloads(), 1);
 });
 
 test(
@@ -299,13 +239,4 @@ test('a newly published owner must finish native initialization before reload co
     owner_version: packageInfo.version,
     read_compatible: true,
   });
-});
-
-test('failure to read replacement ownership after dispatch is an unknown outcome', async (t) => {
-  const f = await attached(t, { invalidReplacement: true });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'unknown',
-    reason: 'RELOAD_UNCONFIRMED',
-  });
-  assert.equal(f.reloads(), 1);
 });

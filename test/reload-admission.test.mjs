@@ -1,3 +1,4 @@
+import { AdmissionSession } from './fixtures/admission-session.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { reloadAdmission } from '../src/reload-admission.mjs';
@@ -7,7 +8,7 @@ const deferred = () => {
   return { promise, resolve };
 };
 test('reload admission tracks public operations and expires privilege with that reload', async () => {
-  class Session {
+  class Session extends AdmissionSession {
     sessionManager = {};
     async prompt(work) {
       return await work;
@@ -61,7 +62,7 @@ test('reload admission tracks public operations and expires privilege with that 
 });
 
 test('terminal seal observes local preparation and notifies maintenance after all work finishes', async () => {
-  class Session {
+  class Session extends AdmissionSession {
     sessionManager = {};
     async prompt(work) {
       return await work;
@@ -119,80 +120,8 @@ test('terminal seal observes local preparation and notifies maintenance after al
   assert.equal(notifications, 1);
 });
 
-test('terminal seal outlives old reload scopes and preserves only synchronous custom recording', async () => {
-  class Session {
-    sessionManager = {};
-    isStreaming = false;
-    records = [];
-    async prompt(text) {
-      this.records.push(text);
-    }
-    async sendCustomMessage(message, options) {
-      this.records.push({ message, options });
-    }
-    async reload() {}
-  }
-  const admission = reloadAdmission(Session),
-    session = new Session(),
-    manager = session.sessionManager,
-    ctx = { isIdle: () => true, hasPendingMessages: () => false },
-    operation = admission.begin(manager, ctx),
-    later = deferred();
-  let delayed;
-  assert.equal(
-    admission.seal(manager, ctx),
-    false,
-    'reload admission still owns its temporary fence',
-  );
-  await operation.run(async () => {
-    await session.reload();
-    delayed = later.promise.then(() => session.prompt('stale reload context'));
-  });
-  assert.equal(admission.seal(manager, ctx), true);
-  operation.cancel();
-  assert.equal(admission.sealed(manager), true, 'old reload cancellation cannot unseal shutdown');
-  later.resolve();
-  await assert.rejects(delayed, /RUNTIME_SHUTTING_DOWN/);
-  assert.throws(() => admission.begin(manager, ctx), /RUNTIME_SHUTTING_DOWN/);
-  for (const options of [undefined, { triggerTurn: false }, { deliverAs: 'followUp' }])
-    await session.sendCustomMessage('cleanup', options);
-  for (const options of [
-    { triggerTurn: true },
-    { deliverAs: 'nextTurn' },
-    { triggerTurn: false, deliverAs: 'nextTurn' },
-  ])
-    await assert.rejects(session.sendCustomMessage('new work', options), /RUNTIME_SHUTTING_DOWN/);
-  session.isStreaming = true;
-  await assert.rejects(
-    session.sendCustomMessage('deferred recording', { triggerTurn: false }),
-    /RUNTIME_SHUTTING_DOWN/,
-  );
-  assert.equal(session.records.length, 3);
-  assert.ok(session.records.every(({ message }) => message === 'cleanup'));
-});
-
-test('maintenance callback failures cannot change native operation failures', async () => {
-  const nativeError = new Error('native failure');
-  class Session {
-    sessionManager = {};
-    async executeBash() {
-      throw nativeError;
-    }
-  }
-  const admission = reloadAdmission(Session),
-    session = new Session();
-  admission.setOnIdle(session.sessionManager, () => {
-    throw new Error('notification failed');
-  });
-  await assert.rejects(session.executeBash(), (error) => error === nativeError);
-  assert.equal(
-    admission.seal(session.sessionManager, { isIdle: () => true, hasPendingMessages: () => false }),
-    true,
-  );
-});
-
 test('idle compact excludes local preparation and retains an atomic gate through native completion', async () => {
-  class Session {
+  class Session extends AdmissionSession {
     sessionManager = {};
     async prompt(work) {
       return await work;

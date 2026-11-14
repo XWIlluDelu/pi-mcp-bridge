@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
 import { Bridge } from './bridge.mjs';
 import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
-import { toolNames, descriptions, callBridgeTool, SERVER_INFO } from './protocol.mjs';
+import { toolNames, descriptions, executeBridgeTool, SERVER_INFO } from './protocol.mjs';
 import { publicError } from './errors.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { readOwnerConfig } from './owner-config.mjs';
@@ -20,7 +20,7 @@ export function makeServer(bridge, { execute = (run) => run() } = {}) {
         ...(publicOutputSchemas[name] ? { outputSchema: publicOutputSchemas[name] } : {}),
       },
       (args, extra) =>
-        callBridgeTool(bridge, name, args, {
+        executeBridgeTool(bridge, name, args, {
           execute,
           requestId: extra.requestId,
         }),

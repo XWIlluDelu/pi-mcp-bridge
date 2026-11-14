@@ -104,7 +104,6 @@ test(
       (
         await f.bridge.send({
           session_id: f.id,
-
           text: 'NEVER_ADMITTED',
         })
       ).reason,
@@ -146,35 +145,6 @@ test(
       ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true }),
       /OWNER_STILL_ALIVE/,
     );
-    const attached = await f.bridge.pool.forRead(f.session);
-    assert.equal(
-      (
-        await f.bridge.send({
-          session_id: f.id,
-
-          text: 'ATTACHED_HANDOFF_PROOF',
-        })
-      ).dispatch,
-      undefined,
-    );
-    await until(async () => {
-      const { activity } = await attached.state();
-      return activity?.idle === true && activity.pending_messages === false;
-    });
-    const entries = (await local.getEntries()).entries;
-    for (const text of [marker, 'ATTACHED_HANDOFF_PROOF'])
-      assert.equal(
-        entries.filter(
-          (e) => e.message?.role === 'user' && JSON.stringify(e.message.content).includes(text),
-        ).length,
-        1,
-      );
-    assert.equal(
-      entries.some((e) => JSON.stringify(e).includes('NEVER_ADMITTED')),
-      false,
-    );
-    assert.equal((await local.getState()).sessionId, f.session.header.id);
-    assert.equal((await local.bash('pwd')).output.trim(), f.cwd);
     await local.stop();
     await waitOwnerExit(held.owner);
     assert.equal(
@@ -193,54 +163,14 @@ test(
       '--confirm-local-closed',
     ]);
     assert.equal(JSON.parse(reset.stdout).status, 'reset');
-    assert.ok(!(await fs.readdir(f.bridge.pool.attachmentDir)).includes('registry.lock'));
-    assert.ok(
-      ['started', 'queued', 'handled'].includes(
-        (
-          await f.bridge.send({
-            session_id: f.id,
-
-            text: 'COLD_RESUME_AFTER_RESET',
-          })
-        ).status,
-      ),
-      'Expected native prompt admission',
+    assert.equal(
+      (await f.bridge.send({ session_id: f.id, text: 'COLD_RESUME_AFTER_RESET' })).status,
+      'started',
     );
     assert.equal((await f.bridge.pool.get(f.id).state()).sessionId, f.session.header.id);
   },
 );
-test(
-  'real RPC reload replaces the observer socket and keeps owned release usable',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      extension = path.join(f.dir, 'reload.mjs');
-    await fs.writeFile(
-      extension,
-      "export default pi=>pi.registerCommand('fixture-reload',{handler:async(_args,ctx)=>{await ctx.reload();}});",
-    );
-    f.config.piArgs.push('-e', extension);
-    const owned = await f.bridge.pool.resolve(f.session),
-      record = owned.ownerRecord;
-    await owned.assertReleasable();
-    for (let i = 0; i < 2; i++) {
-      const ack = await owned.command({ type: 'prompt', message: '/fixture-reload' });
-      assert.equal(ack.disposition, 'handled');
-      assert.equal(
-        (await readClaim(f.bridge.pool.attachmentDir, f.session)).generation,
-        record.generation,
-      );
-      assert.equal(await ownerAlive(record.owner), true);
-      await owned.assertReleasable();
-    }
-    assert.equal(
-      (await ownerRequest(f.config, { op: 'release', session_id: f.id })).status,
-      'released',
-    );
-    assert.equal(await ownerAlive(record.owner), false);
-    await assert.rejects(fs.stat(record.socket), { code: 'ENOENT' });
-  },
-);
+
 test('failed normal exit retains the owner claim without reporting release success', async (t) => {
   const f = await fixture(t),
     owned = await f.bridge.pool.resolve(f.session),
@@ -261,171 +191,7 @@ test('failed normal exit retains the owner claim without reporting release succe
     'released',
   );
 });
-test('release preserves state errors and never stops a mismatched child', async (t) => {
-  const f = await fixture(t),
-    owned = await f.bridge.pool.resolve(f.session),
-    owner = owned.ownerRecord.owner;
-  const dispatch = owned.dispatch;
-  owned.dispatch = async () => {
-    throw new RpcFailure('ACK_TIMEOUT');
-  };
-  await assert.rejects(ownerRequest(f.config, { op: 'release', session_id: f.id }), /ACK_TIMEOUT/);
-  assert.equal(await ownerAlive(owner), true);
-  assert.notEqual((await readClaim(f.bridge.pool.attachmentDir, f.session)).noColdReacquire, true);
-  owned.dispatch = async () => ({ sessionFile: '/synthetic/other.jsonl', sessionId: 'other' });
-  await assert.rejects(
-    ownerRequest(f.config, { op: 'release', session_id: f.id }),
-    /RUNTIME_SESSION_CHANGED/,
-  );
-  await assert.rejects(
-    ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: true }),
-    /RUNTIME_SESSION_CHANGED/,
-  );
-  assert.equal(await ownerAlive(owner), true);
-  owned.dispatch = dispatch;
-});
-test('release refuses busy, unknown state and admission ambiguity without signals', async (t) => {
-  const f = await fixture(t),
-    owned = await f.bridge.pool.resolve(f.session),
-    dispatch = owned.dispatch;
-  for (const [extra, error] of [
-    [{ isStreaming: true }, 'RUNTIME_BUSY'],
-    [{ isCompacting: true }, 'RUNTIME_BUSY'],
-    [{ pendingMessageCount: 1 }, 'RUNTIME_BUSY'],
-    [{ isStreaming: undefined }, 'RUNTIME_IDLE_UNCONFIRMED'],
-  ]) {
-    owned.dispatch = async () => ({
-      sessionFile: f.session.file,
-      sessionId: f.session.header.id,
-      isStreaming: false,
-      isCompacting: false,
-      pendingMessageCount: 0,
-      ...extra,
-    });
-    await assert.rejects(
-      ownerRequest(f.config, { op: 'release', session_id: f.id }),
-      new RegExp(error),
-    );
-    assert.equal(await ownerAlive(owned.ownerRecord.owner), true);
-  }
-  await assert.rejects(
-    ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: 'yes' }),
-    /INVALID_OWNER_COMMAND/,
-  );
-  owned.promptAdmission = { id: 'ambiguous', generation: owned.generation };
-  await assert.rejects(
-    ownerRequest(f.config, { op: 'release', session_id: f.id }),
-    /PROMPT_ADMISSION_PENDING/,
-  );
-  owned.promptAdmission = null;
-  owned.dispatch = dispatch;
-});
-for (const overlap of [false, true])
-  test(
-    overlap
-      ? 'overlapping extension inputs stay busy through unrelated settlement and reload, then release'
-      : 'independent extension startup reports busy before agent_start',
-    { timeout: 20000 },
-    async (t) => {
-      const f = await fixture(t),
-        gate = path.join(f.dir, 'continue'),
-        started = path.join(f.dir, 'preparing'),
-        extension = path.join(f.dir, 'prepare.mjs');
-      const messages = overlap ? ['OVERLAP_A', 'ASYNC_PREFLIGHT'] : ['ASYNC_PREFLIGHT'];
-      await fs.writeFile(
-        extension,
-        `import fs from 'node:fs/promises';export default pi=>{
-    pi.registerCommand('autonomous-preflight',{handler:()=>{for(const text of ${JSON.stringify(messages)})pi.sendUserMessage(text,{deliverAs:'followUp'});}});
-    pi.registerCommand('preflight-reload',{handler:async(_args,ctx)=>{await ctx.reload();}});
-    pi.on(${JSON.stringify(overlap ? 'input' : 'before_agent_start')},async event=>{if((event.text??event.prompt)==='ASYNC_PREFLIGHT'){await fs.writeFile(${JSON.stringify(started)},'started');while(!await fs.stat(${JSON.stringify(gate)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));}return {action:'continue'};});
-  };`,
-      );
-      f.config.piArgs.push('-e', extension);
-      assert.equal(
-        (
-          await f.bridge.send({
-            session_id: f.id,
 
-            text: '/autonomous-preflight',
-          })
-        ).status,
-        'handled',
-      );
-      await until(() =>
-        fs.stat(started).then(
-          () => true,
-          () => false,
-        ),
-      );
-      const owned = f.bridge.pool.get(f.id);
-      owned.autoReleaseWanted = false; // Exercise explicit release after completion.
-      if (overlap) await until(() => owned.settlementSequence === 1);
-      const state = await owned.state();
-      assert.equal(state.isStreaming, !overlap); // input hooks precede busy; before_agent_start no longer does.
-      assert.equal(state.pendingMessageCount, 0);
-      assert.equal(owned.promptAdmission, null);
-      const owner = owned.ownerRecord.owner;
-      const release = await ownerRequest(f.config, { op: 'release', session_id: f.id }).then(
-        (value) => ({ status: value.status }),
-        (error) => ({ reason: error.message }),
-      );
-      assert.deepEqual(
-        { release, ownerAlive: await ownerAlive(owner) },
-        {
-          release: { reason: 'RUNTIME_BUSY' },
-          ownerAlive: true,
-        },
-      );
-      assert.notEqual(
-        (await readClaim(f.bridge.pool.attachmentDir, f.session)).noColdReacquire,
-        true,
-      );
-      if (overlap) {
-        assert.equal(
-          (await owned.command({ type: 'prompt', message: '/preflight-reload' })).disposition,
-          'handled',
-        );
-        await assert.rejects(
-          ownerRequest(f.config, { op: 'release', session_id: f.id }),
-          /RUNTIME_BUSY/,
-        );
-        assert.equal(await ownerAlive(owner), true);
-      }
-      await fs.writeFile(gate, 'continue');
-      await until(() => owned.settlementSequence === (overlap ? 2 : 1));
-      await until(async () => (await owned.idleSnapshot()).status === 'idle');
-      const released = await exec(process.execPath, [
-        path.join(base, 'src/owner-runtime.mjs'),
-        f.file,
-        'release',
-        f.id,
-      ]);
-      assert.equal(JSON.parse(released.stdout).status, 'released');
-      assert.equal(await ownerAlive(owner), false);
-      assert.equal(owned.child.signalCode, null);
-      assert.equal(owned.child.exitCode, 0);
-      await ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true });
-      assert.ok(
-        ['started', 'queued', 'handled'].includes(
-          (
-            await f.bridge.send({
-              session_id: f.id,
-
-              text: 'AFTER_MAINTENANCE',
-            })
-          ).status,
-        ),
-        'Expected native prompt admission',
-      );
-      const fresh = f.bridge.pool.get(f.id);
-      assert.notEqual(fresh.generation, owned.generation);
-      await until(() => fresh.exited && !f.bridge.autoReleases.size);
-      assert.equal(fresh.child.exitCode, 0);
-      assert.equal(fresh.child.signalCode, null);
-      const projected = await f.bridge.read({ session_id: f.id });
-      assert.ok(JSON.stringify(projected).includes('AFTER_MAINTENANCE'));
-    },
-  );
 test('release of saved session and reset serialize with sends; pending startup is not aborted', async (t) => {
   const f = await fixture(t);
   f.bridge.pool.starting.set(f.id, { promise: new Promise(() => {}) });

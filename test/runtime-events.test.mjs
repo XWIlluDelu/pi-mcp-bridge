@@ -29,7 +29,7 @@ test('native errors and notifications belong only to their RPC generation, not p
   assert.equal(rpc.runtimeEvents.snapshot(4096), null);
   rpc.receiveResponse(error, generation);
   rpc.receiveResponse(notify('before ACK'), generation);
-  assert.ok(rpc.promptAdmission);
+  assert.ok(rpc.hasPendingCommand('prompt'));
   rpc.receiveResponse(
     {
       type: 'response',
@@ -53,7 +53,7 @@ test('native errors and notifications belong only to their RPC generation, not p
     assert.equal(event.prompt_id, undefined);
     assert.equal(event.id, undefined);
   }
-  const pool = new RuntimePool({});
+  const pool = new RuntimePool({ attachmentDir: '/unused-test-registry' });
   pool.watchRuntime(rpc);
   assert.equal(pool.runtimeEvents.get('s'), rpc.runtimeEvents);
   // A replacement generation replaces retained observations; other sessions are bounded.
@@ -67,7 +67,7 @@ test('native errors and notifications belong only to their RPC generation, not p
 test('an observed native identity switch invalidates retained events even after the runtime closes', async () => {
   const session = { id: 's', file: '/synthetic/a.jsonl', header: { id: 'a' } };
   const rpc = new PiRpc({}, session),
-    pool = new RuntimePool({});
+    pool = new RuntimePool({ attachmentDir: '/unused-test-registry' });
   pool.watchRuntime(rpc);
   rpc.receiveResponse(notify('unverified session notice'), rpc.generation);
   rpc.dispatch = async () => ({ sessionFile: '/synthetic/b.jsonl', sessionId: 'b' });

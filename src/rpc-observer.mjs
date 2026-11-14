@@ -1,19 +1,23 @@
 // Public Pi context observation for a Bridge-owned child. Never owns a claim.
-import net from 'node:net';
 import { ownerRequest } from './owner-runtime.mjs';
 import { opaqueId } from './storage.mjs';
 // Pi's extension loader supplies its own public exports, including the actual
 // CLI class in bundled installations. Importing sdkEntry separately would not.
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { reloadAdmission } from './reload-admission.mjs';
-import packageInfo from '../package.json' with { type: 'json' };
-import fs from 'node:fs/promises';
-import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { ContextObservation } from './context-observation.mjs';
 import { nativeReadFeatures } from './read-features.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { SettledObserver } from './settled-observer.mjs';
-import { MAX_ATTACHMENT_REQUEST_BYTES } from './attachment-protocol.mjs';
+import {
+  attachmentServer,
+  listenPrivate,
+  ownerEnvelope,
+  parseOwnerRequest,
+  ownerIdentity,
+  ownerReadFeatures,
+  ownerRead,
+} from './attachment-protocol.mjs';
 import { compactInputSchema, compactMetadata, nativeCompactReason } from './compact.mjs';
 import { publicError } from './errors.mjs';
 export default async function rpcObserver(pi) {
@@ -85,129 +89,102 @@ export default async function rpcObserver(pi) {
     });
     observation.reset();
     if (server) return;
-    server = net.createServer((connection) => {
-      connections.add(connection);
-      let body = '',
-        handled = false;
-      connection.setEncoding('utf8');
-      connection.setTimeout(5000, () => connection.destroy());
-      connection.on('error', () => {});
-      connection.on('close', () => connections.delete(connection));
-      connection.on('data', async (chunk) => {
-        if (handled) return;
-        body += chunk;
-        if (Buffer.byteLength(body) > MAX_ATTACHMENT_REQUEST_BYTES) {
-          connection.destroy();
-          return;
-        }
-        if (!body.includes('\n')) return;
-        handled = true;
-        let result, request;
-        try {
-          request = JSON.parse(body.slice(0, body.indexOf('\n')));
+    server = attachmentServer(connections, async (frame, connection) => {
+      let result, request;
+      const binding = {
+        generation,
+        file: context?.sessionManager.getSessionFile(),
+        sessionId: context?.sessionManager.getSessionId(),
+      };
+      try {
+        request = parseOwnerRequest(frame, (request) => {
           if (
             !context ||
             !['state', 'read', 'read_features', 'seal', 'compact'].includes(request.op) ||
-            request.generation !== generation ||
-            request.file !== context.sessionManager.getSessionFile() ||
-            request.sessionId !== context.sessionManager.getSessionId()
+            request.generation !== binding.generation ||
+            request.file !== binding.file ||
+            request.sessionId !== binding.sessionId
           )
             throw new Error('RUNTIME_SESSION_CHANGED');
-          if (['seal', 'compact'].includes(request.op)) {
-            if (request.version !== packageInfo.version)
-              throw new Error('OWNER_COMPONENT_UPDATE_REQUIRED');
-          }
-          if (request.op === 'compact') {
-            const input = compactInputSchema.safeParse(request.body);
-            if (!input.success || input.data.interrupt) throw new Error('INVALID_ARGUMENTS');
-            const value = await admission.compact(context.sessionManager, context, () => {
-              connection.setTimeout(0);
-              return new Promise((resolve, reject) =>
-                context.compact({
-                  customInstructions: input.data.instructions,
-                  onComplete: resolve,
-                  onError: (error) =>
-                    reject(
-                      Object.assign(new Error('PI_REJECTED'), {
-                        native_reason: nativeCompactReason(error.message),
-                      }),
-                    ),
-                }),
-              );
-            });
-            result = { data: compactMetadata(value) };
-          } else if (request.op === 'seal') {
-            if (
-              !request.body ||
-              typeof request.body !== 'object' ||
-              Array.isArray(request.body) ||
-              Object.keys(request.body).length
-            )
-              throw new Error('INVALID_ARGUMENTS');
-            const sealed = admission.seal(context.sessionManager, context);
-            result = { data: sealed ? { sealed: true } : { sealed: false, reason: 'busy' } };
-          } else {
-            result = {
-              data:
-                request.op === 'read_features'
-                  ? {
-                      contract: READ_CONTRACT,
-                      sessionFile: request.file,
-                      sessionId: request.sessionId,
-                      ...nativeReadFeatures(
-                        pi.getAllTools?.(),
-                        pi.getCommands?.(),
-                        context.sessionManager.getLeafId(),
-                      ),
-                    }
-                  : request.op === 'state'
-                    ? {
-                        isIdle: context.isIdle() && admission.idle(context.sessionManager),
-                        hasPendingMessages: context.hasPendingMessages(),
-                        sealed: admission.sealed(context.sessionManager),
-                      }
-                    : {
-                        sessionFile: request.file,
-                        sessionId: request.sessionId,
-                        ...(request.body?.view === 'runtime'
-                          ? observation.read(request.body, context)
-                          : prepareContextRead(
-                              {
-                                entries: context.sessionManager.getEntries(),
-                                leafId: context.sessionManager.getLeafId(),
-                                live: live.snapshot(),
-                              },
-                              request.body,
-                              { ...sdk, readAdapters: request.readAdapters },
-                            )),
-                      },
-            };
-          }
-        } catch (error) {
-          result =
-            request?.op === 'compact'
-              ? {
-                  error: publicError(error),
-                  ...(error.native_reason ? { native_reason: error.native_reason } : {}),
-                }
-              : { error: error.message };
+        });
+        if (request.op === 'compact') {
+          const input = compactInputSchema.safeParse(request.body);
+          if (!input.success || input.data.interrupt) throw new Error('INVALID_ARGUMENTS');
+          const value = await admission.compact(context.sessionManager, context, () => {
+            connection.setTimeout(0);
+            return new Promise((resolve, reject) =>
+              context.compact({
+                customInstructions: input.data.instructions,
+                onComplete: resolve,
+                onError: (error) =>
+                  reject(
+                    Object.assign(new Error('PI_REJECTED'), {
+                      native_reason: nativeCompactReason(error.message),
+                    }),
+                  ),
+              }),
+            );
+          });
+          result = { data: compactMetadata(value) };
+        } else if (request.op === 'seal') {
+          if (
+            !request.body ||
+            typeof request.body !== 'object' ||
+            Array.isArray(request.body) ||
+            Object.keys(request.body).length
+          )
+            throw new Error('INVALID_ARGUMENTS');
+          const sealed = admission.seal(context.sessionManager, context);
+          result = { data: sealed ? { sealed: true } : { sealed: false, reason: 'busy' } };
+        } else if (request.op === 'state') {
+          result = {
+            data: {
+              isIdle: context.isIdle() && admission.idle(context.sessionManager),
+              hasPendingMessages: context.hasPendingMessages(),
+              sealed: admission.sealed(context.sessionManager),
+            },
+          };
+        } else if (request.op === 'read_features') {
+          result = {
+            data: ownerReadFeatures(
+              binding,
+              nativeReadFeatures(
+                pi.getAllTools(),
+                pi.getCommands(),
+                context.sessionManager.getLeafId(),
+              ),
+            ),
+          };
+        } else if (request.body?.view === 'runtime') {
+          result = {
+            data: { ...ownerIdentity(binding), ...observation.read(request.body, context) },
+          };
+        } else {
+          result = {
+            data: ownerRead(
+              binding,
+              {
+                entries: context.sessionManager.getEntries(),
+                leafId: context.sessionManager.getLeafId(),
+                live: live.snapshot(),
+              },
+              request.body,
+              { ...sdk, readAdapters: request.readAdapters },
+            ),
+          };
         }
-        connection.end(
-          JSON.stringify({
-            generation,
-            ...(['seal', 'compact'].includes(request?.op)
-              ? { version: packageInfo.version, file: request.file, sessionId: request.sessionId }
-              : {}),
-            ...result,
-          }) + '\n',
-        );
-      });
+      } catch (error) {
+        result =
+          request?.op === 'compact'
+            ? {
+                error: publicError(error),
+                ...(error.native_reason ? { native_reason: error.native_reason } : {}),
+              }
+            : { error: error.message };
+      }
+      connection.end(ownerEnvelope(binding, result));
     });
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socket, resolve);
-    });
-    await fs.chmod(socket, 0o600);
+    await listenPrivate(server, socket);
   });
   pi.on('session_shutdown', async () => {
     if (context) admission.setOnIdle(context.sessionManager, undefined);

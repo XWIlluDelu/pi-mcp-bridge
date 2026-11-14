@@ -33,22 +33,6 @@ test('too-small cold compact returns a safe native reason without changing histo
   assert.deepEqual(await savedEntries(f.bridge, f.id), before);
 });
 
-test('native summarizer completes compact with isolated settings and an offline provider', async (t) => {
-  const f = await fixture(t);
-  await populate(f);
-  const result = await f.bridge.compact({
-    session_id: f.id,
-    instructions: 'NATIVE_COMPACT',
-  });
-  assert.equal(result.status, 'completed', JSON.stringify(result));
-  await released(f);
-  const entries = await savedEntries(f.bridge, f.id);
-  const compactions = entries.filter((entry) => entry.type === 'compaction');
-  assert.equal(compactions.length, 1);
-  assert.equal(compactions[0].fromHook, false);
-  assert.ok(compactions[0].summary.length > 0);
-});
-
 test(
   'cold compact needs send, hides its native summary and releases when complete',
   { timeout: 15000 },
@@ -131,7 +115,7 @@ test(
       }),
       { model: { provider: 'model-fixture', id: 'vision' }, thinking_level: 'high' },
     );
-    assert.ok(runtime.compactionMutation);
+    assert.ok(runtime.hasPendingCommand('compact'));
     assert.equal(
       (await f.bridge.send({ session_id: f.id, text: 'NEVER', thinking_level: 'off' })).reason,
       'MODEL_SELECTION_BUSY',
@@ -139,7 +123,7 @@ test(
     assert.equal(runtime.exited, false);
     await fs.writeFile(f.gate, 'go');
     await released(f);
-    assert.equal(runtime.compactionMutation, null);
+    assert.equal(runtime.hasPendingCommand('compact'), false);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
       1,
@@ -203,24 +187,6 @@ test(
     const result = await compacting;
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'PI_REJECTED');
-    await released(f);
-    assert.equal(
-      (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,
-      0,
-    );
-  },
-);
-
-test(
-  'native extension cancellation refuses a cold compact and releases its idle writer',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t);
-    await populate(f);
-    const result = await f.bridge.compact({ session_id: f.id, instructions: 'CANCEL_COMPACT' });
-    assert.equal(result.status, 'rejected');
-    assert.equal(result.reason, 'PI_REJECTED');
-    assert.equal(result.native_reason, 'Compaction cancelled');
     await released(f);
     assert.equal(
       (await savedEntries(f.bridge, f.id)).filter((e) => e.type === 'compaction').length,

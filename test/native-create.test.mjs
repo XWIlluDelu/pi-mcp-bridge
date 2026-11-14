@@ -88,9 +88,19 @@ const roots=[path.join(home,'first-root'), scenario.root ?? path.join(agent,'ses
 if(scenario.unsafe){await fs.mkdir(roots[1],{recursive:true,mode:0o700});await fs.mkdir(scenario.globalDir);await fs.chmod(scenario.globalDir,0o777);await fs.chmod(home,0o755);await fs.chmod(roots[1],0o755);}
 const config={stateDir:path.join(home,'state'),sessionRoots:roots,folders:[{path:project}],defaults:{...denyAllPermissions(),create:true,list:true,read:true,send:true},piArgs:['--offline','--no-extensions','--no-context-files',...(scenario.cliDir?['--session-dir',scenario.cliDir]:[])],...(scenario.agentOverride?{piRuntime:{agentDir:agent}}:{})};
 let starts=0, bridge;
-const factory=async session=>({alive:true,state:async()=>({isIdle:true}),stop:async()=>{},command:async input=>{
-  starts++; const manager=SessionManager.open(session.file);manager.appendMessage({role:'user',content:[{type:'text',text:input.message}],timestamp:Date.now()});return {disposition:'started'};
-}});
+const factory = async session => ({
+  alive: true,
+  state: async () => ({ isIdle: true }),
+  idleSnapshot: async () => ({ state: { isIdle: true }, status: 'idle' }),
+  hasUnsettledWork: () => false,
+  stop: async () => {},
+  submitPrompt: async input => {
+    starts++;
+    const manager = SessionManager.open(session.file);
+    manager.appendMessage({ role: 'user', content: [{ type: 'text', text: input.text }], timestamp: Date.now() });
+    return { status: 'started' };
+  },
+});
 try{
   bridge=await new Bridge(config,factory).init();
   const args={project,text:'SYNTHETIC_CREATE_INPUT'};

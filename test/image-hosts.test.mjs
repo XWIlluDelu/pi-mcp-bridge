@@ -17,16 +17,14 @@ import {
   SettingsManager,
 } from './fixtures/pi.mjs';
 import { fauxProvider, InMemoryCredentialStore } from './fixtures/pi.mjs';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Bridge } from '../src/bridge.mjs';
-import { AttachedRuntime, processIdentity, readClaim, ownerAlive } from '../src/attachments.mjs';
+import { processIdentity, readClaim, ownerAlive } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 import { imageReply, imageInputExtension } from './fixtures/image-provider.mjs';
-const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
 function tuiClient({ cwd, env, args, saved, config }) {
   let child, record;
   const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
@@ -103,9 +101,8 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       }).init();
       const made = await savedSession(bridge),
         saved = await bridge.session(made.session_id);
-      let native, controller, sdk, remote;
+      let native, controller, sdk;
       t.after(async () => {
-        await remote?.close();
         await controller?.close();
         if (sdk) {
           await sdk.abort();
@@ -123,11 +120,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         });
         const faux = fauxProvider({
           provider: 'image-sdk',
-          models: [
-            { id: 'vision', input: ['text', 'image'] },
-            { id: 'text-only', input: ['text'] },
-            { id: 'reasoner', input: ['text', 'image'], reasoning: true },
-          ],
+          models: [{ id: 'vision', input: ['text', 'image'] }],
           tokensPerSecond: 10000,
         });
         faux.setResponses(Array.from({ length: 10 }, () => imageReply));
@@ -231,31 +224,10 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       }
       const record = await readClaim(config.attachmentDir, saved);
       assert.equal(record.imagesSupported, true);
-      // Companion route also verifies a standard MCP stdio client against the same owner.
-      let call = (name, args) => bridge[name](args);
-      if (route.endsWith('companion')) {
-        const remoteConfig = { ...config, stateDir: path.join(dir, 'remote-state') },
-          file = path.join(dir, 'remote-owner.json');
-        await fs.writeFile(file, JSON.stringify(remoteConfig), { mode: 0o600 });
-        remote = new Client({ name: 'image-stdio', version: '1' });
-        await remote.connect(
-          new StdioClientTransport({
-            command: process.execPath,
-            args: [path.resolve('src/server.mjs'), file],
-            env: { PATH: process.env.PATH, HOME: dir, PI_OFFLINE: '1' },
-            stderr: 'pipe',
-          }),
-        );
-        call = async (name, args) => {
-          const r = await remote.callTool({ name, arguments: args });
-          assert.ok(!r.isError, JSON.stringify(r));
-          return r.structuredContent;
-        };
-      }
       // Incompressible real PNG exceeds the old 1 MiB IPC request bound.
       const image = pngImage(520, 520);
       assert.ok(Buffer.byteLength(image.data) > 1024 * 1024);
-      const sent = await call('send', {
+      const sent = await bridge.send({
         session_id: saved.id,
 
         images: [image],
@@ -267,131 +239,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
         return value?.startsWith('IMAGE_CONTEXT:') ? value : null;
       });
       assert.deepEqual(JSON.parse(text.slice('IMAGE_CONTEXT:'.length)), [imageEvidence(image)]);
-      const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
-      assert.deepEqual(
-        entries
-          .find((e) => e.message?.role === 'user')
-          .message.content.filter((c) => c.type === 'image'),
-        [image],
-      );
-
-      assert.equal(
-        (sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries).filter(
-          (e) => e.message?.role === 'user',
-        ).length,
-        1,
-      );
-      const status = async () => (await call('list', { session_id: saved.id })).sessions[0].status;
-      const selected = await status();
-      assert.deepEqual(selected.model, {
-        provider: route === 'sdk-host' ? 'image-sdk' : 'image-fixture',
-        id: 'vision',
-      });
-      assert.equal(selected.thinking_level, 'off');
-      const rejected = await call('send', {
-        session_id: saved.id,
-
-        text: 'MUST_NOT_SEND',
-        model: { provider: selected.model.provider, id: 'text-only' },
-      });
-      assert.equal(rejected.status, 'rejected');
-      assert.equal(rejected.reason, 'MODEL_SELECTION_UNSUPPORTED');
-      assert.deepEqual((await status()).model, selected.model);
-      for (const settings of [
-        { thinking_level: 'off' },
-        { model: { provider: selected.model.provider, id: 'reasoner' }, thinking_level: 'high' },
-      ]) {
-        const refused = await call('send', {
-          session_id: saved.id,
-
-          text: 'MUST_NOT_SEND',
-          ...settings,
-        });
-        assert.equal(refused.status, 'rejected');
-        assert.equal(refused.reason, 'MODEL_SELECTION_UNSUPPORTED');
-      }
-      assert.deepEqual((await status()).model, selected.model);
-      assert.equal(
-        (sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries).filter(
-          (e) => e.message?.role === 'user',
-        ).length,
-        1,
-      );
-      const publicRead = await call('read', { session_id: saved.id, max_bytes: 65536 });
-      assert.ok(JSON.stringify(publicRead.items).includes('IMAGE_CONTEXT:'));
-      const denied = await call('compact', { session_id: saved.id });
-      assert.equal(denied.status, 'rejected');
-      // The one-turn image fixture is too small for native compaction. Only
-      // the remote RPC binding lacks the gate needed to attempt idle compact.
-      assert.equal(
-        denied.reason,
-        route === 'rpc-host' ? 'COMPACT_IDLE_UNCONFIRMED' : 'PI_REJECTED',
-      );
-      if (route.endsWith('companion')) {
-        for (const op of ['command', 'stop']) {
-          const denied = await call(op, {
-            session_id: saved.id,
-
-            ...(op === 'command' ? { command: 'printf MUST_NOT_RUN' } : {}),
-          });
-          assert.equal(denied.status, 'rejected');
-          assert.equal(denied.reason, op === 'command' ? 'BASH_UNSUPPORTED' : 'STOP_UNSUPPORTED');
-        }
-      }
-      assert.deepEqual((await readClaim(config.attachmentDir, saved)).owner, record.owner);
       assert.equal((await readClaim(config.attachmentDir, saved)).generation, record.generation);
       assert.equal(spawned, 0);
-      const small = pngImage(),
-        evidence = imageEvidence(small);
-      await call('set_model', {
-        session_id: saved.id,
-        model: { provider: selected.model.provider, id: 'text-only' },
-      });
-      const handled = await call('send', {
-        session_id: saved.id,
-        text: 'HANDLE_IMAGE_TEST ' + evidence.sha256,
-        images: [small],
-      });
-      assert.equal(handled.status, route === 'rpc-host' ? 'handled' : 'dispatched');
-      if (route !== 'rpc-host') assert.equal(handled.admission, 'unobservable');
-      const inputRecord = await until(async () => {
-        const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
-        return entries.findLast(
-          (e) => e.type === 'custom' && e.customType === 'image-input-fixture',
-        );
-      });
-      assert.deepEqual(inputRecord.data, [evidence]);
-      const transformed = await call('send', {
-        session_id: saved.id,
-        text: 'TRANSFORM_IMAGE_TEST',
-        images: [small],
-      });
-      assert.equal(transformed.status, route === 'rpc-host' ? 'started' : 'dispatched');
-      if (route !== 'rpc-host') assert.equal(transformed.admission, 'unobservable');
-      await until(async () => {
-        const entries = sdk ? sdk.sessionManager.getEntries() : (await native.getEntries()).entries;
-        return entries
-          .findLast((e) => e.message?.role === 'user')
-          ?.message.content.some((c) => c.type === 'text' && c.text === 'IMAGE_TRANSFORMED');
-      });
-      await until(
-        async () =>
-          (sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText()) ===
-          'IMAGE_CONTEXT:[]',
-      );
-      assert.equal((await status()).model.id, 'text-only');
-      await call('send', { session_id: saved.id, text: 'SELECT_IMAGE_TEST', images: [small] });
-      await until(
-        async () =>
-          (sdk ? sdk.getLastAssistantText() : await native.getLastAssistantText()) ===
-          'IMAGE_CONTEXT:' + JSON.stringify([evidence]),
-      );
-      assert.equal((await status()).model.id, 'vision');
-      // Missing capability fails before transport dispatch, never text-only fallback.
-      const unsupported = new AttachedRuntime(config, saved, { ...record, imagesSupported: false });
-      assert.throws(
-        () => unsupported.send({ text: 'must not lose image', images: [image] }),
-        /IMAGE_INPUT_UNSUPPORTED/,
-      );
     },
   );

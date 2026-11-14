@@ -2,33 +2,30 @@ import { randomUUID } from 'node:crypto';
 import { contextSelection } from './read-schema.mjs';
 import { jsonBytes } from './response-budget.mjs';
 import { READ_SNAPSHOT_LIMIT, renderPreparedContextRead } from './context-read.mjs';
-import {
-  navigationDocuments,
-  navigationRows,
-  documentUnits,
-  documentText,
-  excerpt,
-} from './read-navigation.mjs';
+import { navigationDocuments, navigationRows, documentUnits } from './read-navigation.mjs';
 
 function decode(value) {
   try {
     if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
-    const [token, offset, ...extra] = JSON.parse(Buffer.from(value, 'base64url').toString());
+    const [token, offset, part, ...extra] = JSON.parse(Buffer.from(value, 'base64url').toString());
     if (
       extra.length ||
       typeof token !== 'string' ||
       !/^[0-9a-f-]{36}$/.test(token) ||
       !Number.isSafeInteger(offset) ||
-      offset < 1
+      offset < 0 ||
+      !Number.isSafeInteger(part) ||
+      part < 0 ||
+      (!offset && !part)
     )
       throw new Error();
-    return { token, offset };
+    return { token, offset, part };
   } catch {
     throw new Error('INVALID_CURSOR');
   }
 }
-const encode = (token, offset) =>
-  Buffer.from(JSON.stringify([token, offset])).toString('base64url');
+const encode = (token, offset, part) =>
+  Buffer.from(JSON.stringify([token, offset, part])).toString('base64url');
 
 // Immutable sanitized history, not a version-dependent acceleration cache.
 // Missing snapshots are never reacquired to reconstruct an old cursor.
@@ -40,7 +37,11 @@ export class ContextReadCache {
     const position = decode(cursor),
       entry = this.entries.get(position.token);
     if (!entry) throw new Error('STALE_CURSOR');
-    if (position.offset > (entry.snapshot.navigation?.rows.length ?? entry.snapshot.units.length))
+    const { navigation, units } = entry.snapshot;
+    if (
+      position.offset >= (navigation?.rows.length ?? units.length) ||
+      (navigation && position.part)
+    )
       throw new Error('INVALID_CURSOR');
     return { position, entry };
   }
@@ -86,25 +87,26 @@ export class ContextReadCache {
     this.entries.delete(first.token);
     this.entries.set(first.token, first.entry);
     const snapshot = first.entry.snapshot;
-    const sourcePositions = new Map(snapshot.units.map((unit, index) => [unit, index]));
-    for (const document of snapshot.navigation.documents)
-      if (document.units && document.indices)
-        document.units.forEach((unit, index) => sourcePositions.set(unit, document.indices[index]));
     const selected = new Map();
-    for (const index of [...new Set(resolved.map((r) => r.index))].sort((a, b) => a - b)) {
+    const selectedDocuments = new Set(resolved.map(({ index }) => index));
+    const parentAtoms = new Set(
+      resolved.flatMap(({ document }) => (document.nested ? [] : document.indices)),
+    );
+    for (const index of selectedDocuments) {
       const document = snapshot.navigation.documents[index];
+      if (document.nested && parentAtoms.has(document.indices[0])) continue;
       documentUnits(snapshot, document).forEach((unit, i) => {
-        if (!selected.has(unit))
-          selected.set(
-            unit,
-            document.indices?.[i] ??
-              sourcePositions.get(unit) ??
-              snapshot.navigation.documents[document.parent]?.indices?.[0] ??
-              index,
-          );
+        const position = document.indices[i];
+        selected.set(document.nested ? document.id : position, {
+          position,
+          child: document.nested?.ordinal ?? -1,
+          unit,
+        });
       });
     }
-    const units = [...selected].sort((a, b) => a[1] - b[1]).map(([unit]) => unit);
+    const units = [...selected.values()]
+      .sort((a, b) => a.position - b.position || a.child - b.child)
+      .map(({ unit }) => unit);
     return {
       ...snapshot,
       units,
@@ -179,15 +181,6 @@ export class ContextReadCache {
           : {}),
         units: snapshot.navigation.rows.map((row) => ({
           ...row,
-          ...(row._latest
-            ? {
-                text: excerpt(
-                  documentText(snapshot, snapshot.navigation.documents[row.ref]),
-                  Number.MAX_SAFE_INTEGER,
-                ),
-                truncated: undefined,
-              }
-            : {}),
           ref: reference(row.ref),
           ...(row.related
             ? { related: row.related.map((link) => ({ ...link, ref: reference(link.ref) })) }
@@ -197,7 +190,7 @@ export class ContextReadCache {
     }
     const result = renderPreparedContextRead(rendered, args, {
       cursor,
-      encode: (offset) => encode(token, offset),
+      encode: (offset, part) => encode(token, offset, part),
       resultBudget,
       live,
       runtimeEvents,

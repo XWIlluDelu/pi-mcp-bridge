@@ -130,14 +130,9 @@ and `related` refs. Public kinds match the content controls; reference expansion
 exposes the underlying native unit types. Messages remain in source order.
 The reader does not generate a new summary or infer task success from a reply.
 
-Input, ordinary assistant and thinking previews use an internal limit of 1600
-UTF-16 units; background previews use 900. They preserve meaningful newlines and
-indentation, collapse excessive blank lines, and use roughly 65% beginning plus
-35% ending when shortened. Search uses a 640-unit excerpt around the match.
-The latest body reply in each selected turn is allowed more room and is returned
-in full when the page budget permits. `truncated:true` marks shortened prose;
-its ref retains the captured source. `max_bytes` controls the page, not a public
-per-message length setting.
+Previews keep meaningful newlines and give the latest reply in each turn more
+room. Search shows an excerpt around the match. `truncated:true` marks shortened
+prose. Expand its reference for the captured source.
 
 Tool navigation names the operation and target, recorded status and necessary
 diagnostics; it does not paste ordinary stdout into the overview. Native tool
@@ -209,11 +204,9 @@ captures; a live observer can still supply its own.
 
 ## Native source preservation
 
-Saved v1/v2 histories are normalized in memory by native parsing/migration.
-Malformed lines are skipped as in Pi; optional `history` reports
-`skipped_malformed_lines` and `unterminated_tail`. Only native writer open repairs
-or migrates disk data. Native v1 IDs assigned in memory may differ between fresh
-reads; cursor pages retain captured IDs.
+Bridge uses the selected Pi's native parser and in-memory normalization. It
+leaves the source file untouched. Optional `history` reports skipped malformed
+lines and an unterminated tail. Frozen references retain the captured entry IDs.
 
 ## Source content and references
 
@@ -278,31 +271,15 @@ disabling it and restarting restores ordinary custom-message reading.
 
 ## Capacity and continuation
 
-All browse, search and reference pages move forward in source order. Session
-browsing tries to keep each input turn on one page. A turn that fits an empty
-page moves to the next page when the current page has insufficient space;
-a turn too large for an empty page is shortened and, when necessary, split
-across pages. Empty pages are not emitted to wait for a larger budget.
+Browse, search and reference pages advance in source order. A cursor resumes
+the same frozen capture, including its position within a long source item.
+Changing `max_bytes` changes how much fits on the next page. Long text splits
+during rendering at Unicode code-point boundaries. Each piece preserves its
+source and tool links.
 
-Within a turn, the latest selected assistant body receives priority over earlier
-reply previews, while input and selected thinking retain readable space. Budget
-priority never moves an item ahead of its source position. A very long latest
-reply becomes a larger marked preview with a ref; it does not monopolize ordinary
-cursor pages with its full body. The latest reply need not appear on the first
-page of a multi-turn read; use `range:{recent:1}` to focus on the current turn.
-
-`next_cursor` continues the same capture. `omissions.selection.turns` counts
-excluded input turns; per-kind counts describe records excluded by content or
-range selection. Assistant/thinking counts refer to messages, not content blocks.
-`omissions.capacity.remaining_units` counts items available through continuation;
-`previous_units` counts items on preceding pages. Reader coverage describes its
-own source scope separately.
-
-Small blocks stay whole. Long prose splits at paragraphs/lines, then whitespace
-or Unicode code-point boundaries. Parts retain source/tool links and may carry
-`part`; message parts preserve `content_index`. Items are independently readable
-objects, not JSON fragments. Content counts refer to messages or logical tool operations, not paragraphs or
-these transport fragments.
+`omissions.selection` counts content excluded by turn or kind selection.
+`omissions.capacity` reports source items remaining and the position reached
+before the page. Reader coverage describes its own source scope separately.
 
 If shared metadata or nested-call fields cannot fit, `omitted_fields` names them
 while preserving body text, parent identity and native error state. Other
@@ -335,7 +312,7 @@ including header cwd; identity changes invalidate access to the capture.
 
 `live` is a separate bounded, transient and incomplete observation, outside cursor
 history. It uses the same image/signature sanitization and readable units. Native
-text/thinking deltas and cumulative message events feed it; tool-result streams
+cumulative assistant message events feed it; tool-result streams
 and bash chunks are not assistant text. Owned projection and preview are captured
 together, keeping later-prompt output out of an earlier capture.
 

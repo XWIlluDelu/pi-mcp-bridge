@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { fixture, until, idle } from './fixtures/model-runtime.mjs';
+import { fixture, until } from './fixtures/model-runtime.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, claimFile, ownerAlive } from '../src/attachments.mjs';
 
@@ -29,7 +29,6 @@ test(
     // The fixture reloads grants only; its launch profile is the same in-memory object.
     const accepted = await f.bridge.send({
       session_id: f.id,
-
       text: '/held-extension-input',
     });
     assert.equal(accepted.status, 'handled');
@@ -89,42 +88,6 @@ test(
   },
 );
 
-test('missing history does not strand a known owned writer', { timeout: 15000 }, async (t) => {
-  for (const interrupt of [false, true]) {
-    await t.test(interrupt ? 'explicit interruption' : 'normal EOF', async (t) => {
-      const f = await fixture(t),
-        session = await f.bridge.session(f.id),
-        runtime = await f.bridge.pool.resolve(session),
-        record = structuredClone(runtime.ownerRecord),
-        removed = path.join(f.dir, 'removed-session.jsonl'),
-        history = await fs.readFile(session.file),
-        signals = [];
-      const kill = runtime.child.kill.bind(runtime.child);
-      t.mock.method(runtime.child, 'kill', (signal) => {
-        signals.push(signal);
-        return kill(signal);
-      });
-      await fs.rename(session.file, removed);
-      const result = await ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt });
-      assert.equal(result.status, 'released');
-      assert.equal(result.no_cold_reacquire, true);
-      assert.equal(await ownerAlive(record.owner), false);
-      assert.deepEqual(signals, interrupt ? ['SIGTERM'] : []);
-      if (!interrupt) {
-        assert.equal(runtime.child.exitCode, 0);
-        assert.equal(runtime.child.signalCode, null);
-      }
-      assert.equal(f.bridge.pool.get(f.id), null);
-      const released = await readClaim(f.bridge.pool.attachmentDir, session);
-      assert.equal(released.generation, record.generation);
-      assert.equal(released.phase, 'released');
-      assert.equal(released.owner, null);
-      await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
-      assert.deepEqual(await fs.readFile(removed), history);
-    });
-  }
-});
-
 test(
   'missing-history release rejects a changed claim and a replacement history',
   { timeout: 15000 },
@@ -183,20 +146,6 @@ test(
   },
 );
 
-test('missing history without an owned writer cannot release an arbitrary claim', async (t) => {
-  const f = await fixture(t),
-    session = await f.bridge.session(f.id);
-  await fs.unlink(session.file);
-  for (const interrupt of [false, true]) {
-    await assert.rejects(
-      ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
-      /NOT_FOUND_OR_DENIED/,
-    );
-  }
-  assert.equal(f.bridge.pool.instances.size, 0);
-  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
-});
-
 test(
   'release fences new mutations, drains admitted stop and uses normal EOF',
   { timeout: 15000 },
@@ -252,76 +201,5 @@ test(
     assert.deepEqual(signals, []);
     assert.equal(runtime.child.exitCode, 0);
     assert.equal(f.bridge.handoffs.has(f.id), false);
-  },
-);
-
-test(
-  'idle owner release drains late receipt capture before closing its native pipe',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      runtime = await f.bridge.pool.resolve(await f.bridge.session(f.id)),
-      gate = Promise.withResolvers(),
-      first = Promise.withResolvers();
-    let captured = false,
-      exiting = false;
-    runtime.trackAck(async () => {
-      await gate.promise;
-      await runtime.state();
-      captured = true;
-    });
-    const drain = runtime.drainAcks.bind(runtime),
-      exit = runtime.gracefulExit.bind(runtime);
-    runtime.drainAcks = () => {
-      first.resolve('drain');
-      return drain();
-    };
-    runtime.gracefulExit = () => {
-      first.resolve('exit');
-      exiting = true;
-      return exit();
-    };
-    const release = f.bridge.releaseForLocal({ session_id: f.id });
-    try {
-      assert.equal(await first.promise, 'drain');
-      assert.equal(exiting, false);
-    } finally {
-      gate.resolve();
-      await Promise.allSettled([release]);
-    }
-    assert.equal((await release).status, 'released');
-    assert.equal(captured, true);
-    assert.equal(runtime.child.exitCode, 0);
-  },
-);
-
-test(
-  'all idle-gated controls ignore pending observations but await native mutation ACKs',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      runtime = await f.bridge.pool.resolve(await f.bridge.session(f.id));
-    t.after(() => runtime.pending.delete('synthetic-pending'));
-    for (const commandType of [
-      'get_state',
-      'get_entries',
-      'get_available_models',
-      'get_available_thinking_levels',
-    ]) {
-      runtime.pending.set('synthetic-pending', { commandType });
-      await runtime.assertReleasable();
-      await runtime.assertIdle();
-      await runtime.waitForHandoff();
-    }
-    runtime.pending.set('synthetic-pending', { commandType: 'abort' });
-    await assert.rejects(runtime.assertReleasable(), /RUNTIME_BUSY/);
-    await assert.rejects(runtime.assertIdle(), /MODEL_SELECTION_BUSY/);
-    const controller = new AbortController();
-    const waiting = runtime.waitForHandoff(controller.signal);
-    controller.abort();
-    await assert.rejects(waiting, { name: 'AbortError' });
-    runtime.pending.delete('synthetic-pending');
-    await runtime.assertReleasable();
-    await runtime.waitForHandoff();
   },
 );

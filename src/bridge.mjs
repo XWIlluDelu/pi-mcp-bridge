@@ -13,14 +13,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
 import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
-import {
-  promptInput,
-  hasPromptSettings,
-  assertPromptSelection,
-  promptOptions,
-  promptResult,
-  attachedPromptResult,
-} from './prompt-input.mjs';
+import { promptInput, promptResult } from './prompt-input.mjs';
 import { ContextReadCache } from './read-cache.mjs';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { CompatibilityModules } from './compatibility.mjs';
@@ -411,26 +404,7 @@ export class Bridge {
           let runtime = await this.pool.forRead(session);
           runtime ??= await this.#coldStart(session, checkInput);
           markForAutoRelease(runtime);
-          if (!runtime.attached && !body.interrupt)
-            await runtime.assertIdle({
-              busy: 'COMPACT_BUSY',
-              unconfirmed: 'COMPACT_IDLE_UNCONFIRMED',
-            });
-          const authorized = checkInput;
-          await authorized();
-          const late = () => {}; // Keep native late-ACK identity validation.
-          const result = runtime.attached
-            ? await runtime.compact(body, undefined, authorized)
-            : await runtime.command(
-                {
-                  type: 'compact',
-                  customInstructions: body.instructions,
-                  idleOnly: !body.interrupt,
-                },
-                undefined,
-                late,
-                authorized,
-              );
+          const result = await runtime.compact(body, undefined, checkInput);
           return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
         } catch (error) {
           const nativeReason =
@@ -781,21 +755,14 @@ export class Bridge {
     await beforeResolve();
     return this.pool.resolve(session);
   }
-  // One native prompt on an owned RPC; a late ACK updates the same receipt.
-  #ownedPrompt(runtime, { input, mode, submissionId, selection, authorize }) {
-    return runtime.command(
-      {
-        id: submissionId,
-        type: 'prompt',
-        message: input.text,
-        ...(input.images ? { images: input.images } : {}),
-        // Native admission must also refuse a hook that turns busy after selection.
-        ...promptOptions(hasPromptSettings(input) ? 'idle_only' : mode),
-      },
-      undefined,
-      (late) => this.submissions.update(submissionId, promptResult(late)),
-      () => beforePromptDispatch(runtime, input, selection, authorize),
-    );
+  #submit(runtime, input, submissionId, selection, authorize, markForAutoRelease) {
+    return runtime.submitPrompt(input, {
+      submissionId,
+      selection,
+      authorize,
+      onAdmitted: () => markForAutoRelease(runtime),
+      onLate: (receipt) => this.submissions.update(submissionId, receipt),
+    });
   }
   async acquireNativeRead(session, runtime, args) {
     if (runtime) return runtime.read(args);
@@ -872,38 +839,17 @@ export class Bridge {
             runtime = await this.#coldStart(s);
             markForAutoRelease(runtime);
           }
-          const authorized = beforeDispatch;
-          await authorized();
-          if (runtime.attached)
-            return outcome(
-              attachedPromptResult(
-                await runtime.send({ ...args, ...body, beforeDispatch: authorized }),
-              ),
-            );
-          if (hasPromptSettings(body) && body.mode === 'idle_only') {
-            const idle = await runtime.idleSnapshot();
-            if (idle.status === 'busy')
-              return outcome({ ...selection, status: 'skipped', reason: 'busy' });
-            if (idle.status !== 'idle') throw new Error('MODEL_SELECTION_IDLE_UNCONFIRMED');
-          }
-          await selectPromptModel(runtime, body, selection, authorized);
-          if (body.mode === 'idle_only') {
-            const idle = await runtime.idleSnapshot();
-            if (idle.status === 'busy')
-              return outcome({ ...selection, status: 'skipped', reason: 'busy' });
-            if (idle.status !== 'idle') throw new Error('RUNTIME_IDLE_UNCONFIRMED');
-          }
-          await authorized();
-          if (!runtime.modelMutation && !runtime.compactionMutation && !runtime.promptAdmission)
-            markForAutoRelease(runtime);
-          const result = await this.#ownedPrompt(runtime, {
-            input: body,
-            mode: body.mode,
-            submissionId,
-            selection,
-            authorize: authorized,
-          });
-          return outcome({ ...selection, ...promptResult({ ok: true, data: result }) });
+          await beforeDispatch();
+          return outcome(
+            await this.#submit(
+              runtime,
+              body,
+              submissionId,
+              selection,
+              beforeDispatch,
+              markForAutoRelease,
+            ),
+          );
         } catch (e) {
           return outcome({
             ...selection,
@@ -1063,15 +1009,16 @@ export class Bridge {
           markForAutoRelease(runtime);
           await beforeDispatch();
           if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
-          await selectPromptModel(runtime, input, selection, beforeDispatch);
-          const result = await this.#ownedPrompt(runtime, {
-            input,
-            mode: 'steer',
-            submissionId,
-            selection,
-            authorize: beforeDispatch,
-          });
-          return outcome(promptResult({ ok: true, data: result }));
+          return outcome(
+            await this.#submit(
+              runtime,
+              { ...input, mode: 'steer' },
+              submissionId,
+              selection,
+              beforeDispatch,
+              markForAutoRelease,
+            ),
+          );
         }),
       );
     } catch (error) {
@@ -1369,30 +1316,6 @@ export class Bridge {
     })();
     return this.closePromise;
   }
-}
-// Prompt settings apply on a proven-idle owned RPC before its input.
-async function selectPromptModel(runtime, input, selection, authorize) {
-  if (!hasPromptSettings(input)) return;
-  const actual = await runtime.selectModel(input.model, {
-    thinkingLevel: input.thinking_level,
-    idle: true,
-    beforeDispatch: authorize,
-  });
-  selection.model_selection = { model: actual.model, thinking_level: actual.thinking_level };
-  await authorize();
-}
-async function beforePromptDispatch(runtime, input, selection, authorize) {
-  if (hasPromptSettings(input)) {
-    const current = await runtime.state();
-    assertPromptSelection(input, current);
-    selection.model_selection = modelSettings({
-      model: current.model,
-      thinking_level: current.thinkingLevel,
-    });
-  }
-  // Native selection can change locally while observations are awaited. Check
-  // Stop/handoff admission last; never restore a model to make preflight pass.
-  await authorize();
 }
 function safeReason(error) {
   const code = publicError(error);

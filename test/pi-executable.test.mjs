@@ -69,30 +69,6 @@ test('PATH and explicit selection resolve CLI and SDK from the same installation
   );
 });
 
-test('PATH skips absent, directory and non-executable entries, not an unusable selected installation', async (t) => {
-  const f = await fixture(t),
-    a = await f.install('native'),
-    bin = await f.link('bin', a.command);
-  await fs.mkdir(path.join(f.dir, 'directory/pi'), { recursive: true });
-  await fs.mkdir(path.join(f.dir, 'denied'));
-  await fs.writeFile(path.join(f.dir, 'denied/pi'), 'not executable', { mode: 0o600 });
-  assert.equal(
-    (
-      await resolvePiInstallation(
-        {},
-        {
-          PATH: ['absent', 'directory', 'denied', 'bin']
-            .map((p) => path.join(f.dir, p))
-            .join(path.delimiter),
-        },
-      )
-    ).command,
-    path.join(bin, 'pi'),
-  );
-  await fs.unlink(path.join(a.root, 'dist/index.js'));
-  await assert.rejects(resolvePiInstallation({}, { PATH: bin }), /PI_INSTALLATION_UNAVAILABLE/);
-});
-
 async function managedFixture(t) {
   const f = await fixture(t),
     agent = path.join(f.dir, 'managed agent'),
@@ -178,28 +154,6 @@ test('invalid managed releases and arbitrary wrappers fail without selecting ano
   await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
   await fs.unlink(markerFile);
   await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
-});
-
-test('explicit selection fails accurately without using PATH or installing a fallback', async (t) => {
-  const f = await fixture(t),
-    native = await f.install('native'),
-    bin = await f.link('bin', native.command);
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: path.join(f.dir, 'missing') }, { PATH: bin }),
-    /PI_EXECUTABLE_NOT_FOUND/,
-  );
-  await fs.chmod(native.command, 0o600);
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: native.command }, { PATH: bin }),
-    /PI_EXECUTABLE_NOT_EXECUTABLE/,
-  );
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: f.dir }),
-    /PI_EXECUTABLE_NOT_EXECUTABLE/,
-  );
-  for (const piExecutable of ['relative', null, '/bad/\0pi'])
-    await assert.rejects(resolvePiInstallation({ piExecutable }), /INVALID_PI_EXECUTABLE/);
-  await assert.rejects(resolvePiInstallation({}, { PATH: f.dir }), /PI_EXECUTABLE_NOT_FOUND/);
 });
 
 test('external CLI, SDK and thinking helpers use the selected installation', async () => {

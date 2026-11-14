@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { uiSnapshot } from './rpc-ui.mjs';
 import { modelState } from './models.mjs';
+import { attachedActivity } from './attachment-protocol.mjs';
 
 // Metadata scanning retains at most one JSONL record, never a second full history.
 export async function sessionMetadata(session, cache) {
@@ -76,35 +77,20 @@ export async function runtimeMetadata(pool, session) {
           thinking_level: null,
         },
       };
-    const snapshot = runtime.attached ? null : await runtime.idleSnapshot();
-    const state = snapshot ? snapshot.state : await runtime.state();
+    const snapshot = runtime.attached
+      ? attachedActivity(await runtime.state())
+      : await runtime.idleSnapshot();
+    const { state } = snapshot;
     const selection = modelState(state);
-    const pending = state.pendingMessageCount ?? state.activity?.pending_message_count;
+    const pending = state.pendingMessageCount;
     const count = Number.isSafeInteger(pending) && pending >= 0 ? pending : null;
-    const busy =
-      snapshot?.status === 'busy' ||
-      (!runtime.attached && runtime.hasUnsettledWork()) ||
-      state.isBashRunning === true ||
-      state.isStreaming ||
-      state.isCompacting ||
-      state.isIdle === false ||
-      state.hasPendingMessages === true ||
-      state.activity?.idle === false ||
-      state.activity?.streaming === true ||
-      state.activity?.compacting === true ||
-      state.activity?.pending_messages === true ||
-      count > 0;
-    // Owned RPC snapshots include child admission; get_state alone misses input preparation.
-    const idle =
-      (snapshot
-        ? snapshot.status === 'idle'
-        : state.isIdle === true || state.activity?.idle === true) && !busy;
+    const status = !runtime.attached && runtime.hasUnsettledWork() ? 'busy' : snapshot.status;
     return {
       ...(Object.hasOwn(state, 'sessionName') || runtime.ownerRecord?.kind === 'rpc'
         ? { name: typeof state.sessionName === 'string' ? state.sessionName.trim() || null : null }
         : {}),
       status: {
-        state: busy ? 'busy' : idle ? 'idle' : 'unknown',
+        state: status === 'unconfirmed' ? 'unknown' : status,
         observed_at,
         pending_messages: count,
         model: selection.model,

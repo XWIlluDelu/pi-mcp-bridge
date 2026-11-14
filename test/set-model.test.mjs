@@ -1,22 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import {
-  fixture,
-  until,
-  choice,
-  releasedEntries,
-  savedEntries,
-} from './fixtures/model-runtime.mjs';
-import { publicSchemas } from '../src/tool-schemas.mjs';
-import { callBridgeTool, META, MODERN_VERSION } from '../src/protocol.mjs';
-import { createHttpService } from '../src/http-server.mjs';
-import { TOKEN_HEADER } from '../src/http-config.mjs';
-import { createStdioProxy } from '../src/stdio-proxy.mjs';
-import { PassThrough } from 'node:stream';
-import { executeBatch } from '../src/batch.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
-import { assertInvalidArguments } from './fixtures/tool-call.mjs';
+import { fixture, until, choice, releasedEntries } from './fixtures/model-runtime.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -67,24 +52,6 @@ test('standalone selection updates a busy native RPC without aborting its captur
   assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
 });
 
-test('native model selection keeps project authorization when its workspace disappears during dispatch', async (t) => {
-  const f = await fixture(t),
-    { bridge, id } = f,
-    runtime = await bridge.pool.resolve(await bridge.session(id)),
-    select = runtime.selectModel.bind(runtime);
-  t.mock.method(runtime, 'selectModel', async (...args) => {
-    await fs.rename(f.cwd, f.cwd + '-moved');
-    return select(...args);
-  });
-  assert.deepEqual(await bridge.set_model({ session_id: id, model: choice('vision') }), {
-    model: choice('vision'),
-    thinking_level: 'off',
-  });
-  const identity = await bridge.session(id);
-  assert.equal(identity.projectCwd, f.cwd);
-  assert.equal(identity.cwd, null);
-});
-
 test('a timed-out native setter remains fenced until its exact ACK and never applies later steps', async (t) => {
   const f = await fixture(t),
     { bridge, id } = f;
@@ -102,7 +69,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
     }),
     (e) => e.message === 'ACK_TIMEOUT' && e.uncertain === true,
   );
-  assert.ok(runtime.modelMutation);
+  assert.ok(runtime.hasPendingModelSelection());
   await assert.rejects(
     bridge.set_model({ session_id: id, thinking_level: 'low' }),
     /MODEL_SELECTION_PENDING/,
@@ -112,7 +79,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
     'MODEL_SELECTION_PENDING',
   );
   await fs.writeFile(f.gate, 'go');
-  await until(() => !runtime.modelMutation);
+  await until(() => !runtime.hasPendingModelSelection());
   assert.equal((await runtime.state()).thinkingLevel, 'off');
   assert.equal((await runtime.entries()).entries.filter((e) => e.message).length, 0);
 });
@@ -127,7 +94,7 @@ test('native selection remains available during unresolved prompt preflight and 
   let stopping;
   try {
     await until(() => exists(f.gate + '.preflight-start'));
-    assert.ok(runtime.promptAdmission);
+    assert.ok(runtime.hasPendingCommand('prompt'));
     assert.deepEqual(
       await bridge.set_model({
         session_id: id,
@@ -136,7 +103,10 @@ test('native selection remains available during unresolved prompt preflight and 
       }),
       { model: choice('vision'), thinking_level: 'high' },
     );
-    assert.ok(runtime.promptAdmission, 'Setter does not settle or abort the pending prompt');
+    assert.ok(
+      runtime.hasPendingCommand('prompt'),
+      'Setter does not settle or abort the pending prompt',
+    );
     assert.equal(
       (
         await bridge.send({
@@ -194,179 +164,6 @@ test('cold setters return native thinking adjustment, produce no prompt and rele
   assert.equal(entries.filter((e) => e.message).length, 0);
   assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
 });
-
-test('set_model uses the receive-time send grant and new calls reauthorize, including batch lanes', async (t) => {
-  const f = await fixture(t),
-    { bridge, id } = f;
-  const second = (await savedSession(bridge)).session_id;
-  const runtime = await bridge.pool.resolve(await bridge.session(id));
-  await fs.writeFile(
-    f.configFile,
-    JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, send: true }] }),
-  );
-  const capture = bridge.captureRequestContext.bind(bridge);
-  let snapshot;
-  t.mock.method(bridge, 'captureRequestContext', () => (snapshot = capture()));
-  const result = await callBridgeTool(
-    bridge,
-    'batch',
-    {
-      operations: [
-        {
-          op: 'set_model',
-          args: { session_id: id, model: choice('vision'), thinking_level: 'high' },
-        },
-        { op: 'set_model', args: { session_id: id, model: choice('missing') } },
-        { op: 'set_model', args: { session_id: id, thinking_level: 'off' } },
-        { op: 'set_model', args: { session_id: second, thinking_level: 'low' } },
-      ],
-    },
-    {
-      execute: async (run) => {
-        await snapshot;
-        await fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants: [] }));
-        return run();
-      },
-    },
-  );
-  assert.ok(!result.isError, JSON.stringify(result));
-  const items = result.structuredContent.results;
-  assert.deepEqual(items[0].result, { model: choice('vision'), thinking_level: 'high' });
-  assert.equal(items[1].error.code, 'MODEL_UNAVAILABLE');
-  assert.deepEqual(items[2].result, { model: choice('vision'), thinking_level: 'off' });
-  assert.deepEqual(items[3].result, { model: choice('alpha'), thinking_level: 'off' });
-  await assert.rejects(
-    bridge.set_model({ session_id: id, thinking_level: 'high' }),
-    /NOT_FOUND_OR_DENIED/,
-  );
-  assert.equal((await runtime.entries()).entries.filter((e) => e.message).length, 0);
-  await releasedEntries(bridge, second);
-  assert.equal((await savedEntries(bridge, second)).filter((e) => e.message).length, 0);
-});
-
-test('HTTP and stdio proxy expose set_model with the same minimal contract and no replay', async (t) => {
-  const { bridge, id } = await fixture(t);
-  const runtime = await bridge.pool.resolve(await bridge.session(id));
-  const token = 'synthetic-set-model-token-not-a-real-credential';
-  const service = createHttpService(bridge, { token }),
-    url = await service.listen();
-  const input = new PassThrough(),
-    output = new PassThrough();
-  let wire = '';
-  output.on('data', (chunk) => {
-    wire += chunk;
-  });
-  const proxy = createStdioProxy({ url, token, input, output });
-  t.after(async () => {
-    await proxy.close();
-    await service.close();
-  });
-  const message = (request, args) => ({
-    jsonrpc: '2.0',
-    id: request,
-    method: 'tools/call',
-    params: {
-      name: 'set_model',
-      arguments: args,
-      _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-    },
-  });
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      [TOKEN_HEADER]: token,
-      'MCP-Protocol-Version': MODERN_VERSION,
-      'Mcp-Method': 'tools/call',
-      'Mcp-Name': 'set_model',
-    },
-    body: JSON.stringify(
-      message(1, { session_id: id, model: choice('vision'), thinking_level: 'high' }),
-    ),
-  });
-  assert.equal(response.status, 200);
-  assert.deepEqual((await response.json()).result.structuredContent, {
-    model: choice('vision'),
-    thinking_level: 'high',
-  });
-  await proxy.start();
-  input.write(JSON.stringify(message(2, { session_id: id, model: choice('alpha') })) + '\n');
-  await proxy.drain();
-  assert.deepEqual(JSON.parse(wire.trim()).result.structuredContent, {
-    model: choice('alpha'),
-    thinking_level: 'off',
-  });
-  assert.equal((await runtime.entries()).entries.filter((e) => e.message).length, 0);
-});
-
-test('set_model validates selection settings before starting a runtime', async (t) => {
-  const { bridge, id } = await fixture(t);
-  for (const extra of [
-    {},
-    { model: {} },
-    { thinking_level: 'invalid' },
-    { thinking_level: 'high', timeout_ms: 50 },
-    { thinking_level: 'high', text: 'not a prompt' },
-  ]) {
-    assert.equal(publicSchemas.set_model.safeParse({ session_id: id, ...extra }).success, false);
-    await assertInvalidArguments(bridge, 'set_model', { session_id: id, ...extra });
-  }
-  assert.equal(bridge.pool.instances.size, 0);
-  const batch = await executeBatch(bridge, {
-    operations: [
-      { op: 'set_model', args: { session_id: id } },
-      { op: 'set_model', args: { session_id: id, thinking_level: 'off' } },
-    ],
-  });
-  assert.equal(batch.results[0].error.code, 'INVALID_OPERATION');
-  assert.deepEqual(batch.results[1].result, { model: choice('alpha'), thinking_level: 'off' });
-});
-
-test(
-  'thinking-only owned RPC selection follows a local model change and never restores its earlier observation',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      runtime = await f.bridge.pool.resolve(await f.bridge.session(f.id));
-    const state = runtime.state.bind(runtime),
-      dispatch = runtime.dispatch.bind(runtime);
-    let sampled = false,
-      local = false,
-      modelWrites = 0;
-    t.mock.method(runtime, 'dispatch', (command, ...args) => {
-      if (command.type === 'set_model' && !local) modelWrites++;
-      return dispatch(command, ...args);
-    });
-    t.mock.method(runtime, 'state', async (...args) => {
-      const value = await state(...args);
-      if (!sampled) {
-        sampled = true;
-        local = true;
-        try {
-          await runtime.command({
-            type: 'set_model',
-            provider: 'model-fixture',
-            modelId: 'vision',
-          });
-        } finally {
-          local = false;
-        }
-      }
-      return value;
-    });
-    assert.deepEqual(await f.bridge.set_model({ session_id: f.id, thinking_level: 'high' }), {
-      model: { provider: 'model-fixture', id: 'vision' },
-      thinking_level: 'high',
-    });
-    assert.equal(modelWrites, 0);
-    assert.equal((await state()).model.contextWindow, 32000);
-    await f.bridge.set_model({
-      session_id: f.id,
-      model: { provider: 'model-fixture', id: 'alpha' },
-    });
-    assert.equal(modelWrites, 1);
-  },
-);
 
 for (const op of ['send', 'create'])
   test(

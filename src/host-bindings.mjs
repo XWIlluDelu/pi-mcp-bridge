@@ -75,7 +75,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
-    ...('sessionName' in session ? { sessionName: session.sessionName ?? null } : {}),
+    sessionName: session.sessionName ?? null,
     isIdle: isIdle(),
     isStreaming: session.isStreaming,
     isCompacting: session.isCompacting,
@@ -232,6 +232,12 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
 }
 
 export function createRpcHostBinding(client, { release, reload, onError } = {}) {
+  if (
+    ['getAvailableModels', 'setModel', 'setThinkingLevel'].some(
+      (name) => typeof client?.[name] !== 'function',
+    )
+  )
+    throw new Error('INVALID_HOST_CALLBACKS');
   const tracked = tracker(release, onError);
   const state = async () => {
     const value = await client.getState();
@@ -298,16 +304,12 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
       assertIdentity(before, await state());
       return result;
     },
-    setModel: ['getAvailableModels', 'setModel', 'setThinkingLevel'].every(
-      (name) => typeof client[name] === 'function',
-    )
-      ? createModelSetter({
-          state,
-          models: () => client.getAvailableModels(),
-          setModel: (model) => tracked.track(client.setModel(model.provider, model.id)),
-          setThinkingLevel: (level) => tracked.track(client.setThinkingLevel(level)),
-        })
-      : undefined,
+    setModel: createModelSetter({
+      state,
+      models: () => client.getAvailableModels(),
+      setModel: (model) => tracked.track(client.setModel(model.provider, model.id)),
+      setThinkingLevel: (level) => tracked.track(client.setThinkingLevel(level)),
+    }),
     submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');

@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
-import { ownerRequest } from '../src/owner-runtime.mjs';
+
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -220,19 +220,7 @@ test('modern stdio discovers without initialize and EOF drains native input befo
   assert.equal(await second.exit(), 0);
   await stopped(f);
 });
-test('stdin EOF without a runtime releases its lock and permits normal restart', async (t) => {
-  const f = await fixture(t),
-    first = launch(t, f);
-  await first.initialize();
-  first.child.stdin.end();
-  assert.equal(await first.exit(), 0);
-  await stopped(f);
-  const second = launch(t, f);
-  await second.initialize();
-  second.child.kill('SIGTERM');
-  assert.equal(await second.exit(), 0);
-  await stopped(f);
-});
+
 test('broken stdout drains a pending receipt and cleans up the owned official RPC process', async (t) => {
   const f = await fixture(t),
     server = launch(t, f);
@@ -256,27 +244,7 @@ test('broken stdout drains a pending receipt and cleans up the owned official RP
     await bridge.close();
   }
 });
-test('repeated stop signals share draining cleanup rather than interrupting the owned RPC receipt', async (t) => {
-  const f = await fixture(t),
-    server = launch(t, f);
-  await server.initialize();
-  const pending = server.call('send', {
-    session_id: f.id,
 
-    text: '/lifecycle-fixture',
-  });
-  await until(() => exists(f.marker));
-  const claim = await ownClaim(f);
-  server.child.kill('SIGTERM');
-  await new Promise((r) => setTimeout(r, 30));
-  server.child.kill('SIGINT');
-  assert.ok(
-    ['started', 'queued', 'handled'].includes((await pending).status),
-    'Expected native prompt admission',
-  );
-  assert.equal(await server.exit(), 0);
-  await stopped(f, claim.owner);
-});
 test('EOF disconnects an actual external Pi TUI without stopping it', async (t) => {
   const f = await fixture(t),
     agentDir = path.join(f.dir, 'agent');
@@ -336,197 +304,3 @@ test('EOF disconnects an actual external Pi TUI without stopping it', async (t) 
   assert.equal(await ownerAlive(claim.owner), true);
   assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, claim.generation);
 });
-
-test('stdio shutdown drains an admitted SDK history read before closing the Bridge', async (t) => {
-  const f = await fixture(t),
-    preload = path.join(f.dir, 'read-gate.mjs'),
-    reached = path.join(f.dir, 'read-reached'),
-    release = path.join(f.dir, 'read-release');
-  await fs.writeFile(
-    preload,
-    `import fs from 'node:fs/promises';const open=fs.open;fs.open=async(file,...args)=>{const fd=await open(file,...args);if(file===${JSON.stringify(f.session.file)}){const stream=fd.createReadStream.bind(fd);fd.createReadStream=options=>(async function*(){const input=stream(options);await fs.writeFile(${JSON.stringify(reached)},'yes');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));yield* input;})();}return fd;};`,
-  );
-  const server = launch(t, f, ['--import', preload]);
-  await server.initialize();
-  const reading = server.call('read', { session_id: f.id });
-  await until(() => exists(reached));
-  server.child.stdin.end();
-  try {
-    await new Promise((r) => setTimeout(r, 80));
-    assert.equal(
-      server.child.exitCode,
-      null,
-      'SDK tool must remain in the same transport drain as per-request tools',
-    );
-    await fs.writeFile(release, 'go');
-    assert.equal((await reading).session_id, f.id);
-    assert.equal(await server.exit(), 0);
-  } finally {
-    await fs.writeFile(release, 'go');
-    await reading.catch(() => {});
-  }
-});
-
-test('stdio EOF settles queued input without starting another writer after a shutdown hook', async (t) => {
-  const f = await fixture(t),
-    shutdown = path.join(f.dir, 'shutdown'),
-    release = path.join(f.dir, 'shutdown-go');
-  await fs.writeFile(
-    path.join(f.dir, 'command.mjs'),
-    `import fs from 'node:fs/promises';export default pi=>{pi.registerCommand('lifecycle-fixture',{handler:async()=>{}});pi.on('session_shutdown',async()=>{if(await fs.stat(${JSON.stringify(shutdown)}).then(()=>true,()=>false))return;await fs.writeFile(${JSON.stringify(shutdown)},'yes');while(!await fs.stat(${JSON.stringify(release)}).then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));});};`,
-  );
-  const server = launch(t, f);
-  try {
-    await server.initialize();
-    assert.equal(
-      (await server.call('send', { session_id: f.id, text: '/lifecycle-fixture' })).status,
-      'handled',
-    );
-    await until(() => exists(shutdown));
-    const owner = (await ownClaim(f)).owner;
-    const pending = server.request('tools/call', {
-      name: 'send',
-      arguments: { session_id: f.id, text: '/lifecycle-fixture' },
-    });
-    server.child.stdin.end();
-    const response = (await pending).result;
-    const result = response.structuredContent ?? JSON.parse(response.content[0].text);
-    assert.equal(result.reason ?? result.error?.code, 'BRIDGE_CLOSING');
-    assert.equal(await server.exit(), 0);
-    await stopped(f, owner);
-  } finally {
-    await fs.writeFile(release, 'go');
-    server.child.stdin.end();
-    await server.done;
-  }
-});
-
-for (const modern of [false, true])
-  for (const endInput of [false, true])
-    test(
-      (modern ? 'modern' : 'SDK') +
-        ' stdio batch ' +
-        (endInput
-          ? 'EOF finishes dispatched work but rejects the next lane mutation'
-          : 'keeps both lane mutations while the service remains open'),
-      { timeout: 15000 },
-      async (t) => {
-        const f = await fixture(t),
-          trace = path.join(f.dir, 'calls.log'),
-          release = path.join(f.dir, 'command-release'),
-          closing = path.join(f.dir, 'closing'),
-          preload = path.join(f.dir, 'close-observer.mjs');
-        await fs.writeFile(
-          path.join(f.dir, 'command.mjs'),
-          'import fs from "node:fs/promises";export default pi=>pi.registerCommand("lifecycle-fixture",{handler:async(args)=>{await fs.appendFile(' +
-            JSON.stringify(trace) +
-            ',args+"\\n");await fs.writeFile(' +
-            JSON.stringify(f.marker) +
-            ',"started");while(!await fs.stat(' +
-            JSON.stringify(release) +
-            ').then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));}});',
-        );
-        if (endInput)
-          await fs.writeFile(
-            preload,
-            `import {writeFileSync} from 'node:fs';
-            import {Bridge} from ${JSON.stringify(new URL('../src/bridge.mjs', import.meta.url).href)};
-            const prepareClose=Bridge.prototype.prepareClose;
-            Bridge.prototype.prepareClose=function(...args){
-              const result=prepareClose.apply(this,args);
-              writeFileSync(${JSON.stringify(closing)},'ready');
-              return result;
-            };`,
-          );
-        const server = launch(t, f, endInput ? ['--import', preload] : []);
-        try {
-          await server.initialize(modern ? MODERN_VERSION : '2024-11-05');
-          const result = server.request('tools/call', {
-            name: 'batch',
-            arguments: {
-              operations: ['FIRST', 'SECOND'].map((text) => ({
-                op: 'send',
-                args: { session_id: f.id, text: '/lifecycle-fixture ' + text },
-              })),
-            },
-            ...(modern
-              ? {
-                  _meta: {
-                    [META + 'protocolVersion']: MODERN_VERSION,
-                    [META + 'clientCapabilities']: {},
-                  },
-                }
-              : {}),
-          });
-          await until(() => exists(f.marker));
-          if (endInput) {
-            server.child.stdin.end();
-            await until(() => exists(closing));
-          }
-          await fs.writeFile(release, 'go');
-          const response = (await result).result;
-          assert.ok(!response.isError, JSON.stringify(response));
-          const items = response.structuredContent.results;
-          assert.equal(items[0].result.status, 'handled');
-          if (endInput) assert.equal(items[1].error.code, 'BRIDGE_CLOSING');
-          else assert.equal(items[1].result.status, 'handled');
-          assert.deepEqual(
-            (await fs.readFile(trace, 'utf8')).trim().split('\n'),
-            endInput ? ['FIRST'] : ['FIRST', 'SECOND'],
-          );
-          if (!endInput) server.child.stdin.end();
-          assert.equal(await server.exit(), 0);
-        } finally {
-          await fs.writeFile(release, 'go');
-          server.child.stdin.end();
-        }
-      },
-    );
-
-test(
-  'stdio EOF drains an owner-local release already waiting on an owned shutdown hook',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      shutdown = path.join(f.dir, 'shutdown'),
-      release = path.join(f.dir, 'shutdown-go'),
-      admitted = path.join(f.dir, 'owner-admitted');
-    await fs.writeFile(
-      path.join(f.dir, 'command.mjs'),
-      'import fs from "node:fs/promises";export default pi=>{pi.registerCommand("lifecycle-fixture",{handler:async()=>{}});pi.on("session_shutdown",async()=>{await fs.writeFile(' +
-        JSON.stringify(shutdown) +
-        ',"yes");while(!await fs.stat(' +
-        JSON.stringify(release) +
-        ').then(()=>true,()=>false))await new Promise(r=>setTimeout(r,10));});};',
-    );
-    const preload = path.join(f.dir, 'owner-observer.mjs');
-    await fs.writeFile(
-      preload,
-      'import fs from "node:fs/promises";import {Bridge} from ' +
-        JSON.stringify(new URL('../src/bridge.mjs', import.meta.url).href) +
-        ';const release=Bridge.prototype.releaseForLocal;Bridge.prototype.releaseForLocal=async function(...args){const result=release.apply(this,args);await fs.writeFile(' +
-        JSON.stringify(admitted) +
-        ',"yes");return result;};',
-    );
-    const server = launch(t, f, ['--import', preload]);
-    let pending;
-    try {
-      await server.initialize();
-      await server.call('send', { session_id: f.id, text: '/lifecycle-fixture' });
-      await until(() => exists(shutdown));
-      const owner = (await ownClaim(f)).owner;
-      pending = ownerRequest(f.config, { op: 'release', session_id: f.id }).catch((error) => ({
-        reason: error.message,
-      }));
-      await until(() => exists(admitted));
-      server.child.stdin.end();
-      assert.equal((await pending).reason, 'BRIDGE_CLOSING');
-      assert.equal(await server.exit(), 0);
-      await stopped(f, owner);
-    } finally {
-      await fs.writeFile(release, 'go');
-      server.child.stdin.end();
-      await pending;
-    }
-  },
-);

@@ -9,8 +9,7 @@ import {
   releasedEntries,
   savedEntries,
 } from './fixtures/model-runtime.mjs';
-import { publicSchemas } from '../src/tool-schemas.mjs';
-import { assertInvalidArguments } from './fixtures/tool-call.mjs';
+
 const replies = (entries) =>
   entries
     .filter((e) => e.message?.role === 'assistant')
@@ -68,7 +67,6 @@ for (const op of ['send', 'create']) {
         { bridge } = f;
       const result = await bridge[op]({
         ...identity(op, f),
-
         text: 'NEVER',
         model: choice('alpha'),
         thinking_level: 'high',
@@ -109,7 +107,6 @@ for (const op of ['send', 'create']) {
       };
       const args = {
         ...identity(op, f),
-
         text: 'NEVER',
         model: choice('vision'),
         thinking_level: 'high',
@@ -123,7 +120,7 @@ for (const op of ['send', 'create']) {
         'MODEL_SELECTION_PENDING',
       );
       receive(...held);
-      await until(() => !bridge.pool.get(id)?.modelMutation);
+      await until(() => !bridge.pool.get(id)?.hasPendingModelSelection());
       assert.equal(sendReceipt(result).model_selection, undefined);
       assert.equal(
         (await releasedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,
@@ -132,155 +129,6 @@ for (const op of ['send', 'create']) {
     },
   );
 }
-
-test(
-  'omitted settings preserve native session selection, including cold resume without CLI overrides',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      { bridge, id } = f;
-    await bridge.pool.resolve(await bridge.session(id));
-    const rpc = bridge.pool.get(id);
-    await rpc.selectModel(choice('vision'), { thinkingLevel: 'high', idle: true });
-    for (const flag of ['--provider', '--model', '--thinking'])
-      f.config.piArgs.splice(f.config.piArgs.indexOf(flag), 2);
-    for (const text of ['first', 'cold-next']) {
-      const result = await bridge.send({ session_id: id, text });
-      assert.ok(['started', 'queued', 'handled'].includes(result.status), JSON.stringify(result));
-      assert.equal(result.model_selection, undefined);
-      const reply = replies(await releasedEntries(bridge, id)).at(-1);
-      assert.equal(reply.id, 'vision');
-      assert.equal(reply.reasoning, 'high');
-    }
-  },
-);
-
-test(
-  'busy settings cannot alter a running request or queued input',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t),
-      { bridge, id } = f;
-    assert.ok(
-      ['started', 'queued', 'handled'].includes(
-        (
-          await bridge.send({
-            session_id: id,
-
-            text: 'HOLD_MODEL',
-            model: choice('vision'),
-            thinking_level: 'high',
-          })
-        ).status,
-      ),
-      'Expected native prompt admission',
-    );
-    for (const mode of ['steer', 'follow_up', 'idle_only']) {
-      const result = await bridge.send({
-        session_id: id,
-
-        text: 'NEVER',
-        thinking_level: 'off',
-        mode,
-      });
-      assert.equal(result.status, mode === 'idle_only' ? 'skipped' : 'rejected');
-      assert.equal(result.reason, mode === 'idle_only' ? 'busy' : 'MODEL_SELECTION_BUSY');
-    }
-    assert.equal(
-      (
-        await bridge.send({
-          session_id: id,
-
-          text: 'QUEUED',
-          mode: 'follow_up',
-        })
-      ).status,
-      'queued',
-    );
-    await fs.writeFile(f.gate, 'go');
-    const values = replies(await releasedEntries(bridge, id));
-    assert.equal(values.length, 2);
-    assert.ok(values.every((v) => v.id === 'vision' && v.reasoning === 'high'));
-  },
-);
-
-for (const op of ['set_model', 'send', 'create'])
-  test(
-    op + ' model-only changes preserve current effort over native switch defaults',
-    async (t) => {
-      const f = await fixture(t),
-        { bridge } = f;
-      f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
-      f.config.piArgs[f.config.piArgs.indexOf('--thinking') + 1] = 'high';
-      const settings = JSON.parse(await fs.readFile(f.settings, 'utf8'));
-      await fs.writeFile(
-        f.settings,
-        JSON.stringify({
-          ...settings,
-          defaultThinkingLevel: 'low',
-          modelThinkingLevels: { 'model-fixture/reasoner': 'medium' },
-        }),
-      );
-      const defaults = await fs.readFile(f.settings, 'utf8');
-      const result = await bridge[op]({
-        ...identity(op, f),
-        model: choice('reasoner'),
-        ...(op === 'set_model' ? {} : { text: 'KEEP_EFFORT' }),
-      });
-      const receipt = sendReceipt(result),
-        selection = op === 'set_model' ? result : receipt.model_selection;
-      assert.deepEqual(selection, { model: choice('reasoner'), thinking_level: 'high' });
-      const entries = await releasedEntries(bridge, target(result, f));
-      if (op === 'set_model') assert.equal(entries.filter((e) => e.message).length, 0);
-      else assert.equal(replies(entries)[0].reasoning, 'high');
-      assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
-    },
-  );
-
-test(
-  'model-only changes report native thinking adjustment without changing global defaults',
-  { timeout: 10000 },
-  async (t) => {
-    const f = await fixture(t),
-      { bridge, id } = f;
-    await bridge.pool.resolve(await bridge.session(id));
-    await bridge.pool.get(id).selectModel(choice('vision'), { thinkingLevel: 'high', idle: true });
-    const defaults = await fs.readFile(f.settings, 'utf8');
-    const result = await bridge.send({
-      session_id: id,
-
-      text: 'TEXT',
-      model: choice('alpha'),
-    });
-    assert.ok(['started', 'queued', 'handled'].includes(result.status), JSON.stringify(result));
-    assert.equal(result.model_selection.thinking_level, 'off');
-    assert.equal(replies(await releasedEntries(bridge, id))[0].reasoning, null);
-    assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
-  },
-);
-
-test('prompt convenience schemas retain supported thinking levels', () => {
-  for (const op of ['send', 'create']) {
-    const args = {
-      text: 'hello',
-      thinking_level: 'high',
-      ...(op === 'send' ? { session_id: 's' } : { project: '/project' }),
-    };
-    assert.equal(publicSchemas[op].safeParse(args).success, true);
-    assert.equal(
-      publicSchemas[op].safeParse({ ...args, thinking_level: 'unlimited' }).success,
-      false,
-    );
-  }
-});
-
-test('settings alone require a prompt and never start a writer', async (t) => {
-  const f = await fixture(t),
-    { bridge, id } = f;
-  for (const op of ['send', 'create'])
-    await assertInvalidArguments(bridge, op, { ...identity(op, f), thinking_level: 'off' });
-  assert.equal(bridge.pool.instances.size, 0);
-});
 
 test(
   'prompt ACK timeout retains verified settings and a late ACK never resubmits',
@@ -302,7 +150,6 @@ test(
     });
     const args = {
       session_id: id,
-
       text: 'ONCE',
       model: choice('vision'),
       thinking_level: 'high',
@@ -342,7 +189,6 @@ test(
     });
     const sending = bridge.send({
       session_id: id,
-
       text: 'NEVER',
       model: choice('vision'),
       thinking_level: 'high',

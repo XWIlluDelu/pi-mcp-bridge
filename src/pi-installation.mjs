@@ -143,9 +143,9 @@ export async function piDependencyEntry(installation, name, subpath = '.') {
     value = await manifest(root);
   return packageEntry(root, importEntry(value.exports?.[subpath]));
 }
-export async function loadPiAi(installation, subpath = './compat') {
+export async function loadPiAi(installation) {
   return import(
-    pathToFileURL(await piDependencyEntry(installation, '@earendil-works/pi-ai', subpath)).href
+    pathToFileURL(await piDependencyEntry(installation, '@earendil-works/pi-ai', './models')).href
   );
 }
 export async function nativeSdk(config = {}, env = process.env, cwd = process.cwd()) {

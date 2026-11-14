@@ -186,7 +186,7 @@ test(
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(f.requests.length, 0);
     assert.equal(rpc.pending.size, 0);
-    assert.equal(rpc.compactionMutation, null);
+    assert.equal(rpc.hasPendingCommand('compact'), false);
   },
 );
 
@@ -207,12 +207,12 @@ test('owned compact keeps its control connection and fence for a matching late r
   assert.equal(f.requests.length, 1);
   assert.equal(f.requests[0].version, packageInfo.version);
   assert.equal(rpc.pending.size, 1);
-  assert.ok(rpc.compactionMutation);
+  assert.ok(rpc.hasPendingCommand('compact'));
   await rpc.drainAcks(); // Missing replies are not received ACK tasks.
   response.resolve({ data: compacted });
   assert.deepEqual(await late.promise, { ok: true, data: compacted });
   assert.equal(rpc.pending.size, 0);
-  assert.equal(rpc.compactionMutation, null);
+  assert.equal(rpc.hasPendingCommand('compact'), false);
   assert.equal(f.requests.length, 1);
 });
 
@@ -245,7 +245,7 @@ test('owned compact rechecks Stop synchronously at the socket write boundary', a
   assert.equal(stopped, true);
   assert.equal(f.requests.length, 0);
   assert.equal(rpc.pending.size, 0);
-  assert.equal(rpc.compactionMutation, null);
+  assert.equal(rpc.hasPendingCommand('compact'), false);
 });
 
 test('owned compact validates reply identity and metadata before releasing its fence', async (t) => {
@@ -261,11 +261,11 @@ test('owned compact validates reply identity and metadata before releasing its f
     f.respond(() => result);
     await assert.rejects(rpc.dispatch(idleCompact), { uncertain: true });
     assert.equal(rpc.pending.size, 1);
-    assert.ok(rpc.compactionMutation);
+    assert.ok(rpc.hasPendingCommand('compact'));
   }
   const rpc = ownedRpc(f);
   f.respond(() => ({ error: 'COMPACT_BUSY' }));
   await assert.rejects(rpc.dispatch(idleCompact), { code: 'COMPACT_BUSY', uncertain: false });
   assert.equal(rpc.pending.size, 0);
-  assert.equal(rpc.compactionMutation, null);
+  assert.equal(rpc.hasPendingCommand('compact'), false);
 });

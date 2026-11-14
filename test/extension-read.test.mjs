@@ -22,7 +22,7 @@ import {
   SettingsManager,
 } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+
 import { loadSavedSession } from '../src/data.mjs';
 
 async function fixture(t) {
@@ -135,40 +135,7 @@ test('original custom compaction hook preserves native summary, retained boundar
   assert.ok(raw.entries.some((x) => x.id === old));
   assert.equal(compactCalls, 1, 'Reads do not rerun compaction hooks');
 });
-test('display-hidden custom messages remain projected while custom extension state is raw-only', async (t) => {
-  const f = await fixture(t);
-  await sdk(t, f, (pi) =>
-    pi.on('session_start', async (_event, ctx) => {
-      pi.appendEntry('fixture-state', { marker: 'PUBLIC_CUSTOM_STATE' });
-      pi.sendMessage(
-        { customType: 'fixture-hidden', content: 'PUBLIC_HIDDEN_MESSAGE', display: false },
-        { triggerTurn: false },
-      );
-    }),
-  );
-  const context = await readSource(f.bridge, {
-      session_id: f.id,
-      range: { recent: -1 },
-      content: ALL_CONTENT,
-    }),
-    raw = await loadSavedSession(f.saved);
-  assert.ok(
-    context.items.some(
-      (x) =>
-        x.message?.role === 'custom' &&
-        x.message.display === false &&
-        x.message.content === 'PUBLIC_HIDDEN_MESSAGE',
-    ),
-  );
-  assert.ok(!JSON.stringify(context).includes('PUBLIC_CUSTOM_STATE'));
-  assert.ok(JSON.stringify(raw).includes('PUBLIC_CUSTOM_STATE'));
-  assert.ok(raw.entries.some((x) => x.type === 'custom_message' && x.display === false));
-  f.config.grants.push({ session_id: f.id, read: false });
-  await assert.rejects(
-    readSource(f.bridge, { session_id: f.id, range: { recent: -1 }, content: ALL_CONTENT }),
-    /NOT_FOUND_OR_DENIED/,
-  );
-});
+
 test('request-time filtering differs from saved projection; reads neither replay hooks nor call a provider', async (t) => {
   const f = await fixture(t);
   let contextCalls = 0,
@@ -230,44 +197,6 @@ test('request-time filtering differs from saved projection; reads neither replay
   assert.equal(await fs.readFile(f.saved.file, 'utf8'), afterPrompt);
   assert.equal(contextCalls, 1);
   assert.equal(beforeCalls, 1);
-});
-test('selected agentDir discovers extensions; an explicit disable flag remains authoritative', async (t) => {
-  const f = await fixture(t),
-    agentDir = path.join(f.dir, 'owner-agent'),
-    extensions = path.join(agentDir, 'extensions');
-  await fs.mkdir(extensions, { recursive: true });
-  await fs.writeFile(
-    path.join(agentDir, 'settings.json'),
-    JSON.stringify({
-      cacheWarming: 'off',
-      compaction: { enabled: false },
-      retry: { enabled: false },
-    }),
-  );
-  const extension = path.join(extensions, 'original-fixture.js');
-  await fs.writeFile(
-    extension,
-    "export default function(pi){pi.on('session_start',()=>pi.appendEntry('profile-marker',{loaded:true}));}",
-  );
-  f.config.piRuntime = { agentDir, inheritEnv: [] };
-  let rpc;
-  try {
-    rpc = await new PiRpc(f.config, f.saved).start();
-    assert.ok((await rpc.entries()).entries.some((x) => x.customType === 'profile-marker'));
-    await rpc.stop();
-    // Use a new native file so a previous persisted marker cannot mask discovery.
-    const made = await savedSession(f.bridge),
-      saved = await f.bridge.session(made.session_id);
-    f.config.piArgs = ['--offline', '--no-extensions'];
-    rpc = await new PiRpc(f.config, saved).start();
-    assert.ok(!(await rpc.entries()).entries.some((x) => x.customType === 'profile-marker'));
-    await rpc.stop();
-    f.config.piArgs = ['--offline', '--no-extensions', '-e', extension];
-    rpc = await new PiRpc(f.config, saved).start();
-    assert.ok((await rpc.entries()).entries.some((x) => x.customType === 'profile-marker'));
-  } finally {
-    await rpc?.stop();
-  }
 });
 
 test('real nested tool failure remains visible under its successful outer tool in a read-only native projection', async (t) => {

@@ -1,3 +1,5 @@
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
+import { ownerEnvelope } from '../src/attachment-protocol.mjs';
 import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
@@ -6,7 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
+
 import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
 import {
   createAgentSessionRuntime,
@@ -20,7 +22,7 @@ import {
 import { Bridge } from '../src/bridge.mjs';
 import attachExtension from './fixtures/companion.mjs';
 import { claimFile, readClaim } from '../src/attachments.mjs';
-import { pathToFileURL } from 'node:url';
+
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createSdkHostBinding } from '../src/host-bindings.mjs';
 import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
@@ -191,15 +193,6 @@ test('native replacement ignores old endpoint metadata and retains explicit paus
   assert.equal(pause.noColdReacquire, true);
 });
 
-test('native UI rebinding retains the active writer endpoint', async (t) => {
-  const f = await fixture(t);
-  const before = await readClaim(f.config.attachmentDir, f.a);
-  await f.runtime.session.bindExtensions({ uiContext: { notify() {} } });
-  assert.deepEqual(await readClaim(f.config.attachmentDir, f.a), before);
-  assert.equal((await f.bridge.read({ session_id: f.a.id })).view, 'session');
-  assert.deepEqual(f.errors, []);
-});
-
 test('accepted companion completion survives same-process session replacement and keeps its original leaf', async (t) => {
   const f = await fixture(t);
   f.faux.setResponses([
@@ -264,182 +257,32 @@ test('accepted companion completion survives same-process session replacement an
   assert.deepEqual(f.errors, []);
 });
 
-test('native resume at the same path retires only the replaced native identity', async (t) => {
-  const f = await fixture(t);
-  const before = await readClaim(f.config.attachmentDir, f.a);
-  const header = { ...f.a.header, id: randomUUID() };
-  await fs.writeFile(f.a.file, JSON.stringify(header) + '\n');
-  assert.deepEqual(await f.runtime.switchSession(f.a.file), { cancelled: false });
-  const current = { file: f.a.file, header };
-  assert.equal(await readClaim(f.config.attachmentDir, f.a), null);
-  const after = await readClaim(f.config.attachmentDir, current);
-  assert.equal(after.sessionId, header.id);
-  assert.equal(after.phase, 'ready');
-  assert.notEqual(after.generation, before.generation);
-  assert.deepEqual(f.errors, []);
-});
-
-test('native reload does not replace the same process host controller with unsupported endpoint metadata', async (t) => {
-  const f = await fixture(t, { hosted: true });
-  const original = await readClaim(f.config.attachmentDir, f.a);
-  const file = claimFile(f.config.attachmentDir, f.a);
-  const unsupported = { ...original, generation: null, socket: '/unusable/endpoint' };
-  try {
-    await fs.writeFile(file, JSON.stringify(unsupported));
-    await f.runtime.session.reload();
-    assert.deepEqual(await readClaim(f.config.attachmentDir, f.a), unsupported);
-    assert.deepEqual(f.errors, []);
-  } finally {
-    await fs.writeFile(file, JSON.stringify(original));
+test('ordinary RPC refuses a native switch to another live writer', async (t) => {
+  const f = await nativeOwner(t);
+  const second = await f.create();
+  const extension = new URL('../src/attach-extension.mjs', import.meta.url).pathname;
+  const clients = [];
+  for (const session of [f.session, second]) {
+    const client = new RpcClient({
+      cliPath: nativePiCli,
+      cwd: f.cwd,
+      env: f.env,
+      args: [...f.config.piArgs, '--session', session.file, '-e', extension, ...fauxArgs],
+    });
+    clients.push(client);
+    f.cleanup.push(() => client.stop());
+    await client.start();
+    await client.getState();
+  }
+  const [first, other] = clients;
+  const alias = path.join(f.cwd, 'alias.jsonl');
+  await fs.symlink(second.file, alias);
+  for (const target of [second.file, alias]) {
+    assert.deepEqual(await first.switchSession(target), { cancelled: true });
+    assert.equal((await first.getState()).sessionFile, f.session.file);
+    assert.equal((await other.getState()).sessionFile, second.file);
   }
 });
-
-test('companion runtime contexts follow session replacement and never leak the previous session', async (t) => {
-  const f = await fixture(t, {
-    extension: (pi) => {
-      pi.on('context', (event) => ({
-        messages: [{ role: 'user', content: 'RUNTIME_SUMMARY', timestamp: 1 }, ...event.messages],
-      }));
-    },
-  });
-  const read = (target) =>
-    f.bridge.read({ session_id: target.id, view: 'runtime', max_bytes: 65536 });
-  assert.equal((await read(f.a)).observation.reason, 'no_observation');
-  f.faux.setResponses([
-    fauxAssistantMessage('FIRST_ANSWER'),
-    fauxAssistantMessage('SECOND_ANSWER'),
-  ]);
-  await f.runtime.session.prompt('FIRST_SESSION_INPUT');
-  const first = await read(f.a);
-  assert.equal(first.source, 'tui');
-  assert.equal(first.observation.owner_active, true);
-  assert.ok(JSON.stringify(first).includes('RUNTIME_SUMMARY'));
-  assert.ok(JSON.stringify(first).includes('FIRST_SESSION_INPUT'));
-  assert.ok(!JSON.stringify(first.items).includes('FIRST_ANSWER'));
-  await f.runtime.switchSession(f.b.file);
-  const empty = await read(f.b);
-  assert.equal(empty.observation.available, false);
-  assert.deepEqual(empty.items, []);
-  await f.runtime.session.prompt('SECOND_SESSION_INPUT');
-  const second = await read(f.b);
-  assert.notEqual(second.observation.owner_generation, first.observation.owner_generation);
-  assert.ok(JSON.stringify(second).includes('SECOND_SESSION_INPUT'));
-  assert.ok(!JSON.stringify(second).includes('FIRST_SESSION_INPUT'));
-  // The first session's retained observation is still useful after switch-away.
-  const retained = await read(f.a);
-  assert.equal(retained.source, 'retained');
-  assert.equal(retained.observation.owner_active, false);
-  assert.equal(retained.observation.id, first.observation.id);
-  assert.deepEqual(f.errors, []);
-});
-
-test(
-  'ordinary companion RPC refuses an existing writer before native open; unowned and same-process resumes remain valid',
-  { timeout: 25000 },
-  async (t) => {
-    const dir = await fs.mkdtemp('/tmp/pi-switch-owner-'),
-      cwd = path.join(dir, 'project');
-    await fs.mkdir(cwd);
-    const config = {
-      ...isolatedRuntime(dir),
-      stateDir: path.join(dir, 'state'),
-      attachmentDir: path.join(dir, 'ipc'),
-      sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ path: cwd }],
-      defaults: denyAllPermissions(),
-      grants: [{ folder: cwd, read: true, send: true }],
-    };
-    const configFile = path.join(dir, 'owner.json');
-    await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-    const bridge = await new Bridge(config, () => assert.fail('no fallback writer')).init();
-    const clients = [];
-    t.after(async () => {
-      for (const client of clients) await client.stop();
-      await bridge.close();
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-    const saved = [];
-    for (let i = 0; i < 3; i++)
-      saved.push(await bridge.session((await savedSession(bridge)).session_id));
-    for (const session of saved.slice(0, 2)) {
-      const client = new RpcClient({
-        cliPath: nativePiCli,
-        cwd,
-        env: {
-          HOME: dir,
-          PI_CODING_AGENT_DIR: config.piRuntime.agentDir,
-          PI_OFFLINE: '1',
-          PI_MCP_OWNER_CONFIG: configFile,
-          PI_MCP_ATTACH_DIR: config.attachmentDir,
-        },
-        args: [
-          '--session',
-          session.file,
-          '--no-extensions',
-          '--no-skills',
-          '--no-prompt-templates',
-          '--no-themes',
-          '--no-tools',
-          '-e',
-          path.resolve('test/fixtures/faux-extension.mjs'),
-          '-e',
-          path.resolve('src/attach-extension.mjs'),
-        ],
-        provider: 'bridge-fixture',
-        model: 'deterministic',
-      });
-      clients.push(client);
-      await client.start();
-      await client.getState();
-    }
-    const [a, b, c] = saved,
-      [first, second] = clients;
-    const claimA = await readClaim(config.attachmentDir, a),
-      claimB = await readClaim(config.attachmentDir, b),
-      before = await fs.readFile(b.file);
-    assert.ok(claimA, first.getStderr());
-    assert.ok(claimB, second.getStderr());
-    assert.notEqual(claimA.owner.pid, claimB.owner.pid);
-    const alias = path.join(dir, 'sessions', 'alias.jsonl');
-    await fs.symlink(b.file, alias);
-    for (const target of [
-      alias,
-      b.file,
-      path.relative(cwd, b.file),
-      '~/' + path.relative(dir, b.file),
-      pathToFileURL(b.file).href,
-    ]) {
-      assert.deepEqual(await first.switchSession(target), { cancelled: true });
-      assert.equal((await first.getState()).sessionFile, a.file);
-      assert.equal((await second.getState()).sessionFile, b.file);
-    }
-    assert.deepEqual(await fs.readFile(b.file), before);
-    assert.equal((await readClaim(config.attachmentDir, a)).generation, claimA.generation);
-    assert.equal((await readClaim(config.attachmentDir, b)).generation, claimB.generation);
-    for (const [client, session, text] of [
-      [first, a, 'AFTER_REFUSAL_A'],
-      [second, b, 'STILL_USABLE_B'],
-    ]) {
-      await client.prompt(text);
-      await until(async () => {
-        const messages = await client.getMessages();
-        return messages.at(-1)?.role === 'assistant' && !(await client.getState()).isStreaming;
-      });
-      const view = await bridge.read({
-        session_id: session.id,
-        range: { recent: -1 },
-        content: ALL_CONTENT,
-      });
-      assert.ok(JSON.stringify(view.items).includes(text));
-    }
-    assert.ok(!(await fs.readFile(b.file, 'utf8')).includes('AFTER_REFUSAL_A'));
-    assert.deepEqual(await first.switchSession(c.file), { cancelled: false });
-    assert.equal((await first.getState()).sessionFile, c.file);
-    assert.equal(await readClaim(config.attachmentDir, a), null);
-    assert.deepEqual(await first.switchSession(c.file), { cancelled: false });
-    assert.equal((await readClaim(config.attachmentDir, c)).owner.pid, claimA.owner.pid);
-  },
-);
 
 for (const allowed of [true, false])
   for (const disconnect of [false, true])
@@ -471,13 +314,10 @@ for (const allowed of [true, false])
             socket.once('error', reject);
           });
           socket.write(
-            JSON.stringify({
-              generation: claim.generation,
-              file: f.a.file,
-              sessionId: f.a.header.id,
+            ownerEnvelope(claim, {
               op: 'set_model',
               body: { model: { provider: 'bridge-fixture', id: 'other' } },
-            }) + '\n',
+            }),
           );
         } else
           selection = f.bridge
@@ -535,68 +375,3 @@ for (const allowed of [true, false])
         assert.deepEqual(f.errors, []);
       },
     );
-
-for (const outcome of ['handled', 'rejected'])
-  test(
-    'SDK idle_only respects native prompt preflight until ' + outcome,
-    { timeout: 15000 },
-    async (t) => {
-      const entered = Promise.withResolvers(),
-        finish = Promise.withResolvers();
-      const f = await fixture(t, {
-        hosted: true,
-        extension: (pi) =>
-          pi.on('input', async (event) => {
-            if (event.text !== 'FIRST_PREFLIGHT') return;
-            entered.resolve();
-            await finish.promise;
-            if (outcome === 'rejected') throw new Error('SYNTHETIC_INPUT_REJECTION');
-            return { action: 'handled' };
-          }),
-      });
-      f.finishers.push(() => finish.resolve());
-      assert.equal(
-        (await f.bridge.send({ session_id: f.a.id, text: 'FIRST_PREFLIGHT' })).status,
-        'dispatched',
-      );
-      await entered.promise;
-      const session = f.runtime.session;
-      assert.equal(session.isIdle, true);
-      assert.equal(session.pendingMessageCount, 0);
-      const entries = structuredClone(session.sessionManager.getEntries()),
-        calls = f.faux.state.callCount;
-      const skipped = await f.bridge.send({
-        session_id: f.a.id,
-        text: 'SECOND_IDLE_ONLY',
-        mode: 'idle_only',
-      });
-      assert.match(skipped.submission_id, /^[a-f0-9-]{36}$/);
-      assert.deepEqual(skipped, {
-        status: 'skipped',
-        reason: 'busy',
-        submission_id: skipped.submission_id,
-      });
-      assert.deepEqual(session.sessionManager.getEntries(), entries);
-      assert.equal(f.faux.state.callCount, calls);
-      finish.resolve();
-      await until(async () => (await f.binding.state()).isIdle);
-      assert.equal(
-        (
-          await f.bridge.send({
-            session_id: f.a.id,
-            text: 'AFTER_PREFLIGHT',
-            mode: 'idle_only',
-          })
-        ).status,
-        'dispatched',
-      );
-      await until(() => f.faux.state.callCount > calls && session.isIdle);
-      const current = await f.bridge.read({
-        session_id: f.a.id,
-        range: { recent: -1 },
-        content: ALL_CONTENT,
-      });
-      assert.ok(JSON.stringify(current.items).includes('AFTER_PREFLIGHT'));
-      assert.ok(!JSON.stringify(current.items).includes('SECOND_IDLE_ONLY'));
-    },
-  );

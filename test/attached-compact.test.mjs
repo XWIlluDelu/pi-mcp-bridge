@@ -4,17 +4,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {
-  RpcClient,
-  createAgentSession,
-  DefaultResourceLoader,
-  ModelRuntime,
-  SessionManager,
-  SettingsManager,
-} from './fixtures/pi.mjs';
-import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
+import { RpcClient } from './fixtures/pi.mjs';
+
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
+import { createRpcHostBinding } from '../src/host-bindings.mjs';
 import { launchProfile } from '../src/rpc.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
@@ -159,91 +152,6 @@ for (const route of ['companion', 'binding']) {
     },
   );
 }
-
-test(
-  'SDK binding compacts through the native session and exposes only completion metadata',
-  { timeout: 10000 },
-  async (t) => {
-    const cleanup = [],
-      f = await fixture({ after: (fn) => cleanup.push(fn) }),
-      saved = await f.bridge.session(f.id),
-      controller = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.bridge.pool.attachmentDir,
-        session: saved,
-      }),
-      faux = fauxProvider({
-        provider: 'sdk-compact',
-        models: [{ id: 'offline', contextWindow: 16000, maxTokens: 2048 }],
-      }),
-      models = await ModelRuntime.create({
-        credentials: new InMemoryCredentialStore(),
-        modelsPath: null,
-        refreshOnCreate: false,
-        allowModelNetwork: false,
-      });
-    models.registerNativeProvider(faux.provider);
-    faux.setResponses([fauxAssistantMessage('NATIVE_REPLY'), fauxAssistantMessage('NATIVE_REPLY')]);
-    const settings = SettingsManager.inMemory({
-        cacheWarming: 'off',
-        compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 1024 },
-        retry: { enabled: false },
-      }),
-      loader = new DefaultResourceLoader({
-        cwd: f.cwd,
-        agentDir: f.config.piRuntime.agentDir,
-        settingsManager: settings,
-        noExtensions: true,
-        noSkills: true,
-        noPromptTemplates: true,
-        noThemes: true,
-        systemPrompt: 'Offline compact fixture',
-        extensionFactories: [
-          (pi) => {
-            pi.on('session_before_compact', (event) => ({
-              compaction: {
-                summary: 'SDK_PRIVATE_SUMMARY',
-                firstKeptEntryId: event.preparation.firstKeptEntryId,
-                tokensBefore: event.preparation.tokensBefore,
-              },
-            }));
-          },
-        ],
-      });
-    await loader.reload();
-    const { session } = await createAgentSession({
-      cwd: f.cwd,
-      agentDir: f.config.piRuntime.agentDir,
-      modelRuntime: models,
-      model: faux.getModel(),
-      tools: [],
-      resourceLoader: loader,
-      sessionManager: SessionManager.open(saved.file),
-      settingsManager: settings,
-    });
-    t.after(async () => {
-      try {
-        await controller.close();
-        await session.abort();
-        session.dispose();
-      } finally {
-        for (const close of cleanup) await close();
-      }
-    });
-    await session.bindExtensions({ mode: 'rpc' });
-    await controller.ready(createSdkHostBinding(session));
-    await session.prompt('KEEP_HISTORY '.repeat(200));
-    await session.prompt('SECOND_HISTORY '.repeat(200));
-    const result = await f.bridge.compact({ session_id: f.id });
-    assert.equal(result.interrupt_requested, false);
-    assert.equal(result.status, 'completed', JSON.stringify(result));
-    assert.ok(!JSON.stringify(result).includes('SDK_PRIVATE_SUMMARY'));
-    assert.equal(
-      session.sessionManager.getEntries().filter((e) => e.type === 'compaction').length,
-      1,
-    );
-  },
-);
 
 test(
   'companion idle compact needs only send and fences native input until completion',

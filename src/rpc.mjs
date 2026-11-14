@@ -10,6 +10,12 @@ import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { RetainedObservations } from './context-observation.mjs';
 import { sameModel, assertThinkingLevel } from './models.mjs';
+import {
+  assertPromptSelection,
+  hasPromptSettings,
+  promptOptions,
+  promptResult,
+} from './prompt-input.mjs';
 import { modelSettings } from './set-model.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +44,13 @@ const READ_COMMANDS = new Set([
   'get_available_models',
   'get_available_thinking_levels',
 ]);
+const MODEL_COMMANDS = new Set(['set_model', 'set_thinking_level']);
+const ADMISSION_COMMANDS = new Set(['prompt', 'compact', ...MODEL_COMMANDS]);
+function registryPath({ attachmentDir, stateDir }) {
+  if (attachmentDir === undefined && typeof stateDir !== 'string')
+    throw new RpcFailure('INVALID_OWNER_CONFIG');
+  return attachmentDir ?? path.join(stateDir, 'ipc');
+}
 export class RpcFailure extends Error {
   constructor(code, uncertain = false) {
     super(code);
@@ -82,9 +95,6 @@ export class PiRpc {
     this.exited = false;
     this.generation = randomUUID();
     this.runtimeEvents = new RuntimeEvents(this.generation);
-    this.promptAdmission = null;
-    this.modelMutation = null;
-    this.compactionMutation = null;
     this.exitSeal = null;
     this.settlementSequence = 0;
     this.requiredSettlementSequence = 0;
@@ -101,6 +111,8 @@ export class PiRpc {
     signal?.throwIfAborted();
     validateLaunchArgs(this.config.piArgs);
     await assertSingleSessionFile(this.session.file);
+    const attachmentDir = registryPath(this.config);
+    this.config = { ...this.config, attachmentDir };
     const { env: baseEnv, toolArgs } = launchProfile(this.config);
     if (this.config.piRuntime?.agentDir)
       await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
@@ -108,23 +120,21 @@ export class PiRpc {
     const env = await piLaunchEnvironment(executable, baseEnv, this.session.cwd);
     signal?.throwIfAborted();
     try {
-      if (this.config.attachmentDir) {
-        this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
-        await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
-          socket: path.join(
-            this.config.attachmentDir,
-            `${process.pid}-${this.ownerRecord.generation.slice(0, 8)}.sock`,
-          ),
-        });
-        // An installed daily companion must use this writer's actual registry,
-        // not an unrelated default owner profile, then defer to the RPC claim.
-        env.PI_MCP_ATTACH_DIR = this.config.attachmentDir;
-        env.PI_MCP_RPC_OBSERVER = JSON.stringify({
-          socket: this.ownerRecord.socket,
-          generation: this.ownerRecord.generation,
-          ownerControl: this.completionControl,
-        });
-      }
+      this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
+      await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
+        socket: path.join(
+          this.config.attachmentDir,
+          `${process.pid}-${this.ownerRecord.generation.slice(0, 8)}.sock`,
+        ),
+      });
+      // An installed daily companion must use this writer's actual registry,
+      // not an unrelated default owner profile, then defer to the RPC claim.
+      env.PI_MCP_ATTACH_DIR = this.config.attachmentDir;
+      env.PI_MCP_RPC_OBSERVER = JSON.stringify({
+        socket: this.ownerRecord.socket,
+        generation: this.ownerRecord.generation,
+        ownerControl: this.completionControl,
+      });
       // Recheck at the actual launch boundary: content preflight and owner
       // reservation may have taken time since discovery verified this path.
       await validateExecutionCwd(this.session.cwd);
@@ -132,9 +142,8 @@ export class PiRpc {
       const launch = {
         command: executable.command,
         args: [
-          ...(this.ownerRecord
-            ? ['-e', fileURLToPath(new URL('./rpc-observer.mjs', import.meta.url))]
-            : []),
+          '-e',
+          fileURLToPath(new URL('./rpc-observer.mjs', import.meta.url)),
           '--mode',
           'rpc',
           '--session',
@@ -171,17 +180,7 @@ export class PiRpc {
     this.child.stderr.resume(); // Drain diagnostics without retaining provider output.
     const fail = () => {
       this.alive = false;
-      for (const req of this.pending.values()) {
-        clearTimeout(req.timer);
-        req.controller?.abort();
-        req.reject(
-          Object.assign(
-            new RpcFailure(this.startFailure?.code ?? 'RUNTIME_DISCONNECTED', req.written),
-            uiSnapshot(req.uiFacts),
-          ),
-        );
-      }
-      this.pending.clear();
+      this.clearPending();
     };
     this.child.once('error', () => {
       if (!this.child.pid && !this.child.ready) this.exited = true;
@@ -190,7 +189,6 @@ export class PiRpc {
     this.child.once('exit', () => {
       runtimeLog('runtime.exited', { kind: 'rpc', generation: this.generation });
       this.exited = true;
-      this.promptAdmission = null;
       fail();
     });
     this.child.stdin.on('error', fail);
@@ -207,16 +205,14 @@ export class PiRpc {
     try {
       await this.child.ready;
       this.childIdentity = await processIdentity(this.child.pid);
-      if (this.ownerRecord) {
-        const owner = this.childIdentity;
-        if (!owner) throw new RpcFailure('RUNTIME_START_FAILED');
-        await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
-          owner,
-          phase: 'ready',
-          bridgeVersion: packageInfo.version,
-          readContract: READ_CONTRACT,
-        });
-      }
+      const owner = this.childIdentity;
+      if (!owner) throw new RpcFailure('RUNTIME_START_FAILED');
+      await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
+        owner,
+        phase: 'ready',
+        bridgeVersion: packageInfo.version,
+        readContract: READ_CONTRACT,
+      });
       // Launch identity is now usable even if native readiness or its failure
       // cleanup never finishes. Delete need not wait for the ready promise.
       this.launchSettled.resolve();
@@ -236,6 +232,19 @@ export class PiRpc {
         new RpcFailure(error.message?.startsWith('HERDR_') ? error.message : 'RUNTIME_START_FAILED')
       );
     }
+  }
+  clearPending() {
+    for (const request of this.pending.values()) {
+      clearTimeout(request.timer);
+      request.controller?.abort();
+      request.reject(
+        Object.assign(
+          new RpcFailure(this.startFailure?.code ?? 'RUNTIME_DISCONNECTED', request.written),
+          uiSnapshot(request.uiFacts),
+        ),
+      );
+    }
+    this.pending.clear();
   }
   receiveResponse(event, generation) {
     if (generation !== this.generation || !event) return;
@@ -345,12 +354,6 @@ export class PiRpc {
         this.requiredSettlementSequence,
         (req.settlementSequence ?? this.settlementSequence) + 1,
       );
-    if (this.compactionMutation?.id === id && this.compactionMutation.generation === generation)
-      this.compactionMutation = null;
-    if (this.modelMutation?.id === id && this.modelMutation.generation === generation)
-      this.modelMutation = null;
-    if (this.promptAdmission?.id === id && this.promptAdmission.generation === generation)
-      this.promptAdmission = null;
     const notifyIdle = () => {
       if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
     };
@@ -402,11 +405,11 @@ export class PiRpc {
     if (command.type === 'get_state') return this.state(timeout);
     await this.state();
     const late =
-      onLate &&
+      (ADMISSION_COMMANDS.has(command.type) || onLate) &&
       (async (result) => {
         const state = await this.dispatch({ type: 'get_state' });
         this.assertSessionIdentity(state);
-        await onLate(result);
+        await onLate?.(result);
       });
     await beforeDispatch?.();
     let result, rejection;
@@ -419,8 +422,7 @@ export class PiRpc {
     try {
       await this.state();
     } catch (error) {
-      if (['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type))
-        error.uncertain = true;
+      if (ADMISSION_COMMANDS.has(command.type)) error.uncertain = true;
       const observedUI = result?.ui ?? rejection?.ui;
       if (observedUI && !error.ui) error.ui = observedUI;
       throw error;
@@ -444,17 +446,14 @@ export class PiRpc {
       return Promise.reject(new RpcFailure('HANDOFF_PENDING'));
     if (this.gracefulExitPromise) return Promise.reject(new RpcFailure('RUNTIME_SHUTTING_DOWN'));
     if (
-      ['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type) &&
-      this.compactionMutation &&
-      !(allowBusySelection && ['set_model', 'set_thinking_level'].includes(command.type))
+      ADMISSION_COMMANDS.has(command.type) &&
+      this.hasPendingCommand('compact') &&
+      !(allowBusySelection && MODEL_COMMANDS.has(command.type))
     )
       return Promise.reject(new RpcFailure('COMPACTION_PENDING'));
-    if (
-      ['prompt', 'set_model', 'set_thinking_level', 'compact'].includes(command.type) &&
-      this.modelMutation
-    )
+    if (ADMISSION_COMMANDS.has(command.type) && this.hasPendingModelSelection())
       return Promise.reject(new RpcFailure('MODEL_SELECTION_PENDING'));
-    if (['prompt', 'compact'].includes(command.type) && this.promptAdmission)
+    if (['prompt', 'compact'].includes(command.type) && this.hasPendingCommand('prompt'))
       return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
     const id = command.id ?? randomUUID(),
       generation = this.generation;
@@ -468,10 +467,6 @@ export class PiRpc {
     )
       return Promise.reject(new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED'));
     const serialized = `${JSON.stringify({ ...nativeCommand, id })}\n`;
-    if (command.type === 'prompt') this.promptAdmission = { id, generation };
-    if (['set_model', 'set_thinking_level'].includes(command.type))
-      this.modelMutation = { id, generation };
-    if (command.type === 'compact') this.compactionMutation = { id, generation };
     return new Promise((resolve, reject) => {
       const req = {
         resolve,
@@ -588,12 +583,20 @@ export class PiRpc {
   entries() {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
   }
+  hasPendingCommand(type) {
+    return [...this.pending.values()].some((request) => request.commandType === type);
+  }
+  hasPendingModelSelection() {
+    return [...this.pending.values()].some((request) => MODEL_COMMANDS.has(request.commandType));
+  }
+  hasPendingAdmission() {
+    return [...this.pending.values()].some((request) =>
+      ADMISSION_COMMANDS.has(request.commandType),
+    );
+  }
   hasUnsettledWork() {
     return Boolean(
       this.activeBashes > 0 ||
-      this.promptAdmission ||
-      this.modelMutation ||
-      this.compactionMutation ||
       this.settlementSequence < this.requiredSettlementSequence ||
       [...this.pending.values()].some((r) => !READ_COMMANDS.has(r.commandType)),
     );
@@ -604,6 +607,8 @@ export class PiRpc {
       this.hasUnsettledWork() ||
       state.isStreaming === true ||
       state.isCompacting === true ||
+      state.isBashRunning === true ||
+      state.isIdle === false ||
       state.pendingMessageCount > 0
     )
       return { state, status: 'busy' };
@@ -629,7 +634,7 @@ export class PiRpc {
     busy = 'MODEL_SELECTION_BUSY',
     unconfirmed = 'MODEL_SELECTION_IDLE_UNCONFIRMED',
   } = {}) {
-    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
     const result = await this.idleSnapshot();
     if (result.status !== 'idle')
       throw new RpcFailure(result.status === 'busy' ? busy : unconfirmed);
@@ -643,8 +648,8 @@ export class PiRpc {
     model,
     { thinkingLevel, idle = false, nativeThinking = false, timeout = 5000, beforeDispatch } = {},
   ) {
-    if (this.modelMutation) throw new RpcFailure('MODEL_SELECTION_PENDING');
-    if (idle && this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    if (idle && this.hasPendingCommand('prompt')) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
     if (idle) await this.assertIdle();
     const models = model ? (await this.command({ type: 'get_available_models' })).models : null;
     const initial = await this.state();
@@ -666,7 +671,7 @@ export class PiRpc {
       const changed = await this.command(
         { type: 'set_model', provider: target.provider, modelId: target.id },
         timeout,
-        () => {},
+        undefined,
         beforeDispatch,
         !idle,
       );
@@ -680,7 +685,7 @@ export class PiRpc {
       await this.command(
         { type: 'set_thinking_level', level },
         timeout,
-        () => {},
+        undefined,
         beforeDispatch,
         !idle,
       );
@@ -692,6 +697,62 @@ export class PiRpc {
         throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
     }
     return modelSettings({ model: selected.model, thinking_level: selected.thinkingLevel });
+  }
+  async submitPrompt(input, { submissionId, onLate, authorize, selection, onAdmitted }) {
+    const settings = hasPromptSettings(input);
+    const checkIdle = async (code) => {
+      const { status } = await this.idleSnapshot();
+      if (status === 'busy') return false;
+      if (status !== 'idle') throw new RpcFailure(code);
+      return true;
+    };
+    if (settings) {
+      if (input.mode === 'idle_only' && !(await checkIdle('MODEL_SELECTION_IDLE_UNCONFIRMED')))
+        return { status: 'skipped', reason: 'busy' };
+      selection.model_selection = await this.selectModel(input.model, {
+        thinkingLevel: input.thinking_level,
+        idle: true,
+        beforeDispatch: authorize,
+      });
+      await authorize();
+    }
+    if (input.mode === 'idle_only' && !(await checkIdle('RUNTIME_IDLE_UNCONFIRMED')))
+      return { status: 'skipped', reason: 'busy' };
+    await authorize();
+    if (!this.hasPendingAdmission()) onAdmitted?.();
+    const result = await this.command(
+      {
+        id: submissionId,
+        type: 'prompt',
+        message: input.text,
+        ...(input.images ? { images: input.images } : {}),
+        ...promptOptions(settings ? 'idle_only' : input.mode),
+      },
+      undefined,
+      onLate && ((result) => onLate(promptResult(result))),
+      async () => {
+        if (settings) {
+          const state = await this.state();
+          assertPromptSelection(input, state);
+          selection.model_selection = modelSettings({
+            model: state.model,
+            thinking_level: state.thinkingLevel,
+          });
+        }
+        await authorize();
+      },
+    );
+    return promptResult({ ok: true, data: result });
+  }
+  async compact({ instructions, interrupt }, timeout, beforeDispatch) {
+    if (!interrupt)
+      await this.assertIdle({ busy: 'COMPACT_BUSY', unconfirmed: 'COMPACT_IDLE_UNCONFIRMED' });
+    return this.command(
+      { type: 'compact', customInstructions: instructions, idleOnly: !interrupt },
+      timeout,
+      undefined,
+      beforeDispatch,
+    );
   }
   async executeBash({ command, timeout_ms = 5000, max_chars, beforeDispatch }) {
     this.activeBashes++;
@@ -754,7 +815,7 @@ export class PiRpc {
     }
   }
   async assertReleasable() {
-    if (this.promptAdmission) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    if (this.hasPendingCommand('prompt')) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
     await this.assertIdle({ busy: 'RUNTIME_BUSY', unconfirmed: 'RUNTIME_IDLE_UNCONFIRMED' });
   }
   async waitForHandoff(signal) {
@@ -880,7 +941,7 @@ export class PiRpc {
       }
     };
     if (!this.child || this.exited) {
-      this.promptAdmission = null;
+      this.clearPending();
       await release();
       return;
     }
@@ -910,7 +971,7 @@ export class PiRpc {
       }
       await exit.closed;
       this.exited = true;
-      this.promptAdmission = null;
+      this.clearPending();
       this.lines?.close();
       if (this.ownerRecord?.socket)
         await fs.unlink(this.ownerRecord.socket).catch((error) => {
@@ -931,17 +992,15 @@ export class RuntimePool {
   constructor(config, factory, { configFile, completionControl, compatibility } = {}) {
     this.compatibility = compatibility;
     this.config = config;
-    this.attachmentDir =
-      config.attachmentDir ?? (config.stateDir ? path.join(config.stateDir, 'ipc') : undefined);
+    const { attachmentDir, stateDir } = config;
+    this.registryConfig = { attachmentDir, stateDir };
     this.factory =
       factory ??
       (async (session) => {
         // Placement is sampled only after reuse has been ruled out. It does not
         // alter the receive-time authorization snapshot or a running writer.
         const desired = configFile ? (await readOwnerConfig(configFile)).config : config;
-        const desiredRegistry =
-          desired.attachmentDir ??
-          (desired.stateDir ? path.join(desired.stateDir, 'ipc') : undefined);
+        const desiredRegistry = registryPath(desired);
         // A different namespace cannot prove this target has no writer. This
         // affects only acquisition, not reads or reuse of an existing owner.
         if (desiredRegistry !== this.attachmentDir) throw new RpcFailure('CONFIG_RESTART_REQUIRED');
@@ -964,6 +1023,9 @@ export class RuntimePool {
     this.runtimeEvents = new Map();
     this.observations = new RetainedObservations();
     this.starting = new Map();
+  }
+  get attachmentDir() {
+    return registryPath(this.registryConfig);
   }
   watchRuntime(runtime) {
     if (runtime instanceof PiRpc) {
@@ -999,7 +1061,6 @@ export class RuntimePool {
   }
   async forRead(session) {
     const existing = this.instances.get(session.id);
-    if (!this.attachmentDir) return existing?.alive ? existing : null;
     const claim = await readClaim(this.attachmentDir, session);
     if (claim && (await ownerAlive(claim.owner))) {
       if (claim.kind === 'rpc') {
@@ -1046,10 +1107,8 @@ export class RuntimePool {
       });
       return attached;
     }
-    if (this.attachmentDir) {
-      const claim = await readClaim(this.attachmentDir, session);
-      if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
-    }
+    const claim = await readClaim(this.attachmentDir, session);
+    if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
     const existing = this.instances.get(session.id);
     if (existing?.alive) return existing;
     if (existing) await existing.stop();
@@ -1079,9 +1138,9 @@ export class RuntimePool {
     // Acquire once, before termination, not after the writer has released.
     // Any owner admitted before this point is the target of this deletion;
     // later acquisitions are blocked through the move and final cleanup.
-    const deletion = this.attachmentDir ? await acquireDeletion(this.attachmentDir, session) : null;
+    const deletion = await acquireDeletion(this.attachmentDir, session);
     try {
-      const claim = await deletion?.writer(),
+      const claim = await deletion.writer(),
         owned = this.instances.get(session.id) ?? pending?.runtime,
         herdr =
           owned instanceof PiRpc && owned.child instanceof HerdrRpcTransport ? owned.child : null;
@@ -1103,9 +1162,9 @@ export class RuntimePool {
         await herdr.terminateScope(this.config.attachmentExitTimeoutMs ?? 5000);
       await this.stop(session.id);
       this.observations.delete(session.id);
-      return deletion?.finish;
+      return deletion.finish;
     } catch (error) {
-      await deletion?.finish();
+      await deletion.finish();
       throw error;
     }
   }

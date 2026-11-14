@@ -21,6 +21,8 @@ export function reloadAdmission(AgentSession) {
   let shared = AgentSession[key];
   const install = !shared;
   if (!shared) {
+    if (methods.some((name) => typeof AgentSession.prototype[name] !== 'function'))
+      throw new Error('INVALID_HOST_SESSION');
     shared = { sessions: new WeakMap(), scope: new AsyncLocalStorage() };
     Object.defineProperty(AgentSession, key, { value: shared });
   }
@@ -84,7 +86,6 @@ export function reloadAdmission(AgentSession) {
   if (install)
     for (const name of methods) {
       const original = AgentSession.prototype[name];
-      if (typeof original !== 'function') continue;
       AgentSession.prototype[name] = function (...args) {
         return shared.invoke(this, name, args, original);
       };

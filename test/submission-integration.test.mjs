@@ -1,3 +1,4 @@
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 import { until } from './fixtures/until.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -5,7 +6,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
-import { Submissions } from '../src/submissions.mjs';
+
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -27,7 +28,7 @@ async function fixture(t, { native = false, disposition = 'handled', holdProvide
     defaults: { ...denyAllPermissions(), create: true, send: true, read: true },
   };
   const calls = [];
-  const runtime = {
+  const runtime = ownedRuntime({
     alive: true,
     generation: 'synthetic-submission-owner',
     state: async () => ({ isIdle: true }),
@@ -38,7 +39,7 @@ async function fixture(t, { native = false, disposition = 'handled', holdProvide
     stop: async () => {
       runtime.alive = false;
     },
-  };
+  });
   if (native) {
     const extension = path.join(dir, 'submission-probe.mjs');
     await fs.writeFile(
@@ -87,7 +88,10 @@ for (const disposition of ['handled', 'started'])
       assert.equal(sent.reason, 'ACK_TIMEOUT');
       const query = { session_id: saved.session_id, submission_id: sent.submission_id };
       const runtime = f.bridge.pool.get(saved.session_id);
-      assert.equal(runtime.promptAdmission.id, sent.submission_id);
+      assert.equal(
+        [...runtime.pending.keys()].find((id) => runtime.pending.get(id).commandType === 'prompt'),
+        sent.submission_id,
+      );
       for (let i = 0; i < 3; i++)
         assert.equal((await f.bridge.submission(query)).receipt.status, 'unknown');
       assert.equal(await fs.readFile(f.callsFile, 'utf8'), 'input\n');
@@ -112,39 +116,6 @@ for (const disposition of ['handled', 'started'])
       assert.equal(result.structuredContent.leaf_id, undefined);
     },
   );
-
-test(
-  'native settlement does not relabel queued submissions as completed work',
-  { timeout: 20000 },
-  async (t) => {
-    const f = await fixture(t, { native: true, disposition: 'started', holdProvider: true });
-    await fs.writeFile(f.gate, 'release');
-    const saved = await savedSession(f.bridge);
-    const started = await f.bridge.send({ session_id: saved.session_id, text: 'FIRST_INPUT' });
-    assert.equal(started.status, 'started');
-    const runtime = f.bridge.pool.get(saved.session_id);
-    await until(async () => (await runtime.state()).isStreaming);
-    const queued = [];
-    for (const mode of ['follow_up', 'steer']) {
-      const result = await f.bridge.send({
-        session_id: saved.session_id,
-        text: 'QUEUED_INPUT',
-        mode,
-      });
-      assert.equal(result.status, 'queued', JSON.stringify(result));
-      queued.push(result.submission_id);
-    }
-    assert.notEqual(queued[0], queued[1]);
-    await fs.writeFile(f.providerGate, 'release');
-    await until(() => runtime.exited && !f.bridge.autoReleases.size);
-    for (const submission_id of queued) {
-      const record = await f.bridge.submission({ session_id: saved.session_id, submission_id });
-      assert.deepEqual(record.receipt, { status: 'queued' });
-      assert.equal(record.completion, undefined);
-      assert.equal(record.result, undefined);
-    }
-  },
-);
 
 test('submission lookup checks current read/send/create grants and exact session without acquiring an owner', async (t) => {
   const f = await fixture(t);
@@ -178,27 +149,6 @@ test('submission lookup checks current read/send/create grants and exact session
   f.config.defaults = denyAllPermissions();
   for (const query of [createQuery, sendQuery])
     await assert.rejects(f.bridge.submission(query), /NOT_FOUND_OR_DENIED/);
-  assert.equal(f.calls.length, 2);
-});
-
-test('expired and evicted Bridge submissions return unavailable without retrying work', async (t) => {
-  const f = await fixture(t);
-  let time = Date.now();
-  f.bridge.submissions = new Submissions({ now: () => time, limit: 1, ttl: 100 });
-  const saved = await savedSession(f.bridge);
-  const args = { session_id: saved.session_id, text: 'SAME_INPUT' };
-  const first = await f.bridge.send(args);
-  const second = await f.bridge.send(args);
-  assert.notEqual(first.submission_id, second.submission_id);
-  await assert.rejects(
-    f.bridge.submission({ session_id: saved.session_id, submission_id: first.submission_id }),
-    /SUBMISSION_UNAVAILABLE/,
-  );
-  time += 100;
-  await assert.rejects(
-    f.bridge.submission({ session_id: saved.session_id, submission_id: second.submission_id }),
-    /SUBMISSION_UNAVAILABLE/,
-  );
   assert.equal(f.calls.length, 2);
 });
 

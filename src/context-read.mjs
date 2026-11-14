@@ -11,7 +11,7 @@ import {
 } from './read-navigation.mjs';
 
 // Change only when the live read request/snapshot semantics become incompatible.
-export const READ_CONTRACT = 'pi-bridge-read-v1';
+export const READ_CONTRACT = 'pi-bridge-read-v2';
 export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
 const READ_PAGE_LIMIT = 65536;
 const UNIT_TARGET = 2048;
@@ -396,54 +396,27 @@ function cleanRecord(record) {
   return result;
 }
 
-// Prefer paragraphs and lines; long lines split at whitespace where possible,
-// otherwise at Unicode code point boundaries. Parts retain the original source.
-function* longLineParts(line) {
-  let group = '',
-    bytes = 2;
-  for (const point of line) {
-    const size = jsonBytes(point) - 2;
-    if (bytes + size > UNIT_TARGET) {
-      const whitespace = group.match(/\s+(?=\S*$)/u),
-        end =
-          whitespace && whitespace.index > group.length / 2
-            ? whitespace.index + whitespace[0].length
-            : group.length;
-      yield group.slice(0, end);
-      group = group.slice(end);
-      bytes = jsonBytes(group);
-    }
-    group += point;
-    bytes += size;
-  }
-  if (group) yield group;
-}
+// Split only for the response. Keep source text intact and use stable part
+// boundaries so a continuation can change its page budget.
 function* textParts(text) {
   if (typeof text !== 'string' || jsonBytes(text) <= UNIT_TARGET) {
     yield text;
     return;
   }
-  let group = '',
-    groupBytes = 0;
-  for (const [paragraph] of text.matchAll(/[\s\S]+?(?:\r?\n[ \t]*\r?\n|$)/g)) {
-    const pieces =
-      jsonBytes(paragraph) <= UNIT_TARGET ? [paragraph] : paragraph.matchAll(/[^\n]*\n|[^\n]+$/g);
-    for (const piece of pieces) {
-      const line = typeof piece === 'string' ? piece : piece[0],
-        size = jsonBytes(line);
-      if (group && groupBytes + size > UNIT_TARGET) {
-        yield group;
-        group = '';
-        groupBytes = 0;
-      }
-      if (size > UNIT_TARGET) yield* longLineParts(line);
-      else {
-        group += line;
-        groupBytes += size;
-      }
+  let start = 0;
+  let bytes = 2;
+  let end = 0;
+  for (const point of text) {
+    const size = jsonBytes(point) - 2;
+    if (bytes + size > UNIT_TARGET) {
+      yield text.slice(start, end);
+      start = end;
+      bytes = 2;
     }
+    bytes += size;
+    end += point.length;
   }
-  if (group) yield group;
+  if (end > start) yield text.slice(start, end);
 }
 function* splitText(record, text, replace) {
   const parts = textParts(text),
@@ -556,8 +529,7 @@ function* splitMessageBody(record, message, replace) {
   }
   yield record;
 }
-function* semanticUnits(raw) {
-  const record = cleanRecord(raw);
+function* pageParts(record) {
   if (jsonBytes(record) <= UNIT_TARGET) {
     yield record;
     return;
@@ -636,18 +608,10 @@ function omittedUnit(unit) {
   };
 }
 export function appendUnits(target, record) {
-  for (const unit of semanticUnits(record)) {
-    // No encoded record or native entry is retained. Clone each sanitized unit
-    // so sliced strings and arbitrary business objects cannot retain raw input.
-    let bounded = unit;
-    if (metadataUnit(unit) && jsonBytes(unit) > READ_PAGE_LIMIT)
-      bounded = fitMetadata(unit, (candidate) => jsonBytes(candidate) <= READ_PAGE_LIMIT);
-    const detached =
-      jsonBytes(bounded) > READ_PAGE_LIMIT ? omittedUnit(bounded) : structuredClone(bounded);
-    target.accountedBytes += jsonBytes(detached) * 4 + 256;
-    if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
-    target.units.push(detached);
-  }
+  const unit = cleanRecord(record);
+  target.accountedBytes += jsonBytes(unit) * 4 + 256;
+  if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
+  target.units.push(structuredClone(unit));
 }
 export function validateReadEntryIds(value) {
   if (
@@ -842,71 +806,13 @@ function smallLive(live, budget) {
   }
   return jsonBytes(result) <= budget ? result : null;
 }
-// Presentation priority only allocates text space. Rows always stay in source
-// order; a cursor advances through the same frozen row sequence.
-function publicNavigationRow(unit) {
-  const { _turn, _latest, ...row } = unit;
-  return row;
-}
-function navigationTurnEnd(units, start) {
-  let turn = units[start]._turn,
-    end = start + 1;
-  // Background before a turn travels with it when possible, without becoming
-  // part of that turn's content selection.
-  for (; end < units.length; end++) {
-    const next = units[end]._turn;
-    if (next == null) continue;
-    if (turn == null) turn = next;
-    else if (next !== turn) break;
-  }
-  return end;
-}
-function fitNavigationTurn(units, fits, { shortenLatest = true } = {}) {
-  const original = units.map(publicNavigationRow);
-  if (fits(original)) return original;
-  // Compress earlier process before touching the latest reply. Input and
-  // thinking retain useful previews; no kind receives space when absent.
-  const short = units.map((unit) => {
-    const row = publicNavigationRow(unit);
-    if (unit._latest) return row;
-    const limit = ['input', 'thinking'].includes(unit.type) ? 400 : 200;
-    return row.text.length <= limit
-      ? row
-      : fitNavigationRow(row, (candidate) => candidate.text.length <= limit);
-  });
-  if (fits(short)) return short;
-  if (!shortenLatest) return null;
-  const latest = units
-    .map((unit, index) => (unit._latest ? index : -1))
-    .filter((index) => index >= 0);
-  if (!latest.length) return null;
-  const total = latest.reduce((sum, index) => sum + short[index].text.length, 0);
-  const trimmed = (limit) =>
-    short.map((row, index) => {
-      if (!units[index]._latest) return row;
-      const share = Math.floor((limit * row.text.length) / Math.max(1, total));
-      return row.text.length <= share
-        ? row
-        : fitNavigationRow(row, (candidate) => candidate.text.length <= share);
-    });
-  // Do not squeeze a long directory into empty labels merely to claim that a
-  // turn fits. Such turns continue on another page in source order.
-  if (!fits(trimmed(Math.min(total, 200 * latest.length)))) return null;
-  let low = Math.min(total, 200 * latest.length),
-    high = total;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (fits(trimmed(mid))) low = mid;
-    else high = mid - 1;
-  }
-  return trimmed(low);
-}
 export function renderPreparedContextRead(
   snapshot,
   args,
   { cursor, encode, resultBudget, live, runtimeEvents } = {},
 ) {
   const start = cursor?.offset ?? 0,
+    firstPart = cursor?.part ?? 0,
     max = args.max_bytes ?? DEFAULT_READ_BYTES;
   if (start < 0 || start > snapshot.units.length) throw new Error('INVALID_CURSOR');
   const navigation = Boolean(snapshot.navigation);
@@ -932,10 +838,10 @@ export function renderPreparedContextRead(
       ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
       : {}),
   };
-  const page = (items, offset) => ({
+  const page = (items, offset, part = 0) => ({
     ...base,
     items,
-    next_cursor: offset < snapshot.units.length ? encode(offset) : null,
+    next_cursor: offset < snapshot.units.length ? encode(offset, part) : null,
     omissions: {
       selection: snapshot.omissions,
       capacity: { remaining_units: snapshot.units.length - offset, previous_units: start },
@@ -943,84 +849,50 @@ export function renderPreparedContextRead(
   });
   const fits = (value) => jsonBytes(value) <= max && fitsResult(value, resultBudget);
   const items = [];
-  let offset = start,
-    splitUntil = start;
-  while (offset < snapshot.units.length) {
-    if (navigation && !snapshot.query && offset >= splitUntil) {
-      const end = navigationTurnEnd(snapshot.units, offset);
-      const group = snapshot.units.slice(offset, end);
-      const plain = group.map(publicNavigationRow);
-      if (fits(page([...items, ...plain], end))) {
-        items.push(...plain);
-        offset = end;
-        continue;
+  let offset = start;
+  let part = firstPart;
+  render: while (offset < snapshot.units.length) {
+    const atom = snapshot.units[offset];
+    const parts = navigation ? [atom].values() : pageParts(atom);
+    let next = parts.next();
+    for (let i = 0; i < part && !next.done; i++) next = parts.next();
+    if (next.done) throw new Error('INVALID_CURSOR');
+    const atomOffset = offset;
+    while (!next.done) {
+      let unit = next.value;
+      next = parts.next();
+      const nextOffset = next.done ? atomOffset + 1 : atomOffset;
+      const nextPart = next.done ? 0 : part + 1;
+      const withUnit = (candidate) => page([...items, candidate], nextOffset, nextPart);
+      if (!items.length && !fits(withUnit(unit))) {
+        base.live = smallLive(base.live, 256);
+        delete base.runtime_events;
+        if (!fits(withUnit(unit))) base.live = null;
       }
-      // A turn that fits an empty page is not split across the current tail.
-      if (items.length && fits(page(plain, end))) break;
-      const earlierPreviews = fitNavigationTurn(
-        group,
-        (rows) => fits(page([...items, ...rows], end)),
-        { shortenLatest: false },
-      );
-      if (earlierPreviews) {
-        items.push(...earlierPreviews);
-        offset = end;
-        continue;
+      if (!items.length && !fits(withUnit(unit))) {
+        if (metadataUnit(unit)) unit = fitMetadata(unit, (value) => fits(withUnit(value)));
+        else if (navigation) unit = fitNavigationRow(unit, (value) => fits(withUnit(value)));
       }
-      // Before shortening a reply to use the current page tail, try preserving
-      // it on a fresh page with only the earlier process abbreviated.
-      if (
-        items.length &&
-        fitNavigationTurn(group, (rows) => fits(page(rows, end)), { shortenLatest: false })
-      )
-        break;
-      const shortened = fitNavigationTurn(group, (rows) => fits(page([...items, ...rows], end)));
-      if (shortened) {
-        items.push(...shortened);
-        offset = end;
-        continue;
+      const maximum = { ...withUnit(unit), items: [unit], live: null };
+      delete maximum.runtime_events;
+      if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
+        if (items.length && metadataUnit(unit)) break render;
+        unit = omittedUnit(unit);
       }
-      if (items.length && fitNavigationTurn(group, (rows) => fits(page(rows, end)))) break;
-      splitUntil = end;
+      if (!fits(withUnit(unit))) {
+        if (items.length) break render;
+        if (jsonBytes(withUnit(unit)) <= max && resultBudget)
+          throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
+        const error = new Error('READ_BUDGET_TOO_SMALL');
+        error.minimum_max_bytes = jsonBytes(withUnit(unit));
+        throw error;
+      }
+      items.push(unit);
+      part = nextPart;
     }
-    let unit = navigation ? publicNavigationRow(snapshot.units[offset]) : snapshot.units[offset];
-    // Live previews never prevent committed history from making progress.
-    if (!items.length && !fits(page([unit], offset + 1))) {
-      base.live = smallLive(base.live, 256);
-      delete base.runtime_events;
-      if (!fits(page([unit], offset + 1))) base.live = null;
-    }
-    if (metadataUnit(unit) && !items.length && !fits(page([unit], offset + 1)))
-      unit = fitMetadata(unit, (candidate) => fits(page([candidate], offset + 1)));
-    if (
-      unit.ref &&
-      typeof unit.text === 'string' &&
-      !items.length &&
-      !fits(page([unit], offset + 1))
-    )
-      unit = fitNavigationRow(unit, (candidate) => fits(page([candidate], offset + 1)));
-    const maximum = { ...page([unit], offset + 1), live: null };
-    delete maximum.runtime_events;
-    if (jsonBytes(maximum) > READ_PAGE_LIMIT)
-      unit = metadataUnit(unit)
-        ? fitMetadata(
-            unit,
-            (candidate) =>
-              jsonBytes({ ...page([candidate], offset + 1), live: null }) <= READ_PAGE_LIMIT,
-          )
-        : omittedUnit(unit);
-    if (!fits(page([...items, unit], offset + 1))) {
-      if (items.length) break;
-      if (jsonBytes(page([unit], offset + 1)) <= max && resultBudget)
-        throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
-      const error = new Error('READ_BUDGET_TOO_SMALL');
-      error.minimum_max_bytes = jsonBytes({ ...page([unit], offset + 1), live: null });
-      throw error;
-    }
-    items.push(unit);
-    offset++;
+    offset = atomOffset + 1;
   }
-  const result = page(items, offset);
+  const result = page(items, offset, part);
   if (!fits(result)) throw new Error('READ_BUDGET_TOO_SMALL');
   return structuredClone(result);
 }

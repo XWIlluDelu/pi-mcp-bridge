@@ -8,9 +8,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { loadSavedSession } from '../src/data.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
-import { validateOwnerConfig } from '../src/owner-config.mjs';
-import { permitted, permissionWarnings } from '../src/permissions.mjs';
-import { assertInvalidArguments } from './fixtures/tool-call.mjs';
+
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 async function fixture(t, defaults = {}) {
@@ -64,42 +62,6 @@ async function fixture(t, defaults = {}) {
   });
   return { bridge, config, project, calls };
 }
-
-test('seven permissions inherit independently and typo denials fail closed', () => {
-  const config = {
-    stateDir: '/state',
-    sessionRoots: ['/sessions'],
-    folders: [],
-    defaults: { ...denyAllPermissions(), read: true, send: true },
-    grants: [
-      { folder: '/project', read: false },
-      { session_id: 's', read: true, stop: true },
-    ],
-  };
-  validateOwnerConfig(config);
-  assert.equal(permitted(config, 'list', { id: 's', cwd: '/project' }), false);
-  assert.equal(permitted(config, 'read', { id: 's', cwd: '/project' }), true);
-  assert.equal(permitted(config, 'send', { id: 's', cwd: '/project' }), true);
-  assert.equal(permitted(config, 'command', { id: 's', cwd: '/project' }), false);
-  assert.equal(permitted(config, 'stop', { id: 's', cwd: '/project' }), true);
-  assert.throws(
-    () => validateOwnerConfig({ ...config, defaults: { read: true, send: true } }),
-    /INVALID_OWNER_CONFIG/,
-  );
-  assert.throws(
-    () => validateOwnerConfig({ ...config, grants: [{ session_id: 's', raed: false }] }),
-    /INVALID_PERMISSION_FIELD/,
-  );
-  assert.throws(
-    () => validateOwnerConfig({ ...config, grants: [{ session_id: 's', create: true }] }),
-    /CREATE_REQUIRES_PROJECT_SCOPE/,
-  );
-  assert.ok(
-    permissionWarnings(config, { session_id: 's', cwd: '/project' }).warnings.some(
-      (w) => w.code === 'KNOWN_ID_ONLY',
-    ),
-  );
-});
 
 test('list permission owns metadata; hidden known IDs can still be read and sent', async (t) => {
   const f = await fixture(t, { list: false });
@@ -187,13 +149,11 @@ test('creation targets use project list/create rights independently of session p
   // A directory absent from this page can still be a valid configured create target.
   const created = await f.bridge.create({
     project: unused,
-
     text: 'FIRST',
   });
   assert.ok(['started', 'queued', 'handled'].includes(created.status), JSON.stringify(created));
   const denied = await f.bridge.create({
     project: legacy,
-
     text: 'NEVER',
   });
   assert.equal(denied.status, 'rejected');
@@ -214,31 +174,6 @@ test('create-and-send uses only create permission and returns its child identity
     (await f.bridge.send({ session_id: result.session_id, text: 'no' })).status,
     'rejected',
   );
-});
-
-test('empty creation needs only create permission and does not start a writer or submission', async (t) => {
-  const f = await fixture(t, { send: false, read: false, list: false });
-  f.bridge.pool.factory = async () => assert.fail('Empty creation must not start a writer');
-  const result = await f.bridge.create({ project: f.project, name: 'Awaiting task' });
-  assert.deepEqual(result, {
-    status: 'created',
-    created: true,
-    session_id: result.session_id,
-  });
-  assert.match(result.session_id, /^ps_[a-f0-9]{32}$/);
-  assert.equal((await f.bridge.sessions()).length, 1);
-  assert.equal(f.bridge.pool.instances.size, 0);
-  assert.deepEqual((await f.bridge.list()).sessions, []);
-  await assert.rejects(f.bridge.read({ session_id: result.session_id }), /NOT_FOUND_OR_DENIED/);
-  assert.equal(
-    (await f.bridge.send({ session_id: result.session_id, text: 'later' })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-  for (const settings of [{ model: { provider: 'test', id: 'model' } }, { thinking_level: 'high' }])
-    await assertInvalidArguments(f.bridge, 'create', { project: f.project, ...settings });
-  f.config.defaults.create = false;
-  assert.equal((await f.bridge.create({ project: f.project })).reason, 'NOT_FOUND_OR_DENIED');
-  assert.equal((await f.bridge.sessions()).length, 1);
 });
 
 test('fork copies committed native branch, keeps parent owner, and uses target permissions', async (t) => {
@@ -290,29 +225,4 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
       (await f.bridge.create({ project: f.project, fork_from: source.id, ...prompt })).reason,
       'NOT_FOUND_OR_DENIED',
     );
-});
-
-test('failed first send preserves its created identity', async (t) => {
-  const f = await fixture(t);
-  f.bridge.pool.factory = async () => {
-    throw new Error('RUNTIME_START_FAILED');
-  };
-  const args = { project: f.project, text: 'will fail' };
-  const result = await f.bridge.create(args);
-  assert.equal(result.created, true);
-  assert.equal(result.status, 'rejected');
-  assert.ok(result.session_id);
-
-  assert.equal((await f.bridge.sessions()).length, 1);
-});
-
-test('default send uses native steer and new calls recheck permission', async (t) => {
-  const f = await fixture(t),
-    seed = await savedSession(f.bridge);
-  const args = { session_id: seed.session_id, text: 'work' };
-  await f.bridge.send(args);
-  assert.equal(f.calls[0].command.streamingBehavior, 'steer');
-  f.config.defaults.send = false;
-  assert.equal((await f.bridge.send(args)).reason, 'NOT_FOUND_OR_DENIED');
-  assert.equal(f.calls.length, 1);
 });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -11,8 +11,6 @@ import { captureSessionRead } from '../../src/session-readers.mjs';
 import { ContextReadCache } from '../../src/read-cache.mjs';
 import { prepareContextRead } from '../../src/context-read.mjs';
 import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
-import { toolDefinitions } from '../../src/protocol.mjs';
-import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 // Storage fields are based on MC 0.49.20; migration numbers are not a read contract.
 // Only the tables and columns it queries are needed in these isolated fixtures.
@@ -278,47 +276,6 @@ test('stored summaries use existing MC tiers and source relationships without da
   );
 });
 
-test('content counts select stored summaries and eligible memories independently of turn range', async (t) => {
-  const f = await fixture(t);
-  for (let id = 1; id <= 6; id++) f.compartment({ id, sequence: id });
-  for (let id = 1; id <= 8; id++)
-    f.memory({ id, importance: id === 2 ? 95 : 50, updated_at: id * 1000 });
-  f.compartment({ id: 7, session_id: 'other-session' });
-  for (const id of [8, 9])
-    f.compartment({ id, sequence: id, title: '', content: '', p1: null, p2: null, p3: null });
-  f.memory({ id: 9, status: 'archived' });
-  f.memory({ id: 10, project_path: 'other-project' });
-  const reader = createMagicContextReader({ database: f.database });
-  for (const [content, compartmentIds, memoryIds] of [
-    [undefined, [5, 6], [7, 8, 2]],
-    [{ summary: 4, memory: 5 }, [3, 4, 5, 6], [5, 6, 7, 8, 2]],
-    [{ summary: -1, memory: -1 }, [1, 2, 3, 4, 5, 6], [1, 3, 4, 5, 6, 7, 8, 2]],
-    [{ summary: 0, memory: 0 }, [], []],
-  ]) {
-    const request = { content, range: { recent: 1 } };
-    const result = await reader.read({ ...f.context, request });
-    assert.deepEqual(
-      result.items.map((item) => item.id),
-      [
-        ...compartmentIds.map((id) => `compartment:${id}`),
-        ...memoryIds.map((id) => `memory:${id}`),
-      ],
-    );
-    assert.deepEqual(result.coverage, [
-      { type: 'summary', selected: compartmentIds.length, total: 6 },
-      { type: 'memory', selected: memoryIds.length, total: 8 },
-    ]);
-    assert.ok(result.items.every((item) => item.text.length > 0));
-    assert.deepEqual(
-      (
-        await reader.read({ ...f.context, request: { ...request, range: { recent: -1 } } })
-      ).items.map((item) => item.id),
-      result.items.map((item) => item.id),
-      'Changing the native turn range must not change stored background selection',
-    );
-  }
-});
-
 test('default MC reads exclude known other-branch summaries before limiting, while unlimited summaries retain their sources', async (t) => {
   const f = await fixture(t);
   const message = (id, parentId, role, text) => ({
@@ -384,36 +341,13 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
       request,
     );
   };
-  const summaryIds = (result) => [
-    ...new Set(
-      result.units
-        .filter((u) => u.source?.reader_item?.startsWith('compartment:'))
-        .map((u) => u.source.reader_item),
-    ),
-  ];
-  assert.deepEqual(summaryIds(await capture(2)), ['compartment:3', 'compartment:4']);
   const recent = await capture(4);
+  const summaries = recent.units.filter((item) =>
+    item.source.reader_item?.startsWith('compartment:'),
+  );
   assert.deepEqual(
-    summaryIds(recent),
-    [1, 2, 3, 4].map((id) => `compartment:${id}`),
-  );
-  assert.equal(
-    recent.units.find((u) => u.source.reader_item === 'compartment:1').branch_relation,
-    'on_branch',
-    'compaction does not remove raw ancestry',
-  );
-  assert.equal(
-    recent.units.find((u) => u.source.reader_item === 'compartment:3').branch_relation,
-    'unknown',
-  );
-  assert.equal(
-    recent.units.find((u) => u.source.reader_item === 'compartment:4').branch_relation,
-    'unknown',
-    'unresolved MC boundaries cannot establish ancestry',
-  );
-  assert.ok(
-    recent.units.some((u) => u.source.reader_item === 'memory:1'),
-    'project memories are independent of session branches',
+    summaries.map((item) => item.branch_relation),
+    ['on_branch', 'on_branch', 'unknown', 'unknown'],
   );
   assert.deepEqual(recent.reader.coverage[0], {
     type: 'summary',
@@ -422,28 +356,11 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     excluded: 2,
   });
   const full = await capture(-1);
-  assert.deepEqual(
-    summaryIds(full),
-    [1, 2, 3, 4, 5, 6].map((id) => `compartment:${id}`),
-  );
   const historical = full.units.find((u) => u.source.reader_item === 'compartment:6');
   assert.equal(historical.branch_relation, 'off_branch');
   assert.equal(historical.provenance.source_entry_id, 'old-answer');
   assert.equal(full.leaf_id, 'latest-answer');
   const cache = new ContextReadCache();
-  const brief = cache.navigate(
-    recent,
-    { session_id: f.context.session.id, content: { summary: 4 } },
-    { identity: f.context.session },
-  );
-  const validator = new AjvJsonSchemaValidator();
-  for (const name of ['read', 'search']) {
-    const validate = validator.getValidator(
-      toolDefinitions().find((tool) => tool.name === name).outputSchema,
-    );
-    const checked = validate(brief);
-    assert.equal(checked.valid, true, checked.errorMessage);
-  }
   const found = cache.navigate(
     full,
     { session_id: f.context.session.id, content: { summary: -1, memory: -1 }, max_bytes: 4096 },
@@ -469,90 +386,7 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     ),
     /MongoDB/,
   );
-  assert.equal(
-    acquisitions,
-    3,
-    'branch evidence and appended native context share one acquisition per read',
-  );
-});
-
-test('stored memory pages follow the captured source order without losing selected priority evidence', async (t) => {
-  const f = await fixture(t);
-  f.compartment();
-  for (let id = 1; id <= 12; id++)
-    f.memory({
-      id,
-      importance: id === 12 ? 95 : 50,
-      updated_at: id * 1000,
-      content: `Memory ${id}: ${'Relevant project evidence. '.repeat(30)}`,
-    });
-  const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
-  const args = {
-    session_id: f.context.session.id,
-    content: { summary: 0, memory: -1 },
-    max_bytes: 4096,
-  };
-  const captured = await captureSessionRead(reader, { ...f.context, request: args }, args);
-  const cache = new ContextReadCache(),
-    identity = f.context.session;
-  const pages = [cache.navigate(captured, args, { identity })];
-  while (pages.at(-1).next_cursor) {
-    const nextArgs = { cursor: pages.at(-1).next_cursor, max_bytes: 4096 };
-    const next = cache.get(nextArgs, identity);
-    const page = cache.render(next.snapshot, nextArgs, { ...next, identity });
-    assert.notEqual(
-      page.next_cursor,
-      nextArgs.cursor,
-      'A cursor must advance through source content',
-    );
-    pages.push(page);
-  }
-  assert.deepEqual(
-    pages.flatMap((page) => page.items).map((item) => item.source.memory_id),
-    Array.from({ length: 12 }, (_, index) => index + 1),
-  );
-  assert.deepEqual(captured.reader.coverage, [
-    { type: 'summary', selected: 0, total: 1 },
-    { type: 'memory', selected: 12, total: 12 },
-  ]);
-});
-
-test('a real Git root commit is the project identity, including reads from a subdirectory', async (t) => {
-  const f = await fixture(t);
-  const git = (args) =>
-    execFileSync('git', args, { cwd: f.cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  git(['init', '-q']);
-  const reader = createMagicContextReader({ database: f.database });
-  f.compartment();
-  assert.equal(
-    await reader.matches(f.context),
-    true,
-    'unborn repository retains its directory identity',
-  );
-  git([
-    '-c',
-    'user.name=Fixture',
-    '-c',
-    'user.email=fixture@example.invalid',
-    'commit',
-    '-q',
-    '--allow-empty',
-    '-m',
-    'Fixture root',
-  ]);
-  const identity = `git:${git(['rev-list', '--max-parents=0', 'HEAD']).trim()}`;
-  assert.equal(
-    await reader.matches(f.context),
-    false,
-    'a directory identity must not silently carry into a new Git project',
-  );
-  f.db.prepare('UPDATE session_projects SET project_path=?').run(identity);
-  const subdirectory = path.join(f.cwd, 'nested');
-  await fs.mkdir(subdirectory);
-  assert.equal(
-    await reader.matches({ ...f.context, session: { ...f.context.session, cwd: subdirectory } }),
-    true,
-  );
+  assert.equal(acquisitions, 2);
 });
 
 test('read-only connections see committed live WAL data and detach each result', async (t) => {

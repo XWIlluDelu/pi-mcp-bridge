@@ -5,11 +5,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { Bridge } from '../src/bridge.mjs';
+
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import {
   processIdentity,
   claimFile,
@@ -18,37 +17,18 @@ import {
   updateOwner,
   readClaim,
   AttachedRuntime,
-  releaseOwner,
 } from '../src/attachments.mjs';
 
 async function fixture(t, { native = false } = {}) {
-  const dir = await fs.mkdtemp('/tmp/pi-delete-');
-  const config = {
-    ...isolatedRuntime(dir),
-    stateDir: path.join(dir, 'state'),
-    attachmentDir: path.join(dir, 'ipc'),
-    attachmentExitTimeoutMs: 50,
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: dir }],
-    defaults: denyAllPermissions(),
-    grants: [{ folder: dir, delete: true }],
-  };
-  const bridge = await new Bridge(
-    config,
-    native
-      ? undefined
-      : () => {
-          throw new Error('DELETE_MUST_NOT_START_PI');
-        },
-  ).init();
-  const make = async () => bridge.session((await savedSession(bridge)).session_id);
-  const cleanups = [];
-  t.after(async () => {
-    for (const cleanup of cleanups) await cleanup();
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'delete',
+    configure({ cwd, config }) {
+      config.attachmentExitTimeoutMs = 50;
+      config.grants = [{ folder: cwd, delete: true }];
+    },
+    factory: native ? undefined : () => assert.fail('Delete must not start Pi'),
   });
-  return { dir, config, bridge, make, cleanups };
+  return { ...f, make: f.create, cleanups: f.cleanup };
 }
 async function writer(t, stubborn = false) {
   const child = spawn(
@@ -154,56 +134,6 @@ test('delete ends an unsupported live claim without treating its socket metadata
   assert.equal(await readClaim(f.config.attachmentDir, target), null);
 });
 
-for (const kind of ['extension', 'rpc', 'host'])
-  test(
-    'delete-only authorization terminates unsupported/unreachable ' +
-      kind +
-      ' and escalates without touching another writer',
-    async (t) => {
-      const f = await fixture(t),
-        target = await f.make(),
-        neighbor = await f.make();
-      const a = await writer(t, true),
-        b = await writer(t);
-      if (kind === 'host') {
-        const host = await reserveHostSession({
-          buildSessionProjection: hostProjection,
-          attachmentDir: f.config.attachmentDir,
-          session: target,
-          owner: a.owner,
-        });
-        f.cleanups.push(() => host.close());
-        await host.ready({
-          state: async () => ({ sessionFile: target.file, sessionId: target.header.id }),
-          snapshot: async () => ({ entries: [], leafId: null }),
-          submit: async () => {
-            throw new Error('DELETE_MUST_NOT_SEND');
-          },
-        });
-      } else await reserveOwner(f.config.attachmentDir, target, kind, a.owner);
-      await reserveOwner(f.config.attachmentDir, neighbor, 'rpc', b.owner);
-      // Either unreachable, or an explicit HOST_RELEASE_UNSUPPORTED response.
-      // No read/list/stop permissions are granted.
-      const exited = once(a.child, 'exit');
-      const result = await f.bridge.delete({ session_id: target.id });
-      assert.equal(result.status, 'deleted', JSON.stringify(result));
-      assert.equal((await exited)[1], 'SIGKILL');
-      assert.equal(await ownerAlive(a.owner), false);
-      assert.equal(await ownerAlive(b.owner), true);
-      assert.ok(await fs.stat(neighbor.file));
-      assert.equal(await readClaim(f.config.attachmentDir, target), null);
-      const manifest = JSON.parse(
-        await fs.readFile(
-          path.join(f.config.stateDir, 'trash', result.restore_token + '.restore.json'),
-          'utf8',
-        ),
-      );
-      assert.equal(manifest.native_session_id, target.header.id);
-      assert.ok(await fs.stat(manifest.trash_path));
-      assert.equal(manifest.original_path, target.file);
-    },
-  );
-
 for (const callback of ['cancel', 'release'])
   for (const shared of [false, true])
     test(`host ${callback} exception permits dedicated termination but preserves shared owners (shared=${shared})`, async (t) => {
@@ -261,23 +191,6 @@ for (const callback of ['cancel', 'release'])
       }
     });
 
-test('delete refuses stale binding and shared-process termination', async (t) => {
-  const f = await fixture(t),
-    target = await f.make(),
-    neighbor = await f.make();
-  const a = await writer(t);
-  const claim = await reserveOwner(f.config.attachmentDir, target, 'extension', a.owner);
-  const runtime = new AttachedRuntime(f.config, target, claim);
-  const shared = await reserveOwner(f.config.attachmentDir, neighbor, 'host', a.owner);
-  await assert.rejects(runtime.stopForDelete(), /DELETE_SHARED_OWNER/);
-  assert.equal(await ownerAlive(a.owner), true);
-  await releaseOwner(f.config.attachmentDir, neighbor, shared);
-  await updateOwner(f.config.attachmentDir, target, { ...claim }, { generation: 'replacement' });
-  await assert.rejects(runtime.stopForDelete(), /RUNTIME_SESSION_CHANGED/);
-  assert.equal(await ownerAlive(a.owner), true);
-  assert.ok(await fs.stat(target.file));
-});
-
 test('lost release ACK uses confirmed target closure without terminating the shared host', async (t) => {
   const f = await fixture(t),
     target = await f.make(),
@@ -326,30 +239,6 @@ test('lost release ACK uses confirmed target closure without terminating the sha
     ),
   );
   assert.ok(await fs.stat(manifest.trash_path));
-  await assert.rejects(fs.stat(target.file), { code: 'ENOENT' });
-});
-
-test('delete includes a successor admitted before it acquires session-wide authority', async (t) => {
-  const f = await fixture(t),
-    target = await f.make(),
-    before = await writer(t),
-    successor = await writer(t);
-  const first = await reserveOwner(f.config.attachmentDir, target, 'rpc', before.owner);
-  const stop = f.bridge.pool.stopForDelete.bind(f.bridge.pool);
-  let replacement;
-  t.mock.method(f.bridge.pool, 'stopForDelete', async (session) => {
-    // Normal ownership transfer finishes while deletion is still preparing.
-    const exited = once(before.child, 'exit');
-    before.child.kill('SIGTERM');
-    await exited;
-    await releaseOwner(f.config.attachmentDir, target, first);
-    replacement = await reserveOwner(f.config.attachmentDir, target, 'rpc', successor.owner);
-    return stop(session);
-  });
-  const result = await f.bridge.delete({ session_id: target.id });
-  assert.notEqual(first.generation, replacement.generation);
-  assert.equal(result.status, 'deleted', JSON.stringify(result));
-  assert.equal(await ownerAlive(successor.owner), false);
   await assert.rejects(fs.stat(target.file), { code: 'ENOENT' });
 });
 

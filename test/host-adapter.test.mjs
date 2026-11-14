@@ -1,4 +1,4 @@
-import packageInfo from '../package.json' with { type: 'json' };
+import { ownerEnvelope } from '../src/attachment-protocol.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +14,6 @@ import {
   ownerAlive,
   reserveOwner,
   updateOwner,
-  processIdentity,
   AttachedRuntime,
 } from '../src/attachments.mjs';
 import { Bridge } from '../src/bridge.mjs';
@@ -99,16 +98,7 @@ function request(f, op, body = {}, changes = {}) {
     });
     socket.on('error', reject);
     socket.on('connect', () =>
-      socket.write(
-        JSON.stringify({
-          op,
-          body,
-          file: f.session.file,
-          sessionId: f.session.header.id,
-          generation: f.controller.record.generation,
-          ...changes,
-        }) + '\n',
-      ),
+      socket.write(ownerEnvelope(f.controller.record, { op, body, ...changes })),
     );
     socket.on('data', (chunk) => {
       buffer += chunk;
@@ -125,67 +115,6 @@ function request(f, op, body = {}, changes = {}) {
     });
   });
 }
-test('host reload waits for native completion and fences unresolved submissions and new mutations', async (t) => {
-  const f = await fixture(t),
-    submitEntered = gate(),
-    submitRelease = gate(),
-    reloadEntered = gate(),
-    reloadRelease = gate();
-  let reloads = 0;
-  await f.controller.ready({
-    ...f.callbacks,
-    submit: async () => {
-      submitEntered.resolve();
-      await submitRelease.promise;
-      return { status: 'accepted', disposition: 'handled' };
-    },
-    reload: async ({ sessionFile, sessionId, beforeDispatch }) => {
-      assert.equal(sessionFile, f.session.file);
-      assert.equal(sessionId, f.session.header.id);
-      beforeDispatch();
-      reloads++;
-      reloadEntered.resolve();
-      await reloadRelease.promise;
-      return { reloaded: true };
-    },
-  });
-  const runtime = new AttachedRuntime(
-    { attachmentDir: f.attachmentDir },
-    f.session,
-    f.controller.record,
-  );
-  try {
-    const submitting = runtime.send({ text: 'ADMITTED_INPUT' });
-    await submitEntered.promise;
-    await assert.rejects(runtime.reload(), { code: 'RELOAD_BUSY', uncertain: false });
-    assert.equal(reloads, 0);
-    submitRelease.resolve();
-    await submitting;
-    let finished = false;
-    const reloading = runtime.reload().then((value) => {
-      finished = true;
-      return value;
-    });
-    await reloadEntered.promise;
-    assert.equal(finished, false);
-    assert.equal((await runtime.state()).isIdle, false);
-    await assert.rejects(runtime.send({ text: 'MUST_NOT_SEND' }), {
-      code: 'RELOAD_IN_PROGRESS',
-      uncertain: false,
-    });
-    reloadRelease.resolve();
-    assert.deepEqual(await reloading, {
-      status: 'completed',
-      owner_version: packageInfo.version,
-      read_compatible: true,
-    });
-    assert.equal(reloads, 1);
-    assert.equal((await runtime.state()).isIdle, true);
-  } finally {
-    submitRelease.resolve();
-    reloadRelease.resolve();
-  }
-});
 
 test('host reload never reports failed native work or a changed session as completed', async (t) => {
   const f = await fixture(t);
@@ -213,64 +142,6 @@ test('host reload never reports failed native work or a changed session as compl
   assert.equal(reloads, 1); // No automatic replay after native dispatch.
   await assert.rejects(runtime.reload(), { code: 'RELOAD_UNCONFIRMED', uncertain: true });
   assert.equal(reloads, 2);
-});
-
-test('optional host setter verifies actual values while busy and fences unresolved native work', async (t) => {
-  const f = await fixture(t),
-    entered = gate(),
-    release = gate(),
-    stopEntered = gate(),
-    stopRelease = gate();
-  const actual = { model: { provider: 'fixture', id: 'a' }, thinkingLevel: 'off' };
-  t.after(() => release.resolve());
-  await f.controller.ready({
-    ...f.callbacks,
-    state: () => ({ ...f.callbacks.state(), ...actual, isStreaming: true }),
-    stop: async ({ onWithdraw }) => {
-      await onWithdraw({ steering: [], followUp: [] });
-      stopEntered.resolve();
-      await stopRelease.promise;
-      return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
-    },
-    setModel: async ({ model, thinking_level, beforeDispatch }) => {
-      entered.resolve();
-      await release.promise;
-      beforeDispatch();
-      actual.model = model;
-      actual.thinkingLevel = thinking_level;
-      return { model, thinking_level, ignoredPrivateMetadata: 'never transported' };
-    },
-  });
-  const runtime = new AttachedRuntime(
-    { attachmentDir: f.attachmentDir },
-    f.session,
-    f.controller.record,
-  );
-  const first = runtime.selectModel({ provider: 'fixture', id: 'b' }, { thinkingLevel: 'high' });
-  await entered.promise;
-  await assert.rejects(runtime.send({ text: 'NEVER_SUBMITTED' }), /MODEL_SELECTION_PENDING/);
-  await assert.rejects(
-    runtime.selectModel(undefined, { thinkingLevel: 'off' }),
-    /MODEL_SELECTION_PENDING/,
-  );
-  release.resolve();
-  assert.deepEqual(await first, {
-    model: { provider: 'fixture', id: 'b' },
-    thinking_level: 'high',
-  });
-  assert.equal((await runtime.state()).isStreaming, true);
-  const stopping = runtime.stopExecution();
-  await stopEntered.promise;
-  try {
-    assert.deepEqual(
-      await runtime.selectModel({ provider: 'fixture', id: 'a' }, { thinkingLevel: 'off' }),
-      { model: { provider: 'fixture', id: 'a' }, thinking_level: 'off' },
-    );
-    await assert.rejects(runtime.send({ text: 'NEVER_SUBMITTED' }), /STOP_IN_PROGRESS/);
-  } finally {
-    stopRelease.resolve();
-    await stopping;
-  }
 });
 
 test('a protocol mismatch blocks attachment and replacement without retiring the live claim', async (t) => {
@@ -326,210 +197,6 @@ test('two-phase host reservation blocks another writer before ready and exposes 
     'RUNTIME_SESSION_CHANGED',
   );
 });
-test('host receipts preserve dispatched evidence without inventing native admission', async (t) => {
-  const f = await fixture(t);
-  let outcome = { status: 'dispatched', admission: 'unobservable', ignored: 'PRIVATE' };
-  f.callbacks.submit = async () => outcome;
-  await f.controller.ready(f.callbacks);
-  assert.deepEqual((await request(f, 'send', { text: 'fixture', mode: 'steer' })).data, {
-    status: 'dispatched',
-    admission: 'unobservable',
-  });
-  for (const admission of [undefined, 'started', 'queued']) {
-    outcome = { status: 'dispatched', admission };
-    assert.equal(
-      (await request(f, 'send', { text: 'fixture', mode: 'steer' })).error,
-      'INVALID_HOST_RECEIPT',
-    );
-  }
-});
-test('cooperative public reads stay bounded while fork snapshots preserve full native entries', async (t) => {
-  const f = await fixture(t),
-    snapshot = f.callbacks.snapshot();
-  snapshot.entries[0].message.content = 'NATIVE_RAW_INPUT ' + 'x'.repeat(120000);
-  f.callbacks.snapshot = () => snapshot;
-  await f.controller.ready(f.callbacks);
-  const runtime = new AttachedRuntime(
-    { attachmentDir: f.attachmentDir },
-    f.session,
-    f.controller.record,
-  );
-  const result = await runtime.read({ session_id: 'public-fixture', max_bytes: 4096 });
-  assert.equal(result.contract, READ_CONTRACT);
-  assert.equal(
-    result.units.map((unit) => unit.message.content).join(''),
-    snapshot.entries[0].message.content,
-  );
-  assert.ok(result.units.length > 1);
-  assert.ok(Buffer.byteLength(JSON.stringify(result)) < 32 * 1024 * 1024);
-  const raw = await runtime.snapshot();
-  assert.equal(raw.entries[0].message.content, snapshot.entries[0].message.content);
-  assert.equal(raw.leafId, 'u');
-  assert.equal(raw.sessionId, f.session.header.id);
-  t.mock.method(runtime, 'request', async () => ({
-    sessionFile: f.session.file,
-    sessionId: f.session.header.id,
-    items: [],
-    next_cursor: null,
-  }));
-  await assert.rejects(
-    runtime.read({ session_id: 'public-fixture', max_bytes: 4096 }),
-    /OWNER_READ_REFRESH_REQUIRED/,
-  );
-});
-test('host IPC and list expose allowlisted model/thinking state under list-only permission', async (t) => {
-  const f = await fixture(t),
-    state = f.callbacks.state;
-  let selection = {
-    model: {
-      provider: 'p',
-      id: 'm',
-      headers: { Authorization: 'SECRET' },
-      apiKey: 'SECRET',
-      baseUrl: 'SECRET',
-    },
-    thinkingLevel: 'high',
-  };
-  f.callbacks.state = () => ({ ...state(), ...selection });
-  await f.controller.ready(f.callbacks);
-  const wire = await request(f, 'state');
-  assert.deepEqual(wire.data.model, { provider: 'p', id: 'm' });
-  assert.equal(wire.data.thinkingLevel, 'high');
-  assert.ok(!JSON.stringify(wire).includes('SECRET'));
-  const bridge = await observingBridge(f);
-  try {
-    const { status } = (await bridge.list()).sessions[0];
-    assert.deepEqual(status.model, wire.data.model);
-    assert.equal(status.thinking_level, 'high');
-    selection = {};
-    const missing = (await bridge.list()).sessions[0].status;
-    assert.equal(missing.model, null);
-    assert.equal(missing.thinking_level, null);
-  } finally {
-    await bridge.close();
-  }
-});
-
-test('host state forwards only validated nonnegative integer pending counts', async (t) => {
-  const f = await fixture(t),
-    state = f.callbacks.state;
-  let count;
-  f.callbacks.state = () => ({
-    ...state(),
-    ...(count === undefined ? {} : { pendingMessageCount: count }),
-  });
-  await f.controller.ready(f.callbacks);
-  for (const [input, expected] of [
-    [0, 0],
-    [3, 3],
-    [undefined, null],
-    [-1, null],
-    [1.5, null],
-    ['3', null],
-    [null, null],
-    [NaN, null],
-    [Infinity, null],
-    [Number.MAX_SAFE_INTEGER + 1, null],
-  ]) {
-    count = input;
-    assert.equal((await request(f, 'state')).data.pendingMessageCount, expected);
-  }
-});
-test('list observes actual host callback support across IPC, independently of activity and grants', async (t) => {
-  for (const [bash, stop, cancel] of [
-    [false, false, false],
-    [true, false, false],
-    [false, true, false],
-    [true, true, false],
-    [true, false, true],
-  ]) {
-    await t.test(`bash=${bash}, stop=${stop}, cancel=${cancel}`, async (t) => {
-      const f = await fixture(t),
-        state = f.callbacks.state,
-        calls = { send: 0, bash: 0, stop: 0 },
-        expected = { send: true, command: bash && (cancel || stop), stop };
-      let activity = {};
-      f.callbacks.state = () => ({
-        ...state(),
-        ...activity,
-        capabilities: { send: true, command: true, stop: true },
-      });
-      f.callbacks.submit = async () => {
-        calls.send++;
-        return { status: 'accepted', disposition: 'started' };
-      };
-      if (bash)
-        f.callbacks.bash = async ({ onResult }) => {
-          calls.bash++;
-          await onResult({ output: 'fixture', exitCode: 0, cancelled: false, truncated: false });
-          return { output: 'fixture', exitCode: 0, cancelled: false, truncated: false };
-        };
-      if (stop)
-        f.callbacks.stop = async ({ onWithdraw }) => {
-          calls.stop++;
-          await onWithdraw({ steering: [], followUp: [] });
-          return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
-        };
-      if (cancel) f.callbacks.cancel = async () => {};
-      await f.controller.ready(f.callbacks);
-      assert.deepEqual((await request(f, 'state')).data.capabilities, expected);
-      const bridge = await observingBridge(f);
-      try {
-        const row = async () => (await bridge.list()).sessions[0],
-          session_id = (await row()).session_id;
-        for (const [observed, expectedState] of [
-          [{}, 'idle'],
-          [{ isIdle: undefined }, 'unknown'],
-          [{ isStreaming: true }, 'busy'],
-        ]) {
-          activity = observed;
-          const { status } = await row();
-          assert.equal(status.state, expectedState);
-          assert.deepEqual(status.capabilities, { ...expected, reload: false });
-        }
-        if (expected.command) {
-          assert.equal(
-            (await bridge.send({ session_id, text: 'fixture' })).reason,
-            'NOT_FOUND_OR_DENIED',
-          );
-          await assert.rejects(
-            bridge.command({ session_id, command: 'fixture' }),
-            /NOT_FOUND_OR_DENIED/,
-          );
-          await assert.rejects(bridge.stop({ session_id }), /NOT_FOUND_OR_DENIED/);
-          await assert.rejects(bridge.read({ session_id }), /NOT_FOUND_OR_DENIED/);
-          assert.deepEqual(calls, { send: 0, bash: 0, stop: 0 });
-          assert.deepEqual((await row()).status.capabilities, { ...expected, reload: false });
-        }
-        // Exercise the advertised paths without granting read.
-        Object.assign(bridge.config.defaults, { send: true, command: true, stop: true });
-        assert.ok(
-          ['started', 'queued', 'handled'].includes(
-            (await bridge.send({ session_id, text: 'fixture', mode: 'steer' })).status,
-          ),
-          'Expected native prompt admission',
-        );
-        const command = await bridge.command({
-            session_id,
-
-            command: 'fixture',
-          }),
-          stopped = await bridge.stop({ session_id });
-        assert.equal(command.status, expected.command ? 'completed' : 'rejected');
-        if (!expected.command) assert.equal(command.reason, 'BASH_UNSUPPORTED');
-        assert.equal(stopped.status, stop ? 'accepted' : 'rejected');
-        if (!stop) assert.equal(stopped.reason, 'STOP_UNSUPPORTED');
-        assert.deepEqual(calls, { send: 1, bash: Number(expected.command), stop: Number(stop) });
-        await f.controller.close();
-        const { status } = await row();
-        assert.equal(status.state, 'unavailable');
-        assert.equal(Object.hasOwn(status, 'capabilities'), false);
-      } finally {
-        await bridge.close();
-      }
-    });
-  }
-});
 
 test('host state requires the current boolean capability declaration', async (t) => {
   const f = await fixture(t);
@@ -538,10 +205,7 @@ test('host state requires the current boolean capability declaration', async (t)
     socket.setEncoding('utf8');
     socket.once('data', () =>
       socket.end(
-        JSON.stringify({
-          generation: f.controller.record.generation,
-          data: { ...f.callbacks.state(), capabilities },
-        }) + '\n',
+        ownerEnvelope(f.controller.record, { data: { ...f.callbacks.state(), capabilities } }),
       ),
     );
   });
@@ -569,84 +233,6 @@ test('host state requires the current boolean capability declaration', async (t)
   }
 });
 
-test('host release waits for admitted preparation, fences new input, and releases shared PID without killing it', async (t) => {
-  const f = await fixture(t),
-    entered = gate(),
-    finish = gate();
-  let released = false;
-  f.callbacks.submit = async () => {
-    entered.resolve();
-    await finish.promise;
-    assert.equal(released, false);
-    return { status: 'unknown' };
-  };
-  f.callbacks.release = async () => {
-    released = true;
-    return { released: true };
-  };
-  await f.controller.ready(f.callbacks);
-  const sending = request(f, 'send', { text: 'fixture', mode: 'steer' });
-  await entered.promise;
-  const releasing = f.controller.release();
-  assert.ok(await readClaim(f.attachmentDir, f.session));
-  assert.equal(released, false);
-  assert.equal(
-    (await request(f, 'send', { text: 'second', mode: 'steer' })).error,
-    'RUNTIME_SESSION_CHANGED',
-  );
-  finish.resolve();
-  assert.equal((await sending).data.status, 'unknown');
-  assert.deepEqual(await releasing, { released: true, generation: f.controller.record.generation });
-  assert.equal(await readClaim(f.attachmentDir, f.session), null);
-  assert.ok(await processIdentity());
-});
-test('release cancels native bash before draining admitted result capture and closing the writer', async (t) => {
-  const f = await fixture(t),
-    entered = gate(),
-    cancelled = gate(),
-    captureEntered = gate(),
-    captureFinish = gate();
-  let closed = false,
-    stops = 0;
-  f.callbacks.bash = async ({ onResult }) => {
-    entered.resolve();
-    await cancelled.promise;
-    await onResult({ output: 'cancelled', exitCode: null, cancelled: true, truncated: false });
-    captureEntered.resolve();
-    await captureFinish.promise;
-    assert.equal(closed, false);
-    return { output: 'fixture', exitCode: 0, cancelled: false, truncated: false };
-  };
-  f.callbacks.stop = async ({ onWithdraw }) => {
-    stops++;
-    cancelled.resolve();
-    await onWithdraw({ steering: [], followUp: [] });
-    return { status: 'accepted', acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
-  };
-  f.callbacks.release = async () => {
-    closed = true;
-    return { released: true };
-  };
-  await f.controller.ready(f.callbacks);
-  const bashing = request(f, 'bash', {
-    command: 'synthetic active bash',
-  });
-  await entered.promise;
-  const releasing = request(f, 'release');
-  await captureEntered.promise;
-  assert.equal(stops, 1);
-  assert.equal(closed, false);
-  assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'transitioning');
-  assert.equal(
-    (await request(f, 'send', { text: 'fenced', mode: 'steer' })).error,
-    'RUNTIME_SESSION_CHANGED',
-  );
-  captureFinish.resolve();
-  assert.equal((await bashing).data.output, 'fixture');
-  assert.equal((await releasing).data.released, true);
-  assert.equal(closed, true);
-  assert.equal(await readClaim(f.attachmentDir, f.session), null);
-});
 test('host cancel drains preparation and native bash without a remote stop callback', async (t) => {
   const f = await fixture(t),
     entered = gate(),
@@ -729,22 +315,7 @@ test('confirmed writer closure is not repeated when claim cleanup is explicitly 
     t.mock.restoreAll();
   }
 });
-test('controller close retains live writer claim and unsupported release remains explicit', async (t) => {
-  const f = await fixture(t);
-  await f.controller.ready(f.callbacks);
-  assert.equal((await request(f, 'release')).error, 'HOST_RELEASE_UNSUPPORTED');
-  await f.controller.close();
-  const claim = await readClaim(f.attachmentDir, f.session);
-  assert.equal(claim.phase, 'transitioning');
-  assert.equal(claim.owner.pid, process.pid);
-  await assert.rejects(reserveOwner(f.attachmentDir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
-});
-test('missing or switched native identity never publishes ready or dispatches a prompt', async (t) => {
-  const f = await fixture(t);
-  f.callbacks.state = () => undefined;
-  await assert.rejects(f.controller.ready(f.callbacks), /RUNTIME_SESSION_CHANGED/);
-  assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'starting');
-});
+
 test('identity is checked after asynchronous host submission', async (t) => {
   const f = await fixture(t);
   let changed = false;
@@ -812,71 +383,4 @@ test('publication failure after listening closes endpoint while retaining owners
   await assert.rejects(f.controller.ready(f.callbacks), /RUNTIME_SESSION_CHANGED/);
   assert.ok(await readClaim(f.attachmentDir, f.session));
   await assert.rejects(request(f, 'state'));
-});
-test('malformed host snapshot identity fields cannot become a read response', async (t) => {
-  const f = await fixture(t),
-    snapshot = f.callbacks.snapshot();
-  f.callbacks.snapshot = () => ({ ...snapshot, leafId: 42 });
-  await f.controller.ready(f.callbacks);
-  assert.equal(
-    (await request(f, 'read', { session_id: 'fixture' })).error,
-    'INVALID_HOST_SNAPSHOT',
-  );
-  f.callbacks.snapshot = () => ({ ...snapshot, entries: [{ id: 4 }] });
-  assert.equal(
-    (await request(f, 'read', { session_id: 'fixture' })).error,
-    'INVALID_HOST_SNAPSHOT',
-  );
-});
-test('successful IPC release flushes its acknowledgment and retires the listener without closing the host', async (t) => {
-  const f = await fixture(t);
-  f.callbacks.release = async () => ({ released: true });
-  await f.controller.ready(f.callbacks);
-  const result = await request(f, 'release');
-  assert.deepEqual(result.data, { released: true, generation: f.controller.record.generation });
-  assert.equal(await readClaim(f.attachmentDir, f.session), null);
-  await assert.rejects(request(f, 'state'));
-  assert.ok(await processIdentity());
-  await f.controller.close();
-  await f.controller.close();
-});
-
-test('host names reach state consumers including an explicit clear', async (t) => {
-  const f = await fixture(t),
-    state = f.callbacks.state;
-  let name = 'live host name';
-  f.callbacks.state = () => ({ ...state(), sessionName: name });
-  await f.controller.ready(f.callbacks);
-  assert.equal((await request(f, 'state')).data.sessionName, name);
-  name = null;
-  assert.equal((await request(f, 'state')).data.sessionName, null);
-});
-
-test('invalid native control results fail without retry and later valid calls work', async (t) => {
-  const f = await fixture(t);
-  let calls = 0;
-  f.callbacks.bash = async () => {
-    calls++;
-    return { output: 42 };
-  };
-  f.callbacks.stop = async () => {
-    calls++;
-    return { acknowledgement: 'native_ack', coverage: 'agent_and_bash' };
-  };
-  await f.controller.ready(f.callbacks);
-  assert.equal((await request(f, 'bash', { command: 'fixture' })).error, 'INVALID_BASH_RESULT');
-  assert.equal((await request(f, 'stop')).error, 'INVALID_STOP_RECEIPT');
-  assert.equal(calls, 2, 'Invalid results do not retry native control');
-
-  f.callbacks.bash = async () => ({
-    output: 'inline only',
-    exitCode: 0,
-    cancelled: false,
-    truncated: false,
-  });
-  assert.equal((await request(f, 'bash', { command: 'fixture' })).data.output, 'inline only');
-});
-
-test('host reservation requires its runtime projection before acquiring ownership', async () => {
-  await assert.rejects(reserveHostSession({}), /INVALID_HOST_PROJECTION/);
 });

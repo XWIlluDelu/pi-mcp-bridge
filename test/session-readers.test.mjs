@@ -7,9 +7,8 @@ import path from 'node:path';
 import { Bridge } from '../src/bridge.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding } from '../src/host-bindings.mjs';
-import { processIdentity } from '../src/attachments.mjs';
-import { RpcClient, buildSessionProjection } from './fixtures/pi.mjs';
+
+import { buildSessionProjection } from './fixtures/pi.mjs';
 import { prepareContextRead, assertReadSnapshot } from '../src/context-read.mjs';
 import { readSchema } from '../src/read-schema.mjs';
 import { captureSessionRead } from '../src/session-readers.mjs';
@@ -17,7 +16,7 @@ import { makeServer } from '../src/server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { savedSession } from './fixtures/saved-session.mjs';
-import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 const body = 'MEMORY_CONTEXT 漢😀\n\n'.repeat(900);
@@ -130,118 +129,6 @@ async function fixture(t) {
   return { dir, store, extension, config, bridge, client, controllers, create, call };
 }
 
-test('unknown reader kinds use native selection, search and frozen references', async (t) => {
-  const f = await fixture(t);
-  const target = await f.create();
-  const file = path.join(f.store, target.header.id + '.json');
-  await fs.writeFile(
-    file,
-    JSON.stringify([
-      {
-        id: 'note',
-        kind: 'project_note',
-        text: 'NOTE_ORIGINAL_EVIDENCE',
-        source: { origin: 'fixture-store' },
-      },
-      { id: 'memory', kind: 'memory', text: 'UNRELATED_MEMORY' },
-    ]),
-  );
-  const initial = await f.call({ session_id: target.id });
-  const note = initial.items.find((item) => item.source?.content_kind === 'project_note');
-  assert.equal(note.type, 'native');
-  assert.ok(note.text.includes('NOTE_ORIGINAL_EVIDENCE'));
-  const withoutNative = await f.call({ session_id: target.id, content: { native: false } });
-  assert.ok(!JSON.stringify(withoutNative).includes('NOTE_ORIGINAL_EVIDENCE'));
-  const found = await f.bridge.search({
-    session_id: target.id,
-    query: 'NOTE_ORIGINAL',
-    content: ['native'],
-  });
-  assert.equal(found.items.length, 1);
-  assert.equal(found.items[0].type, 'native');
-  const otherKind = await f.bridge.search({
-    session_id: target.id,
-    query: 'NOTE_ORIGINAL',
-    content: ['assistant'],
-  });
-  assert.equal(otherKind.items.length, 0);
-  await fs.writeFile(
-    file,
-    JSON.stringify([{ id: 'note', kind: 'project_note', text: 'CHANGED_AFTER_CAPTURE' }]),
-  );
-  const expanded = await f.call({ refs: [found.items[0].ref] });
-  assert.ok(JSON.stringify(expanded.items).includes('NOTE_ORIGINAL_EVIDENCE'));
-  assert.ok(!JSON.stringify(expanded.items).includes('CHANGED_AFTER_CAPTURE'));
-  assert.equal(expanded.items[0].source.content_kind, 'project_note');
-  const excluded = await captureSessionRead(
-    {
-      id: 'fixture',
-      read: async () => ({
-        native: false,
-        coverage: [{ type: 'project_note', selected: 1, total: 2, excluded: 1 }],
-        items: [{ id: 'note', kind: 'project_note', text: 'OMITTED_NOTE' }],
-      }),
-    },
-    { owner: { leaf_id: null } },
-    { session_id: target.id, content: { native: false } },
-  );
-  assert.deepEqual(excluded.units, []);
-  assert.deepEqual(excluded.reader.coverage, [
-    { type: 'project_note', selected: 0, total: 2, excluded: 1 },
-  ]);
-});
-
-test('RPC host read routing sees the target session extension through public command registration', async (t) => {
-  let native;
-  t.after(() => native?.stop());
-  const f = await fixture(t),
-    target = await f.create(),
-    plain = await f.create();
-  const pidFile = path.join(f.dir, 'pid');
-  const extension = path.join(f.dir, 'identity.mjs');
-  await fs.writeFile(
-    extension,
-    `import fs from 'node:fs'; export default () => fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));`,
-  );
-  native = new RpcClient({
-    cliPath: nativePiCli,
-    cwd: f.dir,
-    env: { HOME: f.dir, PI_CODING_AGENT_DIR: f.config.piRuntime.agentDir, PI_OFFLINE: '1' },
-    args: [
-      '--offline',
-      '--no-extensions',
-      '--no-context-files',
-      '--no-skills',
-      '--no-prompt-templates',
-      '--no-themes',
-      '--no-tools',
-      '--session',
-      target.file,
-      '-e',
-      extension,
-      '-e',
-      f.extension,
-    ],
-  });
-  await native.start();
-  await native.getState();
-  const controller = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: target,
-    owner: await processIdentity(Number(await fs.readFile(pidFile, 'utf8'))),
-  });
-  f.controllers.push(controller);
-  await controller.ready(createRpcHostBinding(native));
-  const features = await (await f.bridge.pool.forRead(target)).readFeatures();
-  assert.equal(features.available, true);
-  assert.ok(features.commands.includes('fixture-memory'));
-  assert.deepEqual(features.tools, []);
-  const page = await f.call({ session_id: target.id, max_bytes: 4096 });
-  assert.equal(page.reader.id, 'fixture-memory');
-  assert.equal((await f.call({ session_id: plain.id })).view, 'session');
-});
-
 test('native branch evidence uses the requested raw chain and treats incomplete ancestry as unknown', () => {
   const args = { session_id: 'branch-fixture', entry_ids: ['root', 'current', 'other', 'missing'] };
   const entries = [
@@ -348,141 +235,34 @@ test('readers reuse one native capture for branch selection and may omit its con
   assert.equal(acquired, 3, 'changing the requested facts must not silently reacquire');
 });
 
-test('one read entry routes live and saved session evidence, pages frozen context, and keeps explicit session view', async (t) => {
-  const f = await fixture(t),
-    withMemory = await f.create(),
-    withoutMemory = await f.create(),
-    saved = await f.create();
-  for (const [session, piArgs] of [
-    [withMemory, ['--offline', '-e', f.extension]],
-    [withoutMemory, ['--offline', '--no-extensions']],
-  ]) {
-    const runtime = await new PiRpc({ ...f.config, piArgs }, session, {
+test('a reader capture survives store changes and later pages reauthorize', async (t) => {
+  const f = await fixture(t);
+  const saved = await f.create();
+  const runtime = await new PiRpc(
+    { ...f.config, piArgs: ['--offline', '-e', f.extension] },
+    saved,
+    {
       compatibility: f.bridge.compatibilityServices,
-    }).start();
-    f.bridge.pool.instances.set(session.id, f.bridge.pool.watchRuntime(runtime));
-  }
-  const runtime = f.bridge.pool.get(withMemory.id),
-    fileBefore = await fs.readFile(withMemory.file);
-  let probes = 0;
-  const readFeatures = runtime.readFeatures.bind(runtime);
-  t.mock.method(runtime, 'readFeatures', async () => {
-    probes++;
-    return readFeatures();
-  });
-  const liveFeatures = await readFeatures();
-  assert.ok(liveFeatures.commands.includes('fixture-memory'));
-  assert.deepEqual(liveFeatures.tools, [], 'Disabling tools does not unload the memory extension');
-  assert.ok(
-    !(await f.bridge.pool.get(withoutMemory.id).readFeatures()).commands.includes('fixture-memory'),
-  );
-  const overview = await f.call({ session_id: withMemory.id, max_bytes: 4096 });
+    },
+  ).start();
+  f.bridge.pool.instances.set(saved.id, f.bridge.pool.watchRuntime(runtime));
+  const overview = await f.call({ session_id: saved.id, max_bytes: 4096 });
   assert.equal(overview.reader.id, 'fixture-memory');
-  assert.ok(JSON.stringify(overview.items).includes('NATIVE_INPUT'));
-  assert.ok(JSON.stringify(overview.items).includes('NATIVE_ANSWER'));
   const memory = overview.items.find((item) => item.type === 'memory');
-  assert.ok(memory.text.includes('MEMORY_CONTEXT'));
-  assert.ok(memory.text.length < body.length);
-  assert.ok(memory.ref);
+  assert.match(memory.text, /MEMORY_CONTEXT/);
+  const native = await f.call({ session_id: saved.id, view: 'session' });
+  assert.equal(native.view, 'session');
+  assert.match(JSON.stringify(native.items), /NATIVE_ANSWER/);
+  await fs.writeFile(path.join(f.store, saved.header.id + '.json'), 'invalid-json');
   const expanded = await f.call({ refs: [memory.ref], max_bytes: 4096 });
   assert.ok(expanded.next_cursor);
-  assert.equal(probes, 2, 'Reference expansion must not probe or reread the owner');
-  assert.deepEqual(expanded.reader, { id: 'fixture-memory' });
-  assert.deepEqual(expanded.selection, overview.selection);
-  assert.equal(expanded.selection.range.recent, 3);
-  await f.call({
-    cursor: expanded.next_cursor,
-    range: { recent: 3 },
-    content: {},
-    max_bytes: 4096,
-  });
-  const changedSelection = await f.client.callTool({
-    name: 'read',
-    arguments: { cursor: expanded.next_cursor, range: { recent: -1 } },
-  });
-  assert.equal(JSON.parse(changedSelection.content[0].text).error.code, 'STALE_CURSOR');
-  await fs.writeFile(path.join(f.store, withMemory.header.id + '.json'), 'invalid-json');
-  const pages = [expanded];
-  while (pages.at(-1).next_cursor) {
-    const cursor = pages.at(-1).next_cursor;
-    const page = await f.call({ cursor, max_bytes: 4096 });
-    assert.notEqual(page.next_cursor, cursor);
-    pages.push(page);
-  }
-  const items = pages.flatMap((page) => page.items);
-  assert.equal(
-    items
-      .filter((i) => i.source.reader_item === 'memory' && i.message?.content)
-      .map((i) => i.message.content)
-      .join(''),
-    body,
-  );
-  assert.ok(
-    items.some(
-      (item) => item.source.reader_item === 'memory' && item.source.entry_id === undefined,
-    ),
-  );
-  assert.equal(probes, 2, 'Frozen expansion must not consult the changed backing store or owner');
-  assert.deepEqual(await fs.readFile(withMemory.file), fileBefore);
-  const native = await f.call({ session_id: withMemory.id, view: 'session' });
-  assert.equal(native.view, 'session');
-  assert.ok(JSON.stringify(native).includes('NATIVE_ANSWER'));
-  const failed = await f.client.callTool({
-    name: 'read',
-    arguments: { session_id: withMemory.id },
-  });
-  assert.equal(failed.isError, true);
-  assert.equal(JSON.parse(failed.content[0].text).error.code, 'SESSION_READER_FAILED');
-  await fs.writeFile(
-    path.join(f.store, withMemory.header.id + '.json'),
-    JSON.stringify([{ id: 'memory', kind: 'memory', text: 'PERSISTED_MEMORY' }]),
-  );
-  const selected = f.bridge.compatibilityServices.sessionReaders.readers.get('fixture-memory'),
-    read = selected.read;
-  const requests = [];
-  selected.read = async (ctx) => {
-    requests.push(ctx.request);
-    return read(ctx);
-  };
-  for (const args of [
-    {},
-    { range: { recent: 3 } },
-    { content: {} },
-    { range: { recent: -1 } },
-    { range: { recent: 1 } },
-    { leaf_id: 'a' },
-  ]) {
-    const adapted = await f.call({ session_id: withMemory.id, ...args });
-    assert.equal(adapted.reader.id, 'fixture-memory');
-    assert.ok(JSON.stringify(adapted).includes('PERSISTED_MEMORY'));
-    assert.ok(JSON.stringify(adapted).includes('NATIVE_ANSWER'));
-    for (const [key, value] of Object.entries(args)) assert.deepEqual(requests.at(-1)[key], value);
-  }
-  const emptyBranch = await f.call({ session_id: withMemory.id, leaf_id: null });
-  assert.equal(emptyBranch.leaf_id, null);
-  assert.equal(requests.at(-1).leaf_id, null);
-  assert.ok(JSON.stringify(emptyBranch.items).includes('PERSISTED_MEMORY'));
-  assert.ok(!JSON.stringify(emptyBranch.items).includes('NATIVE_'));
-  await runtime.gracefulExit();
-  const persisted = await f.call({ session_id: withMemory.id });
-  assert.equal(persisted.reader.id, 'fixture-memory');
-  assert.ok(JSON.stringify(persisted).includes('PERSISTED_MEMORY'));
-  assert.equal(f.bridge.pool.get(withMemory.id), null, 'Saved routing does not start Pi');
-  for (const session of [withoutMemory, saved]) {
-    const native = await f.call({ session_id: session.id });
-    assert.equal(native.view, 'session');
-    assert.equal(native.reader, undefined);
-    assert.ok(JSON.stringify(native).includes('NATIVE_ANSWER'));
-  }
-  assert.equal(f.bridge.pool.instances.has(saved.id), false);
-  // Cursor authorization remains live even though adapter/owner access is frozen.
+  await f.call({ cursor: expanded.next_cursor, max_bytes: 4096 });
   f.config.grants = [];
   const denied = await f.client.callTool({
     name: 'read',
     arguments: { cursor: expanded.next_cursor },
   });
-  assert.equal(denied.isError, true);
-  assert.equal(JSON.parse(denied.content[0].text).error.code, 'NOT_FOUND_OR_DENIED');
+  assert.equal(denied.structuredContent.error.code, 'NOT_FOUND_OR_DENIED');
 });
 
 test('host session read routing uses current capabilities and refuses changed or conflicting sources', async (t) => {

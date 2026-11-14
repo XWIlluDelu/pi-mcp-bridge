@@ -2,18 +2,13 @@
 
 ## Component versions
 
-`package.json` defines the Bridge product version reported by MCP and owner
-`bridgeVersion`. Control operations retain their required matching-component
-checks (including owned shutdown sealing and idle compaction). Live reading instead checks the
-explicit `READ_CONTRACT` in `context-read.mjs`, published as owner `readContract`
-and snapshot `contract`. Product releases alone do not change this contract.
-A missing or incompatible read contract returns `OWNER_READ_REFRESH_REQUIRED`
-without taking over the writer; update the owner at a safe native lifecycle
-boundary. This is one current read format, with no old-format translation.
-
-Native history projection and raw fork snapshots remain supported independently
-of the Bridge control version. [AGENTS.md](../AGENTS.md) defines release,
-development and production-operation rules.
+`package.json` defines the product version. The current owner control envelope
+binds requests and replies to the generation, canonical file and native session ID.
+Mutations require matching components. State and reload can locate and refresh an
+owner using the current envelope. Live reads use the independent `READ_CONTRACT`
+and report `OWNER_READ_REFRESH_REQUIRED` when the owner's read contract differs.
+The writer claim remains in force through interface mismatches. See
+[AGENTS.md](../AGENTS.md) for the release and ownership rules.
 
 ## Components
 

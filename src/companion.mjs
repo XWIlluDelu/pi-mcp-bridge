@@ -12,17 +12,17 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
-import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { READ_CONTRACT } from './context-read.mjs';
+import { attachedPromptInput, remotePromptRejection } from './prompt-input.mjs';
 import {
-  SEND_MODES,
-  attachedPromptInput,
-  remotePromptRejection,
-  hasPromptSettings,
-} from './prompt-input.mjs';
-import {
-  MAX_ATTACHMENT_SNAPSHOT_BYTES,
   attachmentServer,
   listenPrivate,
+  ownerEnvelope,
+  ownerIdentity,
+  ownerReadFeatures,
+  ownerRead,
+  ownerSnapshot,
+  parseOwnerRequest,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
 import {
@@ -403,8 +403,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       });
       const server = attachmentServer(connections, async (line, socket) => {
         try {
-          const request = JSON.parse(line);
-          check(request);
+          const request = parseOwnerRequest(line, check);
           await validateStorage(runtime);
           check(request);
           let data;
@@ -426,60 +425,35 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               reloadComplete: admission.completed(manager),
             };
           else if (request.op === 'read_features')
-            data = {
-              contract: READ_CONTRACT,
-              sessionFile: file,
-              sessionId: header.id,
-              ...nativeReadFeatures(
-                pi.getAllTools(),
-                pi.getCommands(),
-                ctx.sessionManager.getLeafId(),
-              ),
-            };
+            data = ownerReadFeatures(
+              record,
+              nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
+            );
+          else if (request.op === 'read' && args.view === 'runtime')
+            data = { ...ownerIdentity(record), ...runtime.observation.read(args, ctx) };
           else if (['read', 'snapshot'].includes(request.op)) {
-            const entries = ctx.sessionManager.getEntries(),
-              leafId = ctx.sessionManager.getLeafId();
-            const snapshotJson =
+            const source = { entries: manager.getEntries(), leafId: manager.getLeafId() };
+            data =
               request.op === 'snapshot'
-                ? JSON.stringify({ entries, leaf: leafId, generation: record.generation })
-                : null;
-            if (
-              request.op === 'snapshot' &&
-              Buffer.byteLength(snapshotJson) > MAX_ATTACHMENT_SNAPSHOT_BYTES
-            )
-              throw new AttachmentFailure('SESSION_TOO_LARGE');
-            if (request.op === 'snapshot')
-              data = { sessionFile: file, sessionId: header.id, entries, leafId };
-            else {
-              data = {
-                sessionFile: file,
-                sessionId: header.id,
-                ...(args.view === 'runtime'
-                  ? runtime.observation.read(args, ctx)
-                  : prepareContextRead(
-                      { header, entries, leafId, live: runtime.liveMessage.snapshot() },
-                      args,
-                      { buildSessionProjection, readAdapters: request.readAdapters },
-                    )),
-              };
-            }
+                ? ownerSnapshot(record, source)
+                : ownerRead(record, { ...source, live: runtime.liveMessage.snapshot() }, args, {
+                    buildSessionProjection,
+                    readAdapters: request.readAdapters,
+                  });
           } else if (request.op === 'reload') {
             if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
             const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
             runtime.reload = operation;
             // Native reload closes this socket and drains ordinary mutations.
             // Flush admission first; never add reload itself to that drain set.
-            socket.end(
-              JSON.stringify({ generation: record.generation, data: { reloading: true } }) + '\n',
-              () => {
-                try {
-                  check(request);
-                  pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
-                } catch {
-                  operation.cancel();
-                }
-              },
-            );
+            socket.end(ownerEnvelope(record, { data: { reloading: true } }), () => {
+              try {
+                check(request);
+                pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
+              } catch {
+                operation.cancel();
+              }
+            });
             return;
           } else if (request.op === 'set_model') {
             data = await trackMutation(
@@ -523,27 +497,21 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
             if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
             const input = attachedPromptInput(args);
-            if (hasPromptSettings(input))
-              throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
-            if (!SEND_MODES.includes(args.mode))
-              throw new AttachmentFailure('INVALID_ATTACHED_SEND');
             const rejection = remotePromptRejection(input.text),
               currentActivity = activity();
             if (rejection) data = rejection;
             else if (
-              args.mode === 'idle_only' &&
+              input.mode === 'idle_only' &&
               (!currentActivity.idle || currentActivity.pending_messages)
             )
               data = { status: 'skipped', reason: 'busy' };
             else {
               const options = { expandPromptTemplates: true };
-              if (args.mode === 'steer') options.deliverAs = 'steer';
-              if (args.mode === 'follow_up') options.deliverAs = 'followUp';
+              if (input.mode === 'steer') options.deliverAs = 'steer';
+              if (input.mode === 'follow_up') options.deliverAs = 'followUp';
               try {
                 pi.sendUserMessage(
-                  input.images
-                    ? [...(input.text ? [{ type: 'text', text: input.text }] : []), ...input.images]
-                    : input.text,
+                  input.images ? [{ type: 'text', text: input.text }, ...input.images] : input.text,
                   options,
                 );
                 // The public API confirms invocation, not native admission or
@@ -564,7 +532,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           } else if (request.op === 'shutdown') {
             if (ctx.mode === 'rpc') throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
             data = { shutdown: 'requested' };
-            socket.end(JSON.stringify({ generation: record.generation, data }) + '\n', () => {
+            socket.end(ownerEnvelope(record, { data }), () => {
               try {
                 check(request);
                 ctx.shutdown();
@@ -574,13 +542,10 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             });
             return;
           } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
-          socket.end(JSON.stringify({ generation: record.generation, data }) + '\n');
+          socket.end(ownerEnvelope(record, { data }));
         } catch (error) {
           socket.end(
-            JSON.stringify({
-              generation: record.generation,
-              error: publicError(error, 'ATTACHED_OPERATION_FAILED'),
-            }) + '\n',
+            ownerEnvelope(record, { error: publicError(error, 'ATTACHED_OPERATION_FAILED') }),
           );
         }
       });

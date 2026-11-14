@@ -43,7 +43,6 @@ function validateHeader(header) {
       (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd) || header.cwd.includes('\0')))
   )
     throw new Error('INVALID_SESSION');
-  if (![1, 2, 3].includes(header.version ?? 1)) throw new Error('UNSUPPORTED_SESSION_VERSION');
   return header;
 }
 // Identity discovery never parses transcript bodies. Bound the control header,
@@ -120,7 +119,8 @@ export async function validateExecutionCwd(cwd) {
   return cwd;
 }
 export async function loadSession(file, { omitImageData = false, config } = {}) {
-  const { parseSessionEntries, migrateSessionEntries } = await nativeSdk(config);
+  const { parseSessionEntries, migrateSessionEntries, CURRENT_SESSION_VERSION } =
+    await nativeSdk(config);
   const expected = await assertSingleSessionFile(file),
     fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
     records = [];
@@ -181,6 +181,8 @@ export async function loadSession(file, { omitImageData = false, config } = {}) 
   }
   validateHeader(records[0]);
   migrateSessionEntries(records);
+  if (records[0].version !== CURRENT_SESSION_VERSION)
+    throw new Error('UNSUPPORTED_SESSION_VERSION');
   const [header, ...entries] = records,
     byId = new Map();
   for (const entry of entries) {

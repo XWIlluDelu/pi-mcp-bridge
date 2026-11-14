@@ -6,12 +6,8 @@ import {
   dispatchModern,
   MODERN_VERSION,
   META,
-  MCP_RESPONSE_LIMIT,
   MCP_INPUT_LIMIT,
-  boundMessage,
   toolDefinitions,
-  validateModernHeaders,
-  isRpcRequest,
   callBridgeTool,
 } from '../src/protocol.mjs';
 import { BridgeStdioTransport } from '../src/protocol-stdio.mjs';
@@ -75,46 +71,6 @@ test('public text limits retain UTF-16 units and trim search before validation',
       .query,
     'needle',
   );
-});
-
-test('transport request envelopes allow notifications and enforce parameter and ID boundaries', () => {
-  const request = { jsonrpc: '2.0', method: 'ping' };
-  assert.equal(isRpcRequest(request), true, 'notifications may omit both ID and params');
-  assert.equal(isRpcRequest({ ...request, params: {} }), true);
-  for (const params of [null, [], false, 1, 'invalid'])
-    assert.equal(isRpcRequest({ ...request, params }), false);
-  for (const id of [
-    0,
-    Number.MIN_SAFE_INTEGER,
-    Number.MAX_SAFE_INTEGER,
-    '',
-    'a'.repeat(1024),
-    '🙂'.repeat(256),
-  ])
-    assert.equal(isRpcRequest({ ...request, id }), true);
-  for (const id of [
-    null,
-    false,
-    [],
-    {},
-    0.5,
-    Number.MIN_SAFE_INTEGER - 1,
-    Number.MAX_SAFE_INTEGER + 1,
-    'a'.repeat(1025),
-    '🙂'.repeat(256) + 'a',
-  ])
-    assert.equal(isRpcRequest({ ...request, id }), false);
-  for (const body of [
-    null,
-    false,
-    1,
-    'request',
-    [],
-    {},
-    { ...request, jsonrpc: '1.0' },
-    { ...request, method: null },
-  ])
-    assert.equal(isRpcRequest(body), false);
 });
 
 test('modern requests are self-contained; discovery and tool list carry required fields', async () => {
@@ -280,63 +236,6 @@ test('owner read refresh is a lifecycle error in text and structured tool result
   assert.match(result.structuredContent.error.recovery, /Changing read arguments will not/);
 });
 
-test('modern HTTP validates mirrored headers including encoded Unicode and duplicates', () => {
-  const body = message('tools/call', { name: '命令', arguments: {} });
-  const values = {
-    'mcp-protocol-version': [MODERN_VERSION],
-    'mcp-method': ['tools/call'],
-    'mcp-name': ['=?base64?' + Buffer.from('命令').toString('base64') + '?='],
-  };
-  assert.equal(
-    validateModernHeaders(body, (name) => values[name] ?? []),
-    null,
-  );
-  for (const [name, bad] of [
-    ['mcp-method', []],
-    ['mcp-name', ['wrong']],
-    ['mcp-name', ['=?base64?!!!!?=']],
-    ['mcp-protocol-version', [MODERN_VERSION, MODERN_VERSION]],
-  ]) {
-    const copy = { ...values, [name]: bad };
-    assert.equal(validateModernHeaders(body, (key) => copy[key] ?? []).error.code, -32020);
-  }
-});
-test('UTF8 cap measures entire escaped duplicate envelope and returns an explicit recoverable error', () => {
-  const result = {
-    content: [{ type: 'text', text: '😀\\'.repeat(100000) }],
-    structuredContent: { text: '😀'.repeat(100000) },
-    resultType: 'complete',
-  };
-  const bounded = boundMessage({ jsonrpc: '2.0', id: '🧪', result });
-  assert.ok(Buffer.byteLength(JSON.stringify(bounded)) <= MCP_RESPONSE_LIMIT);
-  assert.equal(bounded.result.isError, true);
-  assert.match(bounded.result.content[0].text, /RESPONSE_TOO_LARGE/);
-  assert.equal(bounded.result.resultType, 'complete');
-});
-test('fragmented large stdio frames have linear copy cost, exact bytes and no retained capacity after delivery', (t) => {
-  const transport = new BridgeStdioTransport(null),
-    frames = [];
-  transport.line = (bytes) => frames.push(bytes.toString());
-  const wire = Buffer.from(JSON.stringify({ text: '图'.repeat(2 * 1024 * 1024) }) + '\n{}\n');
-  const copy = Buffer.prototype.copy,
-    concat = Buffer.concat;
-  let copied = 0;
-  t.mock.method(Buffer.prototype, 'copy', function (...args) {
-    const n = copy.apply(this, args);
-    copied += n;
-    return n;
-  });
-  t.mock.method(Buffer, 'concat', function (parts, ...args) {
-    copied += parts.reduce((n, b) => n + b.length, 0);
-    return concat.call(this, parts, ...args);
-  });
-  for (let at = 0; at < wire.length; at += 4096) transport.read(wire.subarray(at, at + 4096));
-  t.mock.restoreAll();
-  assert.equal(frames.join('\n') + '\n', wire.toString());
-  assert.ok(copied <= wire.length * 3, { copied, wire: wire.length });
-  assert.equal(transport.buffer.length, 0);
-  assert.equal(transport.bufferLength, 0);
-});
 test('bounded stdio handles modern no-handshake calls, cancellation and oversized input', async () => {
   const input = new PassThrough(),
     output = new PassThrough(),

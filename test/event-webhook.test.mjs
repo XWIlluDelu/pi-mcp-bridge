@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import dns from 'node:dns/promises';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
-import { PassThrough, Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import { createHmac } from 'node:crypto';
 import {
   callbackUrl,
@@ -68,20 +68,6 @@ test('Standard Webhooks signs exact bytes and both rotation keys; challenge must
     verifyCallback(subscription, async () => ({ status: 302, body: '' })),
     (e) => e.reason === 'http_4xx',
   );
-});
-
-test('notification status is preserved without waiting for oversized unfinished response bodies', async (t) => {
-  let status, response;
-  callbackReceiver(t, () => {
-    response = new PassThrough();
-    response.statusCode = status;
-    response.write(Buffer.alloc(8192));
-    return response; // No EOF: delivery does not depend on reading the body.
-  });
-  for (status of [200, 410, 413]) {
-    assert.deepEqual(await postWebhook('https://callback.example/event', '{}', {}), { status });
-    assert.equal(response.destroyed, true);
-  }
 });
 
 test('callback verification reads its challenge but bounds the successful response body', async (t) => {

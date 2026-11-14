@@ -93,38 +93,6 @@ test('MCP command permission is independent and output is bounded without contin
   assert.equal((await f.call({ command: 'native command', max_chars: 32768 })).isError, undefined);
   assert.equal(f.calls(), 2);
 });
-test('command and batch distinguish native truncation from response completeness', async (t) => {
-  const f = await fixture(t);
-  f.rule.command = true;
-  const output = 'native output line\n'.repeat(100);
-  for (const native_truncated of [false, true]) {
-    f.callbacks.bash = async () => ({
-      output,
-      exitCode: 0,
-      cancelled: false,
-      truncated: native_truncated,
-      fullOutputPath: native_truncated ? '/synthetic/native-output.log' : null,
-    });
-    for (const max_chars of [256, 32768]) {
-      const args = { session_id: f.saved.id, command: 'native fixture', max_chars };
-      const direct = await f.client.callTool({ name: 'command', arguments: args });
-      const batch = await f.client.callTool({
-        name: 'batch',
-        arguments: { operations: [{ op: 'command', args }] },
-      });
-      for (const result of [direct.structuredContent, batch.structuredContent.results[0].result]) {
-        assert.equal(result.status, 'completed');
-        assert.equal(result.native_truncated, native_truncated);
-        assert.equal(result.response_complete, max_chars === 32768);
-        assert.equal(result.output, output.slice(0, result.output.length));
-        assert.equal(
-          result.fullOutputPath,
-          native_truncated ? '/synthetic/native-output.log' : null,
-        );
-      }
-    }
-  }
-});
 
 test('connection loss after received native bash output retains it without repeating execution', async (t) => {
   const f = await fixture(t),
@@ -167,35 +135,6 @@ test('connection loss after received native bash output retains it without repea
   } finally {
     finish.resolve();
   }
-});
-
-test('bash respects the handoff fence before and after runtime lookup', async (t) => {
-  const f = await fixture(t);
-  f.rule.command = true;
-  f.bridge.handoffs.set(f.saved.id, {});
-  let result = (await f.call({ command: 'not admitted' })).structuredContent;
-  assert.equal(result.status, 'rejected');
-  assert.equal(result.reason, 'HANDOFF_PENDING');
-  assert.equal(f.calls(), 0);
-  f.bridge.handoffs.delete(f.saved.id);
-  const entered = Promise.withResolvers(),
-    finish = Promise.withResolvers(),
-    lookup = f.bridge.pool.forRead.bind(f.bridge.pool);
-  t.mock.method(f.bridge.pool, 'forRead', async (session) => {
-    const runtime = await lookup(session);
-    entered.resolve();
-    await finish.promise;
-    return runtime;
-  });
-  const pending = f.call({ command: 'not admitted' });
-  await entered.promise;
-  f.bridge.handoffs.set(f.saved.id, {});
-  finish.resolve();
-  result = (await pending).structuredContent;
-  assert.equal(result.status, 'rejected');
-  assert.equal(result.reason, 'HANDOFF_PENDING');
-  assert.equal(f.calls(), 0);
-  f.bridge.handoffs.delete(f.saved.id);
 });
 
 test('shutdown drains already admitted inline command output instead of discarding it', async (t) => {

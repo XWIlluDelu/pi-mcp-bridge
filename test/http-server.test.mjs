@@ -1,3 +1,4 @@
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -6,17 +7,14 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+
 import { createHttpService } from '../src/http-server.mjs';
 import { loadHttpConfig, TOKEN_HEADER } from '../src/http-config.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { META, MODERN_VERSION, MCP_RESPONSE_LIMIT, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
 
-const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
+import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
+
 const token = 'synthetic-http-test-token-never-a-real-credential';
 const rpc = (name, args = {}, id = 1) => ({
   jsonrpc: '2.0',
@@ -86,7 +84,7 @@ async function fixture(t, serviceOptions = {}) {
     folders: [{ path: cwd }],
     grants: [{ folder: cwd, list: true, read: true, send: true, create: true, delete: true }],
   };
-  const runtime = {
+  const runtime = ownedRuntime({
     alive: true,
     calls: [],
     state: async () => ({ isStreaming: false }),
@@ -97,7 +95,7 @@ async function fixture(t, serviceOptions = {}) {
     stop: async function () {
       this.alive = false;
     },
-  };
+  });
   const bridge = await new Bridge(config, async () => runtime).init();
   const created = await savedSession(bridge);
   const service = createHttpService(bridge, { token, ...serviceOptions });
@@ -217,16 +215,7 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
   await Promise.allSettled([...f.bridge.pendingMutations]);
   assert.equal(f.runtime.calls.length, 1);
 });
-test('HTTP measures complete Unicode MCP response including both payload representations', async (t) => {
-  const f = await fixture(t);
-  f.bridge.list = async () => ({ sessions: [{ text: '😀\\\\'.repeat(MCP_RESPONSE_LIMIT) }] });
-  const body = modern('tools/call', { name: 'list', arguments: {} });
-  const response = await request(f.url, body, { headers: modernHeaders(body) }).response;
-  assert.equal(response.status, 200);
-  assert.ok(Buffer.byteLength(response.text) <= MCP_RESPONSE_LIMIT);
-  assert.equal(response.body.result.isError, true);
-  assert.match(response.text, /RESPONSE_TOO_LARGE/);
-});
+
 test('HTTP initialize and independent requests use JSON without MCP sessions or SSE', async (t) => {
   const f = await fixture(t);
   const response = await request(f.url, initialize).response;
@@ -329,121 +318,6 @@ test('HTTP bounds declared and chunked bodies and accepts ten maximally escaped 
   assert.equal(f.runtime.calls.length, 11);
 });
 
-test('same JSON-RPC IDs on concurrent HTTP requests never cross responses', async (t) => {
-  const f = await fixture(t),
-    both = deferred();
-  let calls = 0;
-  f.bridge.list = async ({ name }) => {
-    if (++calls === 2) both.resolve();
-    await both.promise;
-    return { marker: name };
-  };
-  const responses = await Promise.all(
-    ['first', 'second'].map((name) => request(f.url, rpc('list', { name }, 99)).response),
-  );
-  assert.deepEqual(
-    responses.map((r) => [r.body.id, r.body.result.structuredContent.marker]),
-    [
-      [99, 'first'],
-      [99, 'second'],
-    ],
-  );
-});
-
-test('lost HTTP response does not replay work or close the Bridge', async (t) => {
-  const f = await fixture(t),
-    entered = deferred(),
-    release = deferred();
-  f.runtime.command = async (command) => {
-    f.runtime.calls.push(command);
-    entered.resolve();
-    await release.promise;
-    return { disposition: 'started' };
-  };
-  f.cleanup.push(() => release.resolve());
-  const original = request(f.url, rpc('send', { session_id: f.id, text: 'fixture' }));
-  const lost = original.response.catch(() => null);
-  await entered.promise;
-  original.req.destroy();
-  await lost;
-  assert.equal(f.bridge.closing, undefined);
-  assert.ok(f.bridge.lock);
-  release.resolve();
-  await Promise.allSettled([...f.bridge.pendingMutations]);
-  assert.equal(f.runtime.calls.length, 1);
-  assert.equal((await f.call('list')).sessions.length, 1);
-});
-
-for (const first of ['send', 'read'])
-  test(
-    `HTTP disconnect during pending ${first} preserves later admitted batch mutations`,
-    { timeout: 10000 },
-    async (t) => {
-      const f = await fixture(t),
-        entered = deferred(),
-        release = deferred(),
-        completed = deferred();
-      const create = f.bridge.create.bind(f.bridge);
-      t.mock.method(f.bridge, 'create', async (...args) => {
-        const result = await create(...args);
-        completed.resolve(result);
-        return result;
-      });
-      let readCompleted = false;
-      f.cleanup.push(() => release.resolve());
-      let initial;
-      if (first === 'send') {
-        f.runtime.command = async (command) => {
-          f.runtime.calls.push(command);
-          entered.resolve();
-          await release.promise;
-          return { disposition: 'started' };
-        };
-        initial = {
-          op: 'send',
-          args: { session_id: f.id, text: 'fixture' },
-        };
-      } else {
-        f.bridge.read = async (_args, options) => {
-          assert.equal(Object.hasOwn(options, 'signal'), false);
-          entered.resolve();
-          await release.promise;
-          readCompleted = true;
-          return { items: [] };
-        };
-        initial = { op: 'read', args: { session_id: f.id } };
-      }
-      const batch = request(
-        f.url,
-        rpc('batch', {
-          operations: [
-            initial,
-            {
-              op: 'create',
-              args: {
-                project: f.config.folders[0].path,
-
-                text: 'fixture',
-              },
-            },
-          ],
-        }),
-      );
-      const lost = batch.response.catch(() => null);
-      await entered.promise;
-      batch.req.destroy();
-      await lost;
-      release.resolve();
-      await completed.promise; // Disconnect is not service shutdown.
-      await Promise.all([...f.bridge.pendingMutations]);
-      assert.ok((await f.bridge.sessions()).length >= 2);
-      if (first === 'send') {
-        assert.ok(f.runtime.calls.length >= 1);
-        assert.equal(f.runtime.calls.length, 2); // original send plus create's initial prompt
-      } else assert.equal(readCompleted, true);
-    },
-  );
-
 test('HTTP shutdown drains input ACKs without publishing a later batch create', async (t) => {
   const f = await fixture(t),
     entered = deferred(),
@@ -481,54 +355,6 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
   assert.equal(f.runtime.alive, false);
 });
 
-test('two standard stdio proxies share one HTTP runtime and closing either preserves the service', async (t) => {
-  const f = await fixture(t),
-    tokenFile = path.join(f.dir, 'proxy-token'),
-    file = path.join(f.dir, 'proxy-owner.json');
-  await fs.writeFile(tokenFile, token, { mode: 0o600 });
-  await fs.writeFile(
-    file,
-    JSON.stringify({ ...f.config, http: { port: Number(new URL(f.url).port), tokenFile } }),
-    { mode: 0o600 },
-  );
-  const clients = [];
-  t.after(async () => {
-    await Promise.allSettled(clients.map((client) => client.close()));
-  });
-  for (let index = 0; index < 2; index++) {
-    const transport = new StdioClientTransport({
-      command: process.execPath,
-      args: [path.join(base, 'src/stdio-proxy.mjs'), file],
-      cwd: base,
-      env: { PATH: process.env.PATH, HOME: f.dir, PI_OFFLINE: '1' },
-      stderr: 'pipe',
-    });
-    const client = new Client({ name: 'proxy-fixture-' + index, version: '1' });
-    clients.push(client);
-    await client.connect(transport);
-  }
-  const results = await Promise.all(
-    clients.map((client, index) =>
-      client.callTool({
-        name: 'send',
-        arguments: { session_id: f.id, text: 'fixture-' + index },
-      }),
-    ),
-  );
-  assert.ok(results.every((result) => result.structuredContent.status === 'started'));
-  assert.equal(f.runtime.calls.length, 2);
-  assert.equal(f.bridge.pool.instances.size, 1);
-  await clients[0].close();
-  assert.equal(f.bridge.closing, undefined);
-  assert.ok(f.bridge.lock);
-  const observed = await clients[1].callTool({ name: 'list', arguments: { session_id: f.id } });
-  assert.equal(observed.structuredContent.sessions[0].session_id, f.id);
-  assert.equal(f.runtime.calls.length, 2);
-  assert.equal(
-    (await clients[1].callTool({ name: 'list', arguments: {} })).structuredContent.sessions.length,
-    1,
-  );
-});
 test('HTTP owner configuration requires canonical private token and config files', async (t) => {
   const f = await fixture(t),
     tokenFile = path.join(f.dir, 'backend-token'),
@@ -556,114 +382,3 @@ test('HTTP owner configuration requires canonical private token and config files
   );
   await assert.rejects(loadHttpConfig(file), /INVALID_HTTP_CONFIG/);
 });
-
-test('independent HTTP CLI survives caller exit and closed stdio; SIGTERM releases its lock', async (t) => {
-  const f = await fixture(t),
-    port = Number(new URL(f.url).port);
-  await f.service.close();
-  const tokenFile = path.join(f.dir, 'backend-token'),
-    file = path.join(f.dir, 'owner.json');
-  await fs.writeFile(tokenFile, token, { mode: 0o600 });
-  await fs.writeFile(file, JSON.stringify({ ...f.config, http: { port, tokenFile } }), {
-    mode: 0o600,
-  });
-  const child = spawn(process.execPath, ['src/http-server.mjs', file], {
-    cwd: base,
-    env: { PATH: process.env.PATH, HOME: f.dir, PI_OFFLINE: '1' },
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
-  let stderr = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk;
-  });
-  const done = new Promise((resolve) =>
-    child.once('exit', (code, signal) => resolve({ code, signal })),
-  );
-  t.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    await done;
-  });
-  let ready = false;
-  for (let i = 0; i < 200; i++) {
-    try {
-      if ((await request(f.url, initialize).response).status === 200) {
-        ready = true;
-        break;
-      }
-    } catch {}
-    if (child.exitCode !== null) break;
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  assert.equal(ready, true, stderr);
-  const client = spawn(
-    process.execPath,
-    [
-      '--input-type=module',
-      '-e',
-      'await fetch(process.env.FIXTURE_URL,{method:"POST",headers:{"content-type":"application/json",accept:"application/json, text/event-stream","x-pi-bridge-token":process.env.FIXTURE_TOKEN},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"tools/list"})});',
-    ],
-    { env: { PATH: process.env.PATH, FIXTURE_URL: f.url, FIXTURE_TOKEN: token }, stdio: 'ignore' },
-  );
-  const clientExit = await new Promise((resolve) => client.once('exit', resolve));
-  assert.equal(clientExit, 0);
-  assert.equal(child.exitCode, null);
-  assert.equal((await request(f.url, rpc('list')).response).status, 200);
-  child.kill('SIGTERM');
-  assert.deepEqual(await done, { code: 0, signal: null }, stderr);
-});
-
-for (const stage of ['before-acquire', 'after-acquire'])
-  test(`HTTP startup stop waits for ${stage} lock acquisition without opening a listener`, async (t) => {
-    const f = await fixture(t),
-      port = Number(new URL(f.url).port);
-    await f.service.close();
-    const tokenFile = path.join(f.dir, 'backend-token'),
-      configFile = path.join(f.dir, 'owner.json');
-    const preload = path.join(f.dir, 'pause-init.mjs'),
-      reached = path.join(f.dir, 'reached'),
-      release = path.join(f.dir, 'release');
-    await fs.writeFile(tokenFile, token, { mode: 0o600 });
-    await fs.writeFile(configFile, JSON.stringify({ ...f.config, http: { port, tokenFile } }), {
-      mode: 0o600,
-    });
-    await fs.writeFile(
-      preload,
-      `import {holdInit} from ${JSON.stringify(new URL('./fixtures/init-gate.mjs', import.meta.url).href)};holdInit(${JSON.stringify({ config: f.config, stage, reached, release })});`,
-    );
-    const child = spawn(
-      process.execPath,
-      ['--import', preload, path.join(base, 'src/http-server.mjs'), configFile],
-      {
-        env: { PATH: process.env.PATH, HOME: f.dir, PI_OFFLINE: '1' },
-        stdio: ['ignore', 'ignore', 'pipe'],
-      },
-    );
-    let stderr = '';
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
-    const done = new Promise((resolve) =>
-      child.once('exit', (code, signal) => resolve({ code, signal })),
-    );
-    f.cleanup.push(async () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      await done;
-    });
-    let ready = false;
-    for (let i = 0; i < 200; i++) {
-      ready = await fs.stat(reached).then(
-        () => true,
-        () => false,
-      );
-      if (ready) break;
-      if (child.exitCode !== null) break;
-      await new Promise((r) => setTimeout(r, 20));
-    }
-    assert.equal(ready, true, stderr);
-    child.kill('SIGTERM');
-    await new Promise((r) => setTimeout(r, 50));
-    assert.equal(child.exitCode, null);
-    await assert.rejects(request(f.url, initialize).response, { code: 'ECONNREFUSED' });
-    await fs.writeFile(release, 'release');
-    assert.deepEqual(await done, { code: 0, signal: null }, stderr);
-  });

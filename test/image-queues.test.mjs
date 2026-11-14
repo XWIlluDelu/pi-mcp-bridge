@@ -9,7 +9,6 @@ import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
 import { savedEntries } from './fixtures/saved-session.mjs';
 
-const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 test(
   'busy steering and follow-up retain images; idle-only skips and restart replays without work',
   { timeout: 20000 },
@@ -56,7 +55,6 @@ test(
       skipped = pngImage();
     const args = {
       session_id: made.session_id,
-
       mode: 'follow_up',
       images: [follow],
     };
@@ -72,7 +70,6 @@ test(
       (
         await bridge.send({
           session_id: made.session_id,
-
           mode: 'idle_only',
           images: [skipped],
         })

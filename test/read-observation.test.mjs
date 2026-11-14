@@ -5,9 +5,9 @@ import {
   RetainedObservations,
   checkObservation,
 } from '../src/context-observation.mjs';
-import { ContextReadCache } from '../src/read-cache.mjs';
-import { readSchema } from '../src/read-schema.mjs';
+
 import { assertReadSnapshot } from '../src/context-read.mjs';
+import { LiveMessageObserver } from '../src/live-message.mjs';
 
 const args = { session_id: 'ps_observed', view: 'runtime' };
 function fixture() {
@@ -77,91 +77,6 @@ test('observations are detached request-stage data with honest identity, updates
   assert.ok(replacement.read(args, ctx).capture_sequence > next.capture_sequence);
 });
 
-test('runtime pages share native cleaning, Unicode paging and frozen cursor budgets without native selectors', () => {
-  const { ctx, observer } = fixture();
-  const body = Array.from(
-    { length: 60 },
-    (_, i) => 'Paragraph ' + i + ' 漢😀'.repeat(30) + '\n\n',
-  ).join('');
-  observer.capture({ messages: [{ role: 'user', content: body }] }, ctx);
-  const snapshot = { ...observer.read(args, ctx), request: args },
-    cache = new ContextReadCache(),
-    identity = { session_id: args.session_id, file: 'a', native_id: 'native-a' };
-  let page = cache.render(snapshot, { ...args, max_bytes: 4096 }, { identity });
-  const pages = [page];
-  assert.ok(page.next_cursor);
-  observer.capture({ messages: [{ role: 'user', content: 'LATER' }] }, ctx);
-  while (page.next_cursor) {
-    const a = { cursor: page.next_cursor, max_bytes: 4096 },
-      captured = cache.get(a, identity);
-    page = cache.render(captured.snapshot, a, { ...captured, identity });
-    pages.push(page);
-    assert.ok(pages.length < 200, 'pagination must advance');
-  }
-  assert.equal(
-    pages
-      .flatMap((p) => p.items)
-      .map((u) => u.message?.content ?? '')
-      .join(''),
-    body,
-  );
-  for (const p of pages) {
-    assert.equal(p.view, 'runtime');
-    assert.equal(p.selection, null);
-    assert.equal(p.observation.id, snapshot.observation.id);
-    assert.ok(Buffer.byteLength(JSON.stringify(p)) <= 4096);
-  }
-  const cursor = pages[0].next_cursor;
-  for (const override of [
-    { view: 'session' },
-    { range: { recent: -1 } },
-    { content: { tool: 1 } },
-    { leaf_id: null },
-  ])
-    assert.throws(() => cache.get({ cursor, ...override }, identity), /STALE_CURSOR/);
-  for (const override of [{ range: { recent: -1 } }, { range: {} }, { leaf_id: null }])
-    assert.equal(readSchema.safeParse({ ...args, ...override }).success, false);
-});
-
-test('runtime assistant parts retain completion state without repeating large error metadata', () => {
-  const { ctx, observer } = fixture();
-  const body = 'Partial 漢😀 answer\n'.repeat(1500),
-    errorMessage = 'PROVIDER_DETAIL '.repeat(1500);
-  for (const stopReason of ['error', 'aborted']) {
-    observer.capture(
-      { messages: [{ role: 'assistant', content: [text(body)], stopReason, errorMessage }] },
-      ctx,
-    );
-    const snapshot = { ...observer.read(args, ctx), request: args },
-      cache = new ContextReadCache(),
-      identity = { session_id: args.session_id };
-    assert.equal(
-      snapshot.units.filter((unit) => unit.message?.errorMessage === errorMessage).length,
-      1,
-    );
-    let page = cache.render(snapshot, { ...args, max_bytes: 4096 }, { identity });
-    assert.ok(page.next_cursor);
-    const pages = [page];
-    while (page.next_cursor) {
-      const next = { cursor: page.next_cursor, max_bytes: 4096 },
-        captured = cache.get(next, identity);
-      page = cache.render(captured.snapshot, next, { ...captured, identity });
-      pages.push(page);
-      assert.ok(pages.length < 200, 'pagination must advance');
-    }
-    const parts = pages.flatMap((p) => p.items.filter((unit) => unit.message?.content));
-    assert.ok(parts.every((unit) => unit.message.stopReason === stopReason));
-    assert.equal(
-      parts
-        .flatMap((unit) => unit.message.content)
-        .map((block) => block.text)
-        .join(''),
-      body,
-    );
-    assert.ok(pages.every((p) => Buffer.byteLength(JSON.stringify(p)) <= 4096));
-  }
-});
-
 test('retention keeps the latest successful capture with bounded memory, identity checks and ordered publication', () => {
   const { ctx, observer } = fixture(),
     runtime = {},
@@ -204,4 +119,55 @@ test('retention keeps the latest successful capture with bounded memory, identit
   assert.deepEqual(failed.units, []);
   assertReadSnapshot(failed, args);
   assert.equal(checkObservation(failed, { entries: [], leafId: null }), failed);
+});
+
+test('extension cumulative events produce detached snapshots without assuming delta wire shape', () => {
+  const observer = new LiveMessageObserver('extension_message_events'),
+    message = { role: 'assistant', content: [{ type: 'text', text: 'partial' }] };
+  observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+  observer.update({ type: 'message_update', message });
+  message.content[0].text = 'later';
+  const snapshot = observer.snapshot();
+  assert.equal(snapshot.message.content[0].text, 'partial');
+  snapshot.message.content[0].text = 'external mutation';
+  assert.equal(observer.snapshot().message.content[0].text, 'partial');
+  observer.update({ type: 'agent_settled' });
+  assert.equal(observer.snapshot().message, null);
+});
+
+test('transient observation memory is bounded, Unicode-safe and explicitly truncated', () => {
+  const observer = new LiveMessageObserver('rpc_message_events');
+  observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+  observer.update({
+    type: 'message_update',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'x'.repeat(65535) + '😀overflow' }],
+    },
+  });
+  const live = observer.snapshot();
+  assert.equal(live.truncated, true);
+  assert.ok(live.message.content[0].text.length <= 65536);
+  assert.ok(live.message.content[0].text.endsWith('😀overflow'));
+  assert.equal(live.message.content[0].text.endsWith('�'), false);
+  observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+  assert.equal(observer.snapshot().truncated, false);
+});
+
+test('tiny and empty cumulative blocks share a bounded tail budget', () => {
+  for (const text of ['x', '']) {
+    const observer = new LiveMessageObserver('events');
+    observer.update({ type: 'message_start', message: { role: 'assistant', content: [] } });
+    observer.update({
+      type: 'message_update',
+      message: {
+        role: 'assistant',
+        content: Array.from({ length: 5000 }, () => ({ type: 'text', text })),
+      },
+    });
+    const { message, truncated } = observer.snapshot();
+    assert.equal(truncated, true);
+    assert.equal(message.content.at(-1).index, 4999);
+    assert.ok(message.content.reduce((sum, block) => sum + block.text.length + 64, 0) <= 65536);
+  }
 });

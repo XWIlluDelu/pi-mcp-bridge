@@ -139,26 +139,3 @@ test('list model/thinking metadata comes only from live state, independently of 
       assert.equal(Object.hasOwn(status, 'capabilities'), false);
   }
 });
-
-test('runtime capabilities stay supported across busy and unknown activity observations', async () => {
-  for (const [state, expected, count] of [
-    [{ isStreaming: false, activity: { idle: true, pending_message_count: 0 } }, 'idle', 0],
-    [{ isStreaming: false, activity: { idle: true, pending_messages: true } }, 'busy', null],
-    [{ isStreaming: false, activity: { idle: false } }, 'busy', null],
-    [{ isStreaming: false, isCompacting: false, pendingMessageCount: 0 }, 'unknown', 0],
-    [{ isStreaming: false, pendingMessageCount: -1 }, 'unknown', null],
-  ]) {
-    const { status: result } = await runtimeMetadata(
-      { forRead: async () => companion(async () => state) },
-      {},
-    );
-    assert.equal(result.state, expected);
-    assert.equal(result.pending_messages, count);
-    assert.deepEqual(result.capabilities, {
-      send: true,
-      reload: false,
-      command: false,
-      stop: false,
-    });
-  }
-});

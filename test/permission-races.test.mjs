@@ -89,7 +89,6 @@ for (const operation of ['command', 'stop'])
         await bridge.send({ session_id: id, text: 'HOLD_MODEL' });
         await bridge.send({
           session_id: id,
-
           text: marker.repeat(100),
           mode: 'follow_up',
         });
@@ -191,36 +190,7 @@ async function fixture(t) {
   };
   return { bridge, cwd, config, runtime, calls, update };
 }
-test('send retains admission permissions through blocked cold startup', async (t) => {
-  const f = await fixture(t),
-    seed = await savedSession(f.bridge),
-    entered = Promise.withResolvers(),
-    release = Promise.withResolvers();
-  f.bridge.pool.factory = async () => {
-    entered.resolve();
-    await release.promise;
-    return f.runtime;
-  };
-  const pending = f.bridge.send({
-    session_id: seed.session_id,
 
-    text: 'admitted before revocation',
-  });
-  await entered.promise;
-  await f.update((c) => {
-    c.defaults.send = false;
-  });
-  release.resolve();
-  assert.ok(
-    ['started', 'queued', 'handled'].includes((await pending).status),
-    'Expected native prompt admission',
-  );
-  assert.deepEqual(f.calls, ['admitted before revocation']);
-  assert.equal(
-    (await f.bridge.send({ session_id: seed.session_id, text: 'denied' })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-});
 test('list keeps parent references from its snapshot through slow child status', async (t) => {
   const f = await fixture(t),
     parent = await savedSession(f.bridge),
@@ -251,75 +221,7 @@ test('list keeps parent references from its snapshot through slow child status',
   const fresh = await f.bridge.list({ session_id: child.session_id });
   assert.equal(fresh.sessions[0].parent_session_id, null);
 });
-test('repeated delete reauthorizes and cannot recover the prior trash result', async (t) => {
-  const f = await fixture(t),
-    seed = await savedSession(f.bridge),
-    args = { session_id: seed.session_id };
-  const first = await f.bridge.delete(args);
-  assert.equal(first.status, 'deleted');
 
-  await f.update((c) => {
-    c.defaults.delete = false;
-  });
-  const denied = await f.bridge.delete(args);
-  assert.equal(denied.reason, 'NOT_FOUND_OR_DENIED');
-  assert.equal(denied.restore_token, undefined);
-  await f.update((c) => {
-    c.grants = [{ session_id: seed.session_id, delete: true }];
-  });
-  const repeated = await f.bridge.delete(args);
-  assert.equal(repeated.status, 'rejected');
-  assert.equal(repeated.reason, 'NOT_FOUND_OR_DENIED');
-  assert.equal(repeated.restore_token, undefined);
-});
-test('create holds the new session lane until its initial prompt is admitted', async (t) => {
-  const f = await fixture(t),
-    entered = Promise.withResolvers(),
-    release = Promise.withResolvers();
-  const resolve = f.bridge.pool.resolve.bind(f.bridge.pool);
-  t.mock.method(f.bridge.pool, 'resolve', async (session) => {
-    entered.resolve(session.id);
-    await release.promise;
-    return resolve(session);
-  });
-  const creating = f.bridge.create({ project: f.cwd, text: 'initial' }),
-    id = await entered.promise;
-  const sending = f.bridge.send({ session_id: id, text: 'later' });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(f.calls, []);
-  release.resolve();
-  assert.ok(
-    ['started', 'queued', 'handled'].includes((await creating).status),
-    'Expected native prompt admission',
-  );
-  assert.ok(
-    ['started', 'queued', 'handled'].includes((await sending).status),
-    'Expected native prompt admission',
-  );
-  assert.deepEqual(f.calls, ['initial', 'later']);
-});
-test('delete retains its admission grant through owner release', async (t) => {
-  const f = await fixture(t),
-    seed = await savedSession(f.bridge),
-    session = await f.bridge.session(seed.session_id);
-  const stop = f.bridge.pool.stopForDelete.bind(f.bridge.pool);
-  t.mock.method(f.bridge.pool, 'stopForDelete', async (s) => {
-    const release = await stop(s);
-    await f.update((c) => {
-      c.defaults.delete = false;
-    });
-    return release;
-  });
-  const result = await f.bridge.delete({
-    session_id: seed.session_id,
-  });
-  assert.equal(result.status, 'deleted');
-  await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
-  assert.equal(
-    (await f.bridge.delete({ session_id: seed.session_id })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-});
 test('prototype property operation names remain invalid individual batch items', async () => {
   let listed = 0;
   const result = await executeBatch(

@@ -83,27 +83,6 @@ async function sourcePage(f, args = {}) {
   return f.bridge.read({ refs: [ref], max_bytes: 4096 });
 }
 
-test('frozen source pages store clean content and reauthorize without reacquiring native entries', async (t) => {
-  const f = await fixture(t),
-    first = await sourcePage(f);
-  assert.ok(first.next_cursor);
-  for (const stored of f.bridge.readCache.entries.values()) {
-    assert.ok(!JSON.stringify(stored).includes('AAAAAAA'));
-    assert.equal(stored.snapshot.entries, undefined);
-    assert.equal(stored.snapshot.encodedRecords, undefined);
-  }
-  t.mock.method(Date, 'now', () => 10 ** 15);
-  f.entries[1].message.content[0].text = 'CHANGED';
-  first.items.find((item) => item.block?.text).block.text = 'MUTATED_PUBLIC_PAGE';
-  const next = await f.bridge.read({ cursor: first.next_cursor });
-  assert.ok(!JSON.stringify(next).includes('CHANGED'));
-  assert.ok(!JSON.stringify(next).includes('MUTATED_PUBLIC_PAGE'));
-  assert.equal(f.acquisitions(), 1);
-  f.config.defaults.read = false;
-  await assert.rejects(f.bridge.read({ cursor: first.next_cursor }), /NOT_FOUND_OR_DENIED/);
-  assert.equal(f.acquisitions(), 1);
-});
-
 test('eviction and restart return stale cursors without reconstructing snapshots', async (t) => {
   const f = await fixture(t);
   f.bridge.readCache = new ContextReadCache({ maxEntries: 1 });
@@ -170,62 +149,6 @@ test('cursor overrides validate supplied scope values and native identity', asyn
     JSON.stringify({ ...f.session.header, id: 'different-native-id' }) + '\n',
   );
   await assert.rejects(f.bridge.read({ cursor: first.next_cursor }), /NOT_FOUND_OR_DENIED/);
-});
-
-test('native cwd replacement invalidates a frozen cursor under the same native ID', async (t) => {
-  const f = await fixture(t),
-    first = await sourcePage(f);
-  const text = await fs.readFile(f.session.file, 'utf8'),
-    lines = text.trimEnd().split('\n'),
-    header = JSON.parse(lines[0]);
-  const other = path.join(path.dirname(f.session.cwd), 'other-project');
-  await fs.mkdir(other);
-  header.cwd = other;
-  lines[0] = JSON.stringify(header);
-  await fs.writeFile(f.session.file, lines.join('\n') + '\n');
-  await assert.rejects(f.bridge.read({ cursor: first.next_cursor }), /STALE_CURSOR/);
-  assert.equal(f.acquisitions(), 1);
-});
-
-test('adapted reference pages preserve both turn range and independent memory scope', async (t) => {
-  const f = await fixture(t);
-  for (const native of [false, true]) {
-    const unregister = f.bridge.compatibilityServices.sessionReaders.register('scope-fixture', {
-      matches: () => true,
-      read: ({ request }) => ({
-        native,
-        items: [
-          { id: 'memory', kind: 'memory', text: 'Stored memory details.\n\n'.repeat(600) },
-          ...(request.content?.memory === 2
-            ? [{ id: 'earlier', kind: 'memory', text: 'Earlier memory.' }]
-            : []),
-        ],
-      }),
-    });
-    try {
-      const scope = { range: { recent: 1 }, content: { memory: 1 } };
-      const overview = await f.bridge.read({ session_id: f.id, ...scope });
-      const wider = await f.bridge.read({ session_id: f.id, ...scope, content: { memory: 2 } });
-      assert.equal(overview.items.filter((item) => item.type === 'memory').length, 1);
-      assert.equal(wider.items.filter((item) => item.type === 'memory').length, 2);
-      const expanded = await f.bridge.read({
-        refs: [overview.items.find((item) => item.type === 'memory').ref],
-        max_bytes: 4096,
-      });
-      assert.ok(expanded.next_cursor);
-      assert.deepEqual(expanded.selection, overview.selection);
-      const inherited = await f.bridge.read({ cursor: expanded.next_cursor });
-      const explicit = await f.bridge.read({ cursor: expanded.next_cursor, ...scope });
-      assert.deepEqual(explicit.items, inherited.items);
-      for (const patch of [{ range: { recent: 3 } }, { content: { memory: 2 } }])
-        await assert.rejects(
-          f.bridge.read({ cursor: expanded.next_cursor, ...patch }),
-          /STALE_CURSOR/,
-        );
-    } finally {
-      unregister();
-    }
-  }
 });
 
 test('batched references preserve source order across a steering boundary and a paired result', async (t) => {

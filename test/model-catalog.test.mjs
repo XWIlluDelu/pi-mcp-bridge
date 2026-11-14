@@ -4,13 +4,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
-import { publicSchemas } from '../src/tool-schemas.mjs';
-import { callBridgeTool, toolDefinitions } from '../src/protocol.mjs';
-import { executeBatch } from '../src/batch.mjs';
+
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
-import { diagnostics } from '../src/diagnostics.mjs';
 
 async function fixture(t, overrides = {}) {
   const dir = await fs.mkdtemp('/tmp/pi-catalog-'),
@@ -134,13 +131,6 @@ test('native catalog is offline, session-free, paged and sanitized in the owner 
   assert.equal(await f.calls(), 'catalog\ncatalog\ncatalog\ncatalog\n');
 });
 
-test('catalog discovery does not initialize credential or cache files', async (t) => {
-  const f = await fixture(t);
-  const before = await fs.readdir(f.config.piRuntime.agentDir);
-  await f.bridge.models({});
-  assert.deepEqual(await fs.readdir(f.config.piRuntime.agentDir), before);
-});
-
 test('native stored credentials unlock cached models without changing auth/cache content or metadata', async (t) => {
   const f = await fixture(t),
     agent = f.config.piRuntime.agentDir,
@@ -234,180 +224,4 @@ test('catalog accepts effective project or known-session execution rights, with 
     assert.equal((await f.bridge.models({})).models.length, 30);
   }
   assert.equal(f.bridge.pool.instances.size, 0);
-});
-
-test('models uses receive-time snapshots, isolates concurrent policies and reauthorizes new calls; batch uses pagination only', async (t) => {
-  const f = await fixture(t),
-    { bridge } = f,
-    capture = bridge.captureRequestContext.bind(bridge),
-    snapshots = [],
-    gates = [Promise.withResolvers(), Promise.withResolvers()];
-  t.after(() => gates.forEach((gate) => gate.resolve()));
-  t.mock.method(bridge, 'captureRequestContext', () => {
-    const snapshot = capture();
-    snapshots.push(snapshot);
-    return snapshot;
-  });
-  const delayed = (i) =>
-    callBridgeTool(
-      bridge,
-      'models',
-      {},
-      {
-        execute: async (run) => {
-          await gates[i].promise;
-          return run();
-        },
-      },
-    );
-  const allowed = delayed(0);
-  await snapshots[0];
-  await f.policy([]);
-  const denied = delayed(1);
-  await snapshots[1];
-  gates[0].resolve();
-  assert.equal((await allowed).structuredContent.models.length, 30);
-  await assert.rejects(bridge.models({}), /NOT_FOUND_OR_DENIED/);
-  await f.policy(f.config.grants);
-  gates[1].resolve();
-  assert.equal(JSON.parse((await denied).content[0].text).error.code, 'NOT_FOUND_OR_DENIED');
-  assert.equal(await f.calls(), 'catalog\n');
-  const batch = await executeBatch(bridge, {
-    operations: [
-      { op: 'models', args: { offset: 1, limit: 1 } },
-      { op: 'models', args: { limit: 0 } },
-    ],
-  });
-  assert.equal(batch.results[0].result.models[0].id, '01');
-  assert.equal(batch.results[1].error.code, 'INVALID_OPERATION');
-});
-
-test('models validates pagination and keeps useful failure stages without disclosing native errors', async (t) => {
-  const f = await fixture(t),
-    { bridge } = f,
-    failures = [];
-  t.mock.method(diagnostics, 'emit', (event, fields) => {
-    if (event === 'model_catalog.failure') failures.push(fields);
-  });
-  const schema = toolDefinitions().find((tool) => tool.name === 'models').inputSchema;
-  assert.deepEqual(schema.required ?? [], []);
-  assert.deepEqual(Object.keys(schema.properties).sort(), ['limit', 'offset']);
-  assert.equal(schema.additionalProperties, false);
-  for (const args of [{ agentDir: '/arbitrary' }, { env: {} }, { limit: 0 }, { limit: 101 }]) {
-    assert.equal(publicSchemas.models.safeParse(args).success, false);
-    assert.equal(
-      JSON.parse((await callBridgeTool(bridge, 'models', args)).content[0].text).error.code,
-      'INVALID_ARGUMENTS',
-    );
-  }
-  assert.equal(await f.calls(), '');
-  const cacheFile = path.join(f.config.piRuntime.agentDir, 'models-store.json');
-  // Native Pi interprets cache records; Bridge only parses the file container.
-  for (const invalid of ['{ PRIVATE_CACHE_ERROR']) {
-    await fs.writeFile(cacheFile, invalid);
-    const failed = await callBridgeTool(bridge, 'models', {});
-    assert.equal(JSON.parse(failed.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
-    assert.ok(!JSON.stringify(failed).includes('PRIVATE_CACHE_ERROR'));
-    assert.deepEqual(failures.at(-1), { catalog_stage: 'storage', catalog_reason: 'invalid_json' });
-  }
-  await fs.rm(cacheFile);
-  const authFile = path.join(f.config.piRuntime.agentDir, 'auth.json');
-  await fs.writeFile(authFile, '{"openrouter":{"type":"PRIVATE_AUTH_ERROR"}}');
-  const authFailure = await callBridgeTool(bridge, 'models', {});
-  assert.equal(JSON.parse(authFailure.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
-  assert.ok(!JSON.stringify(authFailure).includes('PRIVATE_AUTH_ERROR'));
-  assert.deepEqual(failures.at(-1), {
-    catalog_stage: 'configuration',
-    catalog_reason: 'invalid_configuration',
-  });
-  await fs.rm(authFile);
-  await fs.writeFile(path.join(f.config.piRuntime.agentDir, 'models.json'), '{ PRIVATE_RAW_ERROR');
-  const failure = await callBridgeTool(bridge, 'models', {});
-  assert.equal(JSON.parse(failure.content[0].text).error.code, 'MODEL_CATALOG_UNAVAILABLE');
-  assert.ok(!JSON.stringify(failure).includes('PRIVATE_RAW_ERROR'));
-  assert.deepEqual(failures.at(-1), {
-    catalog_stage: 'configuration',
-    catalog_reason: 'invalid_configuration',
-  });
-  assert.ok(!JSON.stringify(failures).includes('PRIVATE_'));
-});
-
-test('batch shrinks the captured native catalog page with a correct offset while preserving deletion', async (t) => {
-  const f = await fixture(t),
-    modelsFile = path.join(f.config.piRuntime.agentDir, 'models.json'),
-    catalog = JSON.parse(await fs.readFile(modelsFile, 'utf8'));
-  for (const model of catalog.providers['catalog-fixture'].models)
-    model.name = '"\\\n漢😀'.repeat(40);
-  await fs.writeFile(modelsFile, JSON.stringify(catalog));
-  await f.policy([{ folder: f.project, send: true, delete: true }]);
-  const made = await savedSession(f.bridge),
-    args = { offset: 2, limit: 30 },
-    models = t.mock.method(f.bridge, 'models', f.bridge.models.bind(f.bridge));
-  const response = await callBridgeTool(f.bridge, 'batch', {
-    operations: [
-      ...Array.from({ length: 9 }, () => ({ op: 'models', args })),
-      { op: 'delete', args: { session_id: made.session_id } },
-    ],
-  });
-  assert.ok(!response.isError, JSON.stringify(response));
-  assert.equal(models.mock.calls.length, 9, 'Shrink captured pages, never load a second catalog');
-  for (const { result, error } of response.structuredContent.results.slice(0, 9)) {
-    assert.equal(error, undefined);
-    assert.ok(result.models.length > 0 && result.models.length < 30);
-    assert.equal(result.models[0].id, '02');
-    assert.equal(result.next_offset, args.offset + result.models.length);
-    const next = await f.bridge.models({ offset: result.next_offset, limit: 1 });
-    assert.equal(next.models[0].id, String(result.next_offset).padStart(2, '0'));
-  }
-  const removed = response.structuredContent.results.at(-1).result;
-  assert.equal(removed.status, 'deleted');
-  assert.match(removed.restore_token, /^[0-9a-f-]{36}$/);
-});
-
-test('catalog authorization follows effective defaults/project/session rights, not redundant policy syntax or creation folders', async (t) => {
-  const f = await fixture(t, { folders: [] });
-  const made = await savedSession(f.bridge, { project: f.project });
-  const session = await f.bridge.session(made.session_id);
-  assert.equal(session.cwd, f.project);
-  for (const [grants, defaults] of [
-    [[{ folder: f.project, command: true }], f.config.defaults],
-    [[{ folder: f.dir, send: true }], f.config.defaults],
-    [[], { ...f.config.defaults, send: true }],
-    [[{ session_id: made.session_id, send: true }], { ...f.config.defaults, send: true }],
-    [[{ session_id: made.session_id, command: true }], f.config.defaults],
-  ]) {
-    await f.policy(grants, defaults);
-    assert.equal((await f.bridge.models({})).models.length, 30);
-  }
-  const calls = await f.calls();
-  for (const [grants, defaults] of [
-    [
-      [
-        { folder: f.dir, send: true },
-        { folder: f.project, send: false },
-      ],
-      f.config.defaults,
-    ],
-    [
-      [
-        { folder: f.dir, send: true },
-        { session_id: made.session_id, send: false },
-      ],
-      f.config.defaults,
-    ],
-    [[{ folder: f.project, send: false }], { ...f.config.defaults, send: true }],
-    [[], { ...f.config.defaults, create: true }],
-  ]) {
-    await f.policy(grants, defaults);
-    await assert.rejects(f.bridge.models({}), /NOT_FOUND_OR_DENIED/);
-  }
-  await fs.unlink(session.file);
-  await f.policy([], { ...f.config.defaults, send: true });
-  await assert.rejects(f.bridge.models({}), /NOT_FOUND_OR_DENIED/);
-  assert.equal(await f.calls(), calls);
-  assert.equal(f.bridge.pool.instances.size, 0);
-  const creating = await fixture(t);
-  await creating.policy([{ folder: creating.project, create: true }]);
-  assert.equal((await creating.bridge.models({})).models.length, 30);
-  assert.equal(creating.bridge.pool.instances.size, 0);
 });

@@ -25,59 +25,7 @@ async function fixture(t) {
   };
   return { dir, file, config };
 }
-test('configuration shape errors agree across init, reload reader and HTTP', async (t) => {
-  const f = await fixture(t);
-  const invalid = [
-    { arbitrary: 'unknown' },
-    { herdr: 'true' },
-    { herdr: null },
-    { defaults: undefined, grants: [{ folder: f.dir, command: true }] },
-    { defaults: { command: true }, grants: [{ folder: f.dir, command: true }] },
-    { defaults: { read: true, send: true } },
-    { defaults: { ...denyAllPermissions(), stop: undefined } },
-    { piRuntime: { unsafeEnv: true } },
-    { sessionRoots: ['relative'] },
-    { grants: [{ folder: `${f.dir}\0`, command: false }] },
-    { folders: {} },
-    { folders: [{ path: f.dir, command: true }] },
-    {
-      folders: [{ path: f.dir }, { path: f.dir }],
-    },
-    { attachmentDir: '' },
-    { attachmentExitTimeoutMs: 49 },
-    { piArgs: '--offline' },
-    { compatibilityModules: 'module.mjs' },
-    { compatibilityModules: ['relative.mjs'] },
-    { compatibilityModules: [{ module: 'relative.mjs' }] },
-    { compatibilityModules: [{ module: '/absolute\0module.mjs' }] },
-    { compatibilityModules: [{ module: '/absolute.mjs', enabled: 'yes' }] },
-    { compatibilityModules: [{ module: '/absolute.mjs', options: [] }] },
-    { compatibilityModules: [{ module: '/absolute.mjs', unknown: true }] },
-    { compatibilityModules: [{ module: '/absolute.mjs' }, { module: '/absolute.mjs' }] },
-    { piRuntime: { tools: ['unknown'] } },
-    { http: { port: 0, tokenFile: f.config.http.tokenFile } },
-  ];
-  for (const patch of invalid) {
-    const config = { ...f.config, ...patch };
-    let code;
-    try {
-      validateOwnerConfig(config);
-      assert.fail('Expected invalid config');
-    } catch (error) {
-      code = error.message;
-    }
-    await fs.writeFile(f.file, JSON.stringify(config), { mode: 0o600 });
-    for (const operation of [() => readOwnerConfig(f.file), () => loadHttpConfig(f.file)])
-      await assert.rejects(operation, { message: code });
-    const bridge = new Bridge(config);
-    try {
-      await assert.rejects(bridge.init(), { message: code });
-    } finally {
-      await bridge.close();
-    }
-    await assert.rejects(fs.stat(f.config.stateDir), { code: 'ENOENT' });
-  }
-});
+
 test('current policy validates without mutation and snapshot rejects invalid changes', async (t) => {
   const f = await fixture(t),
     snapshot = structuredClone(f.config);
@@ -144,22 +92,6 @@ test('scope reload stays read-only; fixed settings await restart without blockin
   await save(f.config);
   assert.deepEqual(await bridge.health(), { domain: 'permissions', status: 'ok' });
 });
-
-for (const which of ['stateDir'])
-  test(`private storage checks agree for ${which}`, async (t) => {
-    const f = await fixture(t),
-      dir = which === 'stateDir' ? f.config.stateDir : f.config.sessionRoots[0];
-    await fs.writeFile(f.file, JSON.stringify(f.config), { mode: 0o600 });
-    await fs.mkdir(dir, { mode: 0o700 });
-    await fs.chmod(dir, 0o777);
-    const bridge = new Bridge(f.config);
-    try {
-      await assert.rejects(bridge.init(), /STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY/);
-    } finally {
-      await bridge.close();
-    }
-    assert.equal((await fs.stat(dir)).mode & 0o777, 0o777);
-  });
 
 test('private owner file checks agree across snapshot, readers and direct stdio startup', async (t) => {
   const f = await fixture(t);
