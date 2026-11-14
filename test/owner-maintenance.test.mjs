@@ -7,22 +7,25 @@ import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, claimFile, ownerAlive } from '../src/attachments.mjs';
 
 test(
-  'explicit owner interruption recovers held native startup without changing the saved session',
+  'explicit owner interruption waits for native startup to unwind before releasing the writer',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t);
+    f.cleanup.unshift(() => f.mark('finish-preparation'));
     await gatedExtension(
       f,
       `
+      process.on('SIGTERM', () => void mark('sigterm'));
       pi.registerCommand('held-extension-input', { handler: () => {
         pi.sendUserMessage('UNFINISHED_EXTENSION_INPUT');
       } });
       pi.on('before_agent_start', async e => {
         if (e.prompt === 'UNFINISHED_EXTENSION_INPUT') {
           await mark('preparing');
-          await new Promise(() => {});
+          await wait('finish-preparation');
         }
       });
+      pi.on('before_provider_request', () => mark('provider-called'));
     `,
     );
     const accepted = await f.bridge.send({ session_id: f.id, text: '/held-extension-input' });
@@ -36,21 +39,32 @@ test(
       ownerRequest(f.config, { op: 'release', session_id: f.id }),
       /RUNTIME_BUSY/,
     );
-    const signals = [],
-      kill = runtime.child.kill.bind(runtime.child);
-    t.mock.method(runtime.child, 'kill', (signal) => {
-      signals.push(signal);
-      return kill(signal);
+    const kill = t.mock.method(runtime.child, 'kill');
+    const release = ownerRequest(f.config, {
+      op: 'release',
+      session_id: f.id,
+      interrupt: true,
     });
-    assert.equal(
-      (await ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: true })).status,
-      'released',
+    void release.catch(() => {});
+    try {
+      await until(() => fs.stat(f.dir + '/sigterm').catch(() => null));
+      assert.equal(await ownerAlive(previous.owner), true);
+      assert.equal(
+        (await readClaim(f.config.attachmentDir, session)).generation,
+        previous.generation,
+      );
+      assert.doesNotMatch(await fs.readFile(session.file, 'utf8'), /UNFINISHED_EXTENSION_INPUT/);
+    } finally {
+      await f.mark('finish-preparation');
+    }
+    assert.equal((await release).status, 'released');
+    assert.deepEqual(
+      kill.mock.calls.map(({ arguments: [signal] }) => signal),
+      ['SIGTERM'],
     );
-    assert.deepEqual(signals, ['SIGTERM']);
     assert.equal(await ownerAlive(previous.owner), false);
     assert.equal((await readClaim(f.bridge.pool.attachmentDir, session)).noColdReacquire, true);
-    const bytes = await fs.readFile(session.file, 'utf8');
-    assert.doesNotMatch(bytes, /UNFINISHED_EXTENSION_INPUT/);
+    await assert.rejects(fs.stat(f.dir + '/provider-called'), { code: 'ENOENT' });
   },
 );
 

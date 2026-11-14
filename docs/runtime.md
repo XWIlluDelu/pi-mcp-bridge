@@ -243,9 +243,11 @@ node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID --int
 
 The private control verifies the captured child, generation and PID/start/boot,
 including a child already exiting after EOF, then sends SIGTERM and waits. It
-neither escalates to SIGKILL nor terminates a shared companion/host. Saved history
-remains; unfinished memory-only work may be lost. A client timeout does not cancel
-requested exit or release ownership. Failed delivery can be retried explicitly.
+keeps the claim while Pi finishes shutdown hooks, so a stalled hook can keep
+release pending after SIGTERM. It neither escalates to SIGKILL nor terminates
+a shared companion/host. Saved history remains; unfinished memory-only work
+may be lost. A client timeout does not cancel requested exit or release ownership.
+Failed delivery can be retried explicitly.
 
 Either release form can close a known owned child after its history file was
 removed, using captured identity and claim. Replacement or unsafe files still

@@ -287,22 +287,40 @@ test(
 );
 
 test(
-  'explicit interruption can end an automatically released writer stuck after EOF',
+  'explicit interruption after EOF sends SIGTERM and holds ownership until native cleanup finishes',
   { timeout: 10000 },
   async (t) => {
-    const f = await fixture(t, shutdownGate);
-    await f.send('CLOSING');
+    const f = await fixture(
+      t,
+      shutdownGate + "\nprocess.on('SIGTERM', () => void mark('sigterm'));",
+    );
+    assert.equal((await f.send('CLOSING')).status, 'started');
     const [rpc] = f.runtimes;
     await f.waitFor('shutdown');
     const owner = rpc.ownerRecord.owner;
     assert.equal(rpc.child.stdin.writableEnded, true);
-    await assert.rejects(
-      reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
-      /LIVE_OWNER_UNREACHABLE/,
+    const kill = t.mock.method(rpc.child, 'kill');
+    const releasing = f.release({ interrupt: true });
+    void releasing.catch(() => {});
+    try {
+      await f.waitFor('sigterm');
+      assert.equal(await ownerAlive(owner), true);
+      assert.deepEqual((await readClaim(f.config.attachmentDir, f.session)).owner, owner);
+      await assert.rejects(
+        reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
+        /LIVE_OWNER_UNREACHABLE/,
+      );
+    } finally {
+      await f.mark('shutdown-go');
+    }
+    assert.equal((await releasing).status, 'released');
+    assert.deepEqual(
+      kill.mock.calls.map(({ arguments: [signal] }) => signal),
+      ['SIGTERM'],
     );
-    assert.equal((await f.release({ interrupt: true })).status, 'released');
     assert.equal(await ownerAlive(owner), false);
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
+    assert.ok((await f.rows()).some((entry) => entry.customType === 'shutdown-saved'));
   },
 );
 

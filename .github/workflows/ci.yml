@@ -30,7 +30,7 @@ jobs:
       - run: npm ci
       - name: Prepare external test Pi
         run: |
-          npm install --prefix "$RUNNER_TEMP/test-pi" --no-save @earendil-works/pi-coding-agent@1.5.0
+          npm install --prefix "$RUNNER_TEMP/test-pi" --no-save @earendil-works/pi-coding-agent@1.5.2
           echo "$RUNNER_TEMP/test-pi/node_modules/.bin" >> "$GITHUB_PATH"
           echo "BRIDGE_TEST_PI_CLI=$RUNNER_TEMP/test-pi/node_modules/.bin/pi" >> "$GITHUB_ENV"
       - run: npm run format:check

@@ -69,7 +69,7 @@ another call.
 
 ### Empty-context resume limitation
 
-Pi 1.5.0 restores saved model/thinking at startup only when the current branch produces context messages. A session whose first input was handled without a run or refused before dispatch can remain empty: `set_model` writes selection entries, but its next cold resume selects native defaults. Bridge retains normal idle release; restoring those entries requires a fix in the selected Pi installation.
+Pi 1.5.2 restores saved model and thinking settings at startup only when the current branch produces context messages. A session whose first input was handled without a run or refused before dispatch can remain empty. In that case, `set_model` writes selection entries and the next cold resume selects native defaults.
 
 ## Prompt model and thinking settings
 
