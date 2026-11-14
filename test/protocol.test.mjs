@@ -152,67 +152,31 @@ test('public mutation payloads are validated before dispatch', async () => {
     'follow_up',
     'idle_only',
   ]);
-  let called = 0;
+  const calls = [];
   const bridge = {
-    create: async (args) => {
-      called++;
-      return { status: 'started' };
-    },
-    reload: async () => {
-      called++;
-      return { status: 'skipped', reason: 'no_active_owner' };
-    },
+    create: async (args) => (calls.push(args), { status: 'started' }),
+    reload: async (args) => (calls.push(args), { status: 'skipped', reason: 'no_active_owner' }),
   };
-  const first = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'create',
-      arguments: { project: '/tmp/p', text: 'initial' },
-    }),
-  );
-  assert.equal(first.message.result.isError, undefined);
-  const empty = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'create',
-      arguments: { project: '/tmp/p' },
-    }),
-  );
-  assert.equal(empty.message.result.isError, undefined);
-  const settingsOnly = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'create',
-      arguments: { project: '/tmp/p', thinking_level: 'high' },
-    }),
-  );
-  assert.equal(settingsOnly.message.result.isError, true);
-  const unknown = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'create',
-      arguments: { project: '/tmp/p', text: 'initial', unexpected: true },
-    }),
-  );
-  assert.equal(unknown.message.result.isError, true);
-  assert.equal(called, 2);
-  const reload = await dispatchModern(
-    bridge,
-    message('tools/call', { name: 'reload', arguments: { session_id: 'ps_test' } }),
-  );
-  assert.deepEqual(reload.message.result.structuredContent, {
+  const call = async (name, args) =>
+    (await dispatchModern(bridge, message('tools/call', { name, arguments: args }))).message.result;
+  const project = '/tmp/p';
+  for (const args of [{ project }, { project, text: 'initial' }])
+    assert.equal((await call('create', args)).isError, undefined);
+  for (const args of [
+    { project, thinking_level: 'high' },
+    { project, unexpected: true },
+  ])
+    assert.equal((await call('create', args)).structuredContent.error.code, 'INVALID_ARGUMENTS');
+  const target = { session_id: 'ps_test' };
+  assert.deepEqual((await call('reload', target)).structuredContent, {
     status: 'skipped',
     reason: 'no_active_owner',
   });
-  const interruptReload = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'reload',
-      arguments: { session_id: 'ps_test', interrupt: true },
-    }),
+  assert.equal(
+    (await call('reload', { ...target, interrupt: true })).structuredContent.error.code,
+    'INVALID_ARGUMENTS',
   );
-  assert.equal(interruptReload.message.result.structuredContent.error.code, 'INVALID_ARGUMENTS');
-  assert.equal(called, 3);
+  assert.deepEqual(calls, [{ project }, { project, text: 'initial' }, target]);
 });
 test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
   const bridge = {

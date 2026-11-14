@@ -2,6 +2,7 @@ import {
   MAX_ATTACHMENT_REQUEST_BYTES,
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
   ownerEnvelope,
+  validNativeSnapshot,
   requiresCurrentControl,
 } from './attachment-protocol.mjs';
 import { readLfLines } from './lf-lines.mjs';
@@ -391,6 +392,7 @@ async function terminateOwnerForDelete(config, session, record) {
 // Owner refusals that prove the operation took no effect. Any other error
 // after a mutating request was written leaves its outcome uncertain.
 const DEFINITE_REFUSALS = {
+  seal: ['RUNTIME_SESSION_CHANGED', 'INVALID_ARGUMENTS'],
   reload: ['RELOAD_BUSY', 'RELOAD_IN_PROGRESS', 'RELOAD_UNSUPPORTED'],
   compact: [
     'COMPACT_UNSUPPORTED',
@@ -422,6 +424,23 @@ const DEFINITE_REFUSALS = {
 };
 // Another admitted operation holds the owner; nothing was dispatched.
 const BUSY_REFUSALS = ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS', 'RELOAD_IN_PROGRESS'];
+const OWNED_COMPACT_REFUSALS = [
+  'COMPACT_BUSY',
+  'PI_REJECTED',
+  'INVALID_ARGUMENTS',
+  'RUNTIME_SHUTTING_DOWN',
+];
+const MUTATING_OPS = new Set([
+  'set_model',
+  'send',
+  'stop',
+  'bash',
+  'compact',
+  'reload',
+  'seal',
+  'shutdown',
+  'release',
+]);
 export class AttachedRuntime {
   constructor(config, session, record, { compatibility } = {}) {
     this.compatibility = compatibility;
@@ -440,17 +459,7 @@ export class AttachedRuntime {
     signal?.throwIfAborted();
     const currentControl = requiresCurrentControl(op);
     const ownedCompact = op === 'compact' && this.record.kind === 'rpc';
-    const mutating = [
-      'set_model',
-      'send',
-      'stop',
-      'bash',
-      'compact',
-      'reload',
-      'seal',
-      'shutdown',
-      'release',
-    ].includes(op);
+    const mutating = MUTATING_OPS.has(op);
     if (
       (op === 'seal' && this.record.kind !== 'rpc') ||
       (currentControl && this.record.bridgeVersion !== packageInfo.version)
@@ -524,22 +533,12 @@ export class AttachedRuntime {
       };
       // Owned compaction has one timer/late-ACK ledger in PiRpc. Its transport
       // remains open after that caller times out, until a reply or exact exit.
-      const timer =
-        timeout === null
-          ? undefined
-          : setTimeout(
-              () => finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
-              timeout,
-            );
       const abort = () =>
         finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating));
+      const timer = timeout === null ? undefined : setTimeout(abort, timeout);
       signal?.addEventListener('abort', abort, { once: true });
-      socket.on('error', () =>
-        finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
-      );
-      socket.on('end', () =>
-        finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating)),
-      );
+      socket.on('error', abort);
+      socket.on('end', abort);
       socket.on('connect', async () => {
         try {
           await beforeDispatch?.();
@@ -553,7 +552,7 @@ export class AttachedRuntime {
         try {
           socket.write(serialized);
         } catch {
-          finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', mutating));
+          abort();
         }
       });
       socket.on('data', (chunk) => {
@@ -593,13 +592,16 @@ export class AttachedRuntime {
           )
             return finish(new AttachmentFailure('RUNTIME_SESSION_CHANGED', written && mutating));
           const failed = Object.hasOwn(response, 'error');
+          const partialReply = response.partial === true;
+          if (partialReply && (failed || (op !== 'bash' && op !== 'stop')))
+            throw new Error('INVALID_ATTACHMENT_RESPONSE');
           const keys = [
             'generation',
             'version',
             'file',
             'sessionId',
             failed ? 'error' : 'data',
-            ...(response.partial === true ? ['partial'] : []),
+            ...(partialReply ? ['partial'] : []),
             ...(ownedCompact && response.native_reason !== undefined ? ['native_reason'] : []),
           ];
           if (
@@ -607,39 +609,27 @@ export class AttachedRuntime {
             keys.some((key) => !Object.hasOwn(response, key))
           )
             throw new Error('INVALID_ATTACHMENT_RESPONSE');
-          if (response.error === 'OWNER_COMPONENT_UPDATE_REQUIRED')
-            return finish(new AttachmentFailure(response.error));
+          const { error, data } = response;
+          if (error === 'OWNER_COMPONENT_UPDATE_REQUIRED')
+            return finish(new AttachmentFailure(error));
           if (currentControl && response.version !== packageInfo.version)
             return finish(
               new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED', written && mutating),
             );
-          if (ownedCompact) {
-            if (failed)
-              return finish(
-                Object.assign(
-                  new AttachmentFailure(
-                    knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
-                    ![
-                      'COMPACT_BUSY',
-                      'PI_REJECTED',
-                      'INVALID_ARGUMENTS',
-                      'RUNTIME_SHUTTING_DOWN',
-                    ].includes(response.error),
-                  ),
-                  { native_reason: nativeCompactReason(response.native_reason) },
-                ),
-              );
-            return finish(null, compactMetadata(response.data));
+          if (failed) {
+            const refusals = ownedCompact ? OWNED_COMPACT_REFUSALS : DEFINITE_REFUSALS[op];
+            const definite =
+              refusals?.includes(error) ||
+              (!ownedCompact && op !== 'seal' && BUSY_REFUSALS.includes(error));
+            const failure = new AttachmentFailure(
+              knownErrorCode(error, 'ATTACHED_OPERATION_FAILED'),
+              written && mutating && !definite,
+            );
+            if (ownedCompact) failure.native_reason = nativeCompactReason(response.native_reason);
+            return finish(failure);
           }
+          if (ownedCompact) return finish(null, compactMetadata(data));
           if (op === 'seal') {
-            if (failed)
-              return finish(
-                new AttachmentFailure(
-                  knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
-                  !['RUNTIME_SESSION_CHANGED', 'INVALID_ARGUMENTS'].includes(response.error),
-                ),
-              );
-            const data = response.data;
             if (
               data &&
               ((data.sealed === true && Object.keys(data).length === 1) ||
@@ -648,28 +638,12 @@ export class AttachedRuntime {
               return finish(null, data);
             throw new Error('INVALID_ATTACHMENT_RESPONSE');
           }
-          if (response.partial === true) {
-            if (op === 'bash') partial = inlineBashResult(response.data);
-            else if (op === 'stop')
-              partial = { withdrawal: inlineWithdrawal(response.data?.withdrawal) };
-            else throw new Error();
+          if (partialReply) {
+            if (op === 'bash') partial = inlineBashResult(data);
+            else partial = { withdrawal: inlineWithdrawal(data?.withdrawal) };
             return;
           }
-          if (op === 'compact' && response.error === 'HOST_COMPACT_UNCERTAIN')
-            return finish(new AttachmentFailure(response.error, true));
-          if (
-            DEFINITE_REFUSALS[op]?.includes(response.error) ||
-            (mutating && BUSY_REFUSALS.includes(response.error))
-          )
-            return finish(new AttachmentFailure(response.error));
-          if (response.error)
-            return finish(
-              new AttachmentFailure(
-                knownErrorCode(response.error, 'ATTACHED_OPERATION_FAILED'),
-                written && mutating,
-              ),
-            );
-          finish(null, response.data);
+          finish(null, data);
         } catch {
           finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE', written && mutating));
         }
@@ -723,12 +697,7 @@ export class AttachedRuntime {
     if (
       result?.sessionFile !== this.session.file ||
       result?.sessionId !== this.session.header.id ||
-      !Array.isArray(result.entries) ||
-      !result.entries.every((entry) => typeof entry?.id === 'string' && entry.id.length <= 128) ||
-      !(
-        result.leafId === null ||
-        (typeof result.leafId === 'string' && result.leafId.length <= 128)
-      )
+      !validNativeSnapshot(result)
     )
       throw new AttachmentFailure('INVALID_HOST_SNAPSHOT');
     return result;

@@ -1,16 +1,13 @@
-import { nativeOwner } from './fixtures/native-owner.mjs';
+import { until } from './fixtures/until.mjs';
+import { nativeOwner, launchNativeTui, nativeTui, fauxArgs } from './fixtures/native-owner.mjs';
 
 import { test } from 'node:test';
 
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import net from 'node:net';
-
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
 
 import { Bridge } from '../src/bridge.mjs';
 import {
@@ -22,7 +19,6 @@ import {
 } from '../src/attachments.mjs';
 import attachExtension from './fixtures/companion.mjs';
 
-const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const fixture = (t) =>
   nativeOwner(t, {
     prefix: 'attach',
@@ -30,107 +26,27 @@ const fixture = (t) =>
       config.attachmentExitTimeoutMs = 4000;
     },
   });
-async function until(fn, timeout = 12000) {
-  const end = Date.now() + timeout;
-  let last;
-  while (Date.now() < end) {
-    try {
-      const value = await fn();
-      if (value) return value;
-    } catch (e) {
-      last = e;
-    }
-    await new Promise((r) => setTimeout(r, 30));
-  }
-  throw last ?? new Error('Fixture deadline');
-}
-const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
-async function tui(t, f, { expectFailure = false } = {}) {
-  const agentDir = path.join(f.dir, 'agent');
-  await fs.mkdir(agentDir);
-  await fs.writeFile(
-    path.join(agentDir, 'settings.json'),
-    JSON.stringify({
-      cacheWarming: 'off',
-      retry: { enabled: false },
-      compaction: { enabled: false },
-    }),
-  );
-  const commands = path.join(f.dir, 'commands.mjs');
-  await fs.writeFile(
-    commands,
-    `export default function(pi){pi.registerCommand('fixture-fork',{handler:async(_a,ctx)=>{await ctx.fork(ctx.sessionManager.getEntries().find(e=>e.type==='message'&&e.message.role==='user').id,{position:'at'});}});}`,
-  );
-  const args = [
-    process.execPath,
-    nativePiCli,
-    '--session',
-    f.session.file,
-    '--no-extensions',
-    '--no-skills',
-    '--no-prompt-templates',
-    '--no-themes',
-    '--no-tools',
-    '-e',
-    path.join(base, 'test/fixtures/faux-extension.mjs'),
-    '-e',
-    path.join(base, 'src/attach-extension.mjs'),
-    '-e',
-    commands,
-    '--provider',
-    'bridge-fixture',
-    '--model',
-    'deterministic',
-    '--thinking',
-    'off',
-  ];
-  const child = spawn('script', ['-qefc', args.map(quote).join(' '), '/dev/null'], {
-    cwd: f.cwd,
-    env: {
-      PATH: process.env.PATH,
-      HOME: f.dir,
-      PI_CODING_AGENT_DIR: agentDir,
-      PI_MCP_ATTACH_DIR: f.config.attachmentDir,
-      PI_OFFLINE: '1',
-      TERM: 'xterm-256color',
-      LANG: 'C.UTF-8',
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  let log = '';
-  child.stdout.on('data', (chunk) => {
-    log = (log + chunk.toString()).slice(-24000);
-  });
-  child.stderr.on('data', (chunk) => {
-    log = (log + chunk.toString()).slice(-24000);
-  });
-  let record;
-  t.after(async () => {
-    // Clean up any TUI left alive by a test that did not delete it.
-    if (record && (await ownerAlive(record.owner))) process.kill(record.owner.pid, 'SIGTERM');
-    child.stdin.destroy();
-    if (child.exitCode === null) child.kill('SIGTERM');
-  });
-  if (expectFailure) return { child, getLog: () => log };
-  try {
-    record = await until(async () => {
-      const r = await readClaim(f.config.attachmentDir, f.session);
-      return r?.phase === 'ready' ? r : null;
-    });
-  } catch (e) {
-    throw new Error('TUI startup failed: ' + log.slice(-3000), { cause: e });
-  }
-  return { child, record, getLog: () => log };
-}
-
 test('overlong attachment path prevents bridge startup and official TUI exits on registration failure', async (t) => {
   const f = await fixture(t);
   await f.bridge.close();
   f.config.attachmentDir = path.join(f.dir, 'x'.repeat(80));
   await assert.rejects(new Bridge(f.config).init(), /ATTACHMENT_SOCKET_PATH_TOO_LONG/);
-  const launched = await tui(t, f, { expectFailure: true });
+  const env = { ...f.env, PI_MCP_ATTACH_DIR: f.config.attachmentDir };
+  delete env.PI_MCP_OWNER_CONFIG;
+  const launched = launchNativeTui(
+    f,
+    [
+      ...f.config.piArgs,
+      '--session',
+      f.session.file,
+      '-e',
+      path.resolve('src/attach-extension.mjs'),
+      ...fauxArgs,
+    ],
+    env,
+  );
+  await launched.waitFor('ATTACHMENT_SOCKET_PATH_TOO_LONG');
   await until(() => launched.child.exitCode !== null);
-  assert.ok(launched.getLog().includes('ATTACHMENT_SOCKET_PATH_TOO_LONG'));
   assert.ok(await fs.stat(f.session.file));
   assert.equal(f.bridge.pool.instances.size, 0);
 });
@@ -275,7 +191,18 @@ test('registry failure during shutdown still closes old socket and retains block
 
 test('official TUI session replacement registers a fresh identity and socket loss does not spawn RPC', async (t) => {
   const f = await fixture(t);
-  const launched = await tui(t, f);
+  const commands = path.join(f.dir, 'commands.mjs');
+  await fs.writeFile(
+    commands,
+    `
+    export default pi => pi.registerCommand('fixture-fork', { handler: async (_a, ctx) => {
+      const entry = ctx.sessionManager.getEntries().find(e => e.message?.role === 'user');
+      await ctx.fork(entry.id, { position: 'at' });
+    } });
+  `,
+  );
+  await nativeTui(f, f.session, ['-e', commands]);
+  const initial = await readClaim(f.config.attachmentDir, f.session);
   await f.bridge.send({ session_id: f.id, text: 'public fork fixture' });
   await until(async () =>
     (await f.bridge.read({ session_id: f.id })).items.some((x) => x.type === 'assistant'),
@@ -290,7 +217,7 @@ test('official TUI session replacement registers a fresh identity and socket los
     const r = await readClaim(f.config.attachmentDir, fork);
     return r?.phase === 'ready' ? r : null;
   });
-  assert.notEqual(forkClaim.generation, launched.record.generation);
+  assert.notEqual(forkClaim.generation, initial.generation);
   // Ready publication precedes asynchronous old-claim cleanup. Await both
   // lifecycle conditions instead of assuming they are a single transaction.
   await until(async () => (await readClaim(f.config.attachmentDir, f.session)) === null);

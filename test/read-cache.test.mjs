@@ -1,80 +1,26 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
+import { message, text } from './fixtures/native-history.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import path from 'node:path';
+
 import { Bridge } from '../src/bridge.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
-import { nativeReadFeatures } from '../src/read-features.mjs';
+
 import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-read-cache-'),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd, { mode: 0o700 });
-  const config = {
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    defaults: { ...denyAllPermissions(), read: true, send: true },
-  };
-  const bridge = await new Bridge(config, () => assert.fail('No writer')).init();
-  const made = await savedSession(bridge),
-    session = await bridge.session(made.session_id);
+  const f = await nativeOwner(t, { prefix: 'read-cache', factory: () => assert.fail('No writer') });
   const entries = [
-    {
-      type: 'message',
-      id: 'u',
-      parentId: null,
-      message: {
-        role: 'user',
-        content: [
-          { type: 'text', text: 'task' },
-          { type: 'image', mimeType: 'image/png', data: 'A'.repeat(50000) },
-        ],
-      },
-    },
-    {
-      type: 'message',
-      id: 'a',
-      parentId: 'u',
-      message: {
-        role: 'assistant',
-        content: [
-          {
-            type: 'text',
-            text: Array.from(
-              { length: 50 },
-              (_, i) => 'line-' + i + ' x'.repeat(400) + '\n\n',
-            ).join(''),
-          },
-        ],
-      },
-    },
+    message('u', null, 'user', 'task'),
+    message('a', 'u', 'assistant', [text('page evidence '.repeat(1500))]),
   ];
-  let acquisitions = 0;
-  bridge.pool.forRead = async () => ({
+  f.bridge.pool.forRead = async () => ({
     generation: 'fixture',
-    readFeatures: async () => nativeReadFeatures([], [], 'a'),
-    read: async (args) => {
-      acquisitions++;
-      return prepareContextRead({ entries, leafId: 'a' }, args);
-    },
+    read: (args) => prepareContextRead({ entries, leafId: 'a' }, args),
   });
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-  return {
-    bridge,
-    config,
-    entries,
-    session,
-    id: made.session_id,
-    acquisitions: () => acquisitions,
-  };
+  return { ...f, entries };
 }
 
 async function sourcePage(f, args = {}) {
@@ -153,12 +99,6 @@ test('cursor overrides validate supplied scope values and native identity', asyn
 
 test('batched references preserve source order across a steering boundary and a paired result', async (t) => {
   const f = await fixture(t);
-  const message = (id, parentId, role, content, extra = {}) => ({
-    type: 'message',
-    id,
-    parentId,
-    message: { role, content, ...extra },
-  });
   f.entries.splice(
     0,
     f.entries.length,

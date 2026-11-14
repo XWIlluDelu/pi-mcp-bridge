@@ -14,67 +14,33 @@ Choose the entry path that matches how you use Pi:
 | A host application integrating the public SDK/RPC APIs       | Follow the [host registration lifecycle](#host-registration-lifecycle).                            |
 | Open a session currently controlled by Bridge in a terminal  | Use the [native launcher](#open-a-bridge-session-in-a-native-terminal), which negotiates handoff.  |
 
-Registration makes an owner reachable; [permissions](configuration.md) still
-decide which operations a remote caller may perform. The capability table below
-describes implementation support, independently of those grants.
-
 ## Ownership and cooperating writers
 
-Bridge reuses a cooperating live Pi instance and starts an RPC child only when
-no live registered writer owns the saved session. Ownership binds the canonical
-file to an exact Linux process: PID, process start time and boot ID. Native
-session ID, generation and socket metadata identify its control endpoint. A live
-but unreachable owner still blocks cold startup.
+Every cooperating process uses the same canonical private registry and Linux
+PID/network namespaces. A writer claim binds a canonical file to a PID, process
+start time and boot ID. Native ID, generation and socket bind its endpoint.
+Live or uncertain claims block new writers through socket loss and component
+mismatches. The short registry mutex is released by process exit independently
+of the writer claim.
 
-Registry transactions use a short kernel-owned mutex derived from the canonical
-private IPC directory. All cooperating processes must share this directory and
-Linux PID/network namespaces. Process death releases the mutex; writer claims
-separately require exact process exit, completed native replacement or a host's
-confirmed session-local writer closure. Ownership
-is checked independently of endpoint compatibility: damaged fields for a known
-different path do not block the target, ambiguous scope does, and obsolete control
-metadata cannot revive an exited writer.
+A matching native reload or switch may retire only its own context after draining
+mutations and closing the old listener. The shutdown reason, previous file and
+destination must agree. Reload also requires the same SessionManager. PID
+equality does not identify independent managers. Switching away preserves an
+explicit pause, including when the old session has left configured scope.
 
-An unsupported live endpoint reports `ATTACHMENT_PROTOCOL_MISMATCH`; update
-Bridge and its companion/host at a safe native reload boundary. A native
-replacement registers a fresh endpoint after closing its old listener and
-draining admitted mutations. Its shutdown reason, previous file and destination
-must match; reload also requires the same `SessionManager`. This process-local
-evidence is consumed once and retires only that context. PID equality or a
-`transitioning` phase alone does not end ownership: independent managers remain
-separate writers even with the same path and native ID. Rebinding the same
-active extension retains its endpoint.
-
-Fresh registration preserves explicit local pauses and existing RPC/host
-controllers. A same-file reload outside current scope retains ownership without
-exposing control or reading excluded content; a later paired switch retires that
-claim. Switching away preserves a pause as a released record. Dead claims can
-be replaced under the registry mutex, but an explicit pause still needs the
-[local reset procedure](#recover-an-explicit-local-pause).
-
-The registry covers cooperating processes. An unregistered RPC has no generic
-attach-by-PID path: its original host must load a companion/controller or close
-it before reopening. Multiple MCP clients should share one Bridge service;
-independent Bridge services cannot share private RPC pipes.
-
-An owned RPC is bound to its reserved file. Its observer cancels native
-new-session, fork and cross-file resume before the target opens; use Bridge
-create/fork or a host that manages cross-session ownership. Identity mismatches
-reject operations and invalidate scoped events without stopping the process.
-
-Ordinary companions check target-path claims before native resume and cancel
-entry into another live writer, including one in the same process. Current-context
-resume and the requester's admitted handoff remain allowed. This read-only check
-creates no reservation, so it cannot make concurrent opens atomic or protect
-startup before extension loading. `session_start` also checks ownership after
-open. Use `/bridge-join` or host coordination for a managed handoff.
+An owned RPC vetoes native new, fork and cross-file resume before open.
+Companions check target claims before native resume and again at registration.
+Use Bridge create/fork, local handoff or explicit host reservation for coordinated
+entry. An unregistered process needs its own companion/controller or a local
+close before reopening. See [component versions](architecture.md#component-versions).
 
 ## Runtime capabilities
 
 | Capability              | Bridge-owned RPC                     | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
 | ----------------------- | ------------------------------------ | ----------------------------------------------------- | --------------------------------------- |
 | Read context            | Session + runtime                    | Session + runtime                                     | Session projection; runtime unavailable |
-| Live text/thinking      | Native delta events                  | Public extension events                               | When supplied by the host               |
+| Live text/thinking      | Cumulative extension events          | Cumulative extension events                           | When supplied by the host               |
 | Send text/images        | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
 | Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
 | Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
@@ -89,140 +55,59 @@ callbacks it implements. In particular, an RPC host must provide its own reload
 callback. Use `list.status.capabilities` to inspect a connected owner's advertised
 send, command, stop and reload support.
 
-Saved reads need no writer. Send, command, compact and `set_model` may cold-start
-an RPC; reload, stop, read, search and list do not. Model catalogs are independent of session
-owners. See [native controls](model-control.md) and [read formats](reading.md).
-
-After prompt/control work, an owned RPC normally follows the
-[idle shutdown contract](#shutdown-and-in-flight-acks) before EOF.
-ACKs, native settlement, queues and observed input preparation must establish
-idle; in-flight reads, Stop recovery and command-output capture finish first.
-Missing ACKs or unfinished input calls retain ownership. There is no idle timer;
-later work resolves ownership again and may cold-start the saved session. Bridge
-input arriving during committed shutdown waits for that exact exit. Companion and host
-lifecycles remain local.
-
-Command timeouts retain their pending ACK; late completion reevaluates release.
-Cold `set_model` and completed/refused compaction use the same safe release path;
-timed-out compaction keeps its native fence until settlement. On companion
-shutdown/switch, admission closes and admitted setters/compaction drain before
-fresh registration can retire the claim. Socket loss does not settle those calls.
-
-The ordinary companion reports `dispatched, admission:"unobservable"` after
-a successful `sendUserMessage()` invocation, and `BASH_UNSUPPORTED` / `STOP_UNSUPPORTED` for controls it
-cannot implement. Native command support must use Pi's bash path, including
-`user_bash`, history and cancellation. Custom hosts declare capabilities from
-the callbacks they implement; command requires bash plus either cancel or stop,
-while remote stop requires the complete stop callback.
-
-The [send modes](api.md#send) use native steering/follow-up queues. For companions
-and SDK bindings, `idle_only` also checks unfinished public SDK calls, including
-input preparation, before invoking Pi. Remote companion/host inputs refuse
-`/bridge-join` and collision aliases; join remains owner-local.
+For cold-start and dispatch outcomes, see the [tool API](api.md#sessions-and-mutations).
 
 ## Remote reload
 
-[`reload({session_id})`](api.md#reload) uses `send` permission and acts only on an
-active owner. `list.status.capabilities.reload` reports support. Busy work is refused, including pending input and admitted control
-operations; there is no interrupt option or deferred reload. A saved session is
-left saved, and an explicit local pause remains in force.
+[The public reload tool](api.md#reload) acts on a supported idle writer. Owned
+RPC reload seals and exits the old worker before starting a fresh one.
+Companion reload keeps the writer claim through shutdown and confirms the new
+ready generation and native completion for the same session. Pending input
+preparation and standalone bash block reload. Saved messages are preserved and
+extension-local capture state is reset.
 
-An ordinary companion invokes Pi's native resource reload. Its old endpoint
-closes during `session_shutdown`; the claim continues blocking other writers
-until `session_start` publishes a fresh ready generation for the same session.
-Bridge confirms that registration, waits for the native reload handler to finish,
-and reports its component version. The companion observes public SDK operation
-lifetimes so asynchronous input preparation and standalone bash also block reload;
-new operations are refused while resources are being replaced. A closed
-socket or an input acknowledgement alone is not completion evidence. An owned
-RPC follows the [idle shutdown contract](#shutdown-and-in-flight-acks), then starts
-a fresh worker with current resources.
-
-Reload preserves saved messages and resets extension-local state, including the
-previous Runtime Context capture. It reads the owner's configured resources;
-it does not rewrite extension paths. A successful reload can therefore return
-`read_compatible:false` when those paths still select an older Bridge component.
-
-SDK host bindings call the existing session's `reload()` and use the same native
-operation guard as companions. Create the binding before accepting local input so
-the guard observes input preparation as well as model execution. Their controller
-and writer remain in place; completion is the resolved native reload, not a new owner generation. Other
-sessions sharing the host process remain untouched. The adapter reports its own
-loaded Bridge version because native resource reload does not reimport host code.
-
-Native Pi RPC has no reload command. `createRpcHostBinding(client, { reload })`
-therefore accepts the host's native reload callback. Custom host adapters can
-provide the same callback in `ready(callbacks)`:
+The SDK host binding calls `AgentSession.reload()` within its native admission
+gate. An RPC host can provide the same callback accepted by a custom controller:
 
 ```text
 reload({sessionFile, sessionId, beforeDispatch}) -> Promise<{reloaded:true}>
 ```
 
-The callback checks idle and fences every local admission path, including input
-preparation, then calls `beforeDispatch()` immediately before native reload.
-Resolve only after that reload finishes, preserving the current writer and native
-session identity. The adapter fences its own mutations while waiting. A command
-ACK is not completion; an exception after dispatch is an unknown outcome. Missing
-a callback is reported by `list.status.capabilities.reload:false`.
+Check idle and close local admission, then invoke `beforeDispatch()` immediately
+before reload. Resolve after native completion on the same writer and session.
+The controller stays loaded and reports its own component version.
 
 ## Model settings and compaction
 
-Owners expose current `model` and `thinkingLevel` through `state`, used by
-`list.status`. The separate catalog and public control semantics are defined in
-[model control](model-control.md); hosts implement these callbacks against their
-existing writer.
+See [model controls](model-control.md) for public behavior.
 
 ### Host model setter
 
-The supplied SDK binding uses public `setModel()` / `setThinkingLevel()`; the
-RPC binding uses those methods on the owner's existing demultiplexed client.
-A custom `reserveHostSession(...).ready(callbacks)` may add:
-
-```text
-setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})
-  -> Promise<{model:{provider,id}, thinking_level}>
-```
-
-For model-only changes, preserve the effort current before switching and use the
-native thinking setter for compatible fallback. Await the native setters, retain
-expected session identity and return the actual selection. `beforeDispatch()`
-checks adapter admission; Stop does not block this input-free control. The adapter checks the result against `state()`, drains an
-admitted setter during close/release, and fences overlapping settings/send until
-settlement. Missing support reports `MODEL_SELECTION_UNSUPPORTED`.
-
-An ordinary RPC-controller timeout cannot reliably distinguish native rejection
-from a lost ACK. The binding reports uncertainty without retrying; exact late-ACK
-tracking belongs to Bridge-owned RPC. Hosts remain responsible for their own
-admissions and must close the actual writer before confirming release.
+Supplied bindings call current native model and thinking setters. A custom host
+can expose `setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})`
+and return the actual `{model:{provider,id}, thinking_level}`. Preserve the prior
+effort during model-only changes, using the native setter for fallback. Check
+admission at dispatch and report actual settings after awaited identity checks.
+The controller fences overlapping settings/send and drains admitted setters.
 
 ### Host compact callback
 
-A custom host may implement
-`compact({instructions?,interrupt?,sessionFile,sessionId,beforeDispatch})` against
-its existing native writer. With `interrupt:false`, it must establish idle through
-its own admission gate. Call `beforeDispatch()` immediately before native dispatch
-and resolve with the native result only after compaction completes. The adapter
-blocks overlapping input/compaction and drains admitted work during release.
-Public control results expose bounded metadata; summary and native details require
-history `read`.
+A custom host can expose `compact({instructions?,interrupt?,sessionFile,sessionId,beforeDispatch})`.
+Establish idle through local admission when interrupt is false. Invoke
+`beforeDispatch()` immediately before native dispatch and return the native
+result after completion. The controller fences overlapping input/compaction and
+drains admitted work before release.
 
 ## Image-capable owners
 
-Images pass through native RPC prompt arguments, SDK prompt options or companion
-`sendUserMessage()` content blocks. [Image input](api.md#image-input-send-and-create)
-defines payloads and limits.
-
-The companion advertises `imagesSupported:true`; supplied host bindings declare
-`supportsImages:true`. A custom host must declare support and forward
-`submit().images` to its native API. Omission keeps text working but rejects images.
-Updating files takes effect only after the running owner reloads or reopens.
+The companion and supplied bindings support native image blocks. A custom host
+declares `supportsImages:true` and forwards `submit().images`. See
+[image input](api.md#image-input-send-and-create).
 
 ## Daily TUI and ordinary RPC registration
 
-First confirm that the owner configuration's `sessionRoots` includes the native
-session location and grants the intended operations. Loading the companion does
-not grant access by itself. Use the same installed Bridge checkout as the service;
-the running components must implement the current control interface.
+Use the service's Bridge installation and an [owner profile](configuration.md)
+that includes the native session path and grants the intended operations.
 
 Add the installed companion's canonical path to Pi's existing settings
 (`~/.pi/agent/settings.json`, or the selected `PI_CODING_AGENT_DIR`), preserving
@@ -271,51 +156,25 @@ cannot make blindly launching `--session` into an owned file safe. A GUI started
 first can expose its Pi through the companion; one opened after a Bridge-owned
 RPC needs shared control or an explicit handoff.
 
-After loading, check the owner status with `list({session_id})` through the
-running Bridge. A fresh native session appears in discovery only after Pi
-persists it. For an active in-scope session, `saved` means no cooperating live
-owner was found; `unavailable` or a protocol mismatch needs investigation before
-sending work.
-See [runtime capabilities](#runtime-capabilities) for the operations registration
-provides and [events](events.md) for notification setup.
+Check owner status with [`list({session_id})`](api.md#list). For an active
+in-scope session, `saved` means Bridge found no cooperating live owner.
 
 ## Host registration lifecycle
 
-Use `reserveHostSession` from `src/host-adapter.mjs` when an application controls
-the actual writer. `createSdkHostBinding` and `createRpcHostBinding` from
-`src/host-bindings.mjs` adapt existing public APIs; they do not open sessions,
-spawn Pi, or take over an RPC client's stdio.
+1. Call `reserveHostSession` before opening the canonical `session:{file,header}`
+   in the shared `attachmentDir`. Pass the selected Pi SDK's
+   `buildSessionProjection` for current and historical leaves. Supply
+   `processIdentity(writerPid)` for a separate RPC child, which can start
+   without a session before reservation.
+2. Open the reserved session through the host's native API. Install
+   `createSdkHostBinding(AgentSession)` before local input or use
+   `createRpcHostBinding(RpcClient)` with the current native client.
+3. Publish via `controller.ready(binding)` when native state and snapshot both
+   identify the reserved session. A different session needs a fresh reservation.
+4. For remote release, provide the [session-local close contract](#explicit-deletion).
+   `controller.close()` retires the endpoint while a live writer still holds its claim.
 
-1. Before opening the target, reserve its canonical `session:{file,header}` in
-   the Bridge's `attachmentDir`. Supply `owner` from `processIdentity(writerPid)`
-   for an RPC child; the default identity is the current process, suitable for an
-   in-process SDK writer. A separate RPC child can start without a session before
-   reservation, then switch to the reserved target.
-2. Open the target through the host's native API. Pass its `AgentSession`
-   instance to `createSdkHostBinding` before admitting local input, so the
-   operation observer installed on that class can track input preparation.
-   Other objects reject with `INVALID_HOST_SESSION`.
-   Pass `buildSessionProjection` from that writer's selected native SDK to
-   `reserveHostSession`. Keep that function bound for the controller lifetime,
-   including historical-leaf reads. An RPC host selects the SDK paired with its
-   worker before reservation; live reads never rediscover Pi through PATH.
-   The native extension loader supplies this same binding to the companion.
-   Missing projection fails before reservation with `INVALID_HOST_PROJECTION`.
-3. Publish with `await controller.ready(binding)` once `state()` and `snapshot()`
-   describe the reserved session. Keep the native writer under the host's
-   lifecycle control and the controller bound to that session. A session change
-   needs a new reservation and the release contract below, not reuse of a
-   controller with a different native identity.
-4. If remote release is supported, provide a `release` callback that fences local
-   admission, aborts/drains all session work and closes the actual writer before
-   returning `{released:true}`. `controller.close()` disconnects the adapter; it
-   does not establish that a still-live writer has released the file.
-
-Custom callbacks follow the same identity and lifecycle requirements. Model,
-compaction and reload contracts appear above; command/stop result callbacks are
-described under [shutdown and in-flight ACKs](#shutdown-and-in-flight-acks).
-[Host integration tests](../test/host-integration.test.mjs) demonstrate the SDK
-and RPC reservation sequences with isolated synthetic sessions.
+See the [SDK and RPC integration examples](../test/host-integration.test.mjs).
 
 ## Open a Bridge session in a native terminal
 
@@ -338,43 +197,16 @@ reject. An already-running companion TUI can invoke `/bridge-join` manually.
 
 ### Handoff behavior
 
-1. Fence Bridge input and wait for admitted Stop recovery.
-2. Check ACKs, native busy/queue/settlement state and observed input preparation.
-3. Complete [idle shutdown](#shutdown-and-in-flight-acks): seal
-   new work in the child, close stdin after confirmation and observe that exact
-   child's normal exit. Handoff sends no process signals; unavailable shutdown
-   UI is a warning after exit.
-4. Reserve the target for the requester before `switchSession()`. The reservation
-   identifies a future requester, not a writer.
-5. Under the registry mutex change `reserved` to `opening`, then invoke native
-   switching and recheck the reservation in the cancellable pre-open hook.
-   Successful `session_start` publishes the writer and retires its prior claims
-   in one transaction.
+1. Fence Bridge input and drain admitted Stop work, ACKs and native preparation.
+2. Seal the owned child and confirm its exact exit after normal EOF.
+3. Reserve the target for the requester. Under the registry mutex the requester
+   moves `reserved` to `opening`, then rechecks the reservation in Pi's pre-open
+   hook. Native registration publishes the writer and retires prior claims.
 
-Owner automation should use this protocol directly. Idle-gated controls and
-local release share its completion checks; reads remain available while waiting
-for idle.
-The owned observer counts outstanding public `prompt`, `steer`, `followUp` and
-`sendCustomMessage` calls by native session manager. This covers input hooks and
-nested asynchronous slash commands, including calls continuing after a parent
-command returns. Each native Promise settles its own count; unrelated run
-settlement cannot clear it. Counts survive extension reload and ordered IPC
-notifications are checked against current child state. ACKs, queues and run
-settlement remain separate evidence. Arbitrary extension timers/background jobs
-are outside this observation.
-
-The fresh TUI shows wait/failure notifications without mirroring old RPC output.
-Ctrl+Alt+J cancels; unrelated work in the fresh TUI causes join to refuse until
-that work finishes. Cancellation before seal dispatch restores admission; later
-cancellation follows the [shutdown contract](#shutdown-and-in-flight-acks).
-Returned cancellation before native open removes the reservation and permits an
-explicit retry.
-A thrown, possibly partial switch retains the requester's claim until exact exit.
-
-A successful switch-away retires the old context's claim; later destination exit
-cannot pause it. Closing a TUI ends its running work, while dead registered owners
-may cold-resume saved history. Live unreachable owners or unavailable identity
-still block startup.
+Ctrl+Alt+J cancels. Cancellation before seal dispatch restores admission.
+Cancellation after dispatch follows the [shutdown contract](#shutdown-and-in-flight-acks).
+A native veto before open removes the reservation. An uncertain switch keeps
+the reservation until confirmed closure or exact requester exit.
 
 ### Recover an explicit local pause
 
@@ -421,141 +253,61 @@ fail validation. After closing all local writers, reset permits cold resume.
 
 ## Shutdown and in-flight ACKs
 
-Transport shutdown freezes admission, cancels local handoffs and interrupts owned
-writers already exiting by EOF before draining requests. Dispatched inputs,
-reads and received ACK checks finish before remaining runtimes close. Queued
-operations may return `BRIDGE_CLOSING`; shutdown never starts replacement work.
-Both per-request MCP and SDK tools participate. Shutdown waits for SIGTERM exit
-without automatic SIGKILL; a process manager's independent stop timeout applies.
+Service shutdown freezes admission, cancels handoffs and drains dispatched
+requests plus received late-ACK checks before closing owned runtimes. It uses
+SIGTERM without automatic SIGKILL. External owners retain their claims.
 
-Normal auto-release, idle local release, handoff and owned RPC reload use the
-same non-interrupting shutdown contract. After pending acknowledgements and
-captures drain, Bridge asks the matching child observer to check its actual
-native activity and permanently close admission to new business work. The child
-checks idle and commits this terminal seal synchronously, with no asynchronous
-gap between them. A busy child refuses without sealing; auto-release leaves it
-open and waits for later settlement. Parent-side cached activity alone cannot
-authorize EOF.
+Auto-release, idle local release, handoff and owned reload share the idle-close
+path. After reads, ACK checks, native settlement, queues and input preparation
+drain, the exact child atomically checks idle and seals new work. Confirmed seal
+permits EOF. Shutdown hooks may record cleanup state. Release the claim only
+after exact exit. A lost seal reply keeps the fence and permits explicit retry;
+post-seal cancellation finishes closure and suppresses the successor.
 
-The current native idle interface omits queued `deliverAs:"nextTurn"` custom
-messages and a same-file resume in progress. Owned idle shutdown can therefore
-discard that queued context or lose its seal during session replacement. These
-two cases need native queue and lifecycle visibility before this contract can
-protect them.
+Native `deliverAs:"nextTurn"` custom messages and in-progress same-file resume
+are absent from Pi's current idle evidence. They can lose queued context or
+invalidate the seal during replacement. Arbitrary extension background work
+also sits outside observed operation lifetimes.
 
-Already admitted reads finish before sealing. A new capture racing with local
-release, handoff or reload may return `RUNTIME_SHUTTING_DOWN`; retry after that
-lifecycle operation completes. Frozen cursors remain subject to their normal
-identity and permission checks.
+Prompt ACKs establish admission. Timeouts may leave unknown outcomes. Use the
+[submission receipt](api.md#submission-receipt) for late evidence. Received ACKs
+are checked against command, generation and native identity before publication.
+Missing ACKs stay fenced until exact outcome or exit.
 
-Once sealed, the child rejects new business work, including work requested by
-shutdown hooks. Hooks may still record cleanup state without starting new work.
-Bridge sends EOF only after confirming the seal for the same session and owner
-generation, then observes that exact child's normal exit before releasing its
-claim. This path sends no process signals. Sealing does not clear an explicit
-`noColdReacquire` pause.
+Headless RPC cancels supported dialog methods while stdin is active and reports
+`EXTENSION_UI_CANCEL_SENT`. Startup can report `EXTENSION_UI_STARTUP_UNAVAILABLE`
+before stdin is ready. After EOF, normal exit can carry `ui.unavailable` for
+shutdown dialogs. Errors and notifications appear in [runtime events](reading.md#live-output-and-runtime-extension-events).
 
-A lost or uncertain seal acknowledgement preserves the owner, claim and admission
-fence; it is not permission to send EOF or start another writer. An explicit
-shutdown retry can confirm or complete closure of that same generation without
-replaying business input. Lifecycle cancellation after seal dispatch does not
-cancel its confirmation or undo a committed seal. Confirmed shutdown still
-finishes, while cancellation prevents a handoff reservation or reload successor
-from being created.
-
-Headless RPC replies `extension_ui_response {cancelled:true}` to `confirm`,
-`select`, `input` and `editor` dialogs. An admitted send/create reports
-`EXTENSION_UI_CANCEL_SENT` when a cancellation frame was sent; Pi does not ACK
-its consumption. Diagnostics record the method/code without dialog content.
-Notifications and extension errors appear in
-[`read.runtime_events`](reading.md#live-output-and-runtime-extension-events);
-other display-only requests are ignored.
-
-Before the first readiness ACK, an interactive dialog reports
-`EXTENSION_UI_STARTUP_UNAVAILABLE`: awaited `session_start` UI precedes Pi's stdin
-reader. After EOF, dialogs also cannot consume responses. Once the process exits
-normally, handoff/release reports methods in `ui.unavailable` and may proceed;
-join shows the warning before switching. A hook can time out or leave cleanup
-unfinished, but abnormal exit, identity mismatch or a surviving writer still
-blocks handoff. These unavailable-dialog cases are distinct from sent cancellation.
-
-Prompt ACKs establish admission, not model completion. Dispatch timeout means an
-unknown outcome; query the returned `submission_id` for a late ACK before deciding
-on another independent call. The bounded receipt cache has no replay or durable
-journal. Received late ACKs create tracked identity checks and update that receipt;
-`drainAcks()` waits for those tasks, not indefinitely for absent ACKs. Wrong IDs,
-methods, generations or native identities cannot establish success.
-
-Command/stop deliver bounded inline results. A custom `bash` callback returns the
-native output object. A `stop` callback returns
-`{status:"accepted",acknowledgement,coverage:"agent_and_bash"}` and reports actual
-withdrawn text through `onWithdraw`. Optional `onResult`/`onWithdraw` publish known
-output on the same request; Bridge retains that prefix if the final ACK is lost.
-Incomplete output and uncertain execution are reported independently. These
-callbacks do not create a later result lookup.
+A custom `bash` callback returns native output. A `stop` callback returns
+`{status:"accepted",acknowledgement,coverage:"agent_and_bash"}`. The inline
+`onResult` and `onWithdraw` callbacks retain captured output if the final ACK is
+lost. Command support requires bash plus cancel or stop. Remote stop requires
+the complete stop callback.
 
 ## Explicit deletion
 
-Delete authorizes interruption independently of idle release and shutdown. It
-validates the native header and registry generation/PID/start/boot before each
-signal, sends SIGTERM, then escalates to SIGKILL after `attachmentExitTimeoutMs`
-(default 5 seconds). A successful read/state endpoint is unnecessary. Identity
-checks/signals hold the registry mutex; exit waits do not. A changed binding stops
-escalation. Other sessions sharing the PID forbid process-wide termination;
-external parents, process groups and daemons are not inferred targets.
+Delete cancels pending handoff/release and installs a process-owned exclusion
+through writer termination and the recoverable trash move. It can revoke an
+unopened reservation. An admitted or uncertain native open must settle or lose
+its requester before the move. A startup can be cancelled before launch;
+captured process identity permits termination after launch before readiness.
 
-Deletion uses a separate lane and a process-owned session-file gate:
+Dedicated writer termination checks the current binding under the registry mutex
+before each signal. It sends SIGTERM and escalates after `attachmentExitTimeoutMs`
+(default 5 seconds). Exit waits occur outside the mutex. Changed identity or
+another session sharing the PID prevents termination. Bridge-created Herdr
+scopes also reap remaining worker/tool descendants. A failed move preserves a
+cold-resume pause; a completed move clears it even if durability is uncertain.
 
-1. Prepare recovery records, fence input and cancel a pending handoff/release.
-2. Acquire the gate under the registry mutex and observe the current owner. A
-   transfer completed before this point is included; new acquisitions cannot enter.
-3. Close the writer, drain the ordinary session lane, recheck file identity and
-   move history to private trash while retaining the gate.
-
-An unopened handoff reservation is revoked without signalling its requester.
-An admitted native switch must finish, cancel or lose its requester before the
-same delete call continues; only that requester's completion can pass the gate.
-Pi has no atomic cancel/open boundary, so an indefinitely stuck or uncertain switch
-can leave deletion waiting until requester exit. A timeout does not authorize
-killing a process that may still use another session.
-
-Startup can be cancelled before launch. After launch, captured identity permits
-delete before readiness, even when startup cleanup is waiting for Pi. Startup
-promises drain after termination. The gate does not replace the owner claim or
-hold the registry mutex during exit; other sessions proceed and Bridge death
-releases it. A failed move preserves the prior cold-resume pause. Once moved,
-cleanup clears the pause even if a later directory sync reports uncertain durability.
-Bridge-created Herdr scopes also terminate remaining worker/tool descendants with
-the same escalation budget; ordinary EOF, handoff and shutdown do not escalate.
-
-The trash move requires confirmed writer exit or a successful session-local host
-close. Under the gate, removal of the claim or its same-generation released state
-confirms closure even if the release ACK was lost; a shared host PID need not exit.
-An unexpected binding change grants no signalling authority.
-
-A host must reserve ownership before opening its writer and publish callbacks only
-after readiness. Session-local release follows these phases:
-
-1. Close business admission and mark the owner transitioning, keeping matching
-   release controls reachable.
-2. Invoke optional `cancel()` and drain all admitted operations, including input
-   preparation and inline result delivery. Active bash uses `stop` only when no
-   cancel callback exists.
-3. Invoke `release()` to close the actual writer, confirm `{released:true}`, then
-   release the claim and permit the filesystem move.
-
-Failed cancel/release leaves admission closed and ownership intact. Concurrent
-release calls share the pending attempt; later explicit release or authorized
-delete may retry unfinished steps. After writer closure, retries only finish
-registry cleanup. Callbacks must resume or confirm closure on retry without
-replaying business work or reopening admission.
-
-Hosts with cancellable preparation must implement `cancel` rather than waiting
-for writer-close, and must fence/drain their own non-Bridge admissions. Controller
-disconnect retires only its endpoint, preserving the live claim. Failed, absent
-or unreachable release does not veto delete of a dedicated writer: Bridge may
-terminate its verified process. A shared host lacking a working session-local
-close path returns `DELETE_SHARED_OWNER` to protect its other sessions.
+For a shared host, session-local release closes admission, invokes optional
+`cancel()` (or `stop` for active bash), drains preparation and inline output,
+then calls `release()` to close the writer and confirm `{released:true}`. A
+confirmed same-generation release can authorize deletion after a lost reply.
+Failed close keeps admission fenced. Concurrent releases share the attempt and
+explicit retry resumes unfinished work. Once the writer confirms closure,
+retries only finish registry cleanup. Without a working session-local close,
+a shared host returns `DELETE_SHARED_OWNER`.
 
 ## Read and fork boundaries
 

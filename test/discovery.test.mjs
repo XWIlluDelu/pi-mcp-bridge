@@ -1,26 +1,13 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+
 import { loadSession, readSessionIdentity, discover } from '../src/data.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-discovery-'),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    defaults: denyAllPermissions(),
-    attachmentDir: path.join(dir, 'ipc'),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, delete: true, create: true }],
-  };
   let starts = 0;
   const runtime = ownedRuntime({
     alive: true,
@@ -30,17 +17,14 @@ async function fixture(t) {
     },
     state: async () => ({ isStreaming: false, isCompacting: false }),
   });
-  const bridge = await new Bridge(config, async () => {
-    starts++;
-    return runtime;
-  }).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'discovery',
+    factory: async () => {
+      starts++;
+      return runtime;
+    },
   });
-  const made = await savedSession(bridge),
-    session = await bridge.session(made.session_id);
-  return { dir, cwd, config, bridge, session, runtime, starts: () => starts };
+  return { ...f, runtime, starts: () => starts };
 }
 test('warm known-ID lookup and listing avoid discovery but revalidate identity and current permissions', async (t) => {
   const f = await fixture(t);

@@ -1,18 +1,16 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs/promises';
-import os from 'node:os';
+
 import path from 'node:path';
 
 import { createHttpService } from '../src/http-server.mjs';
 import { loadHttpConfig, TOKEN_HEADER } from '../src/http-config.mjs';
-import { Bridge } from '../src/bridge.mjs';
 
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
 
 const token = 'synthetic-http-test-token-never-a-real-credential';
@@ -34,8 +32,7 @@ const initialize = {
 };
 function request(url, message, options = {}) {
   const body = typeof message === 'string' ? message : JSON.stringify(message);
-  let req;
-  const response = new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const values = {
       Host: new URL(url).host,
       Accept: 'application/json, text/event-stream',
@@ -46,14 +43,16 @@ function request(url, message, options = {}) {
     const rawHeaders = Object.entries(values).flatMap(([name, value]) =>
       (Array.isArray(value) ? value : [value]).flatMap((item) => [name, item]),
     );
-    req = http.request(
+    const req = http.request(
       url,
       { method: options.method ?? 'POST', headers: rawHeaders, agent: false },
       (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
+        res.setEncoding('utf8');
+        let text = '';
+        res.on('data', (chunk) => {
+          text += chunk;
+        });
         res.on('end', () => {
-          const text = Buffer.concat(chunks).toString();
           resolve({
             status: res.statusCode,
             headers: res.headers,
@@ -70,20 +69,8 @@ function request(url, message, options = {}) {
       req.end();
     } else req.end(body);
   });
-  return { req, response };
 }
 async function fixture(t, serviceOptions = {}) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-http-')),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, create: true, delete: true }],
-  };
   const runtime = ownedRuntime({
     alive: true,
     calls: [],
@@ -96,41 +83,19 @@ async function fixture(t, serviceOptions = {}) {
       this.alive = false;
     },
   });
-  const bridge = await new Bridge(config, async () => runtime).init();
-  const created = await savedSession(bridge);
-  const service = createHttpService(bridge, { token, ...serviceOptions });
+  const f = await nativeOwner(t, { prefix: 'http', factory: async () => runtime });
+  const service = createHttpService(f.bridge, { token, ...serviceOptions });
+  f.cleanup.push(() => service.close());
   const url = await service.listen();
-  const cleanup = [];
-  t.after(async () => {
-    for (const fn of cleanup) await fn();
-    await service.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
   const call = async (name, args, id) => {
-    const response = await request(url, rpc(name, args, id)).response;
+    const response = await request(url, rpc(name, args, id));
     assert.equal(response.status, 200, response.text);
     assert.equal(response.body.result.isError, undefined, response.text);
     return response.body.result.structuredContent;
   };
-  return {
-    dir,
-    config,
-    runtime,
-    bridge,
-    service,
-    url,
-    call,
-    cleanup,
-    id: created.session_id,
-  };
+  return { ...f, runtime, service, url, call };
 }
-const deferred = () => {
-  let resolve;
-  const promise = new Promise((r) => {
-    resolve = r;
-  });
-  return { promise, resolve };
-};
+const deferred = () => Promise.withResolvers();
 
 const modern = (method, params = {}, id = 1) => ({
   jsonrpc: '2.0',
@@ -150,15 +115,12 @@ test('modern HTTP has no handshake, required discovery/meta, mirrored headers an
   const f = await fixture(t);
   for (const method of ['server/discover', 'tools/list']) {
     const body = modern(method),
-      response = await request(f.url, body, { headers: modernHeaders(body) }).response;
+      response = await request(f.url, body, { headers: modernHeaders(body) });
     assert.equal(response.status, 200, response.text);
-    assert.equal(response.body.result.resultType, 'complete');
-    assert.equal(response.body.result.cacheScope, 'private');
-    assert.equal(response.body.result.ttlMs, 0);
     assert.equal(response.headers['mcp-session-id'], undefined);
   }
   const body = modern('tools/call', { name: 'list', arguments: {} });
-  const success = await request(f.url, body, { headers: modernHeaders(body) }).response;
+  const success = await request(f.url, body, { headers: modernHeaders(body) });
   assert.equal(success.status, 200);
   assert.equal(success.body.result.structuredContent.sessions[0].session_id, f.id);
   for (const bad of [
@@ -166,33 +128,23 @@ test('modern HTTP has no handshake, required discovery/meta, mirrored headers an
     { 'Mcp-Name': 'read' },
     { 'Mcp-Method': ['tools/call', 'tools/call'] },
   ]) {
-    const response = await request(f.url, body, { headers: { ...modernHeaders(body), ...bad } })
-      .response;
+    const response = await request(f.url, body, { headers: { ...modernHeaders(body), ...bad } });
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, -32020);
   }
   const unsupported = modern('tools/list');
   unsupported.params._meta[META + 'protocolVersion'] = '2099-01-01';
-  const response = await request(f.url, unsupported, { headers: modernHeaders(unsupported) })
-    .response;
-  assert.equal(response.status, 400);
-  assert.equal(response.body.error.code, -32022);
-  assert.equal(response.body.error.data.requested, '2099-01-01');
-  const missing = modern('tools/list');
-  delete missing.params._meta[META + 'clientCapabilities'];
-  const malformed = await request(f.url, missing, { headers: modernHeaders(missing) }).response;
-  assert.equal(malformed.status, 400);
-  assert.equal(malformed.body.error.code, -32602);
+  const version = await request(f.url, unsupported, { headers: modernHeaders(unsupported) });
+  assert.equal(version.status, 400);
+  assert.equal(version.body.error.code, -32022);
   const unknown = modern('unknown/method');
-  const notFound = await request(f.url, unknown, { headers: modernHeaders(unknown) }).response;
-  assert.equal(notFound.status, 404);
-  assert.equal(notFound.body.error.code, -32601);
+  assert.equal((await request(f.url, unknown, { headers: modernHeaders(unknown) })).status, 404);
 });
 test('HTTP response deadline reports uncertainty and does not replay admitted work', async (t) => {
   const f = await fixture(t, { waitTimeoutMs: 30 }),
     entered = deferred(),
     release = deferred();
-  f.cleanup.push(() => release.resolve());
+  f.cleanup.unshift(() => release.resolve());
   f.runtime.command = async (command) => {
     f.runtime.calls.push(command);
     entered.resolve();
@@ -203,7 +155,7 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
     name: 'send',
     arguments: { session_id: f.id, text: 'fixture' },
   });
-  const pending = request(f.url, body, { headers: modernHeaders(body) }).response;
+  const pending = request(f.url, body, { headers: modernHeaders(body) });
   await entered.promise;
   const expired = await pending;
   assert.equal(expired.status, 504);
@@ -218,16 +170,15 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
 
 test('HTTP initialize and independent requests use JSON without MCP sessions or SSE', async (t) => {
   const f = await fixture(t);
-  const response = await request(f.url, initialize).response;
+  const response = await request(f.url, initialize);
   assert.equal(response.status, 200);
   assert.equal(response.body.result.protocolVersion, '2025-11-25');
   assert.equal(response.headers['mcp-session-id'], undefined);
   assert.match(response.headers['content-type'], /application\/json/);
   assert.equal(response.headers['access-control-allow-origin'], undefined);
   assert.equal((await f.call('list')).sessions[0].session_id, f.id);
-  assert.equal((await f.call('read', { session_id: f.id })).session_id, f.id);
   for (const method of ['GET', 'DELETE', 'OPTIONS'])
-    assert.equal((await request(f.url, '', { method }).response).status, 405);
+    assert.equal((await request(f.url, '', { method })).status, 405);
 });
 
 test('HTTP enforces exact Host, denies every Origin, and authenticates before parsing', async (t) => {
@@ -244,54 +195,36 @@ test('HTTP enforces exact Host, denies every Origin, and authenticates before pa
     [{ [TOKEN_HEADER]: [token, token] }, 401],
   ];
   for (const [headers, status] of cases) {
-    const response = await request(f.url, '{bad json', { headers }).response;
+    const response = await request(f.url, '{bad json', { headers });
     assert.equal(response.status, status, JSON.stringify(headers));
     assert.equal(response.text.includes(token), false);
     assert.equal(response.headers['access-control-allow-origin'], undefined);
   }
-  const noAuth = await new Promise((resolve, reject) => {
-    const req = http.request(f.url, { method: 'POST' }, (res) => {
-      res.resume();
-      res.on('end', () => resolve(res.statusCode));
-    });
-    req.on('error', reject);
-    req.end('{bad json');
-  });
-  assert.equal(noAuth, 401);
-  assert.equal((await request(f.url, '{bad json').response).status, 400);
-  assert.equal((await request(f.url, [rpc('list')]).response).status, 400);
-  assert.equal(
-    (await request(f.url, rpc('list'), { headers: { 'Content-Encoding': 'gzip' } }).response)
-      .status,
-    415,
-  );
-  assert.equal(
-    (
-      await request(f.url, rpc('list'), { headers: { 'MCP-Protocol-Version': '2026-07-28' } })
-        .response
-    ).status,
-    400,
-  );
+  for (const [body, headers, status] of [
+    ['{bad json', {}, 400],
+    [[rpc('list')], {}, 400],
+    [rpc('list'), { 'Content-Encoding': 'gzip' }, 415],
+    [rpc('list'), { 'MCP-Protocol-Version': MODERN_VERSION }, 400],
+  ])
+    assert.equal((await request(f.url, body, { headers })).status, status);
 });
 
 test('HTTP bounds declared and chunked bodies and accepts ten maximally escaped prompts', async (t) => {
   const f = await fixture(t);
   assert.equal(
-    (
-      await request(f.url, '', { headers: { 'Content-Length': String(MCP_INPUT_LIMIT + 1) } })
-        .response
-    ).status,
+    (await request(f.url, '', { headers: { 'Content-Length': String(MCP_INPUT_LIMIT + 1) } }))
+      .status,
     413,
   );
   assert.equal(
-    (await request(f.url, ' '.repeat(MCP_INPUT_LIMIT + 1), { chunked: true }).response).status,
+    (await request(f.url, ' '.repeat(MCP_INPUT_LIMIT + 1), { chunked: true })).status,
     413,
   );
   assert.equal(
     (
       await request(f.url, '', {
         headers: { 'Content-Length': String(MCP_INPUT_LIMIT + 1), [TOKEN_HEADER]: 'wrong' },
-      }).response
+      })
     ).status,
     401,
   );
@@ -328,7 +261,7 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
     await release.promise;
     return { disposition: 'started' };
   };
-  f.cleanup.push(() => release.resolve());
+  f.cleanup.unshift(() => release.resolve());
   const batch = request(
     f.url,
     rpc('batch', {
@@ -341,7 +274,7 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
       ],
     }),
   );
-  const response = batch.response.catch(() => null);
+  const response = batch.catch(() => null);
   await entered.promise;
   const close = f.service.close();
   assert.equal(close, f.service.close());

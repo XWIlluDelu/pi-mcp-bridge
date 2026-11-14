@@ -3,100 +3,80 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { Bridge } from '../src/bridge.mjs';
-
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 
-async function fixture(t, overrides = {}) {
-  const dir = await fs.mkdtemp('/tmp/pi-catalog-'),
-    project = path.join(dir, 'project'),
-    marker = path.join(dir, 'catalog-calls'),
-    configFile = path.join(dir, 'owner.json'),
-    config = {
-      ...isolatedRuntime(dir),
-      stateDir: path.join(dir, 'state'),
-      sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ path: project }, { path: path.join(dir, 'unopened-project') }],
-      defaults: denyAllPermissions(),
-      grants: [{ folder: project, send: true }],
-      ...overrides,
-    };
-  await fs.mkdir(project);
-  await fs.mkdir(config.piRuntime.agentDir);
-  const names = ['NODE_OPTIONS', 'BRIDGE_CATALOG_MARKER', 'BRIDGE_CATALOG_KEY'],
-    previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
-  config.piRuntime.inheritEnv = names;
-  process.env.NODE_OPTIONS =
-    '--import=' + pathToFileURL(path.resolve('test/fixtures/catalog-guard.mjs'));
-  process.env.BRIDGE_CATALOG_MARKER = marker;
-  process.env.BRIDGE_CATALOG_KEY = 'SYNTHETIC_CATALOG_SECRET';
-  await fs.writeFile(
-    path.join(config.piRuntime.agentDir, 'models.json'),
-    JSON.stringify({
-      providers: {
-        'catalog-fixture': {
-          api: 'openai-completions',
-          baseUrl: 'http://127.0.0.1:1/PRIVATE_ENDPOINT',
-          apiKey: 'BRIDGE_CATALOG_KEY',
-          headers: { 'X-Private': 'SYNTHETIC_HEADER_SECRET' },
-          models: Array.from({ length: 33 }, (_, i) => ({
-            id: String(i).padStart(2, '0'),
-            name: 'Offline catalog model',
-            input: ['text', 'image'],
-            reasoning: true,
-            contextWindow: 16000,
-            maxTokens: 2048,
-          })),
-        },
-      },
-    }),
-  );
-  // These factories must never be loaded by directory discovery.
-  const extensions = path.join(config.piRuntime.agentDir, 'extensions');
-  await fs.mkdir(extensions);
-  await fs.writeFile(
-    path.join(extensions, 'poison.mjs'),
-    "throw new Error('Catalog must not execute extension factories');",
-  );
-  await fs.writeFile(
-    path.join(config.piRuntime.agentDir, 'settings.json'),
-    JSON.stringify({ extensions: [path.join(extensions, 'poison.mjs')] }),
-  );
-  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-  const bridge = await new Bridge(
-    config,
-    () => {
-      throw new Error('UNEXPECTED_WRITER');
+async function fixture(t) {
+  const f = await nativeOwner(t, {
+    prefix: 'catalog',
+    seed: false,
+    reloadConfig: true,
+    factory: () => assert.fail('Catalog must not start a writer'),
+    async configure({ dir, cwd, config }) {
+      config.folders.push({ path: path.join(dir, 'unopened-project') });
+      config.grants = [{ folder: cwd, send: true }];
+      const names = ['NODE_OPTIONS', 'BRIDGE_CATALOG_MARKER', 'BRIDGE_CATALOG_KEY'],
+        previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+      t.after(() => {
+        for (const name of names) {
+          if (previous[name] === undefined) delete process.env[name];
+          else process.env[name] = previous[name];
+        }
+      });
+      config.piRuntime.inheritEnv = names;
+      process.env.NODE_OPTIONS =
+        '--import=' + pathToFileURL(path.resolve('test/fixtures/catalog-guard.mjs'));
+      process.env.BRIDGE_CATALOG_MARKER = path.join(dir, 'catalog-calls');
+      process.env.BRIDGE_CATALOG_KEY = 'SYNTHETIC_CATALOG_SECRET';
+      await fs.writeFile(
+        path.join(config.piRuntime.agentDir, 'models.json'),
+        JSON.stringify({
+          providers: {
+            'catalog-fixture': {
+              api: 'openai-completions',
+              baseUrl: 'http://127.0.0.1:1/PRIVATE_ENDPOINT',
+              apiKey: 'BRIDGE_CATALOG_KEY',
+              headers: { 'X-Private': 'SYNTHETIC_HEADER_SECRET' },
+              models: Array.from({ length: 33 }, (_, i) => ({
+                id: String(i).padStart(2, '0'),
+                name: 'Offline catalog model',
+                input: ['text', 'image'],
+                reasoning: true,
+                contextWindow: 16000,
+                maxTokens: 2048,
+              })),
+            },
+          },
+        }),
+      );
+      // These factories must never be loaded by directory discovery.
+      const extensions = path.join(config.piRuntime.agentDir, 'extensions');
+      await fs.mkdir(extensions);
+      await fs.writeFile(
+        path.join(extensions, 'poison.js'),
+        "throw new Error('Catalog must not execute extension factories');",
+      );
+      await fs.writeFile(
+        path.join(config.piRuntime.agentDir, 'settings.json'),
+        JSON.stringify({ extensions: [path.join(extensions, 'poison.js')] }),
+      );
     },
-    { configFile },
-  ).init();
-  t.after(async () => {
-    try {
-      await bridge.close();
-    } finally {
-      for (const name of names) {
-        if (previous[name] === undefined) delete process.env[name];
-        else process.env[name] = previous[name];
-      }
-      await fs.rm(dir, { recursive: true, force: true });
-    }
   });
-  const policy = (grants, defaults = config.defaults) =>
-    fs.writeFile(configFile, JSON.stringify({ ...config, grants, defaults }));
+  const policy = (grants, defaults = f.config.defaults) =>
+    fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants, defaults }));
   const calls = () =>
-    fs.readFile(marker, 'utf8').catch((e) => {
-      if (e.code === 'ENOENT') return '';
-      throw e;
+    fs.readFile(path.join(f.dir, 'catalog-calls'), 'utf8').catch((error) => {
+      if (error.code === 'ENOENT') return '';
+      throw error;
     });
-  return { dir, project, marker, config, configFile, bridge, policy, calls };
+  return { ...f, project: f.cwd, policy, calls };
 }
 
 test('native catalog is offline, session-free, paged and sanitized in the owner launch environment', async (t) => {
   const f = await fixture(t),
     { bridge } = f;
   const env = { ...process.env };
+  const state = await fs.readdir(f.config.stateDir);
   const first = await bridge.models({});
   assert.equal(first.models.length, 30);
   assert.equal(first.next_offset, 30);
@@ -109,12 +89,10 @@ test('native catalog is offline, session-free, paged and sanitized in the owner 
   );
   assert.ok(first.models[0].thinking_levels.includes('high'));
   assert.ok(!/SECRET|PRIVATE_ENDPOINT|apiKey|headers|baseUrl/.test(JSON.stringify(first)));
-  assert.deepEqual(Object.keys(process.env), Object.keys(env));
-  for (const name of Object.keys(env))
-    assert.ok(process.env[name] === env[name], 'Catalog changed environment variable ' + name);
+  assert.deepEqual({ ...process.env }, env);
   assert.equal(bridge.pool.instances.size, 0);
   assert.deepEqual(await fs.readdir(f.config.sessionRoots[0]), []);
-  assert.deepEqual(await fs.readdir(f.config.stateDir), ['ipc']);
+  assert.deepEqual(await fs.readdir(f.config.stateDir), state);
   assert.equal((await bridge.models({ offset: 32, limit: 1 })).models[0].id, '32');
   assert.equal((await bridge.models({ offset: 33 })).next_offset, null);
 

@@ -1,3 +1,4 @@
+import { message, text } from './fixtures/native-history.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
@@ -13,24 +14,14 @@ test('discarded broken branches do not block native current context; traversed c
   const dir = await fs.mkdtemp('/tmp/pi-history-branch-');
   await fs.mkdir(dir + '/sessions', { mode: 0o700 });
   const file = dir + '/sessions/history.jsonl';
-  const message = (id, parentId, role, text) => ({
-    type: 'message',
-    id,
-    parentId,
-    message: {
-      role,
-      content: role === 'assistant' ? [{ type: 'text', text }] : text,
-      timestamp: 0,
-    },
-  });
   const rows = [
     { type: 'session', version: 3, id: 'partial-tree', cwd: dir },
     message('root', null, 'user', 'ROOT'),
-    message('discarded', 'missing', 'assistant', 'DISCARDED'),
+    message('discarded', 'missing', 'assistant', [text('DISCARDED')]),
     message('cycle-a', 'cycle-b', 'user', 'CYCLE_A'),
-    message('cycle-b', 'cycle-a', 'assistant', 'CYCLE_B'),
+    message('cycle-b', 'cycle-a', 'assistant', [text('CYCLE_B')]),
     message('current', 'root', 'user', 'CURRENT'),
-    message('answer', 'current', 'assistant', 'ANSWER'),
+    message('answer', 'current', 'assistant', [text('ANSWER')]),
   ];
   const bytes = rows.map(JSON.stringify).join('\n') + '\n{"torn":\n';
   await fs.writeFile(file, bytes);
@@ -77,26 +68,8 @@ test('current Pi can reopen a raw fork without changing the source', async (t) =
   const f = await nativeOwner(t);
   const image = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' };
   const rows = [
-    {
-      type: 'message',
-      id: 'u',
-      parentId: null,
-      message: {
-        role: 'user',
-        content: [{ type: 'text', text: 'source task' }, image],
-        timestamp: 0,
-      },
-    },
-    {
-      type: 'message',
-      id: 'a',
-      parentId: 'u',
-      message: {
-        role: 'assistant',
-        content: [{ type: 'text', text: 'source answer' }],
-        timestamp: 0,
-      },
-    },
+    message('u', null, 'user', [text('source task'), image]),
+    message('a', 'u', 'assistant', [text('source answer')]),
     {
       type: 'compaction',
       id: 'c',

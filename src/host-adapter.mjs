@@ -21,6 +21,7 @@ import {
   ownerReadFeatures,
   ownerRead,
   ownerSnapshot,
+  validNativeSnapshot,
   parseOwnerRequest,
 } from './attachment-protocol.mjs';
 import {
@@ -237,17 +238,7 @@ export async function reserveHostSession({
       const observed = await callbacks.snapshot();
       const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
       await assertIdentity(snapshot);
-      if (
-        !Array.isArray(snapshot?.entries) ||
-        !snapshot.entries.every(
-          (entry) => typeof entry?.id === 'string' && entry.id.length <= 128,
-        ) ||
-        !(
-          snapshot.leafId === null ||
-          (typeof snapshot.leafId === 'string' && snapshot.leafId.length <= 128)
-        )
-      )
-        fail('INVALID_HOST_SNAPSHOT');
+      if (!validNativeSnapshot(snapshot)) fail('INVALID_HOST_SNAPSHOT');
       data =
         request.op === 'snapshot'
           ? ownerSnapshot(record, snapshot)

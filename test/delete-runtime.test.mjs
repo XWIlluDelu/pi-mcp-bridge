@@ -19,8 +19,8 @@ import {
   AttachedRuntime,
 } from '../src/attachments.mjs';
 
-async function fixture(t, { native = false } = {}) {
-  const f = await nativeOwner(t, {
+const fixture = (t, native = false) =>
+  nativeOwner(t, {
     prefix: 'delete',
     configure({ cwd, config }) {
       config.attachmentExitTimeoutMs = 50;
@@ -28,15 +28,12 @@ async function fixture(t, { native = false } = {}) {
     },
     factory: native ? undefined : () => assert.fail('Delete must not start Pi'),
   });
-  return { ...f, make: f.create, cleanups: f.cleanup };
-}
-async function writer(t, stubborn = false) {
+async function writer(t) {
   const child = spawn(
     process.execPath,
     [
       '-e',
       `
-    ${stubborn ? "process.on('SIGTERM', () => {});" : ''}
     process.send('ready');
     setInterval(() => {}, 1000);
   `,
@@ -60,8 +57,8 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
     `delete interrupts ${stage} without waiting for startup to finish`,
     { timeout: 10000 },
     async (t) => {
-      const f = await fixture(t, { native: true }),
-        target = await f.make(),
+      const f = await fixture(t, true),
+        target = f.session,
         extension = path.join(f.dir, 'startup.mjs');
       const marker = path.join(f.dir, 'entered');
       await fs.writeFile(
@@ -78,7 +75,7 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
       f.config.piArgs.push('-e', extension);
       f.config.grants[0].send = true;
       const sent = f.bridge.send({ session_id: target.id, text: 'MUST_NOT_REACH_PI' });
-      f.cleanups.push(async () => {
+      f.cleanup.push(async () => {
         const rpc =
           f.bridge.pool.starting.get(target.id)?.runtime ?? f.bridge.pool.instances.get(target.id);
         if (rpc?.childIdentity && (await ownerAlive(rpc.childIdentity)))
@@ -109,9 +106,28 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
     },
   );
 
+async function hostWriter(f, owner) {
+  const { session } = f;
+  const host = await reserveHostSession({
+    buildSessionProjection: hostProjection,
+    attachmentDir: f.config.attachmentDir,
+    session,
+    owner,
+  });
+  f.cleanup.push(() => host.close());
+  const ready = (callbacks) =>
+    host.ready({
+      state: async () => ({ sessionFile: session.file, sessionId: session.header.id }),
+      snapshot: async () => ({ entries: [], leafId: null }),
+      submit: () => assert.fail('Delete must not submit'),
+      ...callbacks,
+    });
+  return { host, ready };
+}
+
 test('delete ends an unsupported live claim without treating its socket metadata as file authority', async (t) => {
   const f = await fixture(t),
-    target = await f.make(),
+    target = f.session,
     live = await writer(t);
   const record = await reserveOwner(f.config.attachmentDir, target, 'extension', live.owner);
   const unrelated = path.join(f.dir, 'unrelated-data');
@@ -138,26 +154,15 @@ for (const callback of ['cancel', 'release'])
   for (const shared of [false, true])
     test(`host ${callback} exception permits dedicated termination but preserves shared owners (shared=${shared})`, async (t) => {
       const f = await fixture(t),
-        target = await f.make(),
-        neighbor = await f.make(),
+        target = f.session,
+        neighbor = await f.create(),
         a = await writer(t);
       const b = shared ? a : await writer(t);
-      const host = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.config.attachmentDir,
-        session: target,
-        owner: a.owner,
-      });
-      f.cleanups.push(() => host.close());
+      const { ready } = await hostWriter(f, a.owner);
       await reserveOwner(f.config.attachmentDir, neighbor, 'rpc', b.owner);
       let failed = false,
         released = false;
-      await host.ready({
-        state: async () => ({ sessionFile: target.file, sessionId: target.header.id }),
-        snapshot: async () => ({ entries: [], leafId: null }),
-        submit: async () => {
-          throw new Error('DELETE_MUST_NOT_SEND');
-        },
+      await ready({
         cancel: async () => {
           if (callback === 'cancel') {
             failed = true;
@@ -193,27 +198,14 @@ for (const callback of ['cancel', 'release'])
 
 test('lost release ACK uses confirmed target closure without terminating the shared host', async (t) => {
   const f = await fixture(t),
-    target = await f.make(),
-    neighbor = await f.make(),
+    target = f.session,
+    neighbor = await f.create(),
     a = await writer(t);
   // This case discards a completed ACK; it is not a short-timeout test.
   delete f.config.attachmentExitTimeoutMs;
-  const host = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: target,
-    owner: a.owner,
-  });
-  f.cleanups.push(() => host.close());
+  const { ready } = await hostWriter(f, a.owner);
   await reserveOwner(f.config.attachmentDir, neighbor, 'host', a.owner);
-  await host.ready({
-    state: async () => ({ sessionFile: target.file, sessionId: target.header.id }),
-    snapshot: async () => ({ entries: [], leafId: null }),
-    submit: async () => {
-      throw new Error('DELETE_MUST_NOT_SEND');
-    },
-    release: async () => ({ released: true }),
-  });
+  await ready({ release: async () => ({ released: true }) });
   const request = AttachedRuntime.prototype.request;
   let released = false;
   t.mock.method(AttachedRuntime.prototype, 'request', async function (op, ...args) {
@@ -244,21 +236,10 @@ test('lost release ACK uses confirmed target closure without terminating the sha
 
 test('a failing host release cannot authorize termination after its binding changes', async (t) => {
   const f = await fixture(t),
-    target = await f.make(),
+    target = f.session,
     a = await writer(t);
-  const host = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: target,
-    owner: a.owner,
-  });
-  f.cleanups.push(() => host.close());
-  await host.ready({
-    state: async () => ({ sessionFile: target.file, sessionId: target.header.id }),
-    snapshot: async () => ({ entries: [], leafId: null }),
-    submit: async () => {
-      throw new Error('DELETE_MUST_NOT_SEND');
-    },
+  const { host, ready } = await hostWriter(f, a.owner);
+  await ready({
     release: async () => {
       await updateOwner(
         f.config.attachmentDir,
@@ -278,7 +259,7 @@ test('a failing host release cannot authorize termination after its binding chan
 
 test('denied delete does not signal the owner or prepare trash', async (t) => {
   const f = await fixture(t),
-    target = await f.make(),
+    target = f.session,
     a = await writer(t);
   await reserveOwner(f.config.attachmentDir, target, 'extension', a.owner);
   f.config.grants = [];

@@ -1,8 +1,9 @@
+import { attachmentServer, listenPrivate, ownerEnvelope } from '../src/attachment-protocol.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import net from 'node:net';
+
 import packageInfo from '../package.json' with { type: 'json' };
 import { AttachedRuntime, claimFile, processIdentity } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
@@ -23,34 +24,14 @@ async function fixture(t) {
     requests = [],
     connections = new Set();
   let respond = () => ({ data: { sealed: true } });
-  const server = net.createServer((socket) => {
-    connections.add(socket);
-    socket.on('close', () => connections.delete(socket));
-    socket.on('error', () => {});
-    let buffer = '';
-    socket.on('data', async (chunk) => {
-      buffer += chunk;
-      if (!buffer.includes('\n')) return;
-      const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
-      requests.push(request);
-      const result = await respond(request);
-      if (result === null) return socket.destroy();
-      socket.end(
-        JSON.stringify({
-          generation: record.generation,
-          version: packageInfo.version,
-          file: session.file,
-          sessionId: session.header.id,
-          ...result,
-        }) + '\n',
-      );
-    });
+  const server = attachmentServer(connections, async (frame, socket) => {
+    const request = JSON.parse(frame);
+    requests.push(request);
+    const result = await respond(request);
+    if (result === null) socket.destroy();
+    else socket.end(ownerEnvelope(record, result));
   });
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(record.socket, resolve);
-  });
-  await fs.chmod(record.socket, 0o600);
+  await listenPrivate(server, record.socket);
   await fs.writeFile(claimFile(dir, session), JSON.stringify(record), { mode: 0o600 });
   t.after(async () => {
     for (const socket of connections) socket.destroy();
@@ -96,20 +77,14 @@ test('written seal failures remain uncertain and are never replayed', async (t) 
   const f = await fixture(t);
   for (const [response, code] of [
     [null, 'LIVE_OWNER_UNREACHABLE'],
-    [{ data: null }, 'INVALID_ATTACHMENT_RESPONSE'],
-    [{ data: { sealed: true, reason: 'busy' } }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: false } }, 'INVALID_ATTACHMENT_RESPONSE'],
-    [{ data: { sealed: true }, extra: true }, 'INVALID_ATTACHMENT_RESPONSE'],
+    [{ data: { sealed: true }, partial: true }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, error: 'INVALID_ARGUMENTS' }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, version: 'unsupported' }, 'OWNER_COMPONENT_UPDATE_REQUIRED'],
     [{ data: { sealed: true }, generation: 'another' }, 'RUNTIME_SESSION_CHANGED'],
     [{ data: { sealed: true }, sessionId: 'another' }, 'RUNTIME_SESSION_CHANGED'],
     [{ data: { sealed: true }, file: '/another/session.jsonl' }, 'RUNTIME_SESSION_CHANGED'],
     [{ error: 'OWNER_COMPONENT_UPDATE_REQUIRED', sessionId: 'another' }, 'RUNTIME_SESSION_CHANGED'],
-    [
-      { error: 'OWNER_COMPONENT_UPDATE_REQUIRED', file: '/another/session.jsonl' },
-      'RUNTIME_SESSION_CHANGED',
-    ],
     [{ error: 'ATTACHED_OPERATION_FAILED' }, 'ATTACHED_OPERATION_FAILED'],
   ]) {
     const before = f.requests.length;

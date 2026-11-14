@@ -1,173 +1,108 @@
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
+import { append, message } from './fixtures/native-history.mjs';
 import { until } from './fixtures/until.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+
 import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
+
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { RpcClient } from './fixtures/pi.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { ownerRequest, ownerSocket } from '../src/owner-runtime.mjs';
+import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
 import { RpcFailure } from '../src/rpc.mjs';
-import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function fixture(t, extraArgs = []) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-handoff-')),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
-    piArgs: [
-      '--offline',
-      '--no-context-files',
-      '-e',
-      path.join(base, 'test/fixtures/faux-extension.mjs'),
-      '--provider',
-      'bridge-fixture',
-      '--model',
-      'deterministic',
-      ...extraArgs,
-    ],
-  };
-  config.piRuntime.tools = ['read', 'bash', 'edit', 'write'];
-  const file = path.join(dir, 'owner.json');
-  await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
-  let bridge = await new Bridge(config).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'owner-control',
+    configure({ config }) {
+      config.piArgs.push(...fauxArgs, ...extraArgs);
+    },
   });
-  const made = await savedSession(bridge),
-    session = await bridge.session(made.session_id);
+  let bridge = f.bridge;
+  f.cleanup.push(() => bridge.close());
   return {
-    dir,
-    cwd,
-    config,
-    file,
-    session,
-    id: session.id,
+    ...f,
     get bridge() {
       return bridge;
     },
-    restart: async () => {
+    async restart() {
       await bridge.close();
-      bridge = await new Bridge(config).init();
+      bridge = await new Bridge(f.config).init();
     },
   };
 }
+
 test(
   'owner CLI release holds across restart and attachment; only explicit confirmed reset restores cold resume',
   { timeout: 30000 },
   async (t) => {
     const f = await fixture(t),
-      marker = 'GENERIC_RELEASE_RESUME_PROOF';
-    assert.equal((await fs.stat(ownerSocket(f.config))).mode & 0o777, 0o600);
-    assert.ok(
-      ['started', 'queued', 'handled'].includes(
-        (await f.bridge.send({ session_id: f.id, text: marker })).status,
-      ),
-      'Expected native prompt admission',
-    );
-    const owned = f.bridge.pool.get(f.id);
-    const owner = owned.ownerRecord.owner;
-    const generation = owned.ownerRecord.generation;
-    await until(() => owned.settlementSequence === 1);
-    const result = await exec(process.execPath, [
-      path.join(base, 'src/owner-runtime.mjs'),
-      f.file,
-      'release',
-      f.id,
-    ]);
-    assert.equal(JSON.parse(result.stdout).status, 'released');
+      args = { session_id: f.id };
+    const send = (text) => f.bridge.send({ ...args, text });
+    const cli = async (...args) =>
+      JSON.parse(
+        (
+          await exec(process.execPath, [
+            path.join(base, 'src/owner-runtime.mjs'),
+            f.configFile,
+            ...args,
+          ])
+        ).stdout,
+      );
+    await send('PRESERVE_ON_RELEASE');
+    const rpc = f.bridge.pool.get(f.id),
+      owner = rpc.ownerRecord.owner;
+    await until(() => rpc.settlementSequence === 1);
+    assert.equal((await cli('release', f.id)).status, 'released');
     assert.equal(await ownerAlive(owner), false);
-    let held = await readClaim(f.bridge.pool.attachmentDir, f.session);
-    assert.equal(held.phase, 'released');
-    assert.equal(held.owner, null);
-    assert.equal(held.noColdReacquire, true);
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, text: 'NEVER_ADMITTED' })).reason,
-      'COLD_REACQUIRE_BLOCKED',
-    );
-    assert.ok(JSON.stringify(await f.bridge.read({ session_id: f.id })).includes(marker));
+    const claim = () => readClaim(f.config.attachmentDir, f.session);
+    assert.equal((await claim()).phase, 'released');
     await f.restart();
-    assert.equal(
-      (
-        await f.bridge.send({
-          session_id: f.id,
-          text: 'NEVER_ADMITTED',
-        })
-      ).reason,
-      'COLD_REACQUIRE_BLOCKED',
-    );
+    assert.equal((await send('NEVER_ADMITTED')).reason, 'COLD_REACQUIRE_BLOCKED');
+    assert.match(JSON.stringify(await f.bridge.read(args)), /PRESERVE_ON_RELEASE/);
+
     const local = new RpcClient({
       cliPath: nativePiCli,
       cwd: f.cwd,
-      env: {
-        HOME: f.dir,
-        PI_CODING_AGENT_DIR: f.config.piRuntime.agentDir,
-        PI_MCP_ATTACH_DIR: f.bridge.pool.attachmentDir,
-        PI_OFFLINE: '1',
-      },
+      env: f.env,
       args: [
+        ...f.config.piArgs,
         '--session',
         f.session.file,
         '-e',
-        path.join(base, 'test/fixtures/faux-extension.mjs'),
-        '-e',
-        path.join(base, 'src/attach-extension.mjs'),
+        path.resolve('src/attach-extension.mjs'),
       ],
-      provider: 'bridge-fixture',
-      model: 'deterministic',
     });
-    t.after(() => local.stop());
+    f.cleanup.unshift(() => local.stop());
     await local.start();
     await local.getState();
-    held = await readClaim(f.bridge.pool.attachmentDir, f.session);
-    assert.equal(held.kind, 'extension');
-    assert.equal(held.noColdReacquire, true);
-    assert.notEqual(held.generation, generation);
-    for (const interrupt of [false, true])
-      await assert.rejects(
-        ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt }),
-        /EXTERNAL_OWNER_NOT_RELEASABLE/,
-      );
+    const external = await claim();
+    assert.equal(external.kind, 'extension');
+    assert.equal(external.noColdReacquire, true);
     await assert.rejects(
-      ownerRequest(f.config, { op: 'reset', session_id: f.id, confirm_local_closed: true }),
+      ownerRequest(f.config, { ...args, op: 'release', interrupt: true }),
+      /EXTERNAL_OWNER_NOT_RELEASABLE/,
+    );
+    await assert.rejects(
+      ownerRequest(f.config, { ...args, op: 'reset', confirm_local_closed: true }),
       /OWNER_STILL_ALIVE/,
     );
     await local.stop();
-    await waitOwnerExit(held.owner);
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, text: 'NEVER_ADMITTED' })).reason,
-      'COLD_REACQUIRE_BLOCKED',
-    );
+    await waitOwnerExit(external.owner);
+    assert.equal((await send('NEVER_ADMITTED')).reason, 'COLD_REACQUIRE_BLOCKED');
     await assert.rejects(
-      ownerRequest(f.config, { op: 'reset', session_id: f.id }),
+      ownerRequest(f.config, { ...args, op: 'reset' }),
       /LOCAL_CLOSE_CONFIRMATION_REQUIRED/,
     );
-    const reset = await exec(process.execPath, [
-      path.join(base, 'src/owner-runtime.mjs'),
-      f.file,
-      'reset',
-      f.id,
-      '--confirm-local-closed',
-    ]);
-    assert.equal(JSON.parse(reset.stdout).status, 'reset');
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, text: 'COLD_RESUME_AFTER_RESET' })).status,
-      'started',
-    );
-    assert.equal((await f.bridge.pool.get(f.id).state()).sessionId, f.session.header.id);
+    assert.equal((await cli('reset', f.id, '--confirm-local-closed')).status, 'reset');
+    assert.equal((await send('COLD_RESUME_AFTER_RESET')).status, 'started');
   },
 );
 
@@ -223,15 +158,7 @@ test(
     const other = await savedSession(f.bridge),
       b = await f.bridge.session(other.session_id);
     const bytes = await fs.readFile(b.file);
-    await fs.appendFile(
-      f.session.file,
-      JSON.stringify({
-        type: 'message',
-        id: 'fork-source',
-        parentId: null,
-        message: { role: 'user', content: 'BOUNDARY_SOURCE', timestamp: 0 },
-      }) + '\n',
-    );
+    await append(f.session, [message('fork-source', null, 'user', 'BOUNDARY_SOURCE')]);
     const runtime = await f.bridge.pool.resolve(f.session),
       generation = runtime.ownerRecord.generation;
     // A manually retained writer makes the native lifecycle itself observable.

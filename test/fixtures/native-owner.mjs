@@ -12,7 +12,10 @@ const faux = new URL('./faux-extension.mjs', import.meta.url).pathname;
 const companion = new URL('../../src/attach-extension.mjs', import.meta.url).pathname;
 export const fauxArgs = ['-e', faux, '--provider', 'bridge-fixture', '--model', 'deterministic'];
 
-export async function nativeOwner(t, { prefix = 'owner', configure, factory } = {}) {
+export async function nativeOwner(
+  t,
+  { prefix = 'owner', configure, factory, reloadConfig = false, seed = true } = {},
+) {
   const dir = await fs.mkdtemp('/tmp/pi-' + prefix + '-');
   const cwd = path.join(dir, 'project');
   const configFile = path.join(dir, 'owner.json');
@@ -30,8 +33,15 @@ export async function nativeOwner(t, { prefix = 'owner', configure, factory } = 
   const cleanup = [];
   let bridge;
   t.after(async () => {
+    const errors = [];
     try {
-      for (const close of cleanup) await close();
+      for (const close of cleanup) {
+        try {
+          await close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
     } finally {
       try {
         await bridge?.close();
@@ -39,6 +49,7 @@ export async function nativeOwner(t, { prefix = 'owner', configure, factory } = 
         await fs.rm(dir, { recursive: true, force: true });
       }
     }
+    if (errors.length) throw new AggregateError(errors, 'Native fixture cleanup failed');
   });
   await fs.mkdir(cwd);
   await fs.mkdir(config.piRuntime.agentDir);
@@ -52,9 +63,9 @@ export async function nativeOwner(t, { prefix = 'owner', configure, factory } = 
   );
   await configure?.({ dir, cwd, config, cleanup });
   await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-  bridge = await new Bridge(config, factory).init();
+  bridge = await new Bridge(config, factory, reloadConfig ? { configFile } : undefined).init();
   const create = async () => bridge.session((await savedSession(bridge)).session_id);
-  const session = await create();
+  const session = seed ? await create() : null;
   const env = {
     PATH: process.env.PATH,
     HOME: dir,
@@ -71,7 +82,7 @@ export async function nativeOwner(t, { prefix = 'owner', configure, factory } = 
     cleanup,
     create,
     session,
-    id: session.id,
+    id: session?.id,
     bridge,
     env,
     mark: (name) => fs.writeFile(path.join(dir, name), 'yes'),
@@ -96,9 +107,7 @@ export async function gatedExtension({ dir, config }, source, imports = '') {
 }
 
 export async function nativeTui(fixture, session, extraArgs = []) {
-  const args = [
-    process.execPath,
-    nativePiCli,
+  const terminal = launchNativeTui(fixture, [
     ...fixture.config.piArgs,
     '--session',
     session.file,
@@ -106,11 +115,17 @@ export async function nativeTui(fixture, session, extraArgs = []) {
     companion,
     ...fauxArgs,
     ...extraArgs,
-  ];
+  ]);
+  const record = await terminal.ready(session);
+  return { ...terminal, owner: record.owner };
+}
+
+export function launchNativeTui(fixture, args, env = fixture.env) {
+  const command = [process.execPath, nativePiCli, ...args];
   const quote = (arg) => "'" + arg.replaceAll("'", "'\\''") + "'";
-  const child = spawn('script', ['-qefc', args.map(quote).join(' '), '/dev/null'], {
+  const child = spawn('script', ['-qefc', command.map(quote).join(' '), '/dev/null'], {
     cwd: fixture.cwd,
-    env: { ...fixture.env, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
+    env: { ...env, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let output = '',
@@ -120,20 +135,27 @@ export async function nativeTui(fixture, session, extraArgs = []) {
       output = (output + chunk).slice(-65536);
     });
   fixture.cleanup.push(async () => {
-    const live = record?.owner;
-    if (live && (await ownerAlive(live))) {
-      process.kill(live.pid, 'SIGTERM');
-      await waitOwnerExit(live);
+    try {
+      const live = record?.owner;
+      if (live && (await ownerAlive(live))) {
+        process.kill(live.pid, 'SIGTERM');
+        await waitOwnerExit(live);
+      }
+    } finally {
+      child.stdin.destroy();
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     }
-    child.stdin.destroy();
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
   });
-  await until(async () => {
-    record = await readClaim(fixture.config.attachmentDir, session);
-    return record?.phase === 'ready';
-  }, 'native TUI registration');
   return {
-    owner: record.owner,
+    child,
+    ready: (session) =>
+      until(async () => {
+        const current = await readClaim(fixture.config.attachmentDir, session);
+        if (current?.kind === 'tui' && current.phase === 'ready') {
+          record = current;
+          return record;
+        }
+      }, 'native TUI registration'),
     type: (text) => child.stdin.write(text),
     waitFor: (text) => until(() => output.includes(text), text),
   };

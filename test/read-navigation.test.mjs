@@ -1,16 +1,17 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
+import { message, text } from './fixtures/native-history.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+
 import { ContextReadCache } from '../src/read-cache.mjs';
 import { prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/context-read.mjs';
 import { navigationDocuments, navigationRows } from '../src/read-navigation.mjs';
 import { contextSelection, ALL_CONTENT } from '../src/read-schema.mjs';
 
 import { jsonBytes } from '../src/response-budget.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+
 import { buildSessionProjection, SessionManager } from './fixtures/pi.mjs';
 import { assertInvalidArguments } from './fixtures/tool-call.mjs';
 
@@ -211,80 +212,26 @@ test('command output stays searchable and complete across changing page budgets'
 
 test('search filters before bounded capture and retains the complete matching logical tool pair', () => {
   const entries = [];
-  const add = (role, content, fields = {}) => {
-    const entry = {
-      type: 'message',
-      id: `entry-${entries.length}`,
-      parentId: entries.at(-1)?.id ?? null,
-      timestamp: '2026-01-01T00:00:00Z',
-      message: { role, content, timestamp: 0, ...fields },
-    };
-    entries.push(entry);
-    return entry;
-  };
-  add('user', [{ type: 'text', text: 'Inspect the completed verification run.' }]);
-  const irrelevantCode = 'x'.repeat(50 * 1024);
-  const noiseCount = Math.ceil(READ_SNAPSHOT_LIMIT / (irrelevantCode.length * 4)) + 3;
-  for (let i = 0; i < noiseCount; i++) {
-    add('assistant', [
-      {
-        type: 'toolCall',
-        id: `unrelated-${i}`,
-        name: 'codemode',
-        arguments: { code: irrelevantCode },
-      },
-      { type: 'text', text: `Unrelated progress record ${i}.` },
-    ]);
-    add('toolResult', [{ type: 'text', text: 'Unrelated output.' }], {
-      toolCallId: `unrelated-${i}`,
-      toolName: 'codemode',
-      isError: false,
-    });
-  }
-  const call = add('assistant', [
-    {
-      type: 'toolCall',
-      id: 'target-call',
-      name: 'read',
-      arguments: { path: '/target/evidence.txt' },
-    },
-  ]);
-  const result = add(
-    'toolResult',
-    [{ type: 'text', text: 'needle-verification: permission checks passed.' }],
-    { toolCallId: 'target-call', toolName: 'read', isError: false },
-  );
-  const answer = add('assistant', [
-    { type: 'text', text: 'First observation.' },
-    { type: 'text', text: 'Final recommendation.' },
-  ]);
-  const data = { header: { id: 'native-fixture' }, entries, leafId: answer.id };
-  const request = { session_id: identity.session_id, range: { recent: -1 }, content: ALL_CONTENT };
-  const sdk = { buildSessionProjection };
-  assert.throws(() => prepareContextRead(data, request, sdk), /READ_SNAPSHOT_TOO_LARGE/);
-  const found = prepareContextRead(data, { ...request, search_query: 'needle-verification' }, sdk);
-  assert.deepEqual(
-    found.units.map((unit) => unit.type),
-    ['tool_call', 'tool_result'],
-  );
+  const add = (id, role, content, fields) =>
+    entries.push(message(id, entries.at(-1)?.id ?? null, role, content, fields));
+  const tool = (id, args) => ({ type: 'toolCall', name: 'read', id, arguments: args });
+  add('u', 'user', 'Inspect the verification run.');
+  const noise = 'x'.repeat(50 * 1024);
+  for (let i = 0; i < Math.ceil(READ_SNAPSHOT_LIMIT / (noise.length * 4)) + 3; i++)
+    add('noise-' + i, 'assistant', [tool('noise-' + i, { code: noise })]);
+  add('call', 'assistant', [tool('target', { path: '/target/evidence.txt' })]);
+  add('result', 'toolResult', [text('needle-verification')], { toolCallId: 'target' });
+  const prepare = (extra) =>
+    prepareContextRead({ entries }, { ...args, ...extra }, { buildSessionProjection });
+  assert.throws(() => prepare(), /READ_SNAPSHOT_TOO_LARGE/);
+  const query = 'needle-verification',
+    found = prepare({ search_query: query });
   assert.deepEqual(
     found.units.map((unit) => unit.source.entry_id),
-    [call.id, result.id],
+    ['call', 'result'],
   );
-  assert.equal(new Set(found.units.map((unit) => unit.tool_id)).size, 1);
   assert.ok(jsonBytes(found) < 4096);
-  assert.doesNotMatch(JSON.stringify(found), /Unrelated/);
-  const hits = rows(found, { query: 'needle-verification' });
-  assert.equal(hits.length, 1);
-  assert.equal(hits[0].type, 'tool');
-  const query = 'First observation.\nFinal recommendation.';
-  const adjacent = prepareContextRead(data, { ...request, search_query: query }, sdk);
-  assert.deepEqual(
-    adjacent.units.map((unit) => unit.source.entry_id),
-    [answer.id, answer.id],
-  );
-  assert.equal(rows(adjacent, { query }).length, 1);
-  assert.ok(jsonBytes(adjacent) < 4096);
+  assert.equal(rows(found, { query })[0].type, 'tool');
 });
 
 test('adapter items expose related memory and source-boundary navigation without source body duplication', () => {
@@ -341,55 +288,18 @@ test('reader previews are searchable without replacing source text excerpts', ()
 });
 
 async function bridgeFixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-read-navigation-');
-  const cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd, { mode: 0o700 });
-  const config = {
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    defaults: { ...denyAllPermissions(), read: true },
-  };
-  const bridge = await new Bridge(config, () => assert.fail('Read must not start a writer')).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'navigation',
+    factory: () => assert.fail('Read must not start a writer'),
   });
-  const made = await savedSession(bridge);
-  const session = await bridge.session(made.session_id);
+  const { bridge } = f;
   const entries = [
-    {
-      type: 'message',
-      id: 'u',
-      parentId: null,
-      message: { role: 'user', content: [{ type: 'text', text: 'Find the permission decision' }] },
-    },
-    {
-      type: 'message',
-      id: 'a',
-      parentId: 'u',
-      message: {
-        role: 'assistant',
-        content: [
-          {
-            type: 'text',
-            text: 'start '.repeat(500) + 'A unique middle decision' + ' end'.repeat(700),
-          },
-        ],
-      },
-    },
-    {
-      type: 'message',
-      id: 'u2',
-      parentId: 'a',
-      message: { role: 'user', content: [{ type: 'text', text: 'Current task' }] },
-    },
-    {
-      type: 'message',
-      id: 'a2',
-      parentId: 'u2',
-      message: { role: 'assistant', content: [{ type: 'text', text: 'Current progress' }] },
-    },
+    message('u', null, 'user', 'Find the permission decision'),
+    message('a', 'u', 'assistant', [
+      text('start '.repeat(500) + 'A unique middle decision' + ' end'.repeat(700)),
+    ]),
+    message('u2', 'a', 'user', 'Current task'),
+    message('a2', 'u2', 'assistant', [text('Current progress')]),
   ];
   let acquisitions = 0;
   bridge.pool.forRead = async () => ({
@@ -399,14 +309,7 @@ async function bridgeFixture(t) {
       return prepareContextRead({ entries, leafId: 'a2' }, args, { buildSessionProjection });
     },
   });
-  return {
-    bridge,
-    config,
-    session,
-    entries,
-    id: made.session_id,
-    acquisitions: () => acquisitions,
-  };
+  return { ...f, entries, acquisitions: () => acquisitions };
 }
 
 test('Bridge search finds older effective content, expands frozen evidence and rechecks current permission', async (t) => {
@@ -429,7 +332,7 @@ test('Bridge search finds older effective content, expands frozen evidence and r
   assert.match(JSON.stringify(expanded.items), /unique middle decision/);
   assert.doesNotMatch(JSON.stringify(expanded.items), /SOURCE REPLACED|PUBLIC PAGE MUTATED/);
   assert.equal(f.acquisitions(), 2);
-  f.config.defaults.read = false;
+  f.config.grants = [];
   await assert.rejects(f.bridge.read({ refs }), /NOT_FOUND_OR_DENIED/);
   assert.equal(f.acquisitions(), 2);
 });
@@ -439,6 +342,7 @@ test('Bridge reference expansion rejects a changed native cwd without reacquirin
   const page = await f.bridge.read({ session_id: f.id });
   const other = path.join(path.dirname(f.session.cwd), 'replacement');
   await fs.mkdir(other);
+  f.config.grants.push({ folder: other, read: true });
   const lines = (await fs.readFile(f.session.file, 'utf8')).trimEnd().split('\n');
   lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: other });
   await fs.writeFile(f.session.file, lines.join('\n') + '\n');

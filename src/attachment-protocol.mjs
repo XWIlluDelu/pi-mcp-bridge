@@ -57,9 +57,14 @@ export function ownerSnapshot(binding, { entries, leafId }) {
   return data;
 }
 
-// Owner endpoints accept one newline-terminated
-// JSON request per connection. Excess connections, oversized frames and idle
-// peers are dropped without a reply; the handler owns the response.
+export const validNativeSnapshot = (snapshot) =>
+  Array.isArray(snapshot?.entries) &&
+  snapshot.entries.every((entry) => typeof entry?.id === 'string' && entry.id.length <= 128) &&
+  (snapshot.leafId === null ||
+    (typeof snapshot.leafId === 'string' && snapshot.leafId.length <= 128));
+
+// Owner endpoints accept one newline-terminated JSON request per connection.
+// Drop excess connections, oversized frames and idle peers without a reply.
 export function attachmentServer(connections, onRequest) {
   return net.createServer((socket) => {
     if (connections.size >= 16) {

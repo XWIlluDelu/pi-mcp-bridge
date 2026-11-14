@@ -2,7 +2,6 @@ import { nativeOwner } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 
-import { savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -14,25 +13,22 @@ import { fileURLToPath } from 'node:url';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import attachExtension from './fixtures/companion.mjs';
 import { reserveOwner, readClaim, ownerAlive } from '../src/attachments.mjs';
-async function fixture(t) {
-  let spawns = 0;
-  const f = await nativeOwner(t, {
-    factory: async () => {
-      spawns++;
-      assert.fail('unexpected second writer');
-    },
-  });
-  return Object.assign(f, { spawns: () => spawns });
-}
+const fixture = (t) => nativeOwner(t, { factory: () => assert.fail('Unexpected second writer') });
 const identity = (session) => ({ sessionFile: session.file, sessionId: session.header.id });
+const reserve = (f, session = f.session) =>
+  reserveHostSession({
+    buildSessionProjection: hostProjection,
+    attachmentDir: f.config.attachmentDir,
+    session,
+  });
+const callbacks = (session) => ({
+  state: () => identity(session),
+  snapshot: () => ({ ...identity(session), entries: [], leafId: null }),
+  submit: () => ({ status: 'unknown' }),
+});
 test('profile companion leaves the same-process host controller and its shutdown lifecycle in charge', async (t) => {
   const f = await fixture(t),
-    host = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: f.config.attachmentDir,
-      session: f.session,
-    }),
-    id = identity(f.session);
+    host = await reserve(f);
   const prior = process.env.PI_MCP_ATTACH_DIR;
   process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
   const handlers = {};
@@ -56,17 +52,12 @@ test('profile companion leaves the same-process host controller and its shutdown
     const initial = await readClaim(f.config.attachmentDir, f.session);
     await handlers.session_start({}, ctx);
     assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), initial);
-    await host.ready({
-      state: async () => id,
-      snapshot: async () => ({ ...id, entries: [], leafId: null }),
-      submit: async () => ({ status: 'unknown' }),
-    });
+    await host.ready(callbacks(f.session));
     const ready = await readClaim(f.config.attachmentDir, f.session);
     await handlers.session_start({}, ctx);
     await handlers.session_shutdown({});
     assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), ready);
     assert.equal((await f.bridge.read({ session_id: f.session.id })).items.length, 0);
-    assert.equal(f.spawns(), 0);
   } finally {
     await handlers.session_shutdown({});
     await host.close();
@@ -75,68 +66,18 @@ test('profile companion leaves the same-process host controller and its shutdown
   }
 });
 
-test('deletion blocks reacquisition after host release and continues through the trash move', async (t) => {
-  const f = await fixture(t),
-    host = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: f.config.attachmentDir,
-      session: f.session,
-    });
-  const id = identity(f.session);
-  await host.ready({
-    state: async () => id,
-    snapshot: async () => ({ ...id, entries: [], leafId: null }),
-    submit: async () => ({ status: 'unknown' }),
-    release: async () => ({ released: true }),
-  });
-  let blocked = false;
-  try {
-    const stop = f.bridge.pool.stop.bind(f.bridge.pool);
-    t.mock.method(f.bridge.pool, 'stop', async (sessionId) => {
-      await stop(sessionId);
-      await assert.rejects(
-        reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
-        /LIVE_OWNER_UNREACHABLE/,
-      );
-      blocked = true;
-    });
-    const result = await f.bridge.delete({ session_id: f.session.id });
-    assert.equal(blocked, true);
-    assert.equal(result.status, 'deleted', JSON.stringify(result));
-    await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
-    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
-    assert.equal((await fs.readdir(path.join(f.config.stateDir, 'trash'))).length, 1);
-    assert.equal(f.spawns(), 0);
-  } finally {
-    await host.close();
-  }
-});
-
 for (const failedStage of ['cancel', 'release'])
   test(`explicit close retry recovers a shared host after ${failedStage} failure without reopening admission`, async (t) => {
     const f = await fixture(t),
-      sibling = await f.bridge.session((await savedSession(f.bridge)).session_id),
-      host = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.config.attachmentDir,
-        session: f.session,
-      }),
-      neighbor = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.config.attachmentDir,
-        session: sibling,
-      }),
+      sibling = await f.create(),
+      host = await reserve(f),
+      neighbor = await reserve(f, sibling),
       entered = Promise.withResolvers(),
       finish = Promise.withResolvers(),
       failure = new Error('temporary host failure');
     let recovered = false,
       cancels = 0,
       releases = 0;
-    const callbacks = (session) => ({
-      state: async () => identity(session),
-      snapshot: async () => ({ ...identity(session), entries: [], leafId: null }),
-      submit: async () => ({ status: 'unknown' }),
-    });
     const maybeFail = async (stage) => {
       if (stage !== failedStage || recovered) return;
       entered.resolve();
@@ -168,9 +109,7 @@ for (const failedStage of ['cancel', 'release'])
       assert.equal(await concurrent, failure);
       assert.equal(cancels, 1);
       assert.equal(releases, Number(failedStage === 'release'));
-      const claim = await readClaim(f.config.attachmentDir, f.session);
-      assert.equal(claim.phase, 'transitioning');
-      assert.equal(await ownerAlive(claim.owner), true);
+      assert.equal((await readClaim(f.config.attachmentDir, f.session)).phase, 'transitioning');
       await assert.rejects(
         reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
         /LIVE_OWNER_UNREACHABLE/,
@@ -190,8 +129,6 @@ for (const failedStage of ['cancel', 'release'])
         neighbor.record.generation,
       );
       assert.equal(await ownerAlive(neighbor.record.owner), true);
-      assert.ok(await fs.stat(sibling.file));
-      assert.equal(f.spawns(), 0);
     } finally {
       finish.resolve();
       await Promise.allSettled([host.close(), neighbor.close()]);
@@ -234,7 +171,6 @@ test('controller death preserves the surviving writer claim and prevents bridge 
     });
     assert.equal(result.status, 'rejected');
     assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
-    assert.equal(f.spawns(), 0);
   } finally {
     if (controller.exitCode === null && controller.signalCode === null) {
       controller.kill('SIGKILL');

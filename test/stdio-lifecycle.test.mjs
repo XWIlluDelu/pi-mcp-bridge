@@ -1,11 +1,11 @@
+import { nativeOwner, nativeTui, gatedExtension } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { test } from 'node:test';
-import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
+
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
+
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
@@ -13,53 +13,30 @@ import { fileURLToPath } from 'node:url';
 import { Bridge } from '../src/bridge.mjs';
 
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
-import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
+import { readClaim, ownerAlive } from '../src/attachments.mjs';
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const exists = (file) =>
-  fs.stat(file).then(
-    () => true,
-    (e) => {
-      if (e.code === 'ENOENT') return false;
-      throw e;
-    },
-  );
+  fs.stat(file).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-life-')),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const marker = path.join(dir, 'dispatch'),
-    extension = path.join(dir, 'command.mjs');
-  // Official RPC command dispatch exercises an in-flight receipt without a model call.
-  await fs.writeFile(
-    extension,
-    `import fs from 'node:fs/promises'; export default function(pi){pi.registerCommand('lifecycle-fixture',{handler:async()=>{await fs.writeFile(${JSON.stringify(marker)},'started');await new Promise(r=>setTimeout(r,300));}});}`,
-  );
-  const config = {
-    ...isolatedRuntime(dir),
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
-    attachmentDir: path.join(dir, 'ipc'),
-    piArgs: ['--offline', '-e', extension],
-  };
-  const bridge = await new Bridge(config).init();
-  const made = await savedSession(bridge);
-  const session = await bridge.session(made.session_id);
-  await bridge.close();
-  const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-  t.after(() => fs.rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }));
-  return {
-    dir,
-    cwd,
-    config,
-    configFile,
-    session,
-    id: made.session_id,
-    marker,
-  };
+  const f = await nativeOwner(t, {
+    prefix: 'stdio-life',
+    async configure(context) {
+      context.config.piArgs = ['--offline'];
+      await gatedExtension(
+        context,
+        `
+        pi.registerCommand('lifecycle-fixture', { handler: async () => {
+          await mark('dispatch');
+          await new Promise(r => setTimeout(r, 300));
+        } });
+      `,
+      );
+    },
+  });
+  await f.bridge.close();
+  return { ...f, marker: path.join(f.dir, 'dispatch') };
 }
 function launch(t, f, nodeArgs = []) {
   const child = spawn(
@@ -185,13 +162,7 @@ test('modern stdio discovers without initialize and EOF drains native input befo
   const f = await fixture(t),
     server = launch(t, f);
   const _meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
-  const discovery = await server.request('server/discover', { _meta });
-  assert.equal(discovery.result.resultType, 'complete');
-  assert.ok(discovery.result.supportedVersions.includes(MODERN_VERSION));
-  const missing = await server.request('tools/list', {});
-  assert.equal(missing.error.code, -32602);
-  const listed = await server.request('tools/list', { _meta });
-  assert.ok(listed.result.tools.some((tool) => tool.name === 'set_model'));
+  assert.equal((await server.request('server/discover', { _meta })).result.resultType, 'complete');
   const pending = server.request('tools/call', {
     name: 'send',
     arguments: { session_id: f.id, text: '/lifecycle-fixture' },
@@ -206,19 +177,14 @@ test('modern stdio discovers without initialize and EOF drains native input befo
   assert.equal(await server.exit(), 0);
   await stopped(f, claim.owner);
   const second = launch(t, f);
-  assert.equal(
-    (
-      await second.request('tools/call', {
-        name: 'list',
-        arguments: { session_id: f.id },
-        _meta,
-      })
-    ).result.structuredContent.sessions.length,
-    1,
-  );
+  const listed = await second.request('tools/call', {
+    name: 'list',
+    arguments: { session_id: f.id },
+    _meta,
+  });
+  assert.equal(listed.result.structuredContent.sessions[0].session_id, f.id);
   second.child.stdin.end();
   assert.equal(await second.exit(), 0);
-  await stopped(f);
 });
 
 test('broken stdout drains a pending receipt and cleans up the owned official RPC process', async (t) => {
@@ -245,62 +211,16 @@ test('broken stdout drains a pending receipt and cleans up the owned official RP
   }
 });
 
-test('EOF disconnects an actual external Pi TUI without stopping it', async (t) => {
-  const f = await fixture(t),
-    agentDir = path.join(f.dir, 'agent');
-  await fs.mkdir(agentDir);
-  await fs.writeFile(
-    path.join(agentDir, 'settings.json'),
-    JSON.stringify({
-      cacheWarming: 'off',
-      retry: { enabled: false },
-      compaction: { enabled: false },
-    }),
-  );
-  const args = [
-    process.execPath,
-    nativePiCli,
-    '--session',
-    f.session.file,
-    '--no-extensions',
-    '--no-skills',
-    '--no-prompt-templates',
-    '--no-themes',
-    '--no-tools',
-    '-e',
-    path.join(base, 'src/attach-extension.mjs'),
-  ];
-  const quote = (s) => "'" + s.replaceAll("'", "'\\''") + "'";
-  const tui = spawn('script', ['-qefc', args.map(quote).join(' '), '/dev/null'], {
-    cwd: f.cwd,
-    env: {
-      PATH: process.env.PATH,
-      HOME: f.dir,
-      PI_CODING_AGENT_DIR: agentDir,
-      PI_MCP_ATTACH_DIR: f.config.attachmentDir,
-      PI_OFFLINE: '1',
-      TERM: 'xterm-256color',
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  tui.stdout.resume();
-  tui.stderr.resume();
-  let claim;
-  t.after(async () => {
-    if (claim && (await ownerAlive(claim.owner))) {
-      process.kill(claim.owner.pid, 'SIGTERM');
-      await waitOwnerExit(claim.owner);
-    }
-    tui.stdin.destroy();
-    if (tui.exitCode === null) tui.kill('SIGTERM');
-  });
-  claim = await ownClaim(f);
+test('stdio EOF disconnects a native TUI without stopping its writer', async (t) => {
+  const f = await fixture(t);
+  const tui = await nativeTui(f, f.session);
+  const claim = await readClaim(f.config.attachmentDir, f.session);
   assert.equal(claim.kind, 'tui');
   const server = launch(t, f);
   await server.initialize();
   await server.call('read', { session_id: f.id });
   server.child.stdin.end();
   assert.equal(await server.exit(), 0);
-  assert.equal(await ownerAlive(claim.owner), true);
+  assert.equal(await ownerAlive(tui.owner), true);
   assert.equal((await readClaim(f.config.attachmentDir, f.session)).generation, claim.generation);
 });

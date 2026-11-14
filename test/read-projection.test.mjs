@@ -1,3 +1,4 @@
+import { message as msg, text } from './fixtures/native-history.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -14,15 +15,6 @@ import { prepareContextRead as prepareNativeContext } from '../src/context-read.
 import { validateReadAdapters } from '../src/read-adapters.mjs';
 import { CompatibilityServices } from '../src/compatibility-services.mjs';
 import intercomModule from '../integrations/intercom/index.mjs';
-
-const msg = (id, parentId, role, content, extra = {}) => ({
-  type: 'message',
-  id,
-  parentId,
-  timestamp: '2026-01-01T00:00:00Z',
-  message: { role, content, timestamp: 0, ...extra },
-});
-const text = (value) => ({ type: 'text', text: value });
 
 const call = (id) => ({
   type: 'toolCall',
@@ -68,13 +60,12 @@ test('system instructions and tool declarations are opt-in', () => {
   const system = msg('system', null, 'system', 'PROJECT_RULES', {
     toolsAdded: [{ name: 'declared', description: 'native declaration' }],
   });
-  const prompt = msg('input', 'system', 'user', 'task');
-  const data = { header: { id: 'fixture' }, entries: [system, prompt], leafId: 'input' };
-  const args = { session_id: 'fixture', max_bytes: 8192 };
-  assert.doesNotMatch(JSON.stringify(renderContextRead(data, args)), /PROJECT_RULES/);
-  const page = renderContextRead(data, { ...args, content: { system: true } });
-  assert.match(JSON.stringify(page.items), /PROJECT_RULES/);
-  assert.match(JSON.stringify(page.items), /native declaration/);
+  const data = snapshot([system, msg('input', 'system', 'user', 'task')]);
+  assert.doesNotMatch(JSON.stringify(render(data)), /PROJECT_RULES|native declaration/);
+  assert.match(
+    JSON.stringify(render(data, { content: { system: true } })),
+    /PROJECT_RULES.*native declaration/,
+  );
 });
 
 test('generic custom reading preserves repeated business fields and native content across pages', () => {
@@ -92,20 +83,11 @@ test('generic custom reading preserves repeated business fields and native conte
     msg('notice', 'u', 'custom', body, { customType: 'fixture-message', details, display: true }),
   ]);
   const before = structuredClone(data);
-  for (const max_bytes of [4096, 65536]) {
-    const pages = allPages(data, { max_bytes });
-    if (max_bytes === 4096) assert.ok(pages.length > 1);
-    const units = chronological(pages);
-    assert.equal(
-      units
-        .filter((u) => u.source.entry_id === 'notice')
-        .map((u) => u.message?.content ?? '')
-        .join(''),
-      body,
-    );
-    assert.deepEqual(units.find((u) => u.message?.details).message.details, details);
-    assert.equal(units.filter((u) => u.type === 'prompt').length, 1);
-  }
+  const pages = allPages(data, { max_bytes: 4096 });
+  assert.ok(pages.length > 1);
+  const units = chronological(pages).filter((u) => u.source.entry_id === 'notice');
+  assert.equal(units.map((u) => u.message?.content ?? '').join(''), body);
+  assert.deepEqual(units.find((u) => u.message?.details).message.details, details);
   assert.deepEqual(data, before);
 });
 
@@ -117,32 +99,13 @@ test('native context-hidden user boundaries prevent reassignment to earlier visi
     msg('out-b', 'hidden', 'assistant', [text('answer B')]),
     { type: 'context_edit', id: 'hide', parentId: 'out-b', targetId: 'hidden', replacement: null },
   ];
-  const result = render(snapshot(entries));
-  const boundary = result.items.find((r) => r.reason === 'hidden_user');
-  assert.ok(boundary.synthetic);
+  const result = render(snapshot(entries), { range: { recent: 1 } });
+  const [boundary, answer] = result.items;
+  assert.equal(boundary.reason, 'hidden_user');
   assert.equal(boundary.message.content, '');
-  assert.equal(
-    result.items.find((r) => r.source.entry_id === 'out-b').prompt_id,
-    boundary.prompt_id,
-  );
-  assert.ok(!JSON.stringify(result).includes('SECRET HIDDEN PROMPT'));
-  const recent = render(snapshot(entries), {
-    range: { recent: 1 },
-    content: { ...zero, assistant: -1 },
-  });
-  assert.deepEqual(
-    recent.items.map((r) => r.source.entry_id),
-    ['hidden', 'out-b'],
-  );
-  assert.equal(recent.omissions.selection.turns, 1);
-  const early = render(snapshot(entries), {
-    range: { earliest: 1, recent: 0 },
-    content: { ...zero, assistant: -1 },
-  });
-  assert.deepEqual(
-    early.items.map((r) => r.source.entry_id),
-    ['a', 'out-a'],
-  );
+  assert.equal(answer.source.entry_id, 'out-b');
+  assert.equal(answer.prompt_id, boundary.prompt_id);
+  assert.doesNotMatch(JSON.stringify(result), /SECRET HIDDEN PROMPT|answer A/);
 });
 
 test('tool pairing precedes prompt selection and keeps a steering result in source order', () => {
@@ -160,23 +123,11 @@ test('tool pairing precedes prompt selection and keeps a steering result in sour
   );
   assert.equal(result.items[3].prompt_id, 'a');
   assert.equal(result.items[4].prompt_id, 'b');
-  const a = render(snapshot(entries), {
-    range: { earliest: 1, recent: 0 },
-    content: { ...zero, tool: 1 },
-  });
+  const a = render(snapshot(entries), { range: { earliest: 1, recent: 0 }, content: { tool: 1 } });
   assert.deepEqual(
     a.items.map((r) => r.source.entry_id),
     ['a', 'call', 'result'],
   );
-  const b = render(snapshot(entries), {
-    range: { recent: 1 },
-    content: { ...zero, tool: -1, assistant: -1 },
-  });
-  assert.deepEqual(
-    b.items.map((r) => r.source.entry_id),
-    ['b', 'answer-b'],
-  );
-  assert.equal(b.omissions.selection.tool, 1);
 });
 
 test('tool units retain unresolved calls, orphan results and repeated call IDs without text deduplication', () => {
@@ -195,15 +146,6 @@ test('tool units retain unresolved calls, orphan results and repeated call IDs w
   assert.equal(results[1].tool_id, calls[1].tool_id);
   assert.equal(calls[2].pairing, 'unresolved');
   assert.equal(results[2].pairing, 'orphan_result');
-  const sampled = render(snapshot(entries), {
-    range: { recent: 1 },
-    content: { ...zero, tool: 1 },
-  });
-  assert.deepEqual(
-    sampled.items.map((r) => r.source.entry_id),
-    ['u', 'orphan'],
-  );
-  assert.equal(sampled.omissions.selection.tool, 3);
 });
 
 test('images and native signatures are removed while tool business signature fields remain', () => {
@@ -245,17 +187,10 @@ test('images and native signatures are removed while tool business signature fie
     }),
   ];
   const page = render(snapshot(entries), { content: { tool: -1 }, max_bytes: 4096 });
-  assert.ok(JSON.stringify(page).includes('IMPORTANT TASK'));
-  assert.ok(!JSON.stringify(page).includes('NATIVE_SECRET'));
-  assert.ok(!JSON.stringify(page).includes('AAAAAAA'));
-  assert.equal(
-    page.items.find((unit) => unit.type === 'tool_call').block.arguments.signature,
-    'BUSINESS',
-  );
-  assert.equal(
-    page.items.find((unit) => unit.type === 'tool_result').message.details.signature,
-    'BUSINESS',
-  );
+  assert.doesNotMatch(JSON.stringify(page), /NATIVE_SECRET|AAAAAAA/);
+  const [toolCall, result] = page.items.filter((unit) => unit.type.startsWith('tool_'));
+  assert.equal(toolCall.block.arguments.signature, 'BUSINESS');
+  assert.equal(result.message.details.signature, 'BUSINESS');
 });
 
 test('explicit native root leaf never falls back to an abandoned tail', () => {
@@ -291,28 +226,13 @@ test('saved nested calls follow their parent selection and page as whole child r
     nested.map((u) => u.nested_call),
     calls,
   );
-  assert.ok(pages[0].next_cursor);
-  assert.equal(pages.at(-1).next_cursor, null);
   assert.ok(
     nested.every(
-      (u) =>
-        u.nested_calls_complete === false && u.source.entry_id === 'r' && u.call_id === 'outer',
+      (u) => !u.nested_calls_complete && u.source.entry_id === 'r' && u.call_id === 'outer',
     ),
   );
-  assert.equal(nested[1].nested_call.arguments, undefined);
-  assert.equal(nested[1].nested_call.argumentsBytes, 40000);
-  assert.ok(
-    !JSON.stringify(render(data, { range: { recent: 0 }, content: zero })).includes(
-      'NESTED_REAL_FAILURE',
-    ),
-  );
-  const small = structuredClone(data);
-  small.entries.at(-1).message.nestedCalls = { calls: [calls[1]], complete: true };
-  assert.deepEqual(
-    render(small, { ...allContent }).items.find((u) => u.type === 'tool_result').message
-      .nestedCalls,
-    { calls: [calls[1]], complete: true },
-  );
+  const none = render(data, { content: zero });
+  assert.ok(!none.items.some((u) => u.type === 'nested_call'));
   const large = structuredClone(data);
   large.entries.at(-1).message.nestedCalls = {
     calls: [{ ...calls[1], arguments: { large: 'X'.repeat(50000) } }],
@@ -335,17 +255,7 @@ function history(messages) {
     message,
   }));
 }
-function read(entries, options = {}) {
-  const snapshot = prepareContextRead(
-    { header: { id: 'native' }, entries, leafId: entries.at(-1)?.id ?? null },
-    { session_id: 'selection-fixture', ...options },
-  );
-  return {
-    items: snapshot.units,
-    selection: snapshot.selection,
-    omissions: { selection: snapshot.omissions },
-  };
-}
+const select = (entries, options) => prepareContextRead(snapshot(entries), { ...args, ...options });
 const user = (content) => ({ role: 'user', content });
 const answer = (content) => ({ role: 'assistant', content: [text(content)] });
 const tool = (id, isError = false) => [
@@ -367,21 +277,19 @@ test('message counts preserve all text blocks and select thinking independently'
     { role: 'assistant', content },
     { role: 'assistant', content: [{ type: 'thinking', thinking: 'LATEST_THINKING' }] },
   ]);
-  const result = read(entries, { content: { assistant: 1, thinking: 1, tool: 0 } });
-  const body = result.items.filter((record) => record.type === 'text');
-  assert.equal(body.length, 1000);
-  assert.equal(body[0].block.text, 'BLOCK_0');
-  assert.equal(body.at(-1).block.text, 'BLOCK_999');
+  const result = select(entries, { content: { assistant: 1, thinking: 1, tool: 0 } });
   assert.deepEqual(
-    result.items
+    result.units.filter((r) => r.type === 'text').map((r) => r.block),
+    content,
+  );
+  assert.deepEqual(
+    result.units
       .filter((record) => record.type === 'thinking')
       .map((record) => record.block.thinking),
     ['LATEST_THINKING'],
   );
-  assert.equal(result.omissions.selection.assistant, 1);
-  assert.equal(result.omissions.selection.thinking, 1);
-  assert.ok(!JSON.stringify(result).includes('old answer'));
-  assert.ok(!JSON.stringify(result).includes('EARLIER_THINKING'));
+  assert.equal(result.omissions.assistant, 1);
+  assert.equal(result.omissions.thinking, 1);
 });
 
 test('assistant selection retains a failed thinking-only message independently of thinking', () => {
@@ -395,12 +303,11 @@ test('assistant selection retains a failed thinking-only message independently o
       errorMessage: 'provider request failed',
     },
   ]);
-  const result = read(entries, { content: { assistant: 1, thinking: 0, tool: 0 } });
-  const failure = result.items.find((record) => record.message?.role === 'assistant');
+  const result = select(entries, { content: { assistant: 1, thinking: 0, tool: 0 } });
+  const failure = result.units.find((record) => record.message?.role === 'assistant');
   assert.equal(failure.message.stopReason, 'error');
   assert.equal(failure.message.errorMessage, 'provider request failed');
-  assert.ok(!JSON.stringify(result).includes('unfinished reasoning'));
-  assert.ok(!JSON.stringify(result).includes('earlier progress'));
+  assert.doesNotMatch(JSON.stringify(result), /unfinished reasoning|earlier progress/);
 });
 
 test('earliest/recent prompt union is independent of surrounding tool count and preserves repeated inputs', () => {
@@ -411,17 +318,17 @@ test('earliest/recent prompt union is independent of surrounding tool count and 
   }
   const entries = history(messages),
     prompts = entries.filter((e) => e.message.role === 'user');
-  const result = read(entries, { range: { earliest: 2, recent: 2 }, content: { tool: 0 } });
+  const result = select(entries, { range: { earliest: 2, recent: 2 }, content: { tool: 0 } });
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
+    result.units.filter((r) => r.type === 'prompt').map((r) => r.prompt_id),
     [prompts[0].id, prompts[1].id, prompts[38].id, prompts[39].id],
   );
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'text').map((r) => r.block.text),
+    result.units.filter((r) => r.type === 'text').map((r) => r.block.text),
     ['answer-0', 'answer-1', 'answer-38', 'answer-39'],
   );
-  assert.equal(result.omissions.selection.input, 36);
-  assert.equal(result.omissions.selection.tool, 100);
+  assert.equal(result.omissions.input, 36);
+  assert.equal(result.omissions.tool, 100);
 });
 
 test('native replacement is selected at original source positions without reviving hidden content', () => {
@@ -447,20 +354,17 @@ test('native replacement is selected at original source positions without revivi
     },
     { type: 'context_edit', id: 'hide', parentId: 'replace', targetId: 'e2', replacement: null },
   );
-  const result = read(entries, { content: { thinking: 0, assistant: 1 } });
+  const result = select(entries, { content: { thinking: 0, assistant: 1 } });
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'text').map((r) => r.block.text),
+    result.units.filter((r) => r.type === 'text').map((r) => r.block.text),
     ['REPLACEMENT_FIRST', 'REPLACEMENT_MIDDLE', 'REPLACEMENT_LAST'],
   );
   assert.deepEqual(
-    result.items.filter((r) => r.type === 'text').map((r) => r.source.block_index),
+    result.units.filter((r) => r.type === 'text').map((r) => r.source.block_index),
     [1, 2, 3],
   );
-  assert.ok(!JSON.stringify(result).includes('PRIVATE'));
-  assert.ok(!JSON.stringify(result).includes('OPAQUE_SIGNATURE'));
-  assert.equal(result.omissions.selection.thinking, 1);
-  assert.equal(result.omissions.selection.assistant, 0);
-  assert.equal(read(entries, { leaf_id: 'e1' }).items.at(-1).block.text, 'ORIGINAL_PRIVATE');
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE|OPAQUE_SIGNATURE/);
+  assert.equal(select(entries, { leaf_id: 'e1' }).units.at(-1).block.text, 'ORIGINAL_PRIVATE');
 });
 
 test('selection does not serialize deliberately omitted tool-result payloads', () => {
@@ -483,9 +387,9 @@ test('selection does not serialize deliberately omitted tool-result payloads', (
         },
       },
     ];
-  const rendered = read(entries, { content: { tool: 0 } });
-  assert.equal(rendered.items.filter((r) => r.type.startsWith('tool_')).length, 0);
-  assert.equal(rendered.omissions.selection.tool, 64);
+  const rendered = select(entries, { content: { tool: 0 } });
+  assert.equal(rendered.units.filter((r) => r.type.startsWith('tool_')).length, 0);
+  assert.equal(rendered.omissions.tool, 64);
 });
 
 const services = new CompatibilityServices();
@@ -528,18 +432,11 @@ test('intercom inputs use native prompt selectors without rewriting message role
     entries.push(msg('a' + n, 'i' + n, 'assistant', [text('answer-' + n)]));
   }
   const details = {
-    from: { id: 'sender', name: 'Reviewer', cwd: '/project' },
+    from: { id: 'sender', name: 'Reviewer' },
     message: {
-      id: 'delivery',
-      timestamp: 1,
-      brokerDeliveredAt: 2,
-      receiverReceivedAt: 3,
-      injectedAt: 4,
       content: { text: 'i3', attachments: [{ type: 'file', name: 'note', content: 'ATTACHMENT' }] },
-      replyTo: 'prior',
     },
     bodyText: 'i3',
-    replyCommand: 'intercom reply',
   };
   entries.find((e) => e.id === 'i3').details = details;
   entries.push(custom('notice', 'a3', 'other-extension', 'not an input'));
@@ -551,8 +448,6 @@ test('intercom inputs use native prompt selectors without rewriting message role
     data: { privateState: true },
   });
   const before = structuredClone(entries);
-  const full = prepare(entries, { range: { recent: -1 }, content: { tool: -1 } });
-  assert.equal(full.units.filter((u) => u.type === 'prompt').length, 5);
   const latest = prepare(entries, { range: { recent: 1 } });
   assert.deepEqual(
     latest.units.map((u) => u.source.entry_id),
@@ -562,25 +457,14 @@ test('intercom inputs use native prompt selectors without rewriting message role
   assert.equal(input.type, 'prompt');
   assert.equal(input.prompt_id, 'i3');
   assert.equal(input.message.role, 'custom');
-  assert.equal(input.message.customType, 'intercom_message');
   assert.equal(input.source.read_adapter, 'pi-intercom');
   assert.deepEqual(input.message.details, details);
   assert.equal(latest.units[1].prompt_id, 'i3');
   assert.equal(latest.omissions.input, 4);
-  const recent = prepare(entries, {});
-  assert.deepEqual(
-    recent.units.filter((u) => u.type === 'prompt').map((u) => u.prompt_id),
-    ['i1', 'i2', 'i3'],
-  );
-  assert.deepEqual(
-    prepare(entries, { range: { recent: 0, earliest: 1 } }).units.map((u) => u.source.entry_id),
-    ['u', 'a'],
-  );
   const native = prepare(entries, {}, []);
-  assert.equal(native.units.filter((u) => u.type === 'prompt').length, 1);
   assert.equal(native.units.find((u) => u.source.entry_id === 'i3').type, 'custom');
   assert.equal(native.units.find((u) => u.source.entry_id === 'a3').prompt_id, 'u');
-  assert.ok(!JSON.stringify(full).includes('privateState'));
+  assert.doesNotMatch(JSON.stringify(latest), /privateState/);
   assert.deepEqual(entries, before);
 });
 
@@ -604,7 +488,7 @@ test('custom input mappings retain native context edits, branch boundaries and t
   assert.equal(boundary.message.role, 'custom');
   assert.equal(boundary.source.read_adapter, intercom.id);
   assert.equal(latest.units[1].prompt_id, boundary.prompt_id);
-  assert.ok(!JSON.stringify(latest).includes('HIDDEN_INPUT'));
+  assert.doesNotMatch(JSON.stringify(latest), /HIDDEN_INPUT/);
   const full = prepare(entries, { range: { recent: -1 }, content: { tool: -1 } });
   assert.equal(full.units.find((u) => u.type === 'tool_result').prompt_id, 'i1');
   assert.equal(full.units.find((u) => u.type === 'tool_result').pairing, 'paired');

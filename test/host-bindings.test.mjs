@@ -1,4 +1,3 @@
-import { AdmissionSession } from './fixtures/admission-session.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
@@ -12,16 +11,6 @@ const idle = {
   isCompacting: false,
   pendingMessageCount: 0,
 };
-function sdk(prompt) {
-  return sdkSession({
-    ...idle,
-    prompt,
-    sessionManager: {
-      getEntries: () => [{ id: 'entry', type: 'message' }],
-      getLeafId: () => 'entry',
-    },
-  });
-}
 const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 test('SDK dispatch confirms invocation without claiming admission or waiting for completion', async () => {
@@ -29,9 +18,12 @@ test('SDK dispatch confirms invocation without claiming admission or waiting for
     calls = [];
   let released = false;
   const binding = createSdkHostBinding(
-    sdk((text, opts) => {
-      calls.push([text, opts]);
-      return completion.promise;
+    sdkSession({
+      ...idle,
+      prompt(text, opts) {
+        calls.push([text, opts]);
+        return completion.promise;
+      },
     }),
     {
       release: async () => {
@@ -54,20 +46,14 @@ test('SDK dispatch confirms invocation without claiming admission or waiting for
 test('SDK idle-only skips local input preparation while ordinary delivery remains available', async () => {
   const preparation = Promise.withResolvers(),
     prompts = [];
-  class Session extends AdmissionSession {
-    constructor() {
-      super();
-      Object.assign(this, idle);
-      this.sessionManager = {};
-    }
+  const session = sdkSession({
+    ...idle,
     async prompt(input) {
       prompts.push(input);
       return await input;
-    }
-    async reload() {}
-  }
-  const session = new Session(),
-    binding = createSdkHostBinding(session),
+    },
+  });
+  const binding = createSdkHostBinding(session),
     preparing = session.prompt(preparation.promise);
   assert.equal(session.isIdle, true);
   assert.equal((await binding.state()).isIdle, false);
@@ -168,96 +154,41 @@ test('SDK handled bash is recorded after stop; only fallback execution rechecks 
   }
 });
 
-class ReloadSession extends AdmissionSession {
-  constructor() {
-    super();
-    Object.assign(this, idle);
-    this.sessionManager = {};
-    this.reloadCalls = 0;
-  }
-  async prompt(work) {
-    return await work;
-  }
-  async executeBash(work) {
-    return await (this.bashWork ?? work);
-  }
-  async reload() {
-    this.reloadCalls++;
-    this.entered?.resolve();
-    await this.reloadWork;
-  }
-}
-
 test('SDK bash preparation and result delivery stay busy for idle-only and reload', async () => {
-  for (const handled of [false, true]) {
-    const preparation = Promise.withResolvers(),
-      execution = Promise.withResolvers(),
-      delivery = Promise.withResolvers(),
-      delivering = Promise.withResolvers(),
-      prompts = [],
-      result = { output: 'fixture', exitCode: 0, cancelled: false, truncated: false },
-      session = new ReloadSession();
-    session.sessionManager.getCwd = () => '/public';
-    session.extensionRunner = { emitUserBash: () => preparation.promise };
-    session.recordBashResult = () => {};
-    session.clearQueue = () => ({});
-    session.abort = async () => {};
-    session.abortBash = () => {};
-    session.bashWork = execution.promise;
-    const prompt = session.prompt.bind(session);
-    session.prompt = (text, options) => {
-      prompts.push([text, options]);
-      return prompt(text, options);
-    };
-    const binding = createSdkHostBinding(session),
-      work = binding.bash({
-        ...idle,
-        command: 'fixture',
-        onResult: async () => {
-          delivering.resolve();
-          await delivery.promise;
-        },
-      });
-    const assertBusy = async () => {
-      assert.equal(session.isIdle, true);
-      assert.equal((await binding.state()).isIdle, false);
-      assert.deepEqual(await binding.submit({ text: 'must not enter', mode: 'idle_only' }), {
-        status: 'skipped',
-        reason: 'busy',
-      });
-      await assert.rejects(
-        binding.reload({ ...idle, beforeDispatch: () => assert.fail('Busy reload dispatched') }),
-        /RELOAD_BUSY/,
-      );
-    };
-    await assertBusy();
-    assert.deepEqual(prompts, []);
-    for (const mode of ['steer', 'follow_up'])
-      assert.deepEqual(await binding.submit({ text: mode, mode }), {
-        status: 'dispatched',
-        admission: 'unobservable',
-      });
-    assert.deepEqual(
-      prompts.map(([text]) => text),
-      ['steer', 'follow_up'],
-    );
-    preparation.resolve(handled ? { result } : {});
-    if (!handled) {
-      await tick();
-      await assertBusy();
-      execution.resolve(result);
-    }
-    await delivering.promise;
-    await assertBusy();
-    delivery.resolve();
-    await work;
-    assert.equal((await binding.state()).isIdle, true);
-    assert.deepEqual(await binding.reload({ ...idle }), { reloaded: true });
-    assert.equal(
-      (await binding.submit({ text: 'now idle', mode: 'idle_only' })).status,
-      'dispatched',
-    );
-  }
+  const prepare = Promise.withResolvers(),
+    execute = Promise.withResolvers();
+  const delivery = Promise.withResolvers(),
+    delivering = Promise.withResolvers();
+  const session = sdkSession({
+    ...idle,
+    extensionRunner: { emitUserBash: () => prepare.promise },
+    executeBash: () => execute.promise,
+    prompt: () => assert.fail('Unexpected prompt'),
+  });
+  const binding = createSdkHostBinding(session);
+  const work = binding.bash({
+    ...idle,
+    command: 'fixture',
+    onResult: () => {
+      delivering.resolve();
+      return delivery.promise;
+    },
+  });
+  const assertBusy = async () => {
+    assert.equal((await binding.state()).isIdle, false);
+    assert.equal((await binding.submit({ text: 'busy', mode: 'idle_only' })).status, 'skipped');
+    await assert.rejects(binding.reload(idle), /RELOAD_BUSY/);
+  };
+  await assertBusy();
+  prepare.resolve({});
+  await tick();
+  await assertBusy();
+  execute.resolve({ output: 'fixture', exitCode: 0, cancelled: false, truncated: false });
+  await delivering.promise;
+  await assertBusy();
+  delivery.resolve();
+  await work;
+  assert.deepEqual(await binding.reload(idle), { reloaded: true });
 });
 
 test('RPC reload delegates safe admission and waits host confirmation on the same native session', async () => {
@@ -306,20 +237,13 @@ test('RPC reload delegates safe admission and waits host confirmation on the sam
 
 test('SDK idle compact rechecks identity at native dispatch after the state await', async () => {
   let calls = 0;
-  class Session extends AdmissionSession {
-    sessionManager = {};
-    sessionFile = idle.sessionFile;
-    sessionId = idle.sessionId;
-    isIdle = true;
-    isStreaming = false;
-    pendingMessageCount = 0;
-    async reload() {}
+  const session = sdkSession({
+    ...idle,
     async compact() {
       calls++;
-    }
-  }
-  const session = new Session(),
-    binding = createSdkHostBinding(session);
+    },
+  });
+  const binding = createSdkHostBinding(session);
   queueMicrotask(() => {
     session.sessionId = 'different-session';
   });

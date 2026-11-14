@@ -1,9 +1,9 @@
-import { ownerEnvelope } from '../src/attachment-protocol.mjs';
+import { attachmentServer, listenPrivate, ownerEnvelope } from '../src/attachment-protocol.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import net from 'node:net';
+
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fixture, until, savedEntries } from './fixtures/model-runtime.mjs';
@@ -98,14 +98,11 @@ async function attached(
   t,
   {
     supported = true,
-    error,
     loseAck = false,
     version = packageInfo.version,
     contract = READ_CONTRACT,
-    replaceIdentity = false,
     leaveUnchanged = false,
     initializing = false,
-    invalidReplacement = false,
   } = {},
 ) {
   const f = await fixture(t);
@@ -117,49 +114,36 @@ async function attached(
     stateReads = 0;
   const socketPath = path.join(dir, `reload-${randomUUID().slice(0, 8)}.sock`);
   const sockets = new Set();
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on('close', () => sockets.delete(socket));
-    socket.setEncoding('utf8');
-    let buffer = '';
-    socket.on('data', async (data) => {
-      buffer += data;
-      if (!buffer.includes('\n')) return;
-      const req = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
-      buffer = '';
-      const respond = (value) => socket.end(ownerEnvelope(req, value));
-      if (req.op === 'state') {
-        stateReads++;
-        return respond({
-          data: {
-            sessionFile: session.file,
-            sessionId: session.header.id,
-            isStreaming: false,
-            reloadComplete: !initializing,
-            generation: current.generation,
-          },
-        });
-      }
-      assert.equal(req.op, 'reload');
-      reloads++;
-      if (error) return respond({ error });
-      if (leaveUnchanged) return respond({ data: { reloading: true } });
-      current = {
-        ...record,
-        generation: randomUUID(),
-        phase: 'ready',
-        bridgeVersion: version,
-        readContract: contract,
-        ...(replaceIdentity ? { sessionId: 'different-native-session' } : {}),
-      };
-      if (invalidReplacement) await fs.writeFile(claimFile(dir, session), '{');
-      else await atomicJson(claimFile(dir, session), current);
-      if (loseAck) socket.destroy();
-      else respond({ data: { reloading: true } });
-    });
+  const server = attachmentServer(sockets, async (frame, socket) => {
+    const req = JSON.parse(frame);
+    const respond = (value) => socket.end(ownerEnvelope(req, value));
+    if (req.op === 'state') {
+      stateReads++;
+      return respond({
+        data: {
+          sessionFile: session.file,
+          sessionId: session.header.id,
+          isStreaming: false,
+          reloadComplete: !initializing,
+          generation: current.generation,
+        },
+      });
+    }
+    assert.equal(req.op, 'reload');
+    reloads++;
+    if (leaveUnchanged) return respond({ data: { reloading: true } });
+    current = {
+      ...record,
+      generation: randomUUID(),
+      phase: 'ready',
+      bridgeVersion: version,
+      readContract: contract,
+    };
+    await atomicJson(claimFile(dir, session), current);
+    if (loseAck) socket.destroy();
+    else respond({ data: { reloading: true } });
   });
-  await new Promise((resolve) => server.listen(socketPath, resolve));
-  await fs.chmod(socketPath, 0o600);
+  await listenPrivate(server, socketPath);
   await updateOwner(dir, session, record, {
     socket: socketPath,
     phase: 'ready',

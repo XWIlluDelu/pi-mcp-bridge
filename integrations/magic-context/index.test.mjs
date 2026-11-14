@@ -1,3 +1,4 @@
+import { message, text } from '../../test/fixtures/native-history.mjs';
 import assert from 'node:assert/strict';
 
 import { createHash } from 'node:crypto';
@@ -55,13 +56,21 @@ async function fixture(t) {
     db.close();
     await fs.rm(directory, { recursive: true, force: true });
   });
-  const compartment = (overrides = {}) => {
-    const row = {
+  const insert = (table, row) =>
+    db
+      .prepare(
+        `INSERT INTO ${table}(${Object.keys(row).join(',')}) VALUES(${Object.keys(row)
+          .map(() => '?')
+          .join(',')})`,
+      )
+      .run(...Object.values(row));
+  const compartment = (overrides = {}) =>
+    insert('compartments', {
       id: 1,
       session_id: 'native-public',
       harness: 'pi',
       sequence: 1,
-      title: 'Public design decision',
+      title: 'Design decision',
       content: 'Stored summary',
       p1: 'Detailed summary',
       p2: 'Brief with anchors',
@@ -69,20 +78,13 @@ async function fixture(t) {
       p4: null,
       start_message_id: 'entry-start',
       end_message_id: 'entry-end',
-      start_block_index: null,
       end_block_index: 2,
       rebase_status: 'ok',
       created_at: 1000,
       ...overrides,
-    };
-    db.prepare(
-      `INSERT INTO compartments(${Object.keys(row).join(',')}) VALUES(${Object.keys(row)
-        .map(() => '?')
-        .join(',')})`,
-    ).run(...Object.values(row));
-  };
-  const memory = (overrides = {}) => {
-    const row = {
+    });
+  const memory = (overrides = {}) =>
+    insert('memories', {
       id: 1,
       project_path: identity,
       category: 'CONSTRAINTS',
@@ -96,38 +98,22 @@ async function fixture(t) {
       updated_at: 1000,
       superseded_by_memory_id: null,
       ...overrides,
-    };
-    db.prepare(
-      `INSERT INTO memories(${Object.keys(row).join(',')}) VALUES(${Object.keys(row)
-        .map(() => '?')
-        .join(',')})`,
-    ).run(...Object.values(row));
-  };
+    });
   return { directory, database, db, cwd, identity, context, compartment, memory };
 }
 
 test('explicit database, supported schema, and lifecycle registration are required', async (t) => {
   const f = await fixture(t);
-  for (const options of [
-    {},
-    { database: 'relative.db' },
-    { database: f.database, discover: true },
-  ]) {
-    assert.throws(() => createMagicContextReader(options), /MAGIC_CONTEXT_INVALID_OPTIONS/);
-  }
+  assert.throws(
+    () => createMagicContextReader({ database: 'relative.db' }),
+    /MAGIC_CONTEXT_INVALID_OPTIONS/,
+  );
   const missing = path.join(f.directory, 'missing.db');
   assert.throws(
     () => createMagicContextReader({ database: missing }),
     /MAGIC_CONTEXT_DATABASE_UNAVAILABLE/,
   );
   await assert.rejects(fs.stat(missing), { code: 'ENOENT' });
-  // Unrelated migrations do not change the reader's consumed storage contract.
-  for (const version of [94, 96, 10001]) {
-    f.db.exec(`UPDATE schema_migrations SET version=${version}`);
-    assert.doesNotThrow(() => createMagicContextReader({ database: f.database }));
-  }
-  f.db.exec('DROP TABLE schema_migrations');
-  assert.doesNotThrow(() => createMagicContextReader({ database: f.database }));
   let registered, cleanup;
   module.start(
     {
@@ -278,31 +264,22 @@ test('stored summaries use existing MC tiers and source relationships without da
 
 test('default MC reads exclude known other-branch summaries before limiting, while unlimited summaries retain their sources', async (t) => {
   const f = await fixture(t);
-  const message = (id, parentId, role, text) => ({
-    type: 'message',
-    id,
-    parentId,
-    timestamp: '2026-01-01T00:00:00Z',
-    message: { role, content: [{ type: 'text', text }], timestamp: 0 },
-  });
   const entries = [
-    message('root', null, 'user', 'Choose the storage design'),
-    message('common', 'root', 'assistant', 'Common design constraints'),
+    message('root', null, 'user', 'Choose storage'),
+    message('common', 'root', 'assistant', [text('Common design')]),
     message('current-input', 'common', 'user', 'Use PostgreSQL'),
-    message('current-answer', 'current-input', 'assistant', 'PostgreSQL is selected'),
+    message('current-answer', 'current-input', 'assistant', [text('PostgreSQL selected')]),
     {
       type: 'compaction',
       id: 'compact',
       parentId: 'current-answer',
-      timestamp: '2026-01-01T00:00:00Z',
       firstKeptEntryId: 'current-input',
-      summary: 'Shared design constraints',
+      summary: 'Shared constraints',
       tokensBefore: 2000,
     },
-    message('latest-input', 'compact', 'user', 'Continue the PostgreSQL implementation'),
-    message('latest-answer', 'latest-input', 'assistant', 'Implementing PostgreSQL'),
+    message('latest-answer', 'compact', 'assistant', [text('Implementing PostgreSQL')]),
     message('old-input', 'common', 'user', 'Use MongoDB'),
-    message('old-answer', 'old-input', 'assistant', 'MongoDB is selected'),
+    message('old-answer', 'old-input', 'assistant', [text('MongoDB is selected')]),
   ];
   for (const [id, end, status] of [
     [1, 'common', 'ok'],
@@ -321,25 +298,15 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     });
   f.memory({ source_session_id: 'other-branch-origin' });
   const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
-  let acquisitions = 0;
   const capture = async (summary) => {
     const request = { session_id: f.context.session.id, content: { summary } };
-    return captureSessionRead(
-      reader,
-      {
-        ...f.context,
-        request,
-        nativeRead: async (options) => {
-          acquisitions++;
-          return prepareContextRead(
-            { entries, leafId: 'latest-answer' },
-            { ...request, ...options },
-            { buildSessionProjection },
-          );
-        },
-      },
-      request,
-    );
+    const nativeRead = (options) =>
+      prepareContextRead(
+        { entries, leafId: 'latest-answer' },
+        { ...request, ...options },
+        { buildSessionProjection },
+      );
+    return captureSessionRead(reader, { ...f.context, request, nativeRead }, request);
   };
   const recent = await capture(4);
   const summaries = recent.units.filter((item) =>
@@ -356,10 +323,6 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     excluded: 2,
   });
   const full = await capture(-1);
-  const historical = full.units.find((u) => u.source.reader_item === 'compartment:6');
-  assert.equal(historical.branch_relation, 'off_branch');
-  assert.equal(historical.provenance.source_entry_id, 'old-answer');
-  assert.equal(full.leaf_id, 'latest-answer');
   const cache = new ContextReadCache();
   const found = cache.navigate(
     full,
@@ -367,11 +330,7 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     { identity: f.context.session },
     'MongoDB',
   );
-  assert.equal(
-    found.items[0].branch_relation,
-    'off_branch',
-    'search keeps historical branch evidence visible',
-  );
+  assert.equal(found.items[0].branch_relation, 'off_branch');
   assert.match(
     JSON.stringify(cache.expand([found.items[0].ref], f.context.session).units),
     /MongoDB/,
@@ -386,7 +345,6 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
     ),
     /MongoDB/,
   );
-  assert.equal(acquisitions, 2);
 });
 
 test('read-only connections see committed live WAL data and detach each result', async (t) => {

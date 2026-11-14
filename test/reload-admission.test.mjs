@@ -2,12 +2,9 @@ import { AdmissionSession } from './fixtures/admission-session.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { reloadAdmission } from '../src/reload-admission.mjs';
-const deferred = () => {
-  let resolve;
-  const promise = new Promise((r) => (resolve = r));
-  return { promise, resolve };
-};
-test('reload admission tracks public operations and expires privilege with that reload', async () => {
+const deferred = () => Promise.withResolvers();
+const idle = { isIdle: () => true, hasPendingMessages: () => false };
+function fixture() {
   class Session extends AdmissionSession {
     sessionManager = {};
     async prompt(work) {
@@ -16,14 +13,25 @@ test('reload admission tracks public operations and expires privilege with that 
     async executeBash(work) {
       return await work;
     }
+    async compact(work) {
+      return await work;
+    }
+    async setModel() {
+      return 'selected';
+    }
+    async cycleModel() {
+      await this.prompt('input from a model hook');
+    }
     async reload(work) {
-      return await work();
+      await work?.();
     }
   }
   const admission = reloadAdmission(Session),
-    session = new Session(),
-    manager = session.sessionManager;
-  const ctx = { isIdle: () => true, hasPendingMessages: () => false };
+    session = new Session();
+  return { Session, admission, session, manager: session.sessionManager, ctx: idle };
+}
+test('reload admission tracks public operations and expires privilege with that reload', async () => {
+  const { admission, session, manager, ctx } = fixture();
   const work = deferred(),
     bashing = session.executeBash(work.promise);
   assert.throws(() => admission.begin(manager, ctx), /RELOAD_BUSY/);
@@ -62,21 +70,9 @@ test('reload admission tracks public operations and expires privilege with that 
 });
 
 test('terminal seal observes local preparation and notifies maintenance after all work finishes', async () => {
-  class Session extends AdmissionSession {
-    sessionManager = {};
-    async prompt(work) {
-      return await work;
-    }
-    async executeBash(work) {
-      return await work;
-    }
-  }
-  const admission = reloadAdmission(Session),
-    session = new Session(),
-    manager = session.sessionManager,
+  const { Session, admission, session, manager, ctx } = fixture(),
     promptGate = deferred(),
-    bashGate = deferred(),
-    ctx = { isIdle: () => true, hasPendingMessages: () => false };
+    bashGate = deferred();
   let notifications = 0,
     retiredNotifications = 0;
   admission.setOnIdle(manager, () => retiredNotifications++);
@@ -121,29 +117,7 @@ test('terminal seal observes local preparation and notifies maintenance after al
 });
 
 test('idle compact excludes local preparation and retains an atomic gate through native completion', async () => {
-  class Session extends AdmissionSession {
-    sessionManager = {};
-    async prompt(work) {
-      return await work;
-    }
-    async executeBash(work) {
-      return await work;
-    }
-    async compact(work) {
-      return await work;
-    }
-    async setModel() {
-      return 'selected';
-    }
-    async cycleModel() {
-      await this.prompt('input from a model hook');
-    }
-    async reload() {}
-  }
-  const admission = reloadAdmission(Session),
-    session = new Session(),
-    manager = session.sessionManager;
-  const ctx = { isIdle: () => true, hasPendingMessages: () => false };
+  const { admission, session, manager, ctx } = fixture();
   const preparing = deferred(),
     prepared = session.prompt(preparing.promise);
   await assert.rejects(

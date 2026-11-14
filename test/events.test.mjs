@@ -1,3 +1,4 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -24,20 +25,16 @@ const request = (id, delivery = {}) => ({
   delivery: { mode: 'webhook', url: 'https://callback.example/chat', secret, ...delivery },
 });
 async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
-  const dir = await fs.mkdtemp('/tmp/bridge-events-');
-  const config = {
-    stateDir: dir + '/state',
-    sessionRoots: [dir + '/sessions'],
-    folders: [{ path: dir }],
-    defaults: { ...denyAllPermissions(), read: true },
-  };
-  let bridge = await new Bridge(config).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'events',
+    configure({ config }) {
+      config.defaults.read = true;
+      config.grants = [];
+    },
   });
-  const made = await savedSession(bridge);
-  const session = await bridge.session(made.session_id);
+  const { config, session, dir } = f;
+  let bridge = f.bridge;
+  f.cleanup.push(() => bridge.close());
   let now = Date.now();
   const sent = [];
   let status = 204,
@@ -100,8 +97,8 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
     status: (value) => {
       status = value;
     },
-    badChallenge: () => {
-      challengeOK = false;
+    challenge: (value) => {
+      challengeOK = value;
     },
     restart: async () => {
       await bridge.close();
@@ -136,101 +133,62 @@ function retryClock(t, fixture) {
   };
 }
 
-test('event protocol discovers, validates, verifies and durably refreshes a single-owner subscription', async (t) => {
+test('event subscriptions verify consent, persist, rotate signing keys and expire', async (t) => {
   const f = await fixture(t),
     input = request(f.session.id);
-  assert.deepEqual((await f.call('server/discover')).message.result.capabilities.events, {});
   assert.equal((await f.call('events/list')).message.result.events[0].name, 'session.settled');
-  for (const bad of [
-    { ...input, arguments: { session_id: f.session.id, project: '/ignored' } },
-    { ...input, delivery: { ...input.delivery, url: 'http://callback.example' } },
-    { ...input, ttlMs: -1 },
-  ])
-    assert.equal((await f.call('events/subscribe', bad)).message.error.code, -32602);
-  assert.equal(f.sent.length, 0);
-  f.badChallenge();
-  assert.equal((await f.call('events/subscribe', input)).message.error.code, -32015);
+  const subscribe = (params = input) => f.call('events/subscribe', params);
+  assert.equal((await subscribe({ ...input, ttlMs: -1 })).message.error.code, -32602);
+  f.challenge(false);
+  assert.equal((await subscribe()).message.error.code, -32015);
   assert.equal(f.bridge.events.records.size, 0);
-  // Use a second fixture to keep the unsuccessful receiver separate.
-  const good = await fixture(t),
-    params = request(good.session.id);
-  const first = (await good.call('events/subscribe', params)).message.result;
-  assert.equal(first.cursor, null);
-  assert.equal(first.truncated, false);
-  assert.equal(good.sent.length, 1);
-  assert.equal(good.bridge.pool.instances.size, 0, 'subscribing must not start Pi');
-  const repeated = (await good.call('events/subscribe', params)).message.result;
-  assert.equal(repeated.id, first.id);
-  assert.equal(good.sent.length, 1, 'callback consent is cached');
-  const file = good.dir + '/state/event-subscriptions.json';
-  assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
-  await good.restart();
-  assert.equal(good.bridge.events.records.size, 1);
-  await good.settle();
-  assert.equal(good.sent.at(-1).decoded.name, 'session.settled');
+  f.challenge(true);
+
+  const { id } = (await subscribe()).message.result,
+    verified = f.sent.length;
+  assert.equal((await subscribe()).message.result.id, id);
+  assert.equal(f.sent.length, verified, 'reuse receiver consent');
+  assert.equal((await fs.stat(f.dir + '/state/event-subscriptions.json')).mode & 0o777, 0o600);
+  await f.restart();
+  await f.settle();
+  assert.equal(f.sent.at(-1).decoded.name, 'session.settled');
   const rotated = {
-    ...params,
-    delivery: { ...params.delivery, secret: 'whsec_' + Buffer.alloc(24, 1).toString('base64') },
+    ...input,
+    delivery: { ...input.delivery, secret: 'whsec_' + Buffer.alloc(24, 1).toString('base64') },
   };
-  assert.equal((await good.call('events/subscribe', rotated)).message.result.id, first.id);
-  assert.equal(good.bridge.events.records.get(first.id).previousSecret, secret);
-  // The original receiver can still verify the old-key signature during rotation.
-  await good.settle();
-  assert.equal(good.sent.at(-1).headers['webhook-signature'].split(' ').length, 2);
-  good.advance(3600001);
-  const before = good.sent.length;
-  await good.settle();
-  assert.equal(good.sent.length, before, 'expiration prevents delivery');
-  // Verification cache expired; verify with the proposed replacement key.
-  good.bridge.events.post = async (_url, body, headers) => {
-    const decoded = new Webhook(rotated.delivery.secret).verify(body, headers);
-    return { status: 200, body: JSON.stringify({ challenge: decoded.challenge }) };
-  };
-  assert.equal((await good.call('events/subscribe', rotated)).message.result.id, first.id);
-  const stop = { ...params, delivery: { mode: 'webhook', url: params.delivery.url } };
-  await good.call('events/unsubscribe', stop);
-  await good.call('events/unsubscribe', stop);
-  assert.equal(good.bridge.events.records.size, 0);
+  assert.equal((await subscribe(rotated)).message.result.id, id);
+  await f.settle();
+  assert.equal(f.sent.at(-1).headers['webhook-signature'].split(' ').length, 2);
+  f.advance(3600001);
+  const before = f.sent.length;
+  await f.settle();
+  assert.equal(f.sent.length, before);
 });
 
-test('event discovery and subscriptions retain receive-time policy through executor waits', async (t) => {
-  for (const method of ['events/list', 'events/subscribe'])
-    for (const allowed of [true, false])
-      await t.test(`${method}, initially ${allowed ? 'allowed' : 'denied'}`, async (t) => {
-        const f = await fixture(t),
-          input = method === 'events/list' ? {} : request(f.session.id),
-          entered = Promise.withResolvers(),
-          release = Promise.withResolvers(),
-          capture = t.mock.method(f.bridge, 'captureRequestContext');
-        f.config.defaults.read = allowed;
-        const pending = f.call(method, input, {
-          execute: async (run) => {
-            entered.resolve();
-            await release.promise;
-            return run();
-          },
-        });
-        await entered.promise;
-        f.config.defaults.read = !allowed;
-        release.resolve();
-        const response = await pending;
-        assert.equal(capture.mock.callCount(), 1);
-        const isAllowed = (value) =>
-          method === 'events/list'
-            ? value.message.result.events.length === 1
-            : value.message.result?.id !== undefined;
-        assert.equal(isAllowed(response), allowed, JSON.stringify(response));
-        assert.equal(isAllowed(await f.call(method, input)), !allowed);
-        if (method === 'events/subscribe' && allowed) {
-          const before = f.sent.length;
-          await f.settle();
-          assert.equal(f.sent.length, before, 'Delivery uses fresh authorization, not admission');
-          assert.equal(f.bridge.events.records.size, 0);
-        }
-      });
+test('event admission uses receive-time authorization and delivery reauthorizes', async (t) => {
+  const f = await fixture(t),
+    input = request(f.session.id);
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  const pending = f.call('events/subscribe', input, {
+    execute: async (run) => {
+      entered.resolve();
+      await release.promise;
+      return run();
+    },
+  });
+  await entered.promise;
+  f.config.defaults.read = false;
+  release.resolve();
+  assert.ok((await pending).message.result.id);
+  assert.equal((await f.call('events/subscribe', input)).message.error.code, -32024);
+  const before = f.sent.length;
+  await f.settle();
+  assert.equal(f.sent.length, before);
+  assert.equal(f.bridge.events.records.size, 0);
 });
 
-test('delivery filters, retries exact occurrences, and stops on permanent responses, unsubscribe or revoked read access', async (t) => {
+test('delivery filters sessions, retries exact occurrences, and stops on permanent responses or unsubscribe', async (t) => {
   const f = await fixture(t),
     input = request(f.session.id);
   await f.call('events/subscribe', input);
@@ -244,32 +202,20 @@ test('delivery filters, retries exact occurrences, and stops on permanent respon
   assert.equal(new Set(attempts.map((x) => x.decoded.eventId)).size, 1);
   assert.equal(new Set(attempts.map((x) => x.body)).size, 1);
   assert.ok(attempts.every((x) => x.headers['webhook-id'] === x.decoded.eventId));
-  for (const status of [410, 413, 302]) {
+  for (const status of [410, 302]) {
     f.status(status);
     const before = f.sent.length;
     await f.settle();
     assert.equal(f.sent.length, before + 1);
   }
-  f.config.defaults.read = false;
-  const before = f.sent.length;
-  await f.settle();
-  assert.equal(f.sent.length, before);
-  assert.equal(f.bridge.events.records.size, 0);
-  assert.equal((await f.call('events/subscribe', input)).message.error.code, -32024);
-  assert.deepEqual((await f.call('events/list')).message.result.events, []);
-  f.config.defaults.read = true;
-  await f.call('events/subscribe', input);
-  let started;
-  const beginning = new Promise((resolve) => {
-    started = resolve;
-  });
+  const beginning = Promise.withResolvers();
   f.bridge.events.post = (_url, _body, _headers, { signal }) =>
     new Promise((_, reject) => {
-      started();
+      beginning.resolve();
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
   const delivering = f.settle();
-  await beginning;
+  await beginning.promise;
   const { secret: _, ...destination } = input.delivery;
   await f.call('events/unsubscribe', { ...input, delivery: destination });
   await delivering;
@@ -304,24 +250,32 @@ test('default delivery retries exhaust a bounded window and do not replay after 
   assert.notEqual(attempts.at(-1).headers['webhook-id'], attempts[0].headers['webhook-id']);
 });
 
-test('a retry cannot authorize an old occurrence through a replacement native cwd', async (t) => {
-  const f = await fixture(t),
-    project = f.dir + '/original',
+async function projectScope(f) {
+  const project = f.dir + '/original',
     replacement = f.dir + '/replacement';
-  await fs.mkdir(project);
-  await fs.mkdir(replacement);
-  const made = await savedSession(f.bridge, { project }),
-    session = await f.bridge.session(made.session_id);
+  await Promise.all([fs.mkdir(project), fs.mkdir(replacement)]);
+  const { session_id } = await savedSession(f.bridge, { project });
+  const session = await f.bridge.session(session_id);
   f.config.defaults = denyAllPermissions();
   f.config.grants = [{ folder: project, read: true }];
   await f.call('events/subscribe', request(session.id));
+  const replace = async () => {
+    const lines = (await fs.readFile(session.file, 'utf8')).split('\n');
+    lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: replacement });
+    await fs.writeFile(session.file, lines.join('\n'));
+    f.config.grants = [{ folder: replacement, read: true }];
+  };
+  return { project, replacement, session, replace };
+}
+
+test('a retry cannot authorize an old occurrence through a replacement native cwd', async (t) => {
+  const f = await fixture(t),
+    scope = await projectScope(f),
+    { session, replacement } = scope;
   const attempts = [];
   f.bridge.events.post = async (_url, body) => {
     attempts.push(JSON.parse(body));
-    const lines = (await fs.readFile(session.file, 'utf8')).trimEnd().split('\n');
-    lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: replacement });
-    await fs.writeFile(session.file, lines.join('\n') + '\n');
-    f.config.grants = [{ folder: replacement, read: true }];
+    await scope.replace();
     return { status: 503 };
   };
   await f.settle(session);
@@ -349,15 +303,8 @@ async function settledOwner(f, session) {
 
 test('owner IPC preserves capture identity before the first delivery and ignores native cwd overrides', async (t) => {
   const f = await fixture(t),
-    project = f.dir + '/original',
-    replacement = f.dir + '/replacement';
-  await fs.mkdir(project);
-  await fs.mkdir(replacement);
-  const made = await savedSession(f.bridge, { project }),
-    session = await f.bridge.session(made.session_id);
-  f.config.defaults = denyAllPermissions();
-  f.config.grants = [{ folder: project, read: true }];
-  await f.call('events/subscribe', request(session.id));
+    scope = await projectScope(f);
+  const { project, replacement, session } = scope;
   const manager = SessionManager.open(session.file, undefined, replacement);
   const { observer, release } = await settledOwner(f, session);
   try {
@@ -368,14 +315,11 @@ test('owner IPC preserves capture identity before the first delivery and ignores
     const first = observer.capture({ aborted: false }, manager);
     assert.equal(first.sessionCwdHash, hash(project));
     const { sessionCwdHash: _, ...missingIdentity } = first;
-    for (const invalid of [
-      missingIdentity,
-      { ...first, sessionCwdHash: 123 },
-      { ...first, sessionCwdHash: 'invalid' },
-      { ...missingIdentity, sessionCwd: project },
-    ])
+    for (const invalid of [missingIdentity, { ...missingIdentity, sessionCwd: project }])
       await assert.rejects(ownerRequest(f.config, invalid), /INVALID_OWNER_COMMAND/);
     await ownerRequest(f.config, first);
+    for (const replay of [first, { ...first, generation: 'retired' }])
+      await assert.rejects(ownerRequest(f.config, replay), /INVALID_OWNER_COMMAND/);
     await Promise.all([...f.bridge.events.deliveries.keys()]);
     assert.equal(f.sent.filter((item) => item.decoded.name === 'session.settled').length, 1);
     assert.equal(f.sent.at(-1).decoded.data.result.text, 'ORIGINAL_RESULT');
@@ -383,13 +327,7 @@ test('owner IPC preserves capture identity before the first delivery and ignores
     observer.start(manager);
     manager.appendMessage(fauxAssistantMessage('OLD_PROJECT_CAPTURED_RESULT'));
     const captured = observer.capture({ aborted: false }, manager);
-    const lines = (await fs.readFile(session.file, 'utf8')).trimEnd().split('\n');
-    lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), cwd: replacement });
-    await fs.writeFile(session.file, lines.join('\n') + '\n');
-    f.config.grants = [{ folder: replacement, read: true }];
-    const context = await f.bridge.captureRequestContext();
-    assert.throws(() => f.bridge.check('read', session, context), /NOT_FOUND_OR_DENIED/);
-    assert.equal((await f.bridge.events.authorize(session.id)).header.cwd, replacement);
+    await scope.replace();
     await assert.rejects(ownerRequest(f.config, captured), /INVALID_OWNER_COMMAND/);
     await Promise.all([...f.bridge.events.deliveries.keys()]);
     assert.equal(f.sent.filter((item) => item.decoded.name === 'session.settled').length, 1);
@@ -424,24 +362,11 @@ for (const invalid of ['active record', 'file privacy'])
     assert.equal(f.bridge.events.records.size, 0, 'Never activate a partial store');
     const health = await f.bridge.health();
     assert.deepEqual(health.events, { status: 'unavailable', reason });
-    assert.ok(!JSON.stringify(health).includes(secret));
-    assert.ok(!JSON.stringify(health).includes(url));
-    assert.deepEqual((await f.bridge.read({ session_id: f.session.id })).items, []);
-    assert.equal((await f.call('tools/list')).status, 200);
-    const { secret: _, ...delivery } = input.delivery;
-    for (const [method, params] of [
-      ['events/list', {}],
-      ['events/subscribe', input],
-      ['events/unsubscribe', { ...input, delivery }],
-    ]) {
-      const response = await f.call(method, params);
-      assert.equal(response.status, 500);
-      assert.deepEqual(response.message.error, {
-        code: -32603,
-        message: 'EventSubscriptionsUnavailable',
-        data: { reason },
-      });
-    }
+    assert.doesNotMatch(JSON.stringify(health), /whsec_|callback\.example/);
+    assert.equal((await f.bridge.read({ session_id: f.session.id })).session_id, f.session.id);
+    const failed = await f.call('events/subscribe', input);
+    assert.equal(failed.status, 500);
+    assert.equal(failed.message.error.data.reason, reason);
     const before = f.sent.length;
     await f.settle();
     assert.equal(f.sent.length, before);

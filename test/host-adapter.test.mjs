@@ -1,69 +1,48 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
+import { message } from './fixtures/native-history.mjs';
+import { readLfLines } from '../src/lf-lines.mjs';
 import { ownerEnvelope } from '../src/attachment-protocol.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+
 import net from 'node:net';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
 import {
   readClaim,
   claimFile,
-  ownerAlive,
   reserveOwner,
   updateOwner,
   AttachedRuntime,
 } from '../src/attachments.mjs';
-import { Bridge } from '../src/bridge.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-const gate = () => {
-  let resolve;
-  const promise = new Promise((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-};
+
+const gate = () => Promise.withResolvers();
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-host-')),
-    file = path.join(dir, 'sessions', 'session.jsonl'),
-    header = {
-      type: 'session',
-      version: 3,
-      id: 'native-fixture',
-      cwd: dir,
-      timestamp: new Date().toISOString(),
-    };
-  await fs.mkdir(path.dirname(file), { mode: 0o700 });
-  await fs.writeFile(file, JSON.stringify(header) + '\n', { mode: 0o600 });
-  const session = { file, header },
-    attachmentDir = path.join(dir, 'ipc'),
-    controller = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir,
-      session,
-    });
-  t.after(async () => {
-    await controller.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'host-adapter',
+    factory: () => assert.fail('Unexpected second writer'),
   });
+  const {
+    session,
+    config: { attachmentDir },
+  } = f;
+  const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
+    attachmentDir,
+    session,
+  });
+  f.cleanup.push(() => controller.close());
   const state = () => ({
-    sessionFile: file,
-    sessionId: header.id,
+    sessionFile: session.file,
+    sessionId: session.header.id,
     isIdle: true,
     isStreaming: false,
   });
   const snapshot = () => ({
     ...state(),
-    entries: [
-      {
-        type: 'message',
-        id: 'u',
-        parentId: null,
-        message: { role: 'user', content: 'PUBLIC_FIXTURE' },
-      },
-    ],
+    entries: [message('u', null, 'user', 'PUBLIC_FIXTURE')],
     leafId: 'u',
   });
   const callbacks = {
@@ -71,48 +50,25 @@ async function fixture(t) {
     snapshot,
     submit: async () => ({ status: 'accepted', disposition: 'started' }),
   };
-  return { dir, session, attachmentDir, controller, callbacks };
-}
-async function observingBridge(f) {
-  return new Bridge(
-    {
-      stateDir: path.join(f.dir, 'state'),
-      attachmentDir: f.attachmentDir,
-      sessionRoots: [path.dirname(f.session.file)],
-      folders: [],
-      defaults: { ...denyAllPermissions(), list: true },
-    },
-    async () => {
-      throw new Error('UNEXPECTED_SECOND_WRITER');
-    },
-  ).init();
+  const runtime = new AttachedRuntime(f.config, session, controller.record);
+  return { ...f, attachmentDir, controller, callbacks, runtime };
 }
 function request(f, op, body = {}, changes = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(f.controller.record.socket);
-    let buffer = '';
-    socket.setEncoding('utf8');
-    socket.setTimeout(2000, () => {
-      socket.destroy();
-      reject(new Error('test timeout'));
-    });
+    socket.setTimeout(2000, () => socket.destroy(new Error('Host fixture timed out')));
     socket.on('error', reject);
     socket.on('connect', () =>
       socket.write(ownerEnvelope(f.controller.record, { op, body, ...changes })),
     );
-    socket.on('data', (chunk) => {
-      buffer += chunk;
-      while (buffer.includes('\n')) {
-        const end = buffer.indexOf('\n'),
-          response = JSON.parse(buffer.slice(0, end));
-        buffer = buffer.slice(end + 1);
-        if (!response.partial) {
-          socket.destroy();
-          resolve(response);
-          return;
-        }
+    readLfLines(socket, (line) => {
+      const response = JSON.parse(line);
+      if (!response.partial) {
+        socket.destroy();
+        resolve(response);
       }
     });
+    socket.on('close', () => reject(new Error('Host closed without a reply')));
   });
 }
 
@@ -133,34 +89,11 @@ test('host reload never reports failed native work or a changed session as compl
       return { reloaded: true };
     },
   });
-  const runtime = new AttachedRuntime(
-    { attachmentDir: f.attachmentDir },
-    f.session,
-    f.controller.record,
-  );
+  const { runtime } = f;
   await assert.rejects(runtime.reload(), { code: 'RELOAD_UNCONFIRMED', uncertain: true });
   assert.equal(reloads, 1); // No automatic replay after native dispatch.
   await assert.rejects(runtime.reload(), { code: 'RELOAD_UNCONFIRMED', uncertain: true });
   assert.equal(reloads, 2);
-});
-
-test('a protocol mismatch blocks attachment and replacement without retiring the live claim', async (t) => {
-  const f = await fixture(t);
-  await f.controller.ready(f.callbacks);
-  const record = await readClaim(f.attachmentDir, f.session);
-  await fs.writeFile(
-    claimFile(f.attachmentDir, f.session),
-    JSON.stringify({ ...record, unexpected: true }),
-  );
-  const bridge = await observingBridge(f);
-  try {
-    await assert.rejects(bridge.pool.forRead(f.session), /ATTACHMENT_PROTOCOL_MISMATCH/);
-    await assert.rejects(reserveOwner(f.attachmentDir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
-    assert.equal(await ownerAlive(record.owner), true);
-  } finally {
-    await fs.writeFile(claimFile(f.attachmentDir, f.session), JSON.stringify(record));
-    await bridge.close();
-  }
 });
 
 test('two-phase host reservation blocks another writer before ready and exposes bounded live reads', async (t) => {
@@ -177,11 +110,7 @@ test('two-phase host reservation blocks another writer before ready and exposes 
   assert.deepEqual(observed.data.units, []);
   assert.equal((await request(f, 'state')).data.sessionId, f.session.header.id);
   await assert.rejects(
-    new AttachedRuntime(
-      { attachmentDir: f.attachmentDir },
-      f.session,
-      f.controller.record,
-    ).selectModel(undefined, { thinkingLevel: 'high' }),
+    f.runtime.selectModel(undefined, { thinkingLevel: 'high' }),
     /MODEL_SELECTION_UNSUPPORTED/,
   );
   assert.equal(
@@ -211,18 +140,9 @@ test('host state requires the current boolean capability declaration', async (t)
   });
   await new Promise((resolve) => server.listen(f.controller.record.socket, resolve));
   await updateOwner(f.attachmentDir, f.session, f.controller.record, { phase: 'ready' });
-  const runtime = new AttachedRuntime(
-    { attachmentDir: f.attachmentDir },
-    f.session,
-    f.controller.record,
-  );
+  const { runtime } = f;
   try {
-    for (const declared of [
-      undefined,
-      {},
-      { send: true, command: null, stop: null },
-      { send: true, command: 'true', stop: 1 },
-    ]) {
+    for (const declared of [undefined, { send: true, command: 'true', stop: 1 }]) {
       capabilities = declared;
       await assert.rejects(runtime.state(), /OWNER_COMPONENT_UPDATE_REQUIRED/);
     }

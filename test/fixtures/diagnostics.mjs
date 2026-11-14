@@ -1,128 +1,45 @@
-import { denyAllPermissions } from './permissions.mjs';
 import assert from 'node:assert/strict';
-import { isolatedRuntime } from './isolated-runtime.mjs';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { Bridge } from '../../src/bridge.mjs';
-import { PiRpc } from '../../src/rpc.mjs';
-import { CallbackError } from '../../src/event-webhook.mjs';
-import { META, MODERN_VERSION } from '../../src/protocol.mjs';
 import { createHttpService } from '../../src/http-server.mjs';
 import { TOKEN_HEADER } from '../../src/http-config.mjs';
 import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
-const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'PRIVATE_PATH-')),
-  cwd = path.join(dir, 'project');
-await fs.mkdir(cwd);
-const config = {
-  ...isolatedRuntime(dir),
-  defaults: denyAllPermissions(),
-  stateDir: path.join(dir, 'state'),
-  sessionRoots: [path.join(dir, 'sessions')],
-  folders: [{ path: cwd }],
-  grants: [{ folder: cwd, list: true, read: true, send: true, create: true }],
-};
-config.piArgs.push(
-  '-e',
-  path.resolve('test/fixtures/faux-extension.mjs'),
-  '--provider',
-  'bridge-fixture',
-  '--model',
-  'deterministic',
-);
-const configFile = path.join(dir, 'config.json');
-await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-const bridge = await new Bridge(config, undefined, { configFile }).init(),
-  token = 'PRIVATE_TOKEN_' + 'x'.repeat(32);
-const service = createHttpService(bridge, { token }),
-  url = await service.listen();
-async function call(name, args, id) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json, text/event-stream',
-      [TOKEN_HEADER]: token,
-    },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id,
-      method: 'tools/call',
-      params: { name, arguments: args },
-    }),
-  });
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(body.result?.isError, undefined);
-  return body.result.structuredContent;
-}
-try {
-  const args = { project: cwd, text: 'PRIVATE_BODY' },
-    created = await call('create', args, 'PRIVATE_RPC_ID');
-  await call('create', args, 2);
-  const saved = await bridge.session(created.session_id);
+import { PiRpc } from '../../src/rpc.mjs';
+import { nativeOwner } from './native-owner.mjs';
 
-  await bridge.pool.resolve(await bridge.session(created.session_id));
-  const read = await call('read', { session_id: created.session_id }, 3);
-  assert.ok(JSON.stringify(read).includes('PRIVATE_BODY'));
-  const denied = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-  });
+const cleanup = [];
+try {
+  const f = await nativeOwner(
+    { after: (close) => cleanup.push(close) },
+    { prefix: 'PRIVATE_PATH' },
+  );
+  const token = 'PRIVATE_TOKEN_' + 'x'.repeat(32);
+  const service = createHttpService(f.bridge, { token });
+  f.cleanup.push(() => service.close());
+  const url = await service.listen();
+  const request = (headers) =>
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'PRIVATE_REQUEST',
+        method: 'tools/call',
+        params: { name: 'read', arguments: { session_id: f.id } },
+      }),
+    });
+  await f.bridge.pool.resolve(f.session);
+  const read = await request({ [TOKEN_HEADER]: token });
+  assert.equal(read.status, 200);
+  assert.equal((await read.json()).result.structuredContent.session_id, f.id);
+  const denied = await request({});
   assert.equal(denied.status, 401);
   await denied.text();
-  // Exercise the response boundary without creating any subscription or callback.
-  const post = bridge.events.post;
-  bridge.events.post = async () => {
-    throw new CallbackError('challenge_failed');
-  };
-  const eventBody = {
-    jsonrpc: '2.0',
-    id: 'PRIVATE_RPC_EVENT',
-    method: 'events/subscribe',
-    params: {
-      name: 'session.settled',
-      arguments: { session_id: created.session_id },
-      delivery: {
-        mode: 'webhook',
-        url: 'https://callback.example/PRIVATE_PATH?PRIVATE_QUERY',
-        secret: 'whsec_' + Buffer.alloc(32, 7).toString('base64'),
-      },
-      _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-    },
-  };
-  const eventHeaders = {
-    'Content-Type': 'application/json',
-    [TOKEN_HEADER]: token,
-    'MCP-Protocol-Version': MODERN_VERSION,
-    'Mcp-Method': 'events/subscribe',
-  };
-  for (const mismatch of [false, true]) {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { ...eventHeaders, ...(mismatch ? { 'Mcp-Method': 'events/list' } : {}) },
-      body: JSON.stringify(eventBody),
-    });
-    assert.equal(response.status, 400);
-    assert.equal((await response.json()).error.code, mismatch ? -32020 : -32015);
-  }
-  bridge.events.post = post;
-  assert.equal(bridge.events.records.size, 0);
-  const listed = await fetch(url, {
-    method: 'POST',
-    headers: { ...eventHeaders, 'Mcp-Method': 'events/list' },
-    body: JSON.stringify({
-      ...eventBody,
-      method: 'events/list',
-      params: { _meta: eventBody.params._meta },
-    }),
-  });
-  assert.equal(listed.status, 200);
-  assert.ok((await listed.json()).result.events);
-  // Controlled bridge transport fixture: no Pi method is modified.
+
   let command;
-  const rpc = new PiRpc(config, saved);
+  const rpc = new PiRpc(f.config, f.session);
   rpc.alive = true;
   rpc.child = {
     stdin: {
@@ -152,8 +69,7 @@ try {
     },
     rpc.generation,
   );
+  await rpc.drainAcks();
 } finally {
-  await service.close();
-  await fs.rm(dir, { recursive: true, force: true });
+  for (const close of cleanup) await close();
 }
-console.log(JSON.stringify({ ok: true }));

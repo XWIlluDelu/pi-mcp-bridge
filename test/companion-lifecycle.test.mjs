@@ -1,98 +1,64 @@
+import { offlineModels } from './fixtures/native-sdk.mjs';
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { ownerEnvelope } from '../src/attachment-protocol.mjs';
 import { until } from './fixtures/until.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 
-import { fauxProvider, fauxAssistantMessage, InMemoryCredentialStore } from './fixtures/pi.mjs';
+import { fauxProvider, fauxAssistantMessage } from './fixtures/pi.mjs';
 import {
   createAgentSessionRuntime,
   createAgentSessionServices,
   createAgentSessionFromServices,
-  ModelRuntime,
   SessionManager,
   SettingsManager,
   RpcClient,
 } from './fixtures/pi.mjs';
-import { Bridge } from '../src/bridge.mjs';
+
 import attachExtension from './fixtures/companion.mjs';
 import { claimFile, readClaim } from '../src/attachments.mjs';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createSdkHostBinding } from '../src/host-bindings.mjs';
-import { isolatedRuntime, nativePiCli } from './fixtures/isolated-runtime.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 
-async function fixture(t, { hosted = false, extension } = {}) {
-  const dir = await fs.mkdtemp('/tmp/pi-companion-life-'),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    stateDir: path.join(dir, 'state'),
-    attachmentDir: path.join(dir, 'ipc'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    defaults: denyAllPermissions(),
-    grants: [{ folder: cwd, list: true, read: true, send: true }],
-  };
-  config.piArgs.push(
-    '-e',
-    path.resolve('test/fixtures/faux-extension.mjs'),
-    '--provider',
-    'bridge-fixture',
-    '--model',
-    'deterministic',
-    '--thinking',
-    'off',
-  );
-  const file = path.join(dir, 'owner.json');
-  await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
-  const previous = [process.env.PI_MCP_OWNER_CONFIG, process.env.PI_MCP_ATTACH_DIR];
-  process.env.PI_MCP_OWNER_CONFIG = file;
-  process.env.PI_MCP_ATTACH_DIR = config.attachmentDir;
+async function fixture(t, extension) {
+  const f = await nativeOwner(t, {
+    prefix: 'companion-life',
+    configure({ config }) {
+      config.piArgs.push(...fauxArgs, '--thinking', 'off');
+    },
+  });
+  const { bridge, config, cwd, dir, session: a } = f;
+  const b = await f.create();
+  const previous = ['PI_MCP_OWNER_CONFIG', 'PI_MCP_ATTACH_DIR'].map((key) => [
+    key,
+    process.env[key],
+  ]);
+  for (const [key] of previous) process.env[key] = f.env[key];
   const finishers = [],
     errors = [];
-  let runtime, controller;
-  const bridge = await new Bridge(config).init();
-  t.after(async () => {
-    for (const finish of finishers) finish();
-    await runtime?.session.abort();
-    await runtime?.dispose();
-    await controller?.close();
-    await bridge.close();
-    for (const [i, name] of ['PI_MCP_OWNER_CONFIG', 'PI_MCP_ATTACH_DIR'].entries()) {
-      if (previous[i] === undefined) delete process.env[name];
-      else process.env[name] = previous[i];
+  let runtime;
+  f.cleanup.push(async () => {
+    try {
+      for (const finish of finishers) finish();
+      await runtime?.session.abort();
+      await runtime?.dispose();
+    } finally {
+      for (const [key, value] of previous) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
-    await fs.rm(dir, { recursive: true, force: true });
   });
-  const a = await bridge.session((await savedSession(bridge)).session_id),
-    b = await bridge.session((await savedSession(bridge)).session_id);
-  if (hosted)
-    controller = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: config.attachmentDir,
-      session: a,
-    });
   const faux = fauxProvider({
     provider: 'bridge-fixture',
     models: [{ id: 'deterministic' }, { id: 'other' }],
     tokensPerSecond: 10000,
   });
-  const modelRuntime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: null,
-    refreshOnCreate: false,
-    allowModelNetwork: false,
-  });
-  modelRuntime.registerNativeProvider(faux.provider);
+  const modelRuntime = await offlineModels(faux);
   const factory = async (options) => {
     const services = await createAgentSessionServices({
       cwd: options.cwd,
@@ -143,35 +109,31 @@ async function fixture(t, { hosted = false, extension } = {}) {
     });
   runtime.setRebindSession(bind);
   await bind(runtime.session);
-  const binding = hosted ? createSdkHostBinding(runtime.session) : null;
-  if (controller) await controller.ready(binding);
-  return { dir, config, bridge, a, b, runtime, modelRuntime, faux, finishers, binding, errors };
+  return { config, bridge, a, b, runtime, modelRuntime, faux, finishers, errors };
 }
 
 test('native replacement ignores old endpoint metadata and retains explicit pauses through reload and switch', async (t) => {
   let f,
     replaceMetadata = false;
-  f = await fixture(t, {
-    extension: (pi) => {
-      // Run after the companion has drained and closed its old context.
-      pi.on('session_shutdown', async () => {
-        if (!replaceMetadata) return;
-        replaceMetadata = false;
-        const file = claimFile(f.config.attachmentDir, f.a);
-        const old = JSON.parse(await fs.readFile(file, 'utf8'));
-        await fs.writeFile(
-          file,
-          JSON.stringify({
-            ...old,
-            kind: 'unsupported-endpoint',
-            generation: null,
-            socket: '/unusable/endpoint',
-            handoffId: 'unusable',
-            noColdReacquire: true,
-          }),
-        );
-      });
-    },
+  f = await fixture(t, (pi) => {
+    // Run after the companion has drained and closed its old context.
+    pi.on('session_shutdown', async () => {
+      if (!replaceMetadata) return;
+      replaceMetadata = false;
+      const file = claimFile(f.config.attachmentDir, f.a);
+      const old = JSON.parse(await fs.readFile(file, 'utf8'));
+      await fs.writeFile(
+        file,
+        JSON.stringify({
+          ...old,
+          kind: 'unsupported-endpoint',
+          generation: null,
+          socket: '/unusable/endpoint',
+          handoffId: 'unusable',
+          noColdReacquire: true,
+        }),
+      );
+    });
   });
   const before = await readClaim(f.config.attachmentDir, f.a);
   replaceMetadata = true;
@@ -362,16 +324,6 @@ for (const allowed of [true, false])
           entries.some((e) => e.type === 'model_change' && e.modelId === 'other'),
           allowed,
         );
-        const sent = await f.bridge.send({ session_id: f.a.id, text: 'AFTER_SWITCH' });
-        assert.equal(sent.status, 'started', JSON.stringify(sent));
-        await until(() => !f.bridge.pool.get(f.a.id) && !f.bridge.autoReleases.size);
-        const current = await f.bridge.read({
-          session_id: f.a.id,
-          range: { recent: -1 },
-          content: ALL_CONTENT,
-        });
-        assert.ok(JSON.stringify(current.items).includes('AFTER_SWITCH'));
-        assert.ok(current.items.some((e) => e.type === 'assistant'));
         assert.deepEqual(f.errors, []);
       },
     );

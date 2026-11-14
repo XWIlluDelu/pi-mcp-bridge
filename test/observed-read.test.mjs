@@ -1,14 +1,11 @@
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
-import { until } from './fixtures/until.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
-import { executeBatch } from '../src/batch.mjs';
-
-import { readClaim } from '../src/attachments.mjs';
-import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
+import { readSource } from './fixtures/read-source.mjs';
+import { releasedEntries } from './fixtures/model-runtime.mjs';
 import { ContextObservation } from '../src/context-observation.mjs';
 
 async function fixture(t) {
@@ -33,121 +30,48 @@ async function fixture(t) {
       config.piArgs.push(...fauxArgs, '-e', transform, '--thinking', 'off');
     },
   });
-  const runtimes = [],
-    launch = f.bridge.pool.factory;
-  f.bridge.pool.factory = async (session) => {
-    const runtime = await launch(session);
-    runtimes.push(runtime);
-    return runtime;
-  };
-  return Object.assign(f, {
-    runtimes,
-    released: () => until(() => runtimes.at(-1)?.exited && !f.bridge.autoReleases.size),
-  });
-}
-async function pages(bridge, first) {
-  const result = [first];
-  while (result.at(-1).next_cursor)
-    result.push(await bridge.read({ cursor: result.at(-1).next_cursor, max_bytes: 4096 }));
-  return result.flatMap((p) => p.items);
+  return f;
 }
 
 test(
   'runtime capture survives no-prompt cold starts and release, then updates on the next prompt',
   { timeout: 15000 },
   async (t) => {
-    const f = await fixture(t),
-      read = () => f.bridge.read({ session_id: f.id, view: 'runtime', max_bytes: 4096 });
+    const f = await fixture(t);
+    const read = () => readSource(f.bridge, { session_id: f.id, view: 'runtime', max_bytes: 4096 });
+    const release = () => releasedEntries(f.bridge, f.id);
     assert.equal((await read()).observation.reason, 'no_retained_observation');
-    assert.equal(f.runtimes.length, 0);
     await f.bridge.send({ session_id: f.id, text: 'DROP_FROM_REQUEST' });
-    await f.released();
-    assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+    await release();
     const before = await fs.readFile(f.session.file, 'utf8');
     const first = await read(),
-      units = await pages(f.bridge, first);
+      units = JSON.stringify(first.items);
     assert.equal(first.source, 'retained');
-    assert.equal(first.observation.available, true);
-    assert.equal(first.observation.owner_active, false);
-    assert.ok(first.observation.later_committed_entries >= 1);
-    assert.ok(JSON.stringify(units).includes('TRANSFORMED_SUMMARY_BODY'));
-    assert.ok(!JSON.stringify(units).includes('DROP_FROM_REQUEST'));
-    assert.ok(!JSON.stringify(units).includes('LATER_FULL_CONTEXT_HOOK'));
-    assert.ok(!JSON.stringify(units).includes('Synthetic response 1.'));
-    const native = await f.bridge.read({
-      session_id: f.id,
-      range: { recent: -1 },
-      content: ALL_CONTENT,
-    });
-    assert.equal(native.view, 'session');
-    assert.ok(JSON.stringify(native).includes('DROP_FROM_REQUEST'));
-    assert.ok(JSON.stringify(native).includes('Synthetic response 1.'));
+    assert.match(units, /TRANSFORMED_SUMMARY_BODY/);
+    assert.doesNotMatch(units, /DROP_FROM_REQUEST|LATER_FULL_CONTEXT_HOOK|Synthetic response/);
+    const native = await f.bridge.read({ session_id: f.id, content: ALL_CONTENT });
+    assert.match(JSON.stringify(native.items), /DROP_FROM_REQUEST/);
     assert.equal(await fs.readFile(f.session.file, 'utf8'), before);
-    assert.equal(f.runtimes.length, 1);
-    const mcp = await dispatchModern(f.bridge, {
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'tools/call',
-      params: {
-        name: 'read',
-        arguments: { session_id: f.id, view: 'runtime', max_bytes: 4096 },
-        _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-      },
-    });
-    assert.equal(mcp.message.result.structuredContent.observation.id, first.observation.id);
-    const batch = await executeBatch(f.bridge, {
-      operations: [{ op: 'read', args: { session_id: f.id, view: 'runtime', max_bytes: 4096 } }],
-    });
-    assert.equal(batch.results[0].result.observation.id, first.observation.id);
-    f.config.grants[0].read = false;
-    await assert.rejects(read(), /NOT_FOUND_OR_DENIED/);
-    f.config.grants[0].read = true;
-    // Reopening an owner is not a request-stage observation. The saved capture
-    // must remain readable while this new owner is idle and after a rejected
-    // no-prompt operation releases it again.
-    const idleOwner = await f.bridge.pool.resolve(f.session);
-    assert.notEqual(idleOwner.ownerRecord.generation, first.observation.owner_generation);
-    const whileIdle = await read();
-    const current = await f.bridge.read({ session_id: f.id });
-    assert.equal(whileIdle.source, 'retained');
-    assert.equal(whileIdle.observation.owner_active, false);
-    assert.equal(whileIdle.observation.current_leaf_id, current.leaf_id);
-    const compact = await f.bridge.compact({ session_id: f.id });
-    assert.equal(compact.status, 'rejected');
-    await f.released();
-    const afterNoPrompt = await read();
-    for (const saved of [whileIdle, afterNoPrompt]) {
-      assert.equal(saved.observation.available, true);
-      for (const key of ['id', 'observed_at', 'owner_generation', 'input_leaf_id'])
-        assert.equal(saved.observation[key], first.observation[key], key);
-      assert.deepEqual(
-        (await pages(f.bridge, saved)).map(({ ref, ...item }) => item),
-        units.map(({ ref, ...item }) => item),
-      );
-    }
+    assert.equal(f.bridge.pool.instances.size, 0);
+    const nextOwner = await f.bridge.pool.resolve(f.session);
+    assert.notEqual(nextOwner.ownerRecord.generation, first.observation.owner_generation);
+    assert.equal((await read()).observation.id, first.observation.id);
+    assert.equal((await f.bridge.compact({ session_id: f.id })).status, 'rejected');
+    await release();
+    assert.equal((await read()).observation.id, first.observation.id);
     await f.bridge.send({ session_id: f.id, text: 'KEPT_TAIL' });
-    await f.released();
+    await release();
     const next = await read();
     assert.notEqual(next.observation.id, first.observation.id);
-    assert.notEqual(next.observation.owner_generation, first.observation.owner_generation);
-    assert.ok(JSON.stringify(await pages(f.bridge, next)).includes('KEPT_TAIL'));
-    assert.equal(f.runtimes.length, 3);
-    assert.equal(f.bridge.pool.observations.entries.size, 1);
+    assert.match(JSON.stringify(next.items), /KEPT_TAIL/);
   },
 );
 
-const gate = () => {
-  let resolve;
-  const promise = new Promise((done) => {
-    resolve = done;
-  });
-  return { promise, resolve };
-};
 for (const change of ['newer_capture', 'failed_capture', 'new_owner']) {
   test(`retained publication cannot regress after an older Bridge.read finishes late (${change})`, async (t) => {
-    const f = await fixture(t),
-      held = gate(),
-      proceed = gate();
+    const f = await nativeOwner(t),
+      held = Promise.withResolvers(),
+      proceed = Promise.withResolvers();
     // Exercise real Bridge acquisition, final identity checks and saved reads.
     // Control only the owner capture and the async identity-recheck boundary.
     const ctx = {

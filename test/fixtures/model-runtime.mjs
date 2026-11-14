@@ -1,11 +1,9 @@
+import { nativeOwner } from './native-owner.mjs';
 import { until } from './until.mjs';
 export { until };
-import { denyAllPermissions } from './permissions.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Bridge } from '../../src/bridge.mjs';
-import { isolatedRuntime } from './isolated-runtime.mjs';
-import { savedSession, savedEntries } from './saved-session.mjs';
+import { savedEntries } from './saved-session.mjs';
 export const choice = (id) => ({ provider: 'model-fixture', id });
 export { savedEntries } from './saved-session.mjs';
 export async function releasedEntries(bridge, id) {
@@ -13,70 +11,58 @@ export async function releasedEntries(bridge, id) {
   return savedEntries(bridge, id);
 }
 export async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-model-test-'),
-    cwd = path.join(dir, 'project'),
-    gate = path.join(dir, 'continue');
-  const old = process.env.PI_MODEL_GATE;
-  let bridge;
-  t.after(async () => {
-    try {
-      await fs.writeFile(gate, 'go');
-      await fs.writeFile(gate + '.exit', 'go');
-      await fs.writeFile(gate + '.preflight-release', 'go');
-      await bridge?.close();
-    } finally {
-      if (old === undefined) delete process.env.PI_MODEL_GATE;
-      else process.env.PI_MODEL_GATE = old;
-      await fs.rm(dir, { recursive: true, force: true });
-    }
+  const f = await nativeOwner(t, {
+    prefix: 'model',
+    reloadConfig: true,
+    async configure({ dir, config, cleanup }) {
+      const gate = path.join(dir, 'continue');
+      const old = process.env.PI_MODEL_GATE;
+      process.env.PI_MODEL_GATE = gate;
+      t.after(() => {
+        if (old === undefined) delete process.env.PI_MODEL_GATE;
+        else process.env.PI_MODEL_GATE = old;
+      });
+      config.piRuntime.inheritEnv = ['PI_MODEL_GATE'];
+      cleanup.push(async () => {
+        for (const suffix of ['', '.exit', '.preflight-release'])
+          await fs.writeFile(gate + suffix, 'go');
+      });
+      config.grants[0].delete = false;
+      delete config.piRuntime.tools;
+      config.piArgs.push(
+        '--no-extensions',
+        '-e',
+        path.resolve('test/fixtures/model-provider.mjs'),
+        '--provider',
+        'model-fixture',
+        '--model',
+        'alpha',
+        '--thinking',
+        'off',
+      );
+      const agent = config.piRuntime.agentDir;
+      await fs.writeFile(
+        path.join(agent, 'auth.json'),
+        JSON.stringify({
+          'model-fixture': { type: 'api_key', key: 'synthetic-only' },
+        }),
+      );
+      await fs.writeFile(
+        path.join(agent, 'settings.json'),
+        JSON.stringify({
+          cacheWarming: 'off',
+          retry: { enabled: false },
+          images: { autoResize: false },
+          compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 1024 },
+        }),
+      );
+    },
   });
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, create: true, stop: true }],
+  return {
+    ...f,
+    gate: path.join(f.dir, 'continue'),
+    settings: path.join(f.config.piRuntime.agentDir, 'settings.json'),
   };
-  // Let Pi register the fixture's native tool; the synthetic provider calls only it.
-  delete config.piRuntime.tools;
-  config.piArgs.push(
-    '--no-extensions',
-    '-e',
-    path.resolve('test/fixtures/model-provider.mjs'),
-    '--provider',
-    'model-fixture',
-    '--model',
-    'alpha',
-    '--thinking',
-    'off',
-  );
-  config.piRuntime.inheritEnv = ['PI_MODEL_GATE'];
-  process.env.PI_MODEL_GATE = gate;
-  await fs.mkdir(config.piRuntime.agentDir);
-  // Cold model restoration reads configured auth before the extension's async
-  // availability refresh; make the offline provider available at that boundary.
-  await fs.writeFile(
-    path.join(config.piRuntime.agentDir, 'auth.json'),
-    JSON.stringify({ 'model-fixture': { type: 'api_key', key: 'synthetic-only' } }),
-  );
-  const settings = path.join(config.piRuntime.agentDir, 'settings.json');
-  await fs.writeFile(
-    settings,
-    JSON.stringify({
-      cacheWarming: 'off',
-      compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 1024 },
-      retry: { enabled: false },
-      images: { autoResize: false },
-    }),
-  );
-  const configFile = path.join(dir, 'owner.json');
-  await fs.writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
-  bridge = await new Bridge(config, undefined, { configFile }).init();
-  const made = await savedSession(bridge),
-    id = made.session_id;
-  return { dir, cwd, gate, config, configFile, settings, bridge, id };
 }
 export async function idle(runtime) {
   await until(async () => {

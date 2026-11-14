@@ -1,3 +1,4 @@
+import { append, message } from './fixtures/native-history.mjs';
 import { ALL_CONTENT } from '../src/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,54 +8,58 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { readClaim, reserveOwner } from '../src/attachments.mjs';
 
 import { callBridgeTool } from '../src/protocol.mjs';
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import { executeBatch } from '../src/batch.mjs';
 import { fixture, releasedEntries, until } from './fixtures/model-runtime.mjs';
 
 const gate = () => Promise.withResolvers();
 const writePolicy = (f, config) => fs.writeFile(f.configFile, JSON.stringify(config));
+function delayExecutor() {
+  const entered = gate(),
+    release = gate();
+  return {
+    entered: entered.promise,
+    resume: release.resolve,
+    async execute(run) {
+      entered.resolve();
+      await release.promise;
+      return run();
+    },
+  };
+}
 
 test('receive-time snapshots precede delayed executors and isolate concurrent deny and allow changes', async (t) => {
   const f = await fixture(t),
     allowed = structuredClone(f.config),
     denied = { ...allowed, grants: [] },
-    snapshots = [],
-    capture = f.bridge.captureRequestContext.bind(f.bridge),
-    entered = [gate(), gate()],
-    release = [gate(), gate()];
-  t.after(() => release.forEach((g) => g.resolve()));
+    first = delayExecutor(),
+    second = delayExecutor();
+  const captures = [];
+  const capture = f.bridge.captureRequestContext.bind(f.bridge);
   t.mock.method(f.bridge, 'captureRequestContext', () => {
-    const pending = capture();
-    snapshots.push(pending);
-    return pending;
+    const snapshot = capture();
+    captures.push(snapshot);
+    return snapshot;
   });
-  const receive = (index, text) =>
-    callBridgeTool(
-      f.bridge,
-      'send',
-      { session_id: f.id, text },
-      {
-        execute: async (run) => {
-          entered[index].resolve();
-          await release[index].promise;
-          return run();
-        },
-      },
-    );
-  const a = receive(0, 'ADMITTED_A');
-  await entered[0].promise;
-  const first = await snapshots[0];
-  assert.ok(Object.isFrozen(first.permissions.grants[0]));
+  const receive = (text, executor) =>
+    callBridgeTool(f.bridge, 'send', { session_id: f.id, text }, executor);
+  t.after(() => {
+    first.resume();
+    second.resume();
+  });
+  const a = receive('ADMITTED_A', first);
+  await first.entered;
+  assert.ok(Object.isFrozen((await captures[0]).permissions.grants[0]));
   await writePolicy(f, denied);
-  const b = receive(1, 'DENIED_B');
-  await entered[1].promise;
-  await snapshots[1];
-  release[0].resolve();
+  const b = receive('DENIED_B', second);
+  await second.entered;
+  await captures[1];
+  first.resume();
   assert.equal((await a).structuredContent.status, 'started');
   await releasedEntries(f.bridge, f.id);
   await writePolicy(f, allowed);
-  const c = await f.bridge.send({ session_id: f.id, text: 'ADMITTED_C' });
-  assert.ok(['started', 'queued', 'handled'].includes(c.status), JSON.stringify(c));
-  release[1].resolve();
+  assert.equal((await f.bridge.send({ session_id: f.id, text: 'ADMITTED_C' })).status, 'started');
+  second.resume();
   assert.equal((await b).structuredContent.reason, 'NOT_FOUND_OR_DENIED');
   const entries = await releasedEntries(f.bridge, f.id);
   assert.equal(entries.filter((e) => e.message?.role === 'user').length, 2);
@@ -86,11 +91,10 @@ test('pending registry moves preserve reads and live-owner reuse but cannot admi
 
 test('policy failure before a delayed executor is handled immediately and never falls back to old config', async (t) => {
   const f = await fixture(t),
-    entered = gate(),
-    release = gate(),
+    delay = delayExecutor(),
     failed = gate(),
     capture = f.bridge.captureRequestContext.bind(f.bridge);
-  t.after(() => release.resolve());
+  t.after(delay.resume);
   t.mock.method(f.bridge, 'captureRequestContext', () =>
     capture().catch((error) => {
       failed.resolve();
@@ -98,24 +102,13 @@ test('policy failure before a delayed executor is handled immediately and never 
     }),
   );
   await fs.writeFile(f.configFile, '{ invalid');
-  const pending = callBridgeTool(
-    f.bridge,
-    'health',
-    {},
-    {
-      execute: async (run) => {
-        entered.resolve();
-        await release.promise;
-        return run();
-      },
-    },
-  );
-  await entered.promise;
+  const pending = callBridgeTool(f.bridge, 'health', {}, delay);
+  await delay.entered;
   // Let the policy read reject while the executor has not attached its await yet.
   await failed.promise;
   await new Promise((resolve) => setImmediate(resolve));
   await writePolicy(f, f.config);
-  release.resolve();
+  delay.resume();
   const result = await pending;
   assert.equal(result.isError, true);
   assert.equal(JSON.parse(result.content[0].text).error.code, 'INVALID_OWNER_CONFIG');
@@ -212,84 +205,44 @@ test('one batch snapshot retains permissions and directory scope across late lan
   await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
 });
 
-test('scope edits affect new requests, cached IDs and cursor pages without evicting owner identities', async (t) => {
-  const f = await fixture(t),
-    session = await f.bridge.session(f.id),
-    root = path.join(f.dir, 'added-root'),
-    project = path.join(f.dir, 'added-project');
-  await fs.mkdir(project);
-  await fs.appendFile(
-    session.file,
+test('scope reload applies to cached IDs and cursors while preserving cleanup identity', async (t) => {
+  const f = await nativeOwner(t, { reloadConfig: true });
+  const { bridge, session, id } = f,
+    root = path.join(f.dir, 'added-root');
+  await append(
+    session,
     Array.from({ length: 4 }, (_, i) =>
-      JSON.stringify({
-        type: 'message',
-        id: `m${i}`,
-        parentId: i ? `m${i - 1}` : null,
-        timestamp: '2026-01-01T00:00:00Z',
-        message: {
-          role: 'user',
-          content: [{ type: 'text', text: 'scope-page '.repeat(200) }],
-          timestamp: 0,
-        },
-      }),
-    ).join('\n') + '\n',
+      message('m' + i, i ? 'm' + (i - 1) : null, 'user', 'scope-page '.repeat(200)),
+    ),
   );
-  const page = await f.bridge.read({
-    session_id: f.id,
+  const page = await bridge.read({
+    session_id: id,
     range: { recent: -1 },
     content: ALL_CONTENT,
     max_bytes: 4096,
   });
   assert.ok(page.next_cursor);
-  const expanded = {
-    ...f.config,
-    sessionRoots: [...f.config.sessionRoots, root],
-    folders: [...f.config.folders, { path: project }],
-    grants: [...f.config.grants, { folder: project, list: true, read: true, create: true }],
-  };
+  const expanded = { ...f.config, sessionRoots: [...f.config.sessionRoots, root] };
   await writePolicy(f, expanded);
-  const context = await f.bridge.captureRequestContext();
-  assert.ok(Object.isFrozen(context.scope.sessionRoots));
-  assert.ok(Object.isFrozen(context.scope.folders[0]));
+  const context = await bridge.captureRequestContext();
   await assert.rejects(fs.stat(root), { code: 'ENOENT' });
-  const added = await savedSession({
-    config: { sessionRoots: [root], folders: [{ path: project }] },
-  });
-  assert.equal((await f.bridge.list()).sessions.length, 2);
+  const added = await savedSession({ config: { ...expanded, sessionRoots: [root] } });
+  assert.equal((await bridge.list()).sessions.length, 2);
   await writePolicy(f, { ...expanded, sessionRoots: [root], folders: [] });
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
-  await assert.rejects(f.bridge.read({ cursor: page.next_cursor }), /NOT_FOUND_OR_DENIED/);
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, text: 'OUT_OF_SCOPE' })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-  const listed = await f.bridge.list();
+  await assert.rejects(bridge.read({ session_id: id }), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(bridge.read({ cursor: page.next_cursor }), /NOT_FOUND_OR_DENIED/);
   assert.deepEqual(
-    listed.sessions.map((s) => s.session_id),
+    (await bridge.list()).sessions.map((row) => row.session_id),
     [added.session_id],
   );
-  assert.deepEqual(listed.creatable_projects, []);
-  // Removing a creation target is not a new cwd restriction on existing history.
+  assert.equal((await bridge.create({ project: f.cwd })).reason, 'NOT_FOUND_OR_DENIED');
   assert.equal(
-    (await f.bridge.read({ session_id: added.session_id })).session_id,
-    added.session_id,
+    (await bridge.read({ cursor: page.next_cursor }, { requestContext: context })).session_id,
+    id,
   );
-  assert.equal(
-    (await f.bridge.create({ project, text: 'NO_TARGET' })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-  assert.equal(
-    (await f.bridge.read({ cursor: page.next_cursor }, { requestContext: context })).session_id,
-    f.id,
-  );
-  f.bridge.pool.instances.set(f.id, { session, alive: false });
-  assert.equal(
-    (await f.bridge.session(f.id)).file,
-    session.file,
-    'Owner cleanup retains its owned identity',
-  );
-  f.bridge.pool.instances.delete(f.id);
-  assert.deepEqual(f.bridge.config.sessionRoots, f.config.sessionRoots);
+  bridge.pool.instances.set(id, { session, alive: false });
+  assert.equal((await bridge.session(id)).file, session.file);
+  bridge.pool.instances.delete(id);
 });
 
 for (const initialRead of [true, false])

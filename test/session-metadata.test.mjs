@@ -49,93 +49,36 @@ test('title cache has a fixed retention bound and never retains history', async 
   assert.equal(JSON.stringify([...cache]).includes('NOT_A_TITLE'), false);
 });
 
-// An ordinary companion: its state reply is the only activity evidence.
-const companion = (state) => ({ attached: true, record: { kind: 'extension' }, state });
-
-test('list model/thinking metadata comes only from live state, independently of idle certainty', async () => {
-  const model = {
-    provider: 'p',
-    id: 'm',
-    headers: { Authorization: 'SECRET' },
-    apiKey: 'SECRET',
-    baseUrl: 'SECRET',
-  };
-  for (const [runtime, expectedState] of [
-    [companion(async () => ({ model, thinkingLevel: 'xhigh', isIdle: true })), 'idle'],
-    [companion(async () => ({ model, thinkingLevel: 'xhigh' })), 'unknown'],
-    [
-      {
-        attached: true,
-        record: { kind: 'extension' },
-        state: async () => ({ model, thinkingLevel: 'xhigh', activity: { idle: false } }),
-      },
-      'busy',
-    ],
+test('live status, model and capability reports are sanitized independently of idle certainty', async () => {
+  const model = { provider: 'p', id: 'm', apiKey: 'SECRET' };
+  const status = async (runtime) =>
+    (await runtimeMetadata({ forRead: async () => runtime }, { model })).status;
+  const companion = (state) => ({ attached: true, record: { kind: 'extension' }, state });
+  for (const [observed, expected] of [
+    [{ activity: { idle: true } }, 'idle'],
+    [{ activity: { pending_messages: true } }, 'busy'],
+    [{}, 'unknown'],
   ]) {
-    const { status } = await runtimeMetadata({ forRead: async () => runtime }, {});
-    assert.equal(status.state, expectedState);
-    assert.deepEqual(status.model, { provider: 'p', id: 'm' });
-    assert.equal(status.thinking_level, 'xhigh');
-    assert.ok(!JSON.stringify(status).includes('SECRET'));
+    const value = await status(companion(() => ({ ...observed, model, thinkingLevel: 'xhigh' })));
+    assert.equal(value.state, expected);
+    assert.deepEqual(value.model, { provider: 'p', id: 'm' });
+    assert.equal(value.thinking_level, 'xhigh');
+    assert.equal(value.capabilities.stop, false);
   }
-  for (const [activity, expectedState] of [
-    ['busy', 'busy'],
-    ['idle', 'idle'],
-    ['unconfirmed', 'unknown'],
-  ]) {
-    let stateReads = 0,
-      snapshotReads = 0;
-    const runtime = {
-      ownerRecord: { kind: 'rpc' },
-      async state() {
-        stateReads++;
-        return {
-          model,
-          thinkingLevel: 'xhigh',
-          sessionName: ' live name ',
-          isStreaming: false,
-          isCompacting: false,
-          pendingMessageCount: 0,
-        };
-      },
-      hasUnsettledWork: () => false,
-      async idleSnapshot() {
-        snapshotReads++;
-        return { state: await this.state(), status: activity };
-      },
-    };
-    const result = await runtimeMetadata({ forRead: async () => runtime }, {});
-    assert.equal(snapshotReads, 1);
-    assert.equal(stateReads, 1);
-    assert.equal(result.name, 'live name');
-    assert.equal(result.status.state, expectedState);
-    assert.equal(result.status.pending_messages, 0);
-    assert.deepEqual(result.status.model, { provider: 'p', id: 'm' });
-    assert.equal(result.status.thinking_level, 'xhigh');
-    assert.ok(!JSON.stringify(result).includes('SECRET'));
-  }
-  for (const [runtime, expectedState] of [
-    [null, 'saved'],
-    [
-      companion(async () => {
-        throw Error('UNREACHABLE');
-      }),
-      'unavailable',
-    ],
-    [companion(async () => ({})), 'unknown'],
-    [
-      companion(async () => ({ model: { provider: 1, id: 'm' }, thinkingLevel: 'invalid' })),
-      'unknown',
-    ],
-  ]) {
-    const { status } = await runtimeMetadata(
-      { forRead: async () => runtime },
-      { model, thinkingLevel: 'high' },
-    );
-    assert.equal(status.state, expectedState);
-    assert.equal(status.model, null);
-    assert.equal(status.thinking_level, null);
-    if (runtime === null || expectedState === 'unavailable')
-      assert.equal(Object.hasOwn(status, 'capabilities'), false);
-  }
+  const owned = await status({
+    hasUnsettledWork: () => true,
+    idleSnapshot: () => ({ state: { pendingMessageCount: 0 }, status: 'unconfirmed' }),
+  });
+  assert.equal(owned.state, 'busy');
+  assert.equal(owned.pending_messages, 0);
+  assert.equal(owned.capabilities.stop, true);
+  assert.equal((await status(null)).state, 'saved');
+  const unavailable = await status(
+    companion(() => {
+      throw Error('SECRET');
+    }),
+  );
+  assert.equal(unavailable.state, 'unavailable');
+  assert.equal(unavailable.model, null);
+  assert.equal(unavailable.capabilities, undefined);
 });

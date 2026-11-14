@@ -23,15 +23,14 @@ import {
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import joinExtension from '../src/join-extension.mjs';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-async function exists(file) {
-  try {
-    await fs.stat(file);
-    return true;
-  } catch (e) {
-    if (e.code === 'ENOENT') return false;
-    throw e;
-  }
-}
+const exists = (file) =>
+  fs.stat(file).then(
+    () => true,
+    (error) => {
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    },
+  );
 async function fixture(t, source = '') {
   const f = await nativeOwner(t, {
     prefix: 'idle',
@@ -49,8 +48,32 @@ async function fixture(t, source = '') {
     },
   });
 }
-function transfer(f, options) {
-  return ownerRequest(f.config, f.request, options);
+const transfer = (f, options) => ownerRequest(f.config, f.request, options);
+const cancel = (f) => ownerRequest(f.config, { ...f.request, op: 'handoff_cancel' });
+
+function join(f, switchSession, notify = () => {}) {
+  let command, cancel;
+  joinExtension(
+    {
+      on: () => {},
+      registerShortcut: (_, value) => {
+        cancel = value.handler;
+      },
+      registerCommand: (_, value) => {
+        command = value.handler;
+      },
+    },
+    { file: f.configFile, dir: f.config.attachmentDir },
+  );
+  const ctx = {
+    mode: 'tui',
+    hasUI: true,
+    isIdle: () => true,
+    hasPendingMessages: () => false,
+    ui: { notify },
+    switchSession,
+  };
+  return { start: () => command(f.id, ctx), cancel: () => cancel(ctx) };
 }
 
 test(
@@ -71,16 +94,14 @@ test(
       return value;
     });
     let completed = false;
-    const handoff = f.bridge.handoffForLocal(f.request, { signal: controller.signal }).then(
-      () => {
+    const handoff = assert
+      .rejects(
+        f.bridge.handoffForLocal(f.request, { signal: controller.signal }),
+        /HANDOFF_CANCELLED/,
+      )
+      .finally(() => {
         completed = true;
-        return null;
-      },
-      (error) => {
-        completed = true;
-        return error;
-      },
-    );
+      });
     await until(() => exists(path.join(f.dir, 'shutdown')));
     assert.equal(controller.signal.aborted, true);
     assert.equal(rpc.exitSeal, 'sealed');
@@ -88,15 +109,11 @@ test(
     assert.equal(completed, false);
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).kind, 'rpc');
     await f.mark('shutdown-go');
-    assert.match((await handoff).message, /HANDOFF_CANCELLED/);
-    assert.equal(rpc.exited, true);
+    await handoff;
     assert.equal(rpc.child.exitCode, 0);
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
   },
 );
-async function cancel(f) {
-  return ownerRequest(f.config, { ...f.request, op: 'handoff_cancel' });
-}
 
 for (const stage of ['running', 'busy_handoff', 'handoff_eof', 'release_eof'])
   test(`delete ends the session during ${stage}`, { timeout: 15000 }, async (t) => {
@@ -226,11 +243,7 @@ test(
 
 for (const action of ['cancel', 'delete'])
   test(`${action} during reservation validation never starts native switching or terminates the requester`, async (t) => {
-    const f = await fixture(t),
-      priorConfig = process.env.PI_MCP_OWNER_CONFIG,
-      priorDir = process.env.PI_MCP_ATTACH_DIR;
-    process.env.PI_MCP_OWNER_CONFIG = f.configFile;
-    process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
+    const f = await fixture(t);
     const entered = Promise.withResolvers(),
       release = Promise.withResolvers(),
       open = fs.open,
@@ -253,33 +266,19 @@ for (const action of ['cancel', 'delete'])
       }
       return open.call(this, target, ...args);
     });
-    const commands = {},
-      shortcuts = {};
-    const ctx = {
-      mode: 'tui',
-      hasUI: true,
-      isIdle: () => true,
-      hasPendingMessages: () => false,
-      ui: { notify: () => {} },
-      switchSession: async () => {
-        switches++;
-        return { cancelled: true };
-      },
-    };
+    const local = join(f, async () => {
+      switches++;
+      return { cancelled: true };
+    });
     try {
-      joinExtension({
-        on: () => {},
-        registerShortcut: (name, value) => (shortcuts[name] = value.handler),
-        registerCommand: (name, value) => (commands[name] = value.handler),
-      });
-      const joined = commands['bridge-join'](f.id, ctx);
+      const joined = local.start();
       await entered.promise;
       if (action === 'delete') {
         const deleted = await f.bridge.delete({ session_id: f.id });
         assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
         assert.equal(await ownerAlive(f.request.requester), true);
         await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
-      } else await shortcuts['ctrl+alt+j'](ctx);
+      } else await local.cancel();
       release.resolve();
       await joined;
       assert.equal(switches, 0);
@@ -287,58 +286,30 @@ for (const action of ['cancel', 'delete'])
     } finally {
       release.resolve();
       t.mock.restoreAll();
-      if (priorConfig === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
-      else process.env.PI_MCP_OWNER_CONFIG = priorConfig;
-      if (priorDir === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-      else process.env.PI_MCP_ATTACH_DIR = priorDir;
     }
   });
 
 test('an uncertain native switch exception retains its live reservation instead of allowing a second writer', async (t) => {
   const f = await fixture(t),
-    priorConfig = process.env.PI_MCP_OWNER_CONFIG,
-    priorDir = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_OWNER_CONFIG = f.configFile;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const commands = {},
     notices = [];
-  try {
-    joinExtension({
-      on: () => {},
-      registerShortcut: () => {},
-      registerCommand: (name, value) => (commands[name] = value.handler),
-    });
-    await commands['bridge-join'](f.id, {
-      mode: 'tui',
-      hasUI: true,
-      isIdle: () => true,
-      hasPendingMessages: () => false,
-      ui: { notify: (text) => notices.push(text) },
-      switchSession: async () => {
-        throw new Error('fixture failure after target open');
-      },
-    });
-    const held = await readClaim(f.config.attachmentDir, f.session);
-    assert.equal(held.kind, 'handoff');
-    assert.equal(held.phase, 'opening');
-    assert.equal(held.owner.pid, process.pid);
-    assert.equal(held.noColdReacquire, undefined);
-    assert.ok(notices.some((x) => x.includes('reservation is retained')));
-    await assert.rejects(
-      reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
-      /LIVE_OWNER_UNREACHABLE/,
-    );
-    await ownerRequest(f.config, {
-      ...f.request,
-      op: 'handoff_cancel',
-      handoff_id: held.handoffId,
-    });
-  } finally {
-    if (priorConfig === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
-    else process.env.PI_MCP_OWNER_CONFIG = priorConfig;
-    if (priorDir === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = priorDir;
-  }
+  await join(
+    f,
+    async () => {
+      throw new Error('fixture failure after target open');
+    },
+    (text) => notices.push(text),
+  ).start();
+  const held = await readClaim(f.config.attachmentDir, f.session);
+  assert.equal(held.kind, 'handoff');
+  assert.equal(held.phase, 'opening');
+  assert.equal(held.owner.pid, process.pid);
+  assert.ok(notices.some((x) => x.includes('reservation is retained')));
+  await assert.rejects(
+    reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
+    /LIVE_OWNER_UNREACHABLE/,
+  );
+  f.request.handoff_id = held.handoffId;
+  await cancel(f);
 });
 
 test(

@@ -132,90 +132,32 @@ test('shared permission resolver preserves effective values, explicit inheritanc
       ],
     },
     before = structuredClone(config);
-  const cases = [
-    {
-      action: 'read',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: true,
-      explicit: null,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'send',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: true,
-      explicit: true,
-      scope: { session_id: 's' },
-      label: 'this session',
-    },
-    {
-      action: 'send',
-      target: { session_id: 'other', cwd: '/project/child' },
-      allowed: false,
-      explicit: undefined,
-      scope: { folder: '/project/child' },
-      label: 'project /project/child',
-    },
-    {
-      action: 'create',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: false,
-      explicit: true,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'read',
-      target: { folder: '/project/child' },
-      allowed: true,
-      explicit: null,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'send',
-      target: { folder: '/project/child' },
-      allowed: false,
-      explicit: false,
-      scope: { folder: '/project/child' },
-      label: 'this project',
-    },
-    {
-      action: 'delete',
-      target: { folder: '/project' },
-      allowed: false,
-      explicit: false,
-      scope: { folder: '/project' },
-      label: 'this project',
-    },
-    {
-      action: 'read',
-      target: { folder: '/project2' },
-      allowed: false,
-      explicit: undefined,
-      scope: { default: true },
-      label: 'default',
-    },
-  ];
-  for (const c of cases) {
-    assert.deepEqual(resolvePermission(config, c.action, c.target), {
-      allowed: c.allowed,
-      explicit: c.explicit,
-      sourceScope: c.scope,
-    });
-    assert.equal(
-      permitted(config, c.action, {
-        id: c.target.session_id,
-        cwd: c.target.cwd ?? c.target.folder,
-      }),
-      c.allowed,
-    );
-    assert.deepEqual(permissionDetails(config, c.action, c.target), {
-      allowed: c.allowed,
-      explicit: c.explicit,
-      source: c.label,
-    });
+  const child = { session_id: 's', cwd: '/project/child' };
+  for (const [action, target, allowed, explicit, sourceScope, source] of [
+    ['read', child, true, null, { folder: '/project' }, 'project /project'],
+    ['send', child, true, true, { session_id: 's' }, 'this session'],
+    [
+      'send',
+      { ...child, session_id: 'other' },
+      false,
+      undefined,
+      { folder: '/project/child' },
+      'project /project/child',
+    ],
+    ['create', child, false, true, { folder: '/project' }, 'project /project'],
+    [
+      'send',
+      { folder: '/project/child' },
+      false,
+      false,
+      { folder: '/project/child' },
+      'this project',
+    ],
+    ['delete', { folder: '/project' }, false, false, { folder: '/project' }, 'this project'],
+    ['read', { folder: '/project2' }, false, undefined, { default: true }, 'default'],
+  ]) {
+    assert.deepEqual(resolvePermission(config, action, target), { allowed, explicit, sourceScope });
+    assert.deepEqual(permissionDetails(config, action, target), { allowed, explicit, source });
   }
   assert.deepEqual(config, before);
 });

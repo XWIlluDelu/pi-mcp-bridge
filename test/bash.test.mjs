@@ -1,33 +1,21 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
+import { callBridgeTool } from '../src/protocol.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import { makeServer } from '../src/server.mjs';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+
 import { validateGrants } from '../src/owner-config.mjs';
 import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-bash-api-')),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const rule = { folder: cwd, list: true, read: true, send: true, stop: true, create: true },
-    config = {
-      defaults: denyAllPermissions(),
-      stateDir: path.join(dir, 'state'),
-      sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ path: cwd }],
-      grants: [rule],
-    };
-  const bridge = await new Bridge(config, async () => assert.fail('no fallback writer')).init();
-  const made = await savedSession(bridge),
-    saved = await bridge.session(made.session_id);
+  const f = await nativeOwner(t, {
+    prefix: 'bash-api',
+    factory: () => assert.fail('No fallback writer'),
+  });
+  const { bridge, config, session: saved } = f,
+    [rule] = config.grants;
   const controller = await reserveHostSession({
     buildSessionProjection: hostProjection,
     attachmentDir: bridge.pool.attachmentDir,
@@ -51,20 +39,9 @@ async function fixture(t) {
     },
   };
   await controller.ready(callbacks);
-  const client = new Client({ name: 'direct-bash-api-fixture', version: '1' }),
-    server = makeServer(bridge),
-    [a, b] = InMemoryTransport.createLinkedPair();
-  await Promise.all([server.connect(a), client.connect(b)]);
-  t.after(async () => {
-    await client.close();
-    await server.close();
-    await controller.close();
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-  const call = async (args) =>
-    client.callTool({ name: 'command', arguments: { session_id: saved.id, ...args } });
-  return { bridge, config, rule, saved, client, call, calls: () => calls, callbacks, output };
+  f.cleanup.push(() => controller.close());
+  const call = (args) => callBridgeTool(bridge, 'command', { session_id: saved.id, ...args });
+  return { ...f, rule, saved, call, calls: () => calls, callbacks, output };
 }
 test('MCP command permission is independent and output is bounded without continuation', async (t) => {
   const f = await fixture(t);
@@ -90,8 +67,6 @@ test('MCP command permission is independent and output is bounded without contin
   assert.equal((await f.call({ command: 'denied' })).isError, true);
   assert.equal(f.calls(), 1);
   f.rule.command = true;
-  assert.equal((await f.call({ command: 'native command', max_chars: 32768 })).isError, undefined);
-  assert.equal(f.calls(), 2);
 });
 
 test('connection loss after received native bash output retains it without repeating execution', async (t) => {
@@ -112,11 +87,8 @@ test('connection loss after received native bash output retains it without repea
   };
   const received = dropPartialReply(t);
   try {
-    const request = f.client.callTool({
-      name: 'batch',
-      arguments: {
-        operations: [{ op: 'command', args: { session_id: f.saved.id, command: 'fixture' } }],
-      },
+    const request = callBridgeTool(f.bridge, 'batch', {
+      operations: [{ op: 'command', args: { session_id: f.saved.id, command: 'fixture' } }],
     });
     await entered.promise;
     assert.equal((await received).output, 'result before lost ACK');

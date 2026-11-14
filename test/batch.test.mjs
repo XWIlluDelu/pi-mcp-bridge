@@ -32,6 +32,7 @@ test('batch is a transparent wrapper with per-item validation and original-order
       { op: 'read', args: { session_id: 'denied' } },
       null,
       { op: 'batch', args: {} },
+      ...['constructor', '__proto__', 'toString'].map((op) => ({ op, args: {} })),
       { op: 'health', args: {} },
       send('a', 'two'),
     ],
@@ -39,12 +40,12 @@ test('batch is a transparent wrapper with per-item validation and original-order
   assert.deepEqual(calls, ['one', 'two']);
   assert.deepEqual(
     result.results.map((x) => x.index),
-    [0, 1, 2, 3, 4, 5],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8],
   );
   assert.equal(result.results[1].error.code, 'NOT_FOUND_OR_DENIED');
-  assert.equal(result.results[2].error.code, 'INVALID_OPERATION');
-  assert.equal(result.results[3].error.code, 'INVALID_OPERATION');
-  assert.equal(result.results[4].result.ok, true);
+  for (const invalid of result.results.slice(2, 7))
+    assert.equal(invalid.error.code, 'INVALID_OPERATION');
+  assert.equal(result.results[7].result.ok, true);
 });
 
 test('different sessions progress independently while each session retains input order', async () => {

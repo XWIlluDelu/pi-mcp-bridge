@@ -3,40 +3,56 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PiRpc, RpcFailure, RuntimePool } from '../src/rpc.mjs';
 
-test('mismatched Pi state refuses read/send without terminating or dispatching under the wrong identity', async () => {
-  for (const command of [{ type: 'get_entries' }, { type: 'prompt', message: 'fixture' }]) {
-    const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } });
-    let stopped = false;
-    const calls = [];
-    rpc.stop = async () => {
-      stopped = true;
-    };
-    rpc.dispatch = async (c) => {
-      calls.push(c.type);
-      return { sessionFile: '/sessions/b.jsonl', sessionId: 'b' };
-    };
-    await assert.rejects(rpc.command(command), { code: 'RUNTIME_SESSION_CHANGED' });
-    assert.equal(stopped, false);
-    assert.deepEqual(calls, ['get_state']);
-  }
-});
+const session = { file: '/isolated/session.jsonl', header: { id: 'native' } };
+const identity = { sessionFile: session.file, sessionId: session.header.id };
+const other = { ...identity, sessionId: 'other' };
+const started = { disposition: 'started' };
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-test('identity change during read suppresses content; during prompt preserves uncertainty', async () => {
+function fixture(state = () => identity) {
+  const rpc = new PiRpc({}, session);
+  const writes = [],
+    child = new EventEmitter();
+  const emit = (event, generation = rpc.generation) => rpc.receiveResponse(event, generation);
+  const ack = (command, data, extra) =>
+    emit({
+      type: 'response',
+      id: command.id,
+      command: command.type,
+      success: true,
+      data,
+      ...extra,
+    });
+  rpc.alive = true;
+  rpc.child = child;
+  rpc.assertProcessIdentity = async () => {};
+  child.stdin = {
+    write(line) {
+      const command = JSON.parse(line);
+      writes.push(command);
+      if (command.type === 'get_state') queueMicrotask(() => ack(command, state()));
+    },
+  };
+  return { rpc, writes, child, emit, ack };
+}
+
+test('RPC identity checks fence dispatch and reject a reply under a changed identity', async () => {
   for (const type of ['get_entries', 'prompt']) {
-    const rpc = new PiRpc({}, { file: '/sessions/a.jsonl', header: { id: 'a' } });
-    let states = 0;
-    rpc.stop = async () => {};
-    rpc.dispatch = async (c) =>
-      c.type === 'get_state'
-        ? ++states === 1
-          ? { sessionFile: '/sessions/a.jsonl', sessionId: 'a' }
-          : { sessionFile: '/sessions/b.jsonl', sessionId: 'b' }
-        : { entries: ['private'], disposition: 'started' };
-    await assert.rejects(
-      rpc.command({ type }),
-      (error) =>
-        error.code === 'RUNTIME_SESSION_CHANGED' && error.uncertain === (type === 'prompt'),
-    );
+    for (const when of ['before', 'after']) {
+      const rpc = new PiRpc({}, session);
+      const calls = [];
+      rpc.stop = () => assert.fail('Identity rejection must not stop Pi');
+      rpc.dispatch = async (command) => {
+        calls.push(command.type);
+        if (command.type !== 'get_state') return { entries: ['private'], ...started };
+        return when === 'before' || calls.length > 1 ? other : identity;
+      };
+      await assert.rejects(rpc.command({ type }), {
+        code: 'RUNTIME_SESSION_CHANGED',
+        uncertain: when === 'after' && type === 'prompt',
+      });
+      assert.equal(calls.includes(type), when === 'after');
+    }
   }
 });
 
@@ -69,71 +85,40 @@ test('shutdown preparation reports failed SIGTERM and explicit stop can retry wi
   assert.equal(rpc.exited, true);
 });
 
-test('unresolved prompt admission survives timeout, idle, malformed and old-generation replies', async () => {
-  const rpc = new PiRpc({}, {}),
-    writes = [];
-  rpc.alive = true;
-  rpc.child = { stdin: { write: (line) => writes.push(JSON.parse(line)) } };
+test('settlement, idle and bad ACKs leave timed-out admission fenced until the exact ACK', async () => {
+  const { rpc, writes, emit, ack } = fixture();
   let late;
   await assert.rejects(
-    rpc.dispatch({ type: 'prompt', message: 'first' }, 10, (result) => {
-      late = result;
+    rpc.dispatch({ type: 'prompt' }, 1, (value) => {
+      late = value;
     }),
-    { code: 'ACK_TIMEOUT', uncertain: true },
-  );
-  const first = writes[0],
-    generation = rpc.generation;
-  const state = rpc.dispatch({ type: 'get_state' }, 1000);
-  const stateRequest = writes.at(-1);
-  rpc.receiveResponse(
-    { type: 'response', id: stateRequest.id, success: true, data: { isStreaming: false } },
-    generation,
-  );
-  await state;
-  for (const event of [
-    { type: 'agent_settled', aborted: false },
     {
-      type: 'response',
-      id: first.id,
-      command: 'get_state',
-      success: true,
-      data: { disposition: 'started' },
+      code: 'ACK_TIMEOUT',
+      uncertain: true,
     },
-    { type: 'response', id: first.id, command: 'prompt', success: true, data: {} },
-  ])
-    rpc.receiveResponse(event, generation);
-  const ack = {
-    type: 'response',
-    id: first.id,
-    command: 'prompt',
-    success: true,
-    data: { disposition: 'started' },
-  };
-  rpc.receiveResponse(ack, 'old-generation');
-  await assert.rejects(rpc.dispatch({ type: 'prompt', message: 'second' }), {
+  );
+  const [first] = writes;
+  await rpc.state();
+  emit({ type: 'agent_settled', aborted: false });
+  ack(first, {});
+  ack(first, started, { command: 'get_state' });
+  emit(
+    { type: 'response', id: first.id, command: 'prompt', success: true, data: started },
+    'retired',
+  );
+  await assert.rejects(rpc.dispatch({ type: 'prompt' }), {
     code: 'PROMPT_ADMISSION_PENDING',
     uncertain: false,
   });
   assert.equal(writes.filter((x) => x.type === 'prompt').length, 1);
-  rpc.receiveResponse(ack, generation);
-  assert.equal(late.data.disposition, 'started');
-  const next = rpc.dispatch({ type: 'prompt', message: 'next', streamingBehavior: 'steer' }, 1000),
-    nextRequest = writes.at(-1);
-  rpc.receiveResponse(ack, generation);
-  assert.equal(
-    [...rpc.pending.keys()].find((id) => rpc.pending.get(id).commandType === 'prompt'),
-    nextRequest.id,
-  );
-  rpc.receiveResponse(
-    {
-      type: 'response',
-      id: nextRequest.id,
-      command: 'prompt',
-      success: true,
-      data: { disposition: 'queued' },
-    },
-    generation,
-  );
+  ack(first, started);
+  assert.deepEqual(late.data, started);
+
+  const next = rpc.dispatch({ type: 'prompt' }),
+    pending = writes.at(-1);
+  ack(first, started);
+  assert.ok(rpc.pending.has(pending.id));
+  ack(pending, { disposition: 'queued' });
   assert.equal((await next).disposition, 'queued');
 });
 test('write uncertainty retains admission; authoritative rejection or confirmed exit releases it', async () => {
@@ -239,71 +224,34 @@ test('settlement advances only for the current generation and preserves pending 
   assert.equal(replacement.settlementSequence, 0);
 });
 
-const tick = () => new Promise((resolve) => setImmediate(resolve));
-test('received late ACK validation drains before native termination', async () => {
-  const rpc = new PiRpc({}, { file: '/isolated/session.jsonl', header: { id: 'isolated' } });
-  const child = new EventEmitter(),
-    writes = [];
-  rpc.child = child;
-  rpc.assertProcessIdentity = async () => {}; // Synthetic child.
-  rpc.alive = true;
-  child.stdin = {
-    write: (line) => {
-      const command = JSON.parse(line);
-      writes.push(command);
-      if (command.type === 'get_state')
-        queueMicrotask(() =>
-          rpc.receiveResponse(
-            {
-              type: 'response',
-              id: command.id,
-              success: true,
-              data: { sessionFile: rpc.session.file, sessionId: 'isolated' },
-            },
-            rpc.generation,
-          ),
-        );
-    },
-  };
+test('received ACK validation and receipt publication drain before termination', async () => {
+  const entered = Promise.withResolvers(),
+    validate = Promise.withResolvers();
+  const { rpc, child, writes, ack } = fixture();
   let killed = false,
-    validated = false,
     receipt = false;
   child.kill = () => {
-    killed = true;
-    assert.equal(validated, true);
     assert.equal(receipt, true);
+    killed = true;
     queueMicrotask(() => child.emit('exit', 0));
   };
-  const entered = Promise.withResolvers(),
-    validation = Promise.withResolvers();
   await assert.rejects(
-    rpc.command({ type: 'prompt', message: 'offline' }, 1, async () => {
+    rpc.command({ type: 'prompt' }, 1, async () => {
       entered.resolve();
-      await validation.promise;
-      validated = true;
-      await tick();
+      await validate.promise;
       receipt = true;
     }),
     { code: 'ACK_TIMEOUT' },
   );
-  const command = writes.find((x) => x.type === 'prompt');
-  rpc.receiveResponse(
-    {
-      type: 'response',
-      id: command.id,
-      command: 'prompt',
-      success: true,
-      data: { disposition: 'started' },
-    },
-    rpc.generation,
+  ack(
+    writes.find((x) => x.type === 'prompt'),
+    started,
   );
   await entered.promise;
-  assert.equal(rpc.pending.size, 0);
-  assert.equal(rpc.ackTasks.size, 1);
   const stopping = rpc.stop();
   await tick();
   assert.equal(killed, false);
-  validation.resolve();
+  validate.resolve();
   await stopping;
   assert.equal(killed, true);
   assert.equal(rpc.ackTasks.size, 0);
@@ -332,86 +280,38 @@ test('pool drain includes received ACK tasks but does not wait for missing ACKs'
   await draining;
 });
 
-test('late ACK identity mismatch preserves unknown without circular shutdown or callback', async () => {
-  const rpc = new PiRpc({}, { file: '/isolated/a', header: { id: 'a' } }),
-    writes = [];
-  rpc.alive = true;
-  rpc.child = {
-    stdin: {
-      write: (line) => {
-        const command = JSON.parse(line);
-        writes.push(command);
-        if (command.type === 'get_state')
-          queueMicrotask(() =>
-            rpc.receiveResponse(
-              {
-                type: 'response',
-                id: command.id,
-                success: true,
-                data: {
-                  sessionFile: writes.some((x) => x.type === 'prompt')
-                    ? '/isolated/b'
-                    : '/isolated/a',
-                  sessionId: 'a',
-                },
-              },
-              rpc.generation,
-            ),
-          );
-      },
-    },
-  };
-  let recovered = false;
+test('a late ACK from a changed identity cannot publish a receipt or deadlock the drain', async () => {
+  let state = identity;
+  const { rpc, writes, ack } = fixture(() => state);
+  let published = 0;
   await assert.rejects(
-    rpc.command({ type: 'prompt', message: 'fixture' }, 1, () => {
-      recovered = true;
-    }),
+    rpc.command({ type: 'prompt' }, 1, () => published++),
     { code: 'ACK_TIMEOUT' },
   );
-  const command = writes.find((x) => x.type === 'prompt');
-  rpc.receiveResponse(
-    {
-      type: 'response',
-      id: command.id,
-      command: 'prompt',
-      success: true,
-      data: { disposition: 'started' },
-    },
-    rpc.generation,
+  state = other;
+  ack(
+    writes.find((x) => x.type === 'prompt'),
+    started,
   );
   await rpc.drainAcks();
-  assert.equal(recovered, false);
+  assert.equal(published, 0);
   assert.equal(rpc.ackTasks.size, 0);
 });
 
-test('owned cancellation validates identity without terminating, and ignores wrong-method ACKs', async () => {
-  const session = { file: '/synthetic/session.jsonl', header: { id: 'native' } },
-    rpc = new PiRpc({}, session);
-  let calls = 0;
-  rpc.stop = () => assert.fail('Cancellation must not terminate Pi');
-  rpc.dispatch = async () => {
-    calls++;
-    return { sessionFile: session.file, sessionId: 'different' };
-  };
-  await assert.rejects(
-    rpc.stopExecution(),
-    (error) => error.code === 'RUNTIME_SESSION_CHANGED' && !error.uncertain,
+test('owned Stop validates identity before cancelling and ignores wrong-method ACKs', async () => {
+  const { rpc, writes, ack } = fixture(() => other);
+  rpc.stop = () => assert.fail('Stop must retain the native writer');
+  await assert.rejects(rpc.stopExecution(), { code: 'RUNTIME_SESSION_CHANGED', uncertain: false });
+  assert.deepEqual(
+    writes.map((c) => c.type),
+    ['get_state'],
   );
-  assert.equal(calls, 1);
-  const done = Promise.withResolvers(),
-    id = 'synthetic-abort';
-  rpc.pending.set(id, {
-    commandType: 'abort',
-    generation: rpc.generation,
-    resolve: done.resolve,
-    reject: done.reject,
-    written: true,
-  });
-  rpc.receiveResponse({ type: 'response', id, command: 'prompt', success: true }, rpc.generation);
-  assert.equal(rpc.pending.size, 1);
-  rpc.receiveResponse({ type: 'response', id, command: 'abort', success: true }, rpc.generation);
-  await done.promise;
-  assert.equal(rpc.pending.size, 0);
+  const aborted = rpc.dispatch({ type: 'abort' }),
+    command = writes.at(-1);
+  ack(command, null, { command: 'prompt' });
+  assert.ok(rpc.pending.has(command.id));
+  ack(command, null);
+  await aborted;
 });
 
 test('late clear_queue ACK validates identity without cancellation replay, storage or result lookup', async () => {

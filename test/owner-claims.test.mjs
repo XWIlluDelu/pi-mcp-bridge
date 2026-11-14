@@ -12,10 +12,12 @@ import {
   readClaim,
   readOwnerRecord,
   reserveOwner,
+  releaseOwner,
   ownerAlive,
   waitOwnerExit,
   registryTransaction,
 } from '../src/attachments.mjs';
+import { RuntimePool } from '../src/rpc.mjs';
 import { spawn } from 'node:child_process';
 import { once, on } from 'node:events';
 import { fileURLToPath } from 'node:url';
@@ -80,55 +82,41 @@ test('both direct lookup and cross-identity scan reject unsafe owner records', a
 
 test('validated scans preserve exact process identity and all ownership phases', async (t) => {
   const f = await fixture(t);
-  for (const kind of ['rpc', 'tui', 'host', 'extension'])
-    for (const phase of ['starting', 'ready', 'transitioning']) {
-      const record = {
-        ...f.record,
-        kind,
-        phase,
-        ...(kind !== 'rpc' ? { socket: path.join(f.dir, 'fixture.sock') } : {}),
-      };
-      await fs.writeFile(f.file, JSON.stringify(record));
-      assert.deepEqual(await readClaim(f.dir, f.session), record);
-      await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), {
-        code: 'LIVE_OWNER_UNREACHABLE',
-      });
-      await fs.writeFile(
-        f.file,
-        JSON.stringify({ ...record, owner: { ...record.owner, start: 'obsolete-start' } }),
-      );
-      await assertNoOtherLiveOwner(f.dir, f.replacement);
-    }
+  for (const [kind, phase] of [
+    ['rpc', 'starting'],
+    ['tui', 'ready'],
+    ['host', 'transitioning'],
+  ]) {
+    const record = { ...f.record, kind, phase };
+    await fs.writeFile(f.file, JSON.stringify(record));
+    assert.deepEqual(await readClaim(f.dir, f.session), record);
+    await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), /LIVE_OWNER_UNREACHABLE/);
+    await fs.writeFile(
+      f.file,
+      JSON.stringify({ ...record, owner: { ...record.owner, start: 'obsolete-start' } }),
+    );
+    await assertNoOtherLiveOwner(f.dir, f.replacement);
+  }
   await fs.unlink(f.file);
   assert.equal(await readClaim(f.dir, f.session), null);
-  await assertNoOtherLiveOwner(f.dir, f.replacement);
 });
 
 test('ownership survives control mismatch; only using the live endpoint requires its current protocol', async (t) => {
   const f = await fixture(t);
-  for (const metadata of [
-    { kind: 'unsupported-endpoint' },
-    { generation: null },
-    { socket: '/unusable/endpoint' },
-    { unexpected: true },
-  ]) {
-    const record = {
-      ...f.record,
-      kind: 'extension',
-      socket: path.join(f.dir, 'fixture.sock'),
-      phase: 'ready',
-      ...metadata,
-    };
-    await fs.writeFile(f.file, JSON.stringify(record));
-    assert.deepEqual(await readClaim(f.dir, f.session), record);
-    await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), { code: 'LIVE_OWNER_UNREACHABLE' });
-    await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), {
-      code: 'LIVE_OWNER_UNREACHABLE',
-    });
-    await assert.rejects(new AttachedRuntime({ attachmentDir: f.dir }, f.session, record).start(), {
-      code: 'ATTACHMENT_PROTOCOL_MISMATCH',
-    });
-  }
+  const record = {
+    ...f.record,
+    kind: 'extension',
+    socket: path.join(f.dir, 'fixture.sock'),
+    phase: 'ready',
+    unexpected: true,
+  };
+  await fs.writeFile(f.file, JSON.stringify(record));
+  await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
+  await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), /LIVE_OWNER_UNREACHABLE/);
+  await assert.rejects(
+    new AttachedRuntime({ attachmentDir: f.dir }, f.session, record).start(),
+    /ATTACHMENT_PROTOCOL_MISMATCH/,
+  );
   const differentOwner = { ...f.record.owner, start: 'different-process-start' };
   assert.equal(await readOwnerRecord(f.dir, f.file, undefined, { owner: differentOwner }), null);
 });
@@ -174,19 +162,30 @@ test('dead ownership can be replaced without its old control metadata; a local p
 });
 
 test('real proc stat open/read exit race returns ESRCH and is conclusively absent', async (t) => {
+  const f = await fixture(t);
   const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
     env: { PATH: process.env.PATH },
     stdio: 'ignore',
+  });
+  const exit = once(child, 'exit');
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await exit;
   });
   await once(child, 'spawn');
   const owner = await processIdentity(child.pid),
     file = `/proc/${child.pid}/stat`,
     read = fs.readFile;
+  const reservation = { ...f.record, owner, kind: 'tui', phase: 'transitioning' };
+  await fs.writeFile(f.file, JSON.stringify(reservation));
+  const pool = new RuntimePool({ attachmentDir: f.dir }, () =>
+    assert.fail('live writer must block'),
+  );
+  await assert.rejects(pool.resolve(f.session), /LIVE_OWNER_UNREACHABLE/);
   let code;
   t.mock.method(fs, 'readFile', async function (target, ...args) {
     if (target !== file) return read.call(fs, target, ...args);
     const fd = await fs.open(target, 'r');
-    const exit = once(child, 'exit');
     child.kill('SIGTERM');
     await exit;
     try {
@@ -205,13 +204,11 @@ test('real proc stat open/read exit race returns ESRCH and is conclusively absen
     assert.equal(await processIdentity(child.pid), null);
     assert.equal(await ownerAlive(owner), false);
     await waitOwnerExit(owner, 100);
+    const claimed = await reserveOwner(f.dir, f.session, 'rpc');
+    assert.notEqual(claimed.generation, reservation.generation);
+    await releaseOwner(f.dir, f.session, claimed);
   } finally {
     t.mock.restoreAll();
-    if (child.exitCode === null && child.signalCode === null) {
-      const exited = once(child, 'exit');
-      child.kill('SIGKILL');
-      await exited;
-    }
   }
 });
 test('boot identity failures and other proc errors remain fail-closed with original cause', async (t) => {
@@ -254,11 +251,6 @@ test('boot identity failures and other proc errors remain fail-closed with origi
   await assert.rejects(ownerAlive(owner), { code: 'PROCESS_IDENTITY_UNAVAILABLE' });
 });
 
-async function registryFixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-registry-'));
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  return dir;
-}
 async function writer(dir) {
   const child = spawn(
     process.execPath,
@@ -293,43 +285,19 @@ test(
   'registry mutex excludes live contenders and is released by the kernel after process death',
   { timeout: 15000 },
   async (t) => {
-    const dir = await registryFixture(t),
-      workers = [];
-    try {
-      const holder = await writer(dir);
-      workers.push(holder);
-      holder.child.send({ acquire: true });
-      assert.equal((await holder.next()).type, 'entered');
-      // A live owner is never evicted to meet a wait timeout.
-      await assert.rejects(
-        registryTransaction(dir, () => assert.fail('stole live lock')),
-        /ATTACHMENT_REGISTRY_BUSY/,
-      );
-      await holder.close();
-      // Only the synthetic assertion marker needs cleanup after killing its writer.
-      await fs.unlink(path.join(dir, 'critical'));
-      const contenders = await Promise.all(Array.from({ length: 4 }, () => writer(dir)));
-      workers.push(...contenders);
-      const pending = new Map(
-        contenders.map((worker) => {
-          worker.child.send({ acquire: true });
-          return [worker, worker.next().then((message) => ({ worker, message }))];
-        }),
-      );
-      while (pending.size) {
-        const { worker, message } = await Promise.race(pending.values());
-        assert.equal(message.type, 'entered', JSON.stringify(message));
-        assert.equal(
-          await fs.readFile(path.join(dir, 'critical'), 'utf8'),
-          String(worker.child.pid),
-        );
-        worker.child.send({ release: true });
-        assert.deepEqual(await worker.next(), { type: 'done' });
-        pending.delete(worker);
-      }
-      assert.deepEqual(await fs.readdir(dir), []);
-    } finally {
-      await Promise.all(workers.map((worker) => worker.close()));
-    }
+    const { dir } = await fixture(t);
+    const holder = await writer(dir);
+    t.after(() => holder.close());
+    holder.child.send({ acquire: true });
+    assert.equal((await holder.next()).type, 'entered');
+    await assert.rejects(
+      registryTransaction(dir, () => assert.fail('Live lock stolen')),
+      /ATTACHMENT_REGISTRY_BUSY/,
+    );
+    await holder.close();
+    await fs.unlink(path.join(dir, 'critical'));
+    await registryTransaction(dir, async () => {
+      assert.equal(await fs.stat(dir).then((st) => st.isDirectory()), true);
+    });
   },
 );

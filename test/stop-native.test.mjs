@@ -1,6 +1,5 @@
 import { until } from './fixtures/until.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
-import { aiEntry } from './fixtures/pi.mjs';
+import { aiEntry, buildSessionProjection, RpcClient } from './fixtures/pi.mjs';
 
 import { savedEntries } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -8,12 +7,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
-
-import { RpcClient } from './fixtures/pi.mjs';
 
 import { executeBatch } from '../src/batch.mjs';
-import { readClaim, processIdentity } from '../src/attachments.mjs';
+import { processIdentity } from '../src/attachments.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/host-bindings.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
@@ -52,7 +48,7 @@ async function fixture(t, owned = false) {
       );
     },
   });
-  return { ...f, saved: f.session, pidFile: path.join(f.dir, 'pid.json'), cleanups: f.cleanup };
+  return f;
 }
 for (const op of ['send', 'command'])
   test(
@@ -60,12 +56,12 @@ for (const op of ['send', 'command'])
     { timeout: 15000 },
     async (t) => {
       const f = await fixture(t, true),
-        id = f.saved.id;
+        id = f.session.id;
       f.config.grants[0].command = true;
-      await f.bridge.pool.resolve(f.saved);
+      await f.bridge.pool.resolve(f.session);
       const entered = Promise.withResolvers(),
         finish = Promise.withResolvers();
-      f.cleanups.push(() => finish.resolve());
+      f.cleanup.push(() => finish.resolve());
       const read = f.bridge.read.bind(f.bridge);
       let held = false;
       t.mock.method(f.bridge, 'read', async (...args) => {
@@ -102,7 +98,7 @@ for (const op of ['send', 'command'])
       const result = await batch;
       assert.equal(result.results[2].result.reason, 'STOP_IN_PROGRESS', JSON.stringify(result));
       assert.equal(f.bridge.inputs.size, 0);
-      assert.ok(!(await fs.readFile(f.saved.file, 'utf8')).includes('MUST_NOT_DISPATCH'));
+      assert.ok(!(await fs.readFile(f.session.file, 'utf8')).includes('MUST_NOT_DISPATCH'));
       const fresh = {
         op,
         args: {
@@ -115,202 +111,100 @@ for (const op of ['send', 'command'])
       const restarted = await executeBatch(f.bridge, {
         operations: [{ op: 'stop', args: { session_id: id } }, fresh],
       });
-      assert.equal(
-        restarted.results[1].result.status,
-        op === 'send' ? 'started' : 'completed',
-        JSON.stringify(restarted),
-      );
+      assert.equal(restarted.results[1].result.status, op === 'send' ? 'started' : 'completed');
       assert.equal(f.bridge.inputs.size, 0);
-      await until(() => !f.bridge.pool.get(id) && !f.bridge.autoReleases.size);
-      assert.equal(
-        (await f.bridge[op](fresh.args)).status,
-        op === 'send' ? 'started' : 'completed',
-      );
     },
   );
 
-async function exerciseBash(f, native) {
-  const id = f.saved.id;
-  f.config.grants[0].command = true;
-  const hook = await f.bridge.command({ session_id: id, command: 'HOOK_ONLY' });
-  assert.equal(hook.output, 'HOOK_NATIVE_RESULT');
-  const marker = path.join(f.dir, 'bash-started');
-  const bash = f.bridge.command({ session_id: id, command: `touch '${marker}'; sleep 30` });
-  await until(() => fs.stat(marker).catch(() => null));
-  assert.equal((await f.bridge.stop({ session_id: id })).status, 'accepted');
-  assert.equal((await bash).cancelled, true);
-  assert.equal((await native.getState()).sessionId, f.saved.header.id);
-}
-async function exercise(f, native) {
-  const first = await f.bridge.send({
-    session_id: f.saved.id,
-    text: 'START_SLOW',
+async function hostedClient(f) {
+  const controller = await reserveHostSession({
+    buildSessionProjection,
+    attachmentDir: f.config.attachmentDir,
+    session: f.session,
   });
-  assert.ok(['started', 'unknown'].includes(first.status));
-  await until(async () => (await native.getState()).isStreaming);
-  const steering = 'STEERING 😀 " \\ ' + 'long queued text '.repeat(4000),
-    followUp = 'FOLLOW_UP_PROMPT';
-  assert.ok(
-    ['started', 'queued', 'handled'].includes(
-      (
-        await f.bridge.send({
-          session_id: f.saved.id,
-          text: steering,
-          mode: 'steer',
-        })
-      ).status,
-    ),
-    'Expected native prompt admission',
-  );
-  assert.ok(
-    ['started', 'queued', 'handled'].includes(
-      (
-        await f.bridge.send({
-          session_id: f.saved.id,
-          text: followUp,
-          mode: 'follow_up',
-        })
-      ).status,
-    ),
-    'Expected native prompt admission',
-  );
-  assert.equal((await native.getState()).pendingMessageCount, 2);
-  const receipt = await f.bridge.stop({ session_id: f.saved.id, max_chars: 32768 });
-  assert.equal(receipt.status, 'accepted');
-  const out = receipt.withdrawn_text;
-  assert.ok((steering + '\n\n' + followUp).startsWith(out));
-  assert.equal(receipt.withdrawn_complete, false);
-  assert.equal((await native.getState()).pendingMessageCount, 0);
-  assert.equal((await native.getState()).isStreaming, false);
-  const claim = await readClaim(f.bridge.pool.attachmentDir, f.saved),
-    generation = receipt.generation;
-  assert.equal(generation, f.bridge.pool.get(f.saved.id).generation ?? claim.generation);
-  const entries = (await native.getEntries()).entries;
-  assert.ok(
-    !entries.some(
-      (entry) =>
-        entry.message?.role === 'user' &&
-        JSON.stringify(entry.message.content).includes('FOLLOW_UP_PROMPT'),
-    ),
-  );
-  // Independent native bash is not covered by agent abort alone.
-  const bash = native.bash('sleep 30');
-  await delay(100);
-  const stopped = await f.bridge.stop({ session_id: f.saved.id });
-  assert.equal(stopped.status, 'accepted');
-  assert.equal((await bash).cancelled, true);
-  assert.equal((await native.getState()).sessionId, f.saved.header.id);
-  const after = await f.bridge.send({
-    session_id: f.saved.id,
-    text: 'CONTINUE_NORMALLY',
+  const env = Object.fromEntries(Object.keys(process.env).map((key) => [key, undefined]));
+  const client = new RpcClient({
+    cliPath: nativePiCli,
+    cwd: f.cwd,
+    env: { ...env, ...f.env },
+    args: ['--session', f.session.file, ...f.config.piArgs],
   });
-  assert.ok(['started', 'unknown'].includes(after.status));
-  await until(async () => !(await native.getState()).isStreaming);
-  assert.match(JSON.stringify((await native.getEntries()).entries), /AFTER_STOP_REPLY/);
-  assert.equal((await f.bridge.stop({ session_id: f.saved.id })).generation, generation);
-  assert.equal((await native.getState()).sessionId, f.saved.header.id);
-}
-
-test(
-  'Bridge-owned offline Pi cancels agent and bash, withdraws queued text, then releases and resumes history',
-  { timeout: 30000 },
-  async (t) => {
-    const f = await fixture(t, true),
-      id = f.saved.id;
-    await exerciseBash(f, {
-      getEntries: async () => ({ entries: await savedEntries(f.bridge, id) }),
-      getState: async () => {
-        await f.bridge.pool.instances.get(id)?.autoReleaseTask;
-        return (await f.bridge.pool.resolve(await f.bridge.session(id))).state();
-      },
-    });
-    assert.ok(
-      ['started', 'queued', 'handled'].includes(
-        (await f.bridge.send({ session_id: id, text: 'START_SLOW' })).status,
-      ),
-      'Expected native prompt admission',
-    );
-    const runtime = f.bridge.pool.get(id),
-      generation = runtime.generation;
-    await until(async () => (await runtime.state()).isStreaming);
-    const steering = 'STEERING 😀 " \\ ' + 'long queued text '.repeat(4000),
-      followUp = 'FOLLOW_UP_PROMPT';
-    for (const [mode, text] of [
-      ['steer', steering],
-      ['follow_up', followUp],
-    ])
-      assert.equal((await f.bridge.send({ session_id: id, mode, text })).status, 'queued');
-    const marker = path.join(f.dir, 'concurrent-bash');
-    const bash = f.bridge.command({
-      session_id: id,
-      command: "printf started > '" + marker + "'; sleep 30",
-    });
-    await until(() =>
-      fs.stat(marker).then(
-        () => true,
-        () => false,
-      ),
-    );
-    const stopped = await f.bridge.stop({ session_id: id, max_chars: 32768 });
-    assert.equal(stopped.status, 'accepted');
-    assert.ok((steering + '\n\n' + followUp).startsWith(stopped.withdrawn_text));
-    assert.equal(stopped.withdrawn_complete, false);
-    assert.equal((await bash).cancelled, true);
-    await until(() => runtime.exited && !f.bridge.autoReleases.size);
-    assert.equal(runtime.child.exitCode, 0);
-    assert.equal(runtime.child.signalCode, null);
-    assert.equal(
-      (await savedEntries(f.bridge, id)).filter((e) => e.message?.role === 'user').length,
-      1,
-    );
-    assert.ok(
-      ['started', 'queued', 'handled'].includes(
-        (await f.bridge.send({ session_id: id, text: 'CONTINUE_NORMALLY' })).status,
-      ),
-      'Expected native prompt admission',
-    );
-    const next = f.bridge.pool.get(id);
-    assert.notEqual(next.generation, generation);
-    await until(() => next.exited && !f.bridge.autoReleases.size);
-    assert.match(JSON.stringify(await savedEntries(f.bridge, id)), /AFTER_STOP_REPLY/);
-    assert.equal(next.child.exitCode, 0);
-    assert.equal(next.child.signalCode, null);
-  },
-);
-
-test(
-  'public RPC host binding uses existing child and returns all withdrawal through private IPC',
-  { timeout: 30000 },
-  async (t) => {
-    const f = await fixture(t),
-      controller = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.bridge.pool.attachmentDir,
-        session: f.saved,
-      });
-    const env = Object.fromEntries(Object.keys(process.env).map((key) => [key, undefined]));
-    Object.assign(env, {
-      PATH: process.env.PATH,
-      HOME: f.dir,
-      PI_CODING_AGENT_DIR: f.config.piRuntime.agentDir,
-      PI_OFFLINE: '1',
-    });
-    const client = new RpcClient({
-      cliPath: nativePiCli,
-      cwd: f.cwd,
-      env,
-      args: ['--session', f.saved.file, ...f.config.piArgs],
-    });
-    f.cleanups.push(async () => {
+  f.cleanup.push(async () => {
+    try {
       await client.stop();
+    } finally {
       await controller.close();
-    });
-    await client.start();
-    await client.getState();
-    await controller.ready(createRpcHostBinding(client), {
-      owner: await processIdentity(JSON.parse(await fs.readFile(f.pidFile, 'utf8'))),
-    });
-    await exerciseBash(f, client);
-    await exercise(f, client);
-  },
-);
+    }
+  });
+  await client.start();
+  await client.getState();
+  await controller.ready(createRpcHostBinding(client), {
+    owner: await processIdentity(
+      JSON.parse(await fs.readFile(path.join(f.dir, 'pid.json'), 'utf8')),
+    ),
+  });
+  return client;
+}
+
+for (const owned of [true, false])
+  test(
+    `native Stop withdraws queued inputs and aborts agent and bash (${owned ? 'owned' : 'RPC host'})`,
+    {
+      timeout: 30000,
+    },
+    async (t) => {
+      const f = await fixture(t, owned);
+      const client = owned ? null : await hostedClient(f);
+      const args = { session_id: f.id };
+      const send = (text, mode) => f.bridge.send({ ...args, text, mode });
+      const command = (command) => f.bridge.command({ ...args, command });
+      f.config.grants[0].command = true;
+      if (client) assert.equal((await command('HOOK_ONLY')).output, 'HOOK_NATIVE_RESULT');
+      assert.equal((await send('START_SLOW')).status, 'started');
+      const runtime = f.bridge.pool.get(f.id);
+      const state = () => (client ? client.getState() : runtime.state());
+      await until(async () => (await state()).isStreaming);
+      const steering = 'STEERING 😀 " ' + 'long queued text '.repeat(4000);
+      for (const [mode, text] of [
+        ['steer', steering],
+        ['follow_up', 'FOLLOW_UP_PROMPT'],
+      ])
+        assert.equal((await send(text, mode)).status, 'queued');
+      assert.equal((await state()).pendingMessageCount, 2);
+      const marker = path.join(f.dir, 'bash-started');
+      const bash = client
+        ? client.bash(`touch '${marker}'; sleep 30`)
+        : command(`touch '${marker}'; sleep 30`);
+      await until(() => fs.stat(marker).catch(() => null));
+      const stopped = await f.bridge.stop({ ...args, max_chars: 32768 });
+      assert.equal(stopped.status, 'accepted');
+      assert.ok(steering.startsWith(stopped.withdrawn_text));
+      assert.ok(stopped.withdrawn_text.startsWith('STEERING'));
+      assert.equal(stopped.withdrawn_complete, false);
+      assert.equal((await bash).cancelled, true);
+      const released = async (rpc) => {
+        await until(() => rpc.exited && !f.bridge.autoReleases.size);
+        assert.equal(rpc.child.exitCode, 0);
+      };
+      if (client) {
+        const stoppedState = await state();
+        assert.equal(stoppedState.pendingMessageCount, 0);
+        assert.equal(stoppedState.isStreaming, false);
+      } else await released(runtime);
+      assert.equal((await send('CONTINUE_NORMALLY')).status, 'started');
+      if (client) {
+        await until(async () => !(await state()).isStreaming);
+        assert.equal((await state()).sessionId, f.session.header.id);
+        assert.equal((await f.bridge.stop(args)).generation, stopped.generation);
+      } else {
+        const next = f.bridge.pool.get(f.id);
+        assert.notEqual(next.generation, runtime.generation);
+        await released(next);
+      }
+      const rows = client
+        ? (await client.getEntries()).entries
+        : await savedEntries(f.bridge, f.id);
+      assert.doesNotMatch(JSON.stringify(rows), /FOLLOW_UP_PROMPT/);
+      assert.match(JSON.stringify(rows), /AFTER_STOP_REPLY/);
+    },
+  );

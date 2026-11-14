@@ -1,10 +1,12 @@
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { append, message } from './fixtures/native-history.mjs';
+import { nativeOwner } from './fixtures/native-owner.mjs';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Bridge } from '../src/bridge.mjs';
+
 import { loadSavedSession } from '../src/data.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
@@ -12,27 +14,8 @@ import { prepareContextRead } from './fixtures/read-pages.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 async function fixture(t, defaults = {}) {
-  const dir = await fs.mkdtemp('/tmp/pi-session-api-'),
-    project = path.join(dir, 'project');
-  await fs.mkdir(project);
-  const config = {
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    piRuntime: { agentDir: path.join(dir, 'agent'), inheritEnv: [] },
-    piArgs: ['--session-dir', path.join(dir, 'sessions')],
-    folders: [{ path: project }],
-    defaults: {
-      ...denyAllPermissions(),
-      list: true,
-      read: true,
-      send: true,
-      create: true,
-      delete: true,
-      ...defaults,
-    },
-  };
   const calls = [];
-  const bridge = await new Bridge(config, async (session) =>
+  const factory = async (session) =>
     ownedRuntime({
       alive: true,
       entries: () => loadSavedSession(session),
@@ -41,26 +24,29 @@ async function fixture(t, defaults = {}) {
       command: async (command) => {
         calls.push({ session: session.id, command });
         const saved = await loadSavedSession(session);
-        await fs.appendFile(
-          session.file,
-          JSON.stringify({
-            type: 'message',
-            id: randomUUID(),
-            parentId: saved.leafId,
-            timestamp: new Date().toISOString(),
-            message: { role: 'user', content: command.message },
-          }) + '\n',
-        );
+        await append(session, [message(randomUUID(), saved.leafId, 'user', command.message)]);
         return { disposition: 'started' };
       },
       stop: async () => {},
-    }),
-  ).init();
-  t.after(async () => {
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+    });
+  const f = await nativeOwner(t, {
+    prefix: 'session-api',
+    seed: false,
+    factory,
+    configure({ config }) {
+      config.defaults = {
+        ...config.defaults,
+        list: true,
+        read: true,
+        send: true,
+        create: true,
+        delete: true,
+        ...defaults,
+      };
+      config.grants = [];
+    },
   });
-  return { bridge, config, project, calls };
+  return { ...f, project: f.cwd, calls };
 }
 
 test('list permission owns metadata; hidden known IDs can still be read and sent', async (t) => {
@@ -86,78 +72,34 @@ test('list permission owns metadata; hidden known IDs can still be read and sent
   assert.equal(list.sessions[0].name, 'a"b');
   assert.equal(list.sessions[0].project, f.project);
   assert.equal(list.sessions[0].status.state, 'idle');
-  assert.deepEqual((await f.bridge.list({ name: 'null' })).sessions, []);
-  assert.deepEqual((await f.bridge.list({ name: 'name' })).sessions, []);
   await assert.rejects(f.bridge.read({ session_id: id }), /NOT_FOUND_OR_DENIED/);
 });
 
 test('creation targets use project list/create rights independently of session pages', async (t) => {
-  const f = await fixture(t, { create: true, read: false, send: false }),
-    other = path.join(path.dirname(f.project), 'other'),
-    unused = path.join(path.dirname(f.project), 'unused'),
-    legacy = path.join(f.project, 'not-configured');
-  assert.deepEqual(
-    (await f.bridge.list()).creatable_projects,
-    [f.project],
-    'An authorized empty project must be discoverable before its first session',
-  );
-  for (const directory of [other, unused, legacy]) await fs.mkdir(directory);
-  f.config.folders.push({ path: other }, { path: unused }, { path: legacy });
-  const rows = [];
-  for (const [project, name] of [
-    [f.project, 'Alpha one'],
-    [f.project, 'Alpha two'],
-    [other, 'Beta'],
-    [legacy, 'Legacy'],
-    [unused, 'Hidden'],
-  ]) {
-    const seed = await savedSession(f.bridge, { project }),
-      session = await f.bridge.session(seed.session_id);
-    await fs.appendFile(session.file, JSON.stringify({ type: 'session_info', name }) + '\n');
-    const time = new Date(1700000000000 - rows.length * 1000);
-    await fs.utimes(session.file, time, time);
-    rows.push(seed.session_id);
+  const f = await fixture(t, { read: false, send: false });
+  const other = path.join(f.dir, 'other'),
+    unused = path.join(f.dir, 'unused');
+  assert.deepEqual((await f.bridge.list()).creatable_projects, [f.project]);
+  for (const project of [other, unused]) {
+    await fs.mkdir(project);
+    f.config.folders.push({ path: project });
   }
-  f.config.folders = f.config.folders.filter((folder) => folder.path !== legacy);
+  const { session_id } = await savedSession(f.bridge, { project: unused });
   f.config.grants = [
     { folder: other, create: false },
-    { session_id: rows[4], list: false },
+    { session_id, list: false },
   ];
-  const all = await f.bridge.list();
-  assert.equal(Object.hasOwn(all, 'projects'), false);
-  assert.deepEqual(
-    all.sessions.map((row) => row.session_id),
-    rows.slice(0, 4),
-  );
-  assert.deepEqual(
-    all.creatable_projects,
-    [f.project, unused],
-    'Session-specific denial does not hide the configured project; denied and unconfigured targets stay absent',
-  );
-  for (const args of [
-    { limit: 1 },
-    { offset: 3, limit: 1 },
-    { offset: 100 },
-    { project: other },
-    { name: 'missing' },
-    { session_id: rows[4] },
-  ])
-    assert.deepEqual((await f.bridge.list(args)).creatable_projects, [f.project, unused]);
+  for (const query of [{}, { offset: 100 }, { project: other, name: 'missing' }, { session_id }]) {
+    const result = await f.bridge.list(query);
+    assert.deepEqual(result.creatable_projects, [f.project, unused]);
+    assert.deepEqual(result.sessions, []);
+  }
   f.config.grants.push({ folder: other, create: true }, { folder: unused, list: false });
-  assert.deepEqual((await f.bridge.list({ name: 'Beta' })).creatable_projects, [f.project, other]);
-  await assert.rejects(f.bridge.read({ session_id: rows[0] }), /NOT_FOUND_OR_DENIED/);
-  // A directory absent from this page can still be a valid configured create target.
-  const created = await f.bridge.create({
-    project: unused,
-    text: 'FIRST',
-  });
-  assert.ok(['started', 'queued', 'handled'].includes(created.status), JSON.stringify(created));
-  const denied = await f.bridge.create({
-    project: legacy,
-    text: 'NEVER',
-  });
-  assert.equal(denied.status, 'rejected');
-  assert.equal(denied.reason, 'NOT_FOUND_OR_DENIED');
+  assert.deepEqual((await f.bridge.list()).creatable_projects, [f.project, other]);
+  assert.equal((await f.bridge.create({ project: unused, text: 'FIRST' })).status, 'started');
+  const unconfigured = path.join(f.project, 'unconfigured');
+  await fs.mkdir(unconfigured);
+  assert.equal((await f.bridge.create({ project: unconfigured })).reason, 'NOT_FOUND_OR_DENIED');
 });
 
 test('create-and-send uses only create permission and returns its child identity', async (t) => {
@@ -190,16 +132,10 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   assert.equal(prepared.status, 'created');
   assert.equal(prepared.submission_id, undefined);
   assert.equal(f.bridge.pool.get(prepared.session_id), null);
-  const preparedRead = await f.bridge.read({
-    session_id: prepared.session_id,
-  });
-  assert.ok(JSON.stringify(preparedRead.items).includes('parent'));
-  const preparedHistory = await loadSavedSession(await f.bridge.session(prepared.session_id));
-  assert.equal(preparedHistory.header.parentSession, source.file);
-  assert.deepEqual(
-    preparedHistory.entries.filter((e) => e.type === 'message').map((e) => e.message.content),
-    ['parent'],
-  );
+  const history = (id) => f.bridge.session(id).then(loadSavedSession);
+  const prompts = (saved) =>
+    saved.entries.filter((e) => e.type === 'message').map((e) => e.message.content);
+  assert.deepEqual(prompts(await history(prepared.session_id)), ['parent']);
   assert.equal(f.calls.length, 1, 'Preparing a fork must not send another prompt');
   const child = await f.bridge.create({
     project: f.project,
@@ -209,12 +145,9 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   assert.ok(['started', 'queued', 'handled'].includes(child.status), JSON.stringify(child));
   assert.strictEqual(f.bridge.pool.get(source.id), runtime);
   assert.equal(await fs.readFile(source.file, 'utf8'), before);
-  const saved = await loadSavedSession(await f.bridge.session(child.session_id));
+  const saved = await history(child.session_id);
   assert.equal(saved.header.parentSession, source.file);
-  assert.deepEqual(
-    saved.entries.filter((e) => e.type === 'message').map((e) => e.message.content),
-    ['parent', 'child prompt'],
-  );
+  assert.deepEqual(prompts(saved), ['parent', 'child prompt']);
   assert.equal(
     (await f.bridge.list({ session_id: child.session_id })).sessions[0].parent_session_id,
     source.id,

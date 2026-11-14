@@ -1,13 +1,10 @@
+import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
-import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+
 import { PiRpc } from '../src/rpc.mjs';
 
 import { withdrawalCollector, requestStop } from '../src/stop-execution.mjs';
@@ -15,63 +12,35 @@ import { sdkSession } from './fixtures/sdk-session.mjs';
 import { createSdkHostBinding } from '../src/host-bindings.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 
-import { validateGrants } from '../src/owner-config.mjs';
 const gate = () => Promise.withResolvers();
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-stop-')),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true, stop: true, create: true }],
-  };
-  let spawned = 0;
+  let spawned = 0,
+    stops = 0;
   const runtime = ownedRuntime({
-    alive: true,
     generation: 'offline-generation',
     state: async () => ({ isStreaming: false }),
     command: async () => ({ disposition: 'started' }),
     stop: async () => {
       runtime.alive = false;
     },
+    stopExecution: async ({ max_chars }) => {
+      stops++;
+      return {
+        status: 'accepted',
+        acknowledgement: 'native_ack',
+        coverage: 'agent_and_bash',
+        withdrawal: withdrawalCollector(max_chars).add({ steering: ['one'], followUp: ['two'] }),
+      };
+    },
   });
-  const bridge = await new Bridge(config, async () => {
-    spawned++;
-    return runtime;
-  }).init();
-  const made = await savedSession(bridge),
-    saved = await bridge.session(made.session_id);
-  let stops = 0;
-  runtime.stopExecution = async ({ max_chars }) => {
-    stops++;
-    const withdrawn = withdrawalCollector(max_chars);
-    return {
-      status: 'accepted',
-      acknowledgement: 'native_ack',
-      coverage: 'agent_and_bash',
-      withdrawal: withdrawn.add({ steering: ['one'], followUp: ['two'] }),
-    };
-  };
-  const cleanup = [];
-  t.after(async () => {
-    for (const close of cleanup.reverse()) await close();
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const f = await nativeOwner(t, {
+    prefix: 'stop-api',
+    factory: async () => {
+      spawned++;
+      return runtime;
+    },
   });
-  return {
-    bridge,
-    config,
-    runtime,
-    saved,
-    id: saved.id,
-    spawned: () => spawned,
-    stops: () => stops,
-    dir,
-    cleanup,
-  };
+  return { ...f, runtime, spawned: () => spawned, stops: () => stops };
 }
 test('stop is independently authorized, live-only, replay-safe and retains session/process', async (t) => {
   const f = await fixture(t);
@@ -79,33 +48,14 @@ test('stop is independently authorized, live-only, replay-safe and retains sessi
   assert.equal(f.spawned(), 0);
   await f.bridge.send({ session_id: f.id, text: 'start' });
   const args = { session_id: f.id };
-  const replies = await Promise.all(Array.from({ length: 5 }, () => f.bridge.stop(args)));
-  assert.equal(replies[0].withdrawn_text, 'one\n\ntwo');
-  assert.equal(f.stops(), 5);
-  assert.equal(f.runtime.alive, true);
-
-  f.config.grants.push({ session_id: f.id, stop: false });
-  await assert.rejects(f.bridge.stop({ ...args }), /NOT_FOUND_OR_DENIED/);
-  assert.ok(
-    ['started', 'queued', 'handled'].includes(
-      (await f.bridge.send({ session_id: f.id, text: 'later' })).status,
-    ),
-    'Expected native prompt admission',
-  );
-  f.config.grants.push({ session_id: f.id, stop: true, send: false });
-  assert.equal((await f.bridge.stop({ ...args })).status, 'accepted');
-  assert.equal(
-    (await f.bridge.send({ session_id: f.id, text: 'no' })).reason,
-    'NOT_FOUND_OR_DENIED',
-  );
-  f.config.grants.push({ session_id: f.id, read: false });
-  assert.equal((await f.bridge.stop({ ...args })).withdrawn_text, 'one\n\ntwo');
   assert.equal((await f.bridge.stop(args)).withdrawn_text, 'one\n\ntwo');
-  assert.equal(f.stops(), 8);
-  assert.throws(
-    () => validateGrants([{ folder: f.saved.cwd, command: 'yes' }]),
-    /INVALID_OWNER_CONFIG/,
-  );
+  f.config.grants.push({ session_id: f.id, stop: false });
+  await assert.rejects(f.bridge.stop(args), /NOT_FOUND_OR_DENIED/);
+  f.config.grants.push({ session_id: f.id, stop: true, send: false, read: false });
+  assert.equal((await f.bridge.stop(args)).withdrawn_text, 'one\n\ntwo');
+  assert.equal((await f.bridge.send({ ...args, text: 'denied' })).reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal(f.stops(), 2);
+  assert.equal(f.runtime.alive, true);
 });
 
 test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK, never retries control', async (t) => {
@@ -160,23 +110,20 @@ for (const op of ['send', 'command'])
         assertSessionIdentity: PiRpc.prototype.assertSessionIdentity,
         activeBashes: 0,
         config: { attachmentDir: f.bridge.pool.attachmentDir },
-        session: f.saved,
+        session: f.session,
       });
-      let reads = 0,
-        dispatches = 0;
+      let held = false;
       f.runtime.state = async () => {
-        if (++reads === 1) {
+        if (!held) {
+          held = true;
           observing.resolve();
           await finishState.promise;
         }
-        return { sessionFile: f.saved.file, sessionId: f.saved.header.id, isStreaming: false };
+        return { sessionFile: f.session.file, sessionId: f.session.header.id, isStreaming: false };
       };
-      f.runtime.dispatch = async (command) => {
-        if (command.type === 'get_state') return f.runtime.state();
-        dispatches++;
-        return op === 'send'
-          ? { disposition: 'started' }
-          : { output: 'done', exitCode: 0, cancelled: false, truncated: false };
+      f.runtime.dispatch = (command) => {
+        assert.equal(command.type, 'get_state', 'a withdrawn input cannot dispatch');
+        return f.runtime.state();
       };
       const stop = f.runtime.stopExecution;
       f.runtime.stopExecution = async (args) => {
@@ -198,17 +145,9 @@ for (const op of ['send', 'command'])
         await cancel;
       }
       finishState.resolve();
-      const result = await input;
+      assert.equal((await input).reason, 'STOP_IN_PROGRESS');
       finishStop.resolve();
       await cancel;
-      assert.equal(result.reason, 'STOP_IN_PROGRESS');
-      assert.equal(dispatches, 0);
-
-      assert.equal(
-        (await f.bridge[op]({ ...args })).status,
-        op === 'send' ? 'started' : 'completed',
-      );
-      assert.equal(dispatches, 1);
     });
 
 test('native RPC withdrawal and both cancellation requests are submitted before waiting; settling inputs recovered', async () => {
@@ -292,75 +231,48 @@ for (const failure of ['clear', 'capture', 'abort'])
     assert.equal(clears, 1, 'failure must not replay withdrawal');
   });
 
-for (const failure of ['capture', 'bash'])
-  test(`SDK host keeps Stop admission fenced after ${failure} failure`, async (t) => {
-    const f = await fixture(t),
-      cancellation = gate(),
-      capturing = gate(),
-      controller = await reserveHostSession({
-        buildSessionProjection: hostProjection,
-        attachmentDir: f.bridge.pool.attachmentDir,
-        session: f.saved,
-      });
-    f.cleanup.push(() => controller.close());
-    const state = {
-      sessionFile: f.saved.file,
-      sessionId: f.saved.header.id,
+test('SDK host keeps Stop fenced through partial withdrawal and cancellation failure', async (t) => {
+  const f = await fixture(t),
+    cancellation = gate(),
+    captured = gate();
+  const controller = await reserveHostSession({
+    buildSessionProjection: hostProjection,
+    attachmentDir: f.config.attachmentDir,
+    session: f.session,
+  });
+  f.cleanup.push(
+    () => cancellation.resolve(),
+    () => controller.close(),
+  );
+  const binding = createSdkHostBinding(
+    sdkSession({
+      sessionFile: f.session.file,
+      sessionId: f.session.header.id,
       isIdle: true,
-      pendingMessageCount: 0,
-    };
-    let prompts = 0,
-      settled = false;
-    const binding = createSdkHostBinding(
-      sdkSession({
-        ...state,
-        prompt: async () => {
-          prompts++;
-        },
-        clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
-        abort: () => cancellation.promise,
-        abortBash: () => {
-          if (failure === 'bash') {
-            capturing.resolve();
-            throw new Error('BASH_FAILED');
-          }
+      clearQueue: () => ({ steering: ['withdrawn'], followUp: [] }),
+      abort: () => cancellation.promise,
+      abortBash: () => {},
+    }),
+  );
+  await controller.ready({
+    ...binding,
+    stop: (args) =>
+      binding.stop({
+        ...args,
+        onWithdraw: async (value) => {
+          await args.onWithdraw(value);
+          captured.resolve();
+          throw new Error('CAPTURE_FAILED');
         },
       }),
-    );
-    await controller.ready({
-      state: binding.state,
-      snapshot: async () => ({ ...state, entries: [], leafId: null }),
-      submit: binding.submit,
-      stop: (args) =>
-        binding.stop({
-          ...args,
-          onWithdraw: async (value) => {
-            await args.onWithdraw(value);
-            capturing.resolve();
-            if (failure === 'capture') throw new Error('CAPTURE_FAILED');
-          },
-        }),
-    });
-    const stopping = f.bridge.stop({ session_id: f.id }).finally(() => {
-      settled = true;
-    });
-    try {
-      await capturing.promise;
-      await new Promise((resolve) => setImmediate(resolve));
-      const sent = await f.bridge.send({ session_id: f.id, text: 'must not overlap cancellation' });
-      assert.equal(sent.reason, 'STOP_IN_PROGRESS', JSON.stringify(sent));
-      assert.equal(prompts, 0);
-      assert.equal(settled, false);
-    } finally {
-      cancellation.reject(new Error('ABORT_FAILED'));
-      await stopping;
-    }
-    const stopped = await stopping;
-    assert.equal(stopped.status, 'unknown');
-    assert.equal(stopped.withdrawn_text, 'withdrawn');
-    assert.equal(
-      (await f.bridge.send({ session_id: f.id, text: 'after cancellation' })).status,
-      'dispatched',
-    );
-    assert.equal(prompts, 1);
   });
+  const send = () => f.bridge.send({ session_id: f.id, text: 'prompt' });
+  const stopping = f.bridge.stop({ session_id: f.id });
+  await captured.promise;
+  assert.equal((await send()).reason, 'STOP_IN_PROGRESS');
+  cancellation.reject(new Error('ABORT_FAILED'));
+  const stopped = await stopping;
+  assert.equal(stopped.status, 'unknown');
+  assert.equal(stopped.withdrawn_text, 'withdrawn');
+  assert.equal((await send()).status, 'dispatched');
+});

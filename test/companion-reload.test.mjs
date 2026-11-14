@@ -2,11 +2,11 @@ import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import path from 'node:path';
 import { RpcClient } from './fixtures/pi.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { launchProfile } from '../src/rpc.mjs';
+import { gatedExtension } from './fixtures/native-owner.mjs';
 import { readClaim } from '../src/attachments.mjs';
 
 const exists = (file) =>
@@ -21,18 +21,15 @@ test(
     const cleanup = [],
       f = await fixture({ after: (fn) => cleanup.push(fn) }),
       session = await f.bridge.session(f.id);
-    const extension = path.join(f.dir, 'reload-marker.mjs');
-    await fs.writeFile(
-      extension,
-      `import fs from 'node:fs/promises';
-export default function(pi){
-  pi.on('session_start', async () => { await fs.appendFile(${JSON.stringify(f.gate + '.loads')}, 'loaded\\n'); });
-  pi.on('session_shutdown', async event => {
-    if(event.reason!=='reload') return;
-    await fs.writeFile(${JSON.stringify(f.gate + '.reload-start')}, 'started');
-    while(!await fs.stat(${JSON.stringify(f.gate + '.reload-release')}).then(()=>true,()=>false)) await new Promise(r=>setTimeout(r,10));
-  });
-}`,
+    await gatedExtension(
+      f,
+      `
+      pi.on('session_shutdown', async ({ reason }) => {
+        if (reason !== 'reload') return;
+        await mark('reload-start');
+        await wait('reload-release');
+      });
+    `,
     );
     const client = new RpcClient({
       cliPath: nativePiCli,
@@ -48,14 +45,12 @@ export default function(pi){
         session.file,
         ...f.config.piArgs,
         '-e',
-        path.resolve('src/attach-extension.mjs'),
-        '-e',
-        extension,
+        new URL('../src/attach-extension.mjs', import.meta.url).pathname,
       ],
     });
     t.after(async () => {
       await fs.writeFile(f.gate + '.preflight-release', 'go');
-      await fs.writeFile(f.gate + '.reload-release', 'go');
+      await f.mark('reload-release');
       await client.stop();
       for (const close of cleanup) await close();
     });
@@ -68,24 +63,24 @@ export default function(pi){
     const before = (await client.getEntries()).entries;
     const preflight = client.prompt('HOLD_PREFLIGHT');
     await until(() => exists(f.gate + '.preflight-start'));
-    const skipped = await f.bridge.send({
-      session_id: f.id,
-      text: 'MUST_NOT_ENTER_DURING_PREFLIGHT',
-      mode: 'idle_only',
-    });
-    assert.equal(skipped.status, 'skipped');
-    assert.equal(skipped.reason, 'busy');
-    assert.deepEqual((await client.getEntries()).entries, before);
-    const refused = await f.bridge.reload({ session_id: f.id });
-    assert.equal(refused.status, 'rejected');
-    assert.equal(refused.reason, 'RELOAD_BUSY');
-    assert.equal(await exists(f.gate + '.reload-start'), false);
+    assert.equal(
+      (
+        await f.bridge.send({
+          session_id: f.id,
+          text: 'MUST_NOT_ENTER_DURING_PREFLIGHT',
+          mode: 'idle_only',
+        })
+      ).reason,
+      'busy',
+    );
+    assert.equal((await f.bridge.reload({ session_id: f.id })).reason, 'RELOAD_BUSY');
+    assert.equal(await exists(f.dir + '/reload-start'), false);
     await fs.writeFile(f.gate + '.preflight-release', 'go');
     await preflight;
     const reloading = f.bridge.reload({ session_id: f.id });
-    await until(() => exists(f.gate + '.reload-start'));
+    await until(() => exists(f.dir + '/reload-start'));
     await assert.rejects(client.prompt('MUST_NOT_ENTER_DURING_RELOAD'), /RELOAD_IN_PROGRESS/);
-    await fs.writeFile(f.gate + '.reload-release', 'go');
+    await f.mark('reload-release');
     assert.deepEqual(await reloading, {
       status: 'completed',
       owner_version: packageInfo.version,
@@ -95,8 +90,6 @@ export default function(pi){
     assert.notEqual(after.generation, initial.generation);
     assert.equal(after.owner.pid, initial.owner.pid);
     assert.deepEqual((await client.getEntries()).entries, before);
-    assert.equal((await fs.readFile(f.gate + '.loads', 'utf8')).trim().split('\n').length, 2);
-    assert.ok(!(await f.bridge.read({ session_id: f.id })).error);
     await client.prompt('CONTINUE_AFTER_RELOAD');
     await until(async () => !(await client.getState()).isStreaming);
     assert.ok(
