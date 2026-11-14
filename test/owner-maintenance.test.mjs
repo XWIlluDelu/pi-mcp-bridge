@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import path from 'node:path';
+import { gatedExtension } from './fixtures/native-owner.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, claimFile, ownerAlive } from '../src/attachments.mjs';
@@ -10,34 +10,24 @@ test(
   'explicit owner interruption recovers held native startup without changing the saved session',
   { timeout: 15000 },
   async (t) => {
-    const f = await fixture(t),
-      marker = path.join(f.dir, 'preparing'),
-      extension = path.join(f.dir, 'preflight.mjs');
-    await fs.writeFile(
-      extension,
-      `import fs from 'node:fs/promises';
-    export default pi => {
-      pi.registerCommand('held-extension-input', { handler: () => { pi.sendUserMessage('UNFINISHED_EXTENSION_INPUT'); } });
+    const f = await fixture(t);
+    await gatedExtension(
+      f,
+      `
+      pi.registerCommand('held-extension-input', { handler: () => {
+        pi.sendUserMessage('UNFINISHED_EXTENSION_INPUT');
+      } });
       pi.on('before_agent_start', async e => {
-        if (e.prompt !== 'UNFINISHED_EXTENSION_INPUT') return;
-        await fs.writeFile(${JSON.stringify(marker)}, 'yes');
-        await new Promise(() => {});
+        if (e.prompt === 'UNFINISHED_EXTENSION_INPUT') {
+          await mark('preparing');
+          await new Promise(() => {});
+        }
       });
-    };`,
+    `,
     );
-    f.config.piArgs.push('-e', extension);
-    // The fixture reloads grants only; its launch profile is the same in-memory object.
-    const accepted = await f.bridge.send({
-      session_id: f.id,
-      text: '/held-extension-input',
-    });
+    const accepted = await f.bridge.send({ session_id: f.id, text: '/held-extension-input' });
     assert.equal(accepted.status, 'handled');
-    await until(() =>
-      fs.stat(marker).then(
-        () => true,
-        () => false,
-      ),
-    );
+    await until(() => fs.stat(f.dir + '/preparing').catch(() => null));
     const runtime = f.bridge.pool.get(f.id),
       previous = runtime.ownerRecord,
       session = runtime.session;
@@ -48,10 +38,10 @@ test(
     );
     const signals = [],
       kill = runtime.child.kill.bind(runtime.child);
-    runtime.child.kill = (signal) => {
+    t.mock.method(runtime.child, 'kill', (signal) => {
       signals.push(signal);
       return kill(signal);
-    };
+    });
     assert.equal(
       (await ownerRequest(f.config, { op: 'release', session_id: f.id, interrupt: true })).status,
       'released',
@@ -96,10 +86,8 @@ test(
         assert.equal(await fs.readFile(file, 'utf8'), bytes);
       }
       await fs.writeFile(file, original);
-      const lines = history.toString().split('\n'),
-        replacement = JSON.parse(lines[0]);
-      replacement.id = 'replacement-native-session';
-      lines[0] = JSON.stringify(replacement);
+      const lines = history.toString().split('\n');
+      lines[0] = JSON.stringify({ ...JSON.parse(lines[0]), id: 'replacement-native-session' });
       const bytes = lines.join('\n');
       await fs.writeFile(session.file, bytes);
       await assert.rejects(
@@ -136,10 +124,10 @@ test(
     const release = f.bridge.releaseForLocal({ session_id: f.id });
     const signals = [],
       kill = runtime.child.kill.bind(runtime.child);
-    runtime.child.kill = (signal) => {
+    t.mock.method(runtime.child, 'kill', (signal) => {
       signals.push(signal);
       return kill(signal);
-    };
+    });
     assert.equal(f.bridge.handoffs.get(f.id).kind, 'release');
     try {
       for (const [op, body] of [
@@ -149,7 +137,6 @@ test(
       ]) {
         const result = await f.bridge[op]({
           session_id: f.id,
-
           ...body,
         }).catch((error) => ({ reason: error.code ?? error.message }));
         assert.ok(

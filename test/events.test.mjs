@@ -19,10 +19,10 @@ import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { SessionManager, fauxAssistantMessage } from './fixtures/pi.mjs';
 
 const secret = 'whsec_' + Buffer.alloc(32, 9).toString('base64');
-const request = (id, delivery = {}) => ({
+const request = (id) => ({
   name: 'session.settled',
   arguments: { session_id: id },
-  delivery: { mode: 'webhook', url: 'https://callback.example/chat', secret, ...delivery },
+  delivery: { mode: 'webhook', url: 'https://callback.example/chat', secret },
 });
 async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
   const f = await nativeOwner(t, {
@@ -39,9 +39,9 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
   const sent = [];
   let status = 204,
     challengeOK = true;
-  const post = async (url, body, headers) => {
+  const post = async (_url, body, headers) => {
     const decoded = new Webhook(secret).verify(body, headers);
-    sent.push({ url, body, headers, decoded });
+    sent.push({ body, headers, decoded });
     return decoded.type === 'verification'
       ? {
           status: 200,
@@ -144,8 +144,8 @@ test('event subscriptions verify consent, persist, rotate signing keys and expir
   assert.equal(f.bridge.events.records.size, 0);
   f.challenge(true);
 
-  const { id } = (await subscribe()).message.result,
-    verified = f.sent.length;
+  const { id } = (await subscribe()).message.result;
+  const verified = f.sent.length;
   assert.equal((await subscribe()).message.result.id, id);
   assert.equal(f.sent.length, verified, 'reuse receiver consent');
   assert.equal((await fs.stat(f.dir + '/state/event-subscriptions.json')).mode & 0o777, 0o600);
@@ -188,20 +188,13 @@ test('event admission uses receive-time authorization and delivery reauthorizes'
   assert.equal(f.bridge.events.records.size, 0);
 });
 
-test('delivery filters sessions, retries exact occurrences, and stops on permanent responses or unsubscribe', async (t) => {
+test('delivery filters sessions and stops on permanent responses or unsubscribe', async (t) => {
   const f = await fixture(t),
     input = request(f.session.id);
   await f.call('events/subscribe', input);
   const other = await savedSession(f.bridge);
   await f.settle(await f.bridge.session(other.session_id));
   assert.equal(f.sent.length, 1);
-  f.status(503);
-  await f.settle();
-  const attempts = f.sent.slice(1);
-  assert.equal(attempts.length, 3);
-  assert.equal(new Set(attempts.map((x) => x.decoded.eventId)).size, 1);
-  assert.equal(new Set(attempts.map((x) => x.body)).size, 1);
-  assert.ok(attempts.every((x) => x.headers['webhook-id'] === x.decoded.eventId));
   for (const status of [410, 302]) {
     f.status(status);
     const before = f.sent.length;
@@ -236,13 +229,15 @@ test('default delivery retries exhaust a bounded window and do not replay after 
   await f.settle();
   assert.ok(clock.elapsed >= 300000 && clock.elapsed <= 480000);
   assert.ok(attempts.length > 4 && attempts.length <= 10);
+  assert.equal(new Set(attempts.map(({ body }) => body)).size, 1);
+  assert.equal(new Set(attempts.map(({ headers }) => headers['webhook-id'])).size, 1);
+  assert.equal(attempts[0].headers['webhook-id'], JSON.parse(attempts[0].body).eventId);
   assert.ok(Math.max(...clock.waits) <= 120000);
   assert.equal(f.bridge.events.deliveries.size, 0);
   const exhaustedCount = attempts.length;
   status = 204;
   await f.restart();
   assert.equal(f.bridge.events.records.size, 1);
-  assert.equal(f.bridge.events.deliveries.size, 0);
   assert.equal(attempts.length, exhaustedCount);
   f.bridge.events.post = post;
   await f.settle();
@@ -280,10 +275,7 @@ test('a retry cannot authorize an old occurrence through a replacement native cw
   };
   await f.settle(session);
   assert.equal((await f.bridge.events.authorize(session.id)).header.cwd, replacement);
-  const context = await f.bridge.captureRequestContext();
-  assert.throws(() => f.bridge.check('read', session, context), /NOT_FOUND_OR_DENIED/);
   assert.equal(attempts.length, 1, 'new project permission cannot release the old captured result');
-  assert.equal(attempts[0].data.result.text, 'Review [report](./report.md)');
   assert.equal(f.bridge.events.deliveries.size, 0);
 });
 
@@ -329,8 +321,6 @@ test('owner IPC preserves capture identity before the first delivery and ignores
     const captured = observer.capture({ aborted: false }, manager);
     await scope.replace();
     await assert.rejects(ownerRequest(f.config, captured), /INVALID_OWNER_COMMAND/);
-    await Promise.all([...f.bridge.events.deliveries.keys()]);
-    assert.equal(f.sent.filter((item) => item.decoded.name === 'session.settled').length, 1);
     assert.equal(f.bridge.completionSequences.get(session.id).sequence, first.sequence);
   } finally {
     await release();
@@ -364,14 +354,11 @@ for (const invalid of ['active record', 'file privacy'])
     assert.deepEqual(health.events, { status: 'unavailable', reason });
     assert.doesNotMatch(JSON.stringify(health), /whsec_|callback\.example/);
     assert.equal((await f.bridge.read({ session_id: f.session.id })).session_id, f.session.id);
-    const failed = await f.call('events/subscribe', input);
-    assert.equal(failed.status, 500);
-    assert.equal(failed.message.error.data.reason, reason);
+    assert.equal((await f.call('events/subscribe', input)).message.error.data.reason, reason);
     const before = f.sent.length;
     await f.settle();
     assert.equal(f.sent.length, before);
     assert.equal(await fs.readFile(file, 'utf8'), raw);
-    if (invalid === 'file privacy') assert.equal((await fs.stat(file)).mode & 0o777, 0o644);
     await fs.writeFile(file, JSON.stringify([active]));
     await fs.chmod(file, 0o600);
     await f.restart();

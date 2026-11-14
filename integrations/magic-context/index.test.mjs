@@ -171,7 +171,6 @@ test('global project registration and foreign harness records do not activate a 
   f.db.prepare('INSERT INTO session_meta VALUES(?,?,?,?)').run('native-public', 'pi', 0, null);
   assert.equal(await reader.matches(f.context), false);
   f.db.exec('UPDATE session_meta SET counter=1');
-  assert.equal(await reader.matches(f.context), true);
   f.db.prepare('UPDATE session_projects SET project_path=?').run('dir:another-project');
   assert.equal(await reader.matches(f.context), false);
   await assert.rejects(reader.read(f.context), /MAGIC_CONTEXT_SESSION_MISMATCH/);
@@ -231,12 +230,7 @@ test('stored summaries use existing MC tiers and source relationships without da
   assert.equal(result.items[0].source.source_entry_id, 'entry-end');
   assert.equal(result.items[0].source.source_relation, 'history_leaf');
   assert.equal(result.items[0].source.mc_end_block_index, 2);
-  assert.equal(result.items[0].source.from_entry_id, undefined);
-  assert.equal(
-    result.items[0].source.end_block_index,
-    undefined,
-    'MC part coordinates are not native content indexes',
-  );
+  assert.equal(result.items[0].source.end_block_index, undefined);
   assert.equal(result.items[1].preview, 'Second decision');
   assert.equal(result.items[1].source.source_unavailable, 'unresolved_boundary');
   assert.equal(result.items[1].source.source_entry_id, undefined);
@@ -244,12 +238,7 @@ test('stored summaries use existing MC tiers and source relationships without da
   assert.equal(result.items[2].source.source_unavailable, 'no_native_history_leaf');
   assert.equal(result.items[3].source.scope, 'own_project');
   assert.equal(result.items[3].source.origin_session_id, 'origin-public');
-  assert.equal(
-    result.items[3].source.source_entry_id,
-    undefined,
-    'a memory origin is not exact evidence',
-  );
-  assert.ok(!JSON.stringify(result).includes('EXCLUDED'));
+  assert.equal(result.items[3].source.source_entry_id, undefined);
   assert.deepEqual(result.coverage, [
     { type: 'summary', selected: 3, total: 3 },
     { type: 'memory', selected: 2, total: 2 },

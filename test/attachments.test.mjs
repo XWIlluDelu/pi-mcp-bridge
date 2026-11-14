@@ -17,7 +17,7 @@ import {
   ownerAlive,
   registryTransaction,
 } from '../src/attachments.mjs';
-import attachExtension from './fixtures/companion.mjs';
+import { companionHooks } from './fixtures/companion.mjs';
 
 const fixture = (t) =>
   nativeOwner(t, {
@@ -53,16 +53,9 @@ test('overlong attachment path prevents bridge startup and official TUI exits on
 
 test('delayed shutdown flush cannot call a replaced or invalidated Pi context', async (t) => {
   const f = await fixture(t),
-    previous = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const handlers = {},
+    handlers = await companionHooks(f),
     callbacks = [];
   let shutdowns = 0;
-  await attachExtension({
-    on: (name, fn) => {
-      handlers[name] = fn;
-    },
-  });
   const originalEnd = net.Socket.prototype.end;
   t.mock.method(net.Socket.prototype, 'end', function (...args) {
     if (
@@ -130,21 +123,12 @@ test('delayed shutdown flush cannot call a replaced or invalidated Pi context', 
   } finally {
     await handlers.session_shutdown({ reason: 'quit' }, current.ctx);
     t.mock.restoreAll();
-    if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = previous;
   }
 });
 
 test('registry failure during shutdown still closes old socket and retains blocking ownership', async (t) => {
   const f = await fixture(t),
-    previous = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const handlers = {};
-  await attachExtension({
-    on: (name, fn) => {
-      handlers[name] = fn;
-    },
-  });
+    handlers = await companionHooks(f);
   const ctx = {
     mode: 'tui',
     sessionManager: {
@@ -183,9 +167,6 @@ test('registry failure during shutdown still closes old socket and retains block
   } finally {
     release.resolve();
     await held;
-    await handlers.session_shutdown({ reason: 'quit' }, ctx);
-    if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = previous;
   }
 });
 

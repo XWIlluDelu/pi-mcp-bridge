@@ -17,7 +17,25 @@ const inert = {
   sendUserMessage: () => {},
 };
 
-export default function attachExtension(pi) {
+function loadCompanion(pi, projection = buildSessionProjection) {
   for (const [name, value] of Object.entries(inert)) if (!(name in pi)) pi[name] = value;
-  return companion(pi, { AgentSession, buildSessionProjection });
+  return companion(pi, { AgentSession, buildSessionProjection: projection });
+}
+
+export default function attachExtension(pi) {
+  return loadCompanion(pi);
+}
+
+export async function companionHooks({ config, cleanup }, projection) {
+  const handlers = {};
+  const previous = process.env.PI_MCP_ATTACH_DIR;
+  process.env.PI_MCP_ATTACH_DIR = config.attachmentDir;
+  try {
+    await loadCompanion({ on: (name, handler) => (handlers[name] = handler) }, projection);
+  } finally {
+    if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
+    else process.env.PI_MCP_ATTACH_DIR = previous;
+  }
+  cleanup.push(() => handlers.session_shutdown({ reason: 'quit' }));
+  return handlers;
 }

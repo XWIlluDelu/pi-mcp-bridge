@@ -2,7 +2,7 @@ import { nativeOwner, nativeTui, fauxArgs, gatedExtension } from './fixtures/nat
 import { until } from './fixtures/until.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 
-import { savedSession } from './fixtures/saved-session.mjs';
+import { restoreManifest, savedSession } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -10,6 +10,8 @@ import { readFileSync } from 'node:fs';
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import {
@@ -19,6 +21,8 @@ import {
   reserveOwner,
   claimFile,
   AttachedRuntime,
+  updateOwner,
+  assertNoOtherLiveOwner,
 } from '../src/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import joinExtension from '../src/join-extension.mjs';
@@ -155,12 +159,7 @@ for (const stage of ['running', 'busy_handoff', 'handoff_eof', 'release_eof'])
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
     assert.equal(f.bridge.handoffs.has(f.id), false);
     await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
-    const manifest = JSON.parse(
-      await fs.readFile(
-        path.join(f.config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
-        'utf8',
-      ),
-    );
+    const manifest = await restoreManifest(f.config, deleted);
     assert.match(await fs.readFile(manifest.trash_path, 'utf8'), /DELETE_OVERRIDES_LIFECYCLE/);
   });
 
@@ -310,6 +309,38 @@ test('an uncertain native switch exception retains its live reservation instead 
   );
   f.request.handoff_id = held.handoffId;
   await cancel(f);
+});
+
+test('delete holds exclusion through an opening handoff until the requester exits', async (t) => {
+  const f = await fixture(t);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const exited = once(child, 'exit');
+  t.after(async () => {
+    child.kill();
+    await exited;
+  });
+  await once(child, 'spawn');
+  f.request.requester = await processIdentity(child.pid);
+  await transfer(f);
+  const dir = f.config.attachmentDir;
+  const claim = await readClaim(dir, f.session);
+  await updateOwner(dir, f.session, claim, { phase: 'opening' });
+  const deleting = f.bridge.delete({ session_id: f.id });
+  await until(async () => {
+    try {
+      await assertNoOtherLiveOwner(dir, f.session);
+      return false;
+    } catch (error) {
+      if (error.code !== 'LIVE_OWNER_UNREACHABLE') throw error;
+      return true;
+    }
+  });
+  assert.equal(await ownerAlive(f.request.requester), true);
+  assert.ok(await fs.stat(f.session.file));
+  child.kill();
+  await exited;
+  assert.equal((await deleting).status, 'deleted');
+  await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
 });
 
 test(

@@ -8,17 +8,17 @@ import { RpcClient } from './fixtures/pi.mjs';
 import { readClaim } from '../src/attachments.mjs';
 
 test('native profile discovery leaves an owned RPC claim intact and registers an ordinary RPC', async (t) => {
+  const companion = new URL('../src/attach-extension.mjs', import.meta.url).pathname;
   const f = await nativeOwner(t, {
     prefix: 'startup',
     async configure({ config }) {
       const extensions = path.join(config.piRuntime.agentDir, 'extensions');
       await fs.mkdir(extensions);
-      const companion = new URL('../src/attach-extension.mjs', import.meta.url).href;
       await fs.writeFile(
         path.join(config.piRuntime.agentDir, 'settings.json'),
         JSON.stringify({
           cacheWarming: 'off',
-          extensions: [new URL(companion).pathname],
+          extensions: [companion],
         }),
       );
       await fs.writeFile(
@@ -40,7 +40,7 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
     cliPath: nativePiCli,
     cwd: f.cwd,
     env: f.env,
-    args: ['--offline', '--session', f.session.file],
+    args: ['--offline', '--session', f.session.file, '-e', companion],
   });
   f.cleanup.push(() => local.stop());
   await local.start();
@@ -48,4 +48,5 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
   const external = await claim();
   assert.equal(external.kind, 'extension');
   assert.equal(external.phase, 'ready');
+  assert.equal((await f.bridge.read({ session_id: f.id })).source, 'extension');
 });

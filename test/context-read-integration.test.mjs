@@ -5,8 +5,8 @@ import { READ_CONTRACT, assertReadSnapshot } from '../src/context-read.mjs';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { reserveOwner, updateOwner } from '../src/attachments.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
-import companion from '../src/companion.mjs';
-import { AgentSession, SessionManager, buildSessionProjection } from './fixtures/pi.mjs';
+import { companionHooks } from './fixtures/companion.mjs';
+import { SessionManager, buildSessionProjection } from './fixtures/pi.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { append, message, text } from './fixtures/native-history.mjs';
 import { readSource } from './fixtures/read-source.mjs';
@@ -39,28 +39,8 @@ async function attach(f, kind, projection = buildSessionProjection) {
     });
     return;
   }
-  const previous = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const handlers = new Map();
-  f.cleanup.push(async () => {
-    try {
-      await handlers.get('session_shutdown')?.({ reason: 'quit' });
-    } finally {
-      if (previous === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-      else process.env.PI_MCP_ATTACH_DIR = previous;
-    }
-  });
-  await companion(
-    {
-      on: (name, handler) => handlers.set(name, handler),
-      registerCommand() {},
-      getThinkingLevel: () => 'off',
-      getAllTools: () => [],
-      getCommands: () => [],
-    },
-    { AgentSession, buildSessionProjection: projection },
-  );
-  await handlers.get('session_start')(
+  const handlers = await companionHooks(f, projection);
+  await handlers.session_start(
     {},
     {
       mode: 'tui',

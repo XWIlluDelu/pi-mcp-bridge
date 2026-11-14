@@ -9,6 +9,8 @@ import { once } from 'node:events';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';
+import { restoreManifest } from './fixtures/saved-session.mjs';
+import { until } from './fixtures/until.mjs';
 import {
   processIdentity,
   claimFile,
@@ -83,8 +85,7 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
         await sent;
       });
       const waitFor = stage === 'native readiness' ? marker : path.join(f.dir, 'cleanup-waiting');
-      while (!(await fs.stat(waitFor).catch(() => null)))
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      await until(() => fs.stat(waitFor).catch(() => null));
       const rpc = f.bridge.pool.starting.get(target.id).runtime,
         owner = structuredClone(rpc.childIdentity);
       assert.equal(await ownerAlive(owner), true);
@@ -95,12 +96,7 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
       assert.equal(await readClaim(f.config.attachmentDir, target), null);
       assert.equal(f.bridge.pool.starting.has(target.id), false);
       await assert.rejects(fs.stat(target.file), { code: 'ENOENT' });
-      const manifest = JSON.parse(
-        await fs.readFile(
-          path.join(f.config.stateDir, 'trash', deleted.restore_token + '.restore.json'),
-          'utf8',
-        ),
-      );
+      const manifest = await restoreManifest(f.config, deleted);
       assert.equal(manifest.native_session_id, target.header.id);
       assert.doesNotMatch(await fs.readFile(manifest.trash_path, 'utf8'), /MUST_NOT_REACH_PI/);
     },
@@ -186,12 +182,7 @@ for (const callback of ['cancel', 'release'])
       } else {
         assert.equal(result.status, 'deleted', JSON.stringify(result));
         assert.equal(await ownerAlive(a.owner), false);
-        const manifest = JSON.parse(
-          await fs.readFile(
-            path.join(f.config.stateDir, 'trash', result.restore_token + '.restore.json'),
-            'utf8',
-          ),
-        );
+        const manifest = await restoreManifest(f.config, result);
         assert.ok(await fs.stat(manifest.trash_path));
       }
     });
@@ -224,12 +215,7 @@ test('lost release ACK uses confirmed target closure without terminating the sha
   assert.equal(await ownerAlive(a.owner), true);
   assert.ok(await fs.stat(neighbor.file));
   assert.equal(result.status, 'deleted', JSON.stringify(result));
-  const manifest = JSON.parse(
-    await fs.readFile(
-      path.join(f.config.stateDir, 'trash', result.restore_token + '.restore.json'),
-      'utf8',
-    ),
-  );
+  const manifest = await restoreManifest(f.config, result);
   assert.ok(await fs.stat(manifest.trash_path));
   await assert.rejects(fs.stat(target.file), { code: 'ENOENT' });
 });

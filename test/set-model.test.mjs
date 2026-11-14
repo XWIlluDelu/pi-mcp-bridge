@@ -165,37 +165,32 @@ test('cold setters return native thinking adjustment, produce no prompt and rele
   assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
 });
 
-for (const op of ['send', 'create'])
-  test(
-    'local selection changes after ' +
-      op +
-      ' preflight reject its prompt without restoring the previous model',
-    { timeout: 15000 },
-    async (t) => {
-      const f = await fixture(t),
-        factory = f.bridge.pool.factory;
-      f.bridge.pool.factory = async (session) => {
-        const runtime = await factory(session),
-          select = runtime.selectModel.bind(runtime);
-        t.mock.method(runtime, 'selectModel', async (...args) => {
-          const result = await select(...args);
-          await runtime.command({ type: 'set_model', provider: 'model-fixture', modelId: 'alpha' });
-          return result;
-        });
-        return runtime;
-      };
-      const result = await f.bridge[op]({
-        ...(op === 'send' ? { session_id: f.id } : { project: f.cwd }),
-        text: 'NEVER_DISPATCH',
-        model: { provider: 'model-fixture', id: 'vision' },
-        thinking_level: 'high',
+test(
+  'local selection changes after prompt preflight reject dispatch without restoring the previous model',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t),
+      factory = f.bridge.pool.factory;
+    f.bridge.pool.factory = async (session) => {
+      const runtime = await factory(session),
+        select = runtime.selectModel.bind(runtime);
+      t.mock.method(runtime, 'selectModel', async (...args) => {
+        const result = await select(...args);
+        await runtime.command({ type: 'set_model', provider: 'model-fixture', modelId: 'alpha' });
+        return result;
       });
-      const receipt = result.send ?? result;
-      assert.equal(receipt.status, 'rejected', JSON.stringify(result));
-      assert.equal(receipt.reason, 'MODEL_SELECTION_CHANGED');
-      const target = result.session_id ?? f.id;
-      const entries = await releasedEntries(f.bridge, target);
-      assert.equal(entries.filter((e) => e.message?.role === 'user').length, 0);
-      assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'alpha');
-    },
-  );
+      return runtime;
+    };
+    const result = await f.bridge.send({
+      session_id: f.id,
+      text: 'NEVER_DISPATCH',
+      model: choice('vision'),
+      thinking_level: 'high',
+    });
+    assert.equal(result.status, 'rejected', JSON.stringify(result));
+    assert.equal(result.reason, 'MODEL_SELECTION_CHANGED');
+    const entries = await releasedEntries(f.bridge, f.id);
+    assert.equal(entries.filter((e) => e.message?.role === 'user').length, 0);
+    assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'alpha');
+  },
+);

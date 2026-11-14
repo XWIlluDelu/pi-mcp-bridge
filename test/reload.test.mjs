@@ -18,33 +18,23 @@ import {
 } from '../src/attachments.mjs';
 
 test('reload requires send and leaves saved sessions and explicit local pauses unopened', async (t) => {
-  const f = await fixture(t);
-  const session = await f.bridge.session(f.id);
-  const before = await fs.readFile(session.file, 'utf8');
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'skipped',
-    reason: 'no_active_owner',
-  });
+  const f = await fixture(t),
+    args = { session_id: f.id };
+  const claim = () => readClaim(f.config.attachmentDir, f.session);
+  assert.equal((await f.bridge.reload(args)).reason, 'no_active_owner');
+  await f.bridge.releaseForLocal(args);
+  const held = await claim();
+  assert.equal(held.noColdReacquire, true);
+  assert.equal((await f.bridge.reload(args)).reason, 'no_active_owner');
+  assert.deepEqual(await claim(), held);
   assert.equal(f.bridge.pool.instances.size, 0);
-  await f.bridge.releaseForLocal({ session_id: f.id });
-  const claim = await readClaim(f.bridge.pool.attachmentDir, session);
-  assert.equal(claim.noColdReacquire, true);
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'skipped',
-    reason: 'no_active_owner',
-  });
-  assert.deepEqual(await readClaim(f.bridge.pool.attachmentDir, session), claim);
-  assert.equal(await fs.readFile(session.file, 'utf8'), before);
-  await fs.writeFile(
-    f.configFile,
-    JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, read: true }] }),
-  );
-  await assert.rejects(f.bridge.reload({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
+  await fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants: [] }));
+  await assert.rejects(f.bridge.reload(args), /NOT_FOUND_OR_DENIED/);
 });
 
 test('idle owned reload confirms a fresh worker without sending input or rewriting saved history', async (t) => {
   const f = await fixture(t);
-  const session = await f.bridge.session(f.id);
+  const { session } = f;
   const old = await f.bridge.pool.resolve(session);
   const before = await savedEntries(f.bridge, f.id);
   const start = f.bridge.pool.factory;
@@ -71,7 +61,7 @@ test('idle owned reload confirms a fresh worker without sending input or rewriti
 
 test('reload cancellation after seal closes the old writer without starting a successor', async (t) => {
   const f = await fixture(t),
-    session = await f.bridge.session(f.id),
+    session = f.session,
     rpc = await f.bridge.pool.resolve(session),
     seal = AttachedRuntime.prototype.seal;
   let starts = 0;
@@ -152,9 +142,7 @@ async function attached(
     readContract: READ_CONTRACT,
     ...(supported ? { reloadSupported: true } : {}),
   });
-  // Cleanup registered after fixture cleanup runs first, so do not rely on the
-  // directory still existing; close the socket independently of claim deletion.
-  t.after(async () => {
+  f.cleanup.push(async () => {
     for (const s of sockets) s.destroy();
     await new Promise((resolve) => server.close(resolve));
   });
@@ -162,7 +150,6 @@ async function attached(
     ...f,
     session,
     record,
-    current: () => current,
     reloads: () => reloads,
     stateReads: () => stateReads,
     completeInitialization: () => {

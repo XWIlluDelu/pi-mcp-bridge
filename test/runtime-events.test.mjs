@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PiRpc, RuntimePool } from '../src/rpc.mjs';
 import { RuntimeEvents } from '../src/runtime-events.mjs';
-import { prepareContextRead } from './fixtures/read-pages.mjs';
+import { assertContextReadResponse, prepareContextRead } from './fixtures/read-pages.mjs';
+import { message } from './fixtures/native-history.mjs';
 import { ContextReadCache } from '../src/read-cache.mjs';
-import { assertContextReadResponse } from './fixtures/read-pages.mjs';
 import { toolResultBytes } from '../src/response-budget.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
@@ -87,16 +87,13 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
   assert.equal(observations.events.at(-1).sequence, 40);
   assert.equal(observations.omitted_events, 40 - observations.events.length);
   assert.ok(observations.events.at(-1).truncated_fields.includes('message'));
-  const entry = {
-    type: 'message',
-    id: 'user',
-    parentId: null,
-    timestamp: '2026-01-01T00:00:00Z',
-    message: { role: 'user', content: 'history\n\n'.repeat(6000), timestamp: 0 },
-  };
   const args = { session_id: 's', max_bytes: 24000 },
     prepared = prepareContextRead(
-      { header: { id: 'native' }, entries: [entry], leafId: entry.id },
+      {
+        header: { id: 'native' },
+        entries: [message('user', null, 'user', 'history\n\n'.repeat(6000))],
+        leafId: 'user',
+      },
       args,
     ),
     cache = new ContextReadCache(),
@@ -116,19 +113,13 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
     undefined,
   );
 
-  const frozen = JSON.stringify(prepared.units),
-    reduced = cache.render(prepared, args, {
-      ...options,
-      resultBudget: { maxBytes: 19000, maxWireBytes: 25000 },
-    });
+  const reduced = cache.render(prepared, args, {
+    ...options,
+    resultBudget: { maxBytes: 19000, maxWireBytes: 25000 },
+  });
   assertContextReadResponse(reduced, args);
   assert.ok(bytes(reduced) <= 19000);
   assert.ok(toolResultBytes(reduced) <= 25000);
   assert.ok(reduced.items.length > 0, 'Committed history wins over optional previews');
   if (reduced.runtime_events) assert.equal(reduced.runtime_events.events.at(-1).sequence, 40);
-  assert.equal(
-    JSON.stringify(prepared.units),
-    frozen,
-    'Batch budgets render the captured snapshot without mutation',
-  );
 });

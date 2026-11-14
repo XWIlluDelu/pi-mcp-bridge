@@ -18,9 +18,8 @@ test(
   'companion reload preserves history, refuses input preparation, fences new work and confirms fresh registration',
   { timeout: 30000 },
   async (t) => {
-    const cleanup = [],
-      f = await fixture({ after: (fn) => cleanup.push(fn) }),
-      session = await f.bridge.session(f.id);
+    const f = await fixture(t),
+      { bridge, session } = f;
     await gatedExtension(
       f,
       `
@@ -48,16 +47,15 @@ test(
         new URL('../src/attach-extension.mjs', import.meta.url).pathname,
       ],
     });
-    t.after(async () => {
+    f.cleanup.unshift(async () => {
       await fs.writeFile(f.gate + '.preflight-release', 'go');
       await f.mark('reload-release');
       await client.stop();
-      for (const close of cleanup) await close();
     });
     await client.start();
     await client.getState();
-    const initial = await readClaim(f.bridge.pool.attachmentDir, session);
-    assert.equal(initial.reloadSupported, true);
+    const claim = () => readClaim(f.config.attachmentDir, session);
+    const initial = await claim();
     await client.prompt('PRESERVE_BEFORE_RELOAD');
     await until(async () => !(await client.getState()).isStreaming);
     const before = (await client.getEntries()).entries;
@@ -65,7 +63,7 @@ test(
     await until(() => exists(f.gate + '.preflight-start'));
     assert.equal(
       (
-        await f.bridge.send({
+        await bridge.send({
           session_id: f.id,
           text: 'MUST_NOT_ENTER_DURING_PREFLIGHT',
           mode: 'idle_only',
@@ -73,11 +71,12 @@ test(
       ).reason,
       'busy',
     );
-    assert.equal((await f.bridge.reload({ session_id: f.id })).reason, 'RELOAD_BUSY');
+    const reload = () => bridge.reload({ session_id: f.id });
+    assert.equal((await reload()).reason, 'RELOAD_BUSY');
     assert.equal(await exists(f.dir + '/reload-start'), false);
     await fs.writeFile(f.gate + '.preflight-release', 'go');
     await preflight;
-    const reloading = f.bridge.reload({ session_id: f.id });
+    const reloading = reload();
     await until(() => exists(f.dir + '/reload-start'));
     await assert.rejects(client.prompt('MUST_NOT_ENTER_DURING_RELOAD'), /RELOAD_IN_PROGRESS/);
     await f.mark('reload-release');
@@ -86,7 +85,7 @@ test(
       owner_version: packageInfo.version,
       read_compatible: true,
     });
-    const after = await readClaim(f.bridge.pool.attachmentDir, session);
+    const after = await claim();
     assert.notEqual(after.generation, initial.generation);
     assert.equal(after.owner.pid, initial.owner.pid);
     assert.deepEqual((await client.getEntries()).entries, before);

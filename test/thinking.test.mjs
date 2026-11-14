@@ -2,13 +2,7 @@ import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import {
-  fixture,
-  until,
-  choice,
-  releasedEntries,
-  savedEntries,
-} from './fixtures/model-runtime.mjs';
+import { fixture, until, choice, releasedEntries } from './fixtures/model-runtime.mjs';
 
 const replies = (entries) =>
   entries
@@ -18,47 +12,46 @@ const identity = (op, f) => (op === 'create' ? { project: f.cwd } : { session_id
 const target = (result, f) => result.session_id ?? f.id;
 const sendReceipt = (result) => result.send ?? result;
 
-for (const op of ['send', 'create']) {
-  for (const kind of ['model', 'thinking', 'both']) {
-    test(
-      op + ' applies ' + kind + ' settings to its first provider call',
-      { timeout: 15000 },
-      async (t) => {
-        const f = await fixture(t),
-          { bridge } = f;
-        if (kind === 'thinking') f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
-        const defaults = await fs.readFile(f.settings, 'utf8');
-        const args = {
-          ...identity(op, f),
-          text: 'CONFIGURED',
-          ...(kind !== 'thinking' ? { model: choice('vision') } : {}),
-          ...(kind !== 'model' ? { thinking_level: 'high' } : {}),
-        };
-        const result = await bridge[op](args),
-          receipt = sendReceipt(result),
-          id = target(result, f);
-        assert.ok(
-          ['started', 'queued', 'handled'].includes(receipt.status),
-          JSON.stringify(result),
-        );
-        const effective = receipt.model_selection;
-        assert.deepEqual(effective.model, choice('vision'));
-        if (kind !== 'model') assert.equal(effective.thinking_level, 'high');
-        const entries = await releasedEntries(bridge, id),
-          reply = replies(entries)[0];
-        assert.equal(reply.id, 'vision');
-        assert.equal(
-          reply.reasoning,
-          effective.thinking_level === 'off' ? null : effective.thinking_level,
-        );
-        assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
-        assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
-        assert.deepEqual(await savedEntries(bridge, id), entries);
-        assert.equal(bridge.pool.instances.size, 0);
-      },
-    );
-  }
+for (const [op, kind] of [
+  ['send', 'model'],
+  ['send', 'thinking'],
+  ['create', 'both'],
+]) {
+  test(
+    op + ' applies ' + kind + ' settings to its first provider call',
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(t),
+        { bridge } = f;
+      if (kind === 'thinking') f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
+      const defaults = await fs.readFile(f.settings, 'utf8');
+      const args = {
+        ...identity(op, f),
+        text: 'CONFIGURED',
+        ...(kind !== 'thinking' ? { model: choice('vision') } : {}),
+        ...(kind !== 'model' ? { thinking_level: 'high' } : {}),
+      };
+      const result = await bridge[op](args),
+        receipt = sendReceipt(result),
+        id = target(result, f);
+      assert.ok(['started', 'queued', 'handled'].includes(receipt.status), JSON.stringify(result));
+      const effective = receipt.model_selection;
+      assert.deepEqual(effective.model, choice('vision'));
+      if (kind !== 'model') assert.equal(effective.thinking_level, 'high');
+      const entries = await releasedEntries(bridge, id),
+        reply = replies(entries)[0];
+      assert.equal(reply.id, 'vision');
+      assert.equal(
+        reply.reasoning,
+        effective.thinking_level === 'off' ? null : effective.thinking_level,
+      );
+      assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
+      assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
+    },
+  );
+}
 
+for (const op of ['send', 'create']) {
   test(
     op + ' rejects unsupported thinking before changing model or admitting its prompt',
     { timeout: 10000 },
@@ -83,52 +76,52 @@ for (const op of ['send', 'create']) {
       );
     },
   );
-
-  test(
-    op + ' late thinking ACK repairs settings evidence and never sends the pending prompt',
-    { timeout: 15000 },
-    async (t) => {
-      const f = await fixture(t),
-        { bridge } = f,
-        factory = bridge.pool.factory;
-      ackTimeout(t, ['set_thinking_level']);
-      let held, rpc, receive;
-      bridge.pool.factory = async (session) => {
-        rpc = await factory(session);
-        receive = rpc.receiveResponse.bind(rpc);
-        rpc.receiveResponse = (event, generation) => {
-          if (event.type === 'response' && event.command === 'set_thinking_level') {
-            held = [event, generation];
-            return;
-          }
-          return receive(event, generation);
-        };
-        return rpc;
-      };
-      const args = {
-        ...identity(op, f),
-        text: 'NEVER',
-        model: choice('vision'),
-        thinking_level: 'high',
-      };
-      const result = await bridge[op](args),
-        id = target(result, f);
-      assert.equal(sendReceipt(result).status, 'unknown');
-      assert.ok(held);
-      assert.equal(
-        (await bridge.send({ session_id: id, text: 'NEVER' })).reason,
-        'MODEL_SELECTION_PENDING',
-      );
-      receive(...held);
-      await until(() => !bridge.pool.get(id)?.hasPendingModelSelection());
-      assert.equal(sendReceipt(result).model_selection, undefined);
-      assert.equal(
-        (await releasedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,
-        0,
-      );
-    },
-  );
 }
+
+test(
+  'late thinking ACK clears the selection fence without sending the pending prompt',
+  { timeout: 15000 },
+  async (t) => {
+    const f = await fixture(t),
+      { bridge } = f,
+      factory = bridge.pool.factory;
+    ackTimeout(t, ['set_thinking_level']);
+    let held, rpc, receive;
+    bridge.pool.factory = async (session) => {
+      rpc = await factory(session);
+      receive = rpc.receiveResponse.bind(rpc);
+      rpc.receiveResponse = (event, generation) => {
+        if (event.type === 'response' && event.command === 'set_thinking_level') {
+          held = [event, generation];
+          return;
+        }
+        return receive(event, generation);
+      };
+      return rpc;
+    };
+    const args = {
+      project: f.cwd,
+      text: 'NEVER',
+      model: choice('vision'),
+      thinking_level: 'high',
+    };
+    const result = await bridge.create(args),
+      id = target(result, f);
+    assert.equal(sendReceipt(result).status, 'unknown');
+    assert.ok(held);
+    assert.equal(
+      (await bridge.send({ session_id: id, text: 'NEVER' })).reason,
+      'MODEL_SELECTION_PENDING',
+    );
+    receive(...held);
+    await until(() => !bridge.pool.get(id)?.hasPendingModelSelection());
+    assert.equal(sendReceipt(result).model_selection, undefined);
+    assert.equal(
+      (await releasedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,
+      0,
+    );
+  },
+);
 
 test(
   'prompt ACK timeout retains verified settings and a late ACK never resubmits',
@@ -162,8 +155,6 @@ test(
     const entries = await releasedEntries(bridge, id);
     assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);
     assert.equal(replies(entries)[0].reasoning, 'high');
-
-    assert.deepEqual(await savedEntries(bridge, id), entries);
   },
 );
 

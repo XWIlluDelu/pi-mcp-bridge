@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { reserveHostSession } from '../src/host-adapter.mjs';
-import attachExtension from './fixtures/companion.mjs';
+import { companionHooks } from './fixtures/companion.mjs';
 import { reserveOwner, readClaim, ownerAlive } from '../src/attachments.mjs';
 const fixture = (t) => nativeOwner(t, { factory: () => assert.fail('Unexpected second writer') });
 const identity = (session) => ({ sessionFile: session.file, sessionId: session.header.id });
@@ -28,15 +28,8 @@ const callbacks = (session) => ({
 });
 test('profile companion leaves the same-process host controller and its shutdown lifecycle in charge', async (t) => {
   const f = await fixture(t),
-    host = await reserve(f);
-  const prior = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  const handlers = {};
-  await attachExtension({
-    on: (name, handler) => {
-      handlers[name] = handler;
-    },
-  });
+    host = await reserve(f),
+    handlers = await companionHooks(f);
   const ctx = {
     mode: 'rpc',
     sessionManager: {
@@ -59,10 +52,7 @@ test('profile companion leaves the same-process host controller and its shutdown
     assert.deepEqual(await readClaim(f.config.attachmentDir, f.session), ready);
     assert.equal((await f.bridge.read({ session_id: f.session.id })).items.length, 0);
   } finally {
-    await handlers.session_shutdown({});
     await host.close();
-    if (prior === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = prior;
   }
 });
 

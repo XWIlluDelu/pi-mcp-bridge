@@ -11,7 +11,7 @@ import { reserveOwner, releaseOwner } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
 import { readClaim, AttachedRuntime } from '../src/attachments.mjs';
-import attachExtension from './fixtures/companion.mjs';
+import { companionHooks } from './fixtures/companion.mjs';
 
 const fixture = (t) => nativeOwner(t, { prefix: 'alias' });
 const sessionAt = (manager) => ({ file: manager.getSessionFile(), header: manager.getHeader() });
@@ -21,20 +21,6 @@ const persist = (manager) =>
     content: 'native persistence fixture',
     timestamp: Date.now(),
   });
-
-async function companion(f) {
-  const handlers = {};
-  const original = process.env.PI_MCP_ATTACH_DIR;
-  process.env.PI_MCP_ATTACH_DIR = f.config.attachmentDir;
-  try {
-    await attachExtension({ on: (name, fn) => (handlers[name] = fn) });
-  } finally {
-    if (original === undefined) delete process.env.PI_MCP_ATTACH_DIR;
-    else process.env.PI_MCP_ATTACH_DIR = original;
-  }
-  f.cleanup.push(() => handlers.session_shutdown({}));
-  return handlers;
-}
 
 function context(manager, mode = 'tui') {
   const ctx = {
@@ -66,7 +52,7 @@ test('changing a native ID at the same path cannot hide a live writer', async (t
 
 test('initial attachment rechecks first persistence after a missing-file snapshot', async (t) => {
   const f = await fixture(t),
-    handlers = await companion(f);
+    handlers = await companionHooks(f);
   const manager = SessionManager.create(f.cwd, f.config.sessionRoots[0]);
   const session = sessionAt(manager),
     ctx = context(manager),
@@ -101,8 +87,8 @@ test('initial attachment rechecks first persistence after a missing-file snapsho
 for (const persisted of [false, true])
   test(`independent managers at the same path stay distinct ${persisted ? 'after' : 'before'} first persistence`, async (t) => {
     const f = await fixture(t),
-      a = await companion(f),
-      b = await companion(f);
+      a = await companionHooks(f),
+      b = await companionHooks(f);
     const first = SessionManager.create(f.cwd, f.config.sessionRoots[0]);
     if (persisted) persist(first);
     const second = SessionManager.open(first.getSessionFile());
@@ -142,7 +128,7 @@ test('hardlink aliases are hidden and stale discovered targets cannot claim or s
 
 test('native unflushed startup and /new reserve their paths and validate after persistence', async (t) => {
   const f = await fixture(t),
-    handlers = await companion(f);
+    handlers = await companionHooks(f);
   let previousSessionFile;
   for (const reason of ['startup', 'new']) {
     if (previousSessionFile) await handlers.session_shutdown({ reason });
@@ -174,7 +160,7 @@ test('native unflushed startup and /new reserve their paths and validate after p
 
 test('missing targets do not bypass canonical parent or observed-file checks', async (t) => {
   const f = await fixture(t),
-    handlers = await companion(f);
+    handlers = await companionHooks(f);
   const manager = SessionManager.create(f.cwd, f.config.sessionRoots[0]);
   const { file, header } = sessionAt(manager),
     parentAlias = path.join(f.dir, 'root-alias');
@@ -196,7 +182,7 @@ test('missing targets do not bypass canonical parent or observed-file checks', a
 
 test('RPC extension storage failure retains ownership without shutting down its external host', async (t) => {
   const f = await fixture(t),
-    handlers = await companion(f);
+    handlers = await companionHooks(f);
   const ctx = context(SessionManager.open(f.session.file), 'rpc');
   const alias = path.join(f.dir, 'rpc-alias.jsonl');
   await handlers.session_start({}, ctx);

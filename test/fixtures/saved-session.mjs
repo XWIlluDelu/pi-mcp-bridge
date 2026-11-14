@@ -25,3 +25,9 @@ export async function savedEntries(bridge, id) {
   const session = await bridge.session(id);
   return (await fs.readFile(session.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
 }
+
+export async function restoreManifest({ stateDir }, { restore_token }) {
+  return JSON.parse(
+    await fs.readFile(path.join(stateDir, 'trash', restore_token + '.restore.json'), 'utf8'),
+  );
+}

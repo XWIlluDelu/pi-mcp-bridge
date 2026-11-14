@@ -10,7 +10,6 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { Bridge } from '../src/bridge.mjs';
 
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 import { readClaim, ownerAlive } from '../src/attachments.mjs';
@@ -79,38 +78,21 @@ function launch(t, f, nodeArgs = []) {
       pending.set(id, resolve);
       write({ jsonrpc: '2.0', id, method, params });
     });
-  const bounded = (p) =>
-    Promise.race([
-      p,
-      new Promise((_, reject) => {
-        const timer = setTimeout(() => reject(new Error('MCP fixture timeout')), 10000);
-        timer.unref();
-      }),
-    ]);
-  const call = async (name, args) => {
-    const result = (await bounded(request('tools/call', { name, arguments: args }))).result;
-    assert.ok(result && !result.isError, JSON.stringify(result));
-    return result.structuredContent;
-  };
   return {
     child,
-    call,
     request,
-    done,
     stderr: () => stderr,
-    initialize: async (protocolVersion = '2024-11-05') => {
-      const r = await bounded(
-        request('initialize', {
-          protocolVersion,
-          capabilities: {},
-          clientInfo: { name: 'lifecycle-fixture', version: '1' },
-        }),
-      );
+    initialize: async () => {
+      const r = await request('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'lifecycle-fixture', version: '1' },
+      });
       assert.ok(r.result);
       write({ jsonrpc: '2.0', method: 'notifications/initialized' });
     },
     exit: async () => {
-      const result = await bounded(done);
+      const result = await done;
       assert.equal(result.signal, null, stderr);
       return result.code;
     },
@@ -128,88 +110,82 @@ async function ownClaim(f) {
 }
 
 for (const stage of ['before-acquire', 'after-acquire', 'owner-listen-failure'])
-  test(`stop during initialization waits for ${stage} and releases only its acquired lock`, async (t) => {
-    const f = await fixture(t),
-      preload = path.join(f.dir, 'pause-init.mjs'),
-      reached = path.join(f.dir, 'init-reached'),
-      release = path.join(f.dir, 'init-release');
-    await fs.writeFile(
-      preload,
-      `import {holdInit} from ${JSON.stringify(new URL('./fixtures/init-gate.mjs', import.meta.url).href)};holdInit(${JSON.stringify({ config: f.config, stage, reached, release })});`,
-    );
-    const server = launch(t, f, ['--import', preload]);
-    await until(() => exists(reached));
-    server.child.kill('SIGTERM');
-    await new Promise((r) => setTimeout(r, 80));
-    server.child.kill('SIGINT');
-    assert.equal(server.child.exitCode, null);
-    assert.equal(
-      server.child.signalCode,
-      null,
-      'Signal handlers must be active before init acquires resources',
-    );
-    await fs.writeFile(release, 'continue');
-    assert.equal(await server.exit(), stage === 'owner-listen-failure' ? 1 : 0);
-    await stopped(f);
-    const restarted = launch(t, f);
-    await restarted.initialize();
-    restarted.child.stdin.end();
-    assert.equal(await restarted.exit(), 0);
-    await stopped(f);
-  });
+  test(
+    `stop during initialization waits for ${stage} and releases only its acquired lock`,
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(t),
+        preload = path.join(f.dir, 'pause-init.mjs'),
+        reached = path.join(f.dir, 'init-reached'),
+        release = path.join(f.dir, 'init-release');
+      await fs.writeFile(
+        preload,
+        `import {holdInit} from ${JSON.stringify(new URL('./fixtures/init-gate.mjs', import.meta.url).href)};holdInit(${JSON.stringify({ config: f.config, stage, reached, release })});`,
+      );
+      const server = launch(t, f, ['--import', preload]);
+      await until(() => exists(reached));
+      server.child.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 80));
+      server.child.kill('SIGINT');
+      assert.equal(server.child.exitCode, null);
+      assert.equal(
+        server.child.signalCode,
+        null,
+        'Signal handlers must be active before init acquires resources',
+      );
+      await fs.writeFile(release, 'continue');
+      assert.equal(await server.exit(), stage === 'owner-listen-failure' ? 1 : 0);
+      await stopped(f);
+      const restarted = launch(t, f);
+      await restarted.initialize();
+      restarted.child.stdin.end();
+      assert.equal(await restarted.exit(), 0);
+      await stopped(f);
+    },
+  );
 
-test('modern stdio discovers without initialize and EOF drains native input before restart', async (t) => {
-  const f = await fixture(t),
-    server = launch(t, f);
-  const _meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
-  assert.equal((await server.request('server/discover', { _meta })).result.resultType, 'complete');
-  const pending = server.request('tools/call', {
-    name: 'send',
-    arguments: { session_id: f.id, text: '/lifecycle-fixture' },
-    _meta,
-  });
-  await until(() => exists(f.marker));
-  const claim = await ownClaim(f);
-  server.child.stdin.end();
-  const response = await pending;
-  assert.equal(response.result.resultType, 'complete');
-  assert.equal(response.result.structuredContent.status, 'handled');
-  assert.equal(await server.exit(), 0);
-  await stopped(f, claim.owner);
-  const second = launch(t, f);
-  const listed = await second.request('tools/call', {
-    name: 'list',
-    arguments: { session_id: f.id },
-    _meta,
-  });
-  assert.equal(listed.result.structuredContent.sessions[0].session_id, f.id);
-  second.child.stdin.end();
-  assert.equal(await second.exit(), 0);
-});
-
-test('broken stdout drains a pending receipt and cleans up the owned official RPC process', async (t) => {
-  const f = await fixture(t),
-    server = launch(t, f);
-  await server.initialize();
-  server.request('tools/call', {
-    name: 'send',
-    arguments: { session_id: f.id, text: '/lifecycle-fixture' },
-  });
-  await until(() => exists(f.marker));
-  const claim = await ownClaim(f);
-  server.child.stdout.destroy();
-  server.request('tools/list', {});
-  assert.equal(await server.exit(), 1);
-  await stopped(f, claim.owner);
-  assert.ok(!server.stderr().includes('Unhandled'));
-  const bridge = await new Bridge(f.config).init();
-  try {
-    assert.equal((await bridge.list({ session_id: f.id })).sessions.length, 1);
-    assert.equal(bridge.pool.instances.size, 0);
-  } finally {
-    await bridge.close();
-  }
-});
+for (const outputBroken of [false, true])
+  test(
+    `stdio drains native input before ${outputBroken ? 'closing broken stdout' : 'finishing EOF'}`,
+    {
+      timeout: 15000,
+    },
+    async (t) => {
+      const f = await fixture(t),
+        server = launch(t, f);
+      const _meta = {
+        [META + 'protocolVersion']: MODERN_VERSION,
+        [META + 'clientCapabilities']: {},
+      };
+      if (outputBroken) await server.initialize();
+      const pending = server.request('tools/call', {
+        name: 'send',
+        arguments: { session_id: f.id, text: '/lifecycle-fixture' },
+        ...(outputBroken ? {} : { _meta }),
+      });
+      await until(() => exists(f.marker));
+      const { owner } = await ownClaim(f);
+      if (outputBroken) {
+        server.child.stdout.destroy();
+        server.request('tools/list', {});
+      } else {
+        server.child.stdin.end();
+        assert.equal((await pending).result.structuredContent.status, 'handled');
+      }
+      assert.equal(await server.exit(), Number(outputBroken));
+      await stopped(f, owner);
+      assert.doesNotMatch(server.stderr(), /Unhandled/);
+      const restarted = launch(t, f);
+      const result = await restarted.request('tools/call', {
+        name: 'list',
+        arguments: { session_id: f.id },
+        _meta,
+      });
+      assert.equal(result.result.structuredContent.sessions[0].session_id, f.id);
+      restarted.child.stdin.end();
+      assert.equal(await restarted.exit(), 0);
+    },
+  );
 
 test('stdio EOF disconnects a native TUI without stopping its writer', async (t) => {
   const f = await fixture(t);
@@ -218,7 +194,11 @@ test('stdio EOF disconnects a native TUI without stopping its writer', async (t)
   assert.equal(claim.kind, 'tui');
   const server = launch(t, f);
   await server.initialize();
-  await server.call('read', { session_id: f.id });
+  const read = await server.request('tools/call', {
+    name: 'read',
+    arguments: { session_id: f.id },
+  });
+  assert.equal(read.result.structuredContent.session_id, f.id);
   server.child.stdin.end();
   assert.equal(await server.exit(), 0);
   assert.equal(await ownerAlive(tui.owner), true);
