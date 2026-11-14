@@ -3,7 +3,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
 import { publicError } from './errors.mjs';
-import { compactInputSchema, compactMetadata } from './compact.mjs';
+import { parseCompactInput, compactMetadata } from './compact.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import path from 'node:path';
@@ -467,8 +467,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             );
             check(request);
           } else if (request.op === 'compact') {
-            const input = compactInputSchema.safeParse(args);
-            if (!input.success) throw new AttachmentFailure('INVALID_ARGUMENTS');
+            const input = parseCompactInput(args);
             if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
             const compact = async () => {
               check(request);
@@ -478,7 +477,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                 return await trackMutation(
                   new Promise((resolve, reject) =>
                     ctx.compact({
-                      customInstructions: input.data.instructions,
+                      customInstructions: input.instructions,
                       onComplete: resolve,
                       onError: () => reject(new AttachmentFailure('PI_REJECTED')),
                     }),
@@ -488,7 +487,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                 runtime.compacting = false;
               }
             };
-            const value = input.data.interrupt
+            const value = input.interrupt
               ? await compact()
               : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
             check(request);

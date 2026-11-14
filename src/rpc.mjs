@@ -8,6 +8,7 @@ import { HerdrRpcTransport } from './herdr-rpc-transport.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from './lf-lines.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
+import { nativeBusy, pendingMessages } from './attachment-protocol.mjs';
 import { RetainedObservations } from './context-observation.mjs';
 import { sameModel, assertThinkingLevel } from './models.mjs';
 import {
@@ -603,32 +604,20 @@ export class PiRpc {
   }
   async idleSnapshot() {
     const state = await this.state();
-    if (
-      this.hasUnsettledWork() ||
-      state.isStreaming === true ||
-      state.isCompacting === true ||
-      state.isBashRunning === true ||
-      state.isIdle === false ||
-      state.pendingMessageCount > 0
-    )
-      return { state, status: 'busy' };
+    const pending = pendingMessages(state);
+    const result = (status) => ({ state, status, pending });
+    if (this.hasUnsettledWork() || nativeBusy(state)) return result('busy');
     if (
       state.isStreaming !== false ||
       state.isCompacting !== false ||
-      state.pendingMessageCount !== 0 ||
+      pending !== 0 ||
       !this.ownerRecord?.socket
     )
-      return { state, status: 'unconfirmed' };
+      return result('unknown');
     const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
-    if (
-      observed.isIdle === false ||
-      observed.hasPendingMessages === true ||
-      this.hasUnsettledWork()
-    )
-      return { state, status: 'busy' };
-    if (observed.isIdle !== true || observed.hasPendingMessages !== false)
-      return { state, status: 'unconfirmed' };
-    return { state, status: 'idle' };
+    if (nativeBusy(observed) || this.hasUnsettledWork()) return result('busy');
+    if (observed.isIdle !== true || observed.hasPendingMessages !== false) return result('unknown');
+    return result('idle');
   }
   async assertIdle({
     busy = 'MODEL_SELECTION_BUSY',
@@ -822,7 +811,7 @@ export class PiRpc {
     for (;;) {
       signal?.throwIfAborted();
       const result = await this.idleSnapshot();
-      if (result.status === 'unconfirmed') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+      if (result.status === 'unknown') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
       if (result.status === 'idle') {
         signal?.throwIfAborted();
         return;

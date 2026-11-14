@@ -2,7 +2,6 @@ import fs from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { uiSnapshot } from './rpc-ui.mjs';
 import { modelState } from './models.mjs';
-import { attachedActivity } from './attachment-protocol.mjs';
 
 // Metadata scanning retains at most one JSONL record, never a second full history.
 export async function sessionMetadata(session, cache) {
@@ -77,22 +76,16 @@ export async function runtimeMetadata(pool, session) {
           thinking_level: null,
         },
       };
-    const snapshot = runtime.attached
-      ? attachedActivity(await runtime.state())
-      : await runtime.idleSnapshot();
-    const { state } = snapshot;
+    const { state, status, pending } = await runtime.idleSnapshot();
     const selection = modelState(state);
-    const pending = state.pendingMessageCount;
-    const count = Number.isSafeInteger(pending) && pending >= 0 ? pending : null;
-    const status = !runtime.attached && runtime.hasUnsettledWork() ? 'busy' : snapshot.status;
     return {
       ...(Object.hasOwn(state, 'sessionName') || runtime.ownerRecord?.kind === 'rpc'
         ? { name: typeof state.sessionName === 'string' ? state.sessionName.trim() || null : null }
         : {}),
       status: {
-        state: status === 'unconfirmed' ? 'unknown' : status,
+        state: status,
         observed_at,
-        pending_messages: count,
+        pending_messages: pending,
         model: selection.model,
         thinking_level: selection.thinkingLevel,
         ...uiSnapshot(runtime.uiFacts),

@@ -7,7 +7,12 @@ export const compactSchema = z
     interrupt: z.boolean().optional(),
   })
   .strict();
-export const compactInputSchema = compactSchema.omit({ session_id: true });
+const compactInputSchema = compactSchema.omit({ session_id: true });
+export function parseCompactInput(body) {
+  const input = compactInputSchema.safeParse(body);
+  if (!input.success) throw new Error('INVALID_ARGUMENTS');
+  return input.data;
+}
 
 // Exact native messages only: never forward provider, extension or history text.
 export function nativeCompactReason(message) {

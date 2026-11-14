@@ -1,8 +1,14 @@
-import { attachmentServer, listenPrivate, ownerEnvelope } from '../src/attachment-protocol.mjs';
+import {
+  attachmentServer,
+  listenPrivate,
+  ownerEnvelope,
+  MAX_ATTACHMENT_REQUEST_BYTES,
+} from '../src/attachment-protocol.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import net from 'node:net';
 
 import packageInfo from '../package.json' with { type: 'json' };
 import { AttachedRuntime, claimFile, processIdentity } from '../src/attachments.mjs';
@@ -39,6 +45,7 @@ async function fixture(t) {
     await fs.rm(dir, { recursive: true, force: true });
   });
   return {
+    connections,
     runtime: new AttachedRuntime({ attachmentDir: dir }, session, record),
     requests,
     respond(fn) {
@@ -126,6 +133,57 @@ const ownedRpc = (f) => {
 const idleCompact = { type: 'compact', customInstructions: '', idleOnly: true };
 const compacted = { firstKeptEntryId: 'kept', tokensBefore: 1000 };
 
+function beforeWrite(t, gate) {
+  const request = AttachedRuntime.prototype.request;
+  t.mock.method(AttachedRuntime.prototype, 'request', function (op, body, wait, check, transport) {
+    return request.call(
+      this,
+      op,
+      body,
+      wait,
+      async () => {
+        await check?.();
+        await gate();
+      },
+      transport,
+    );
+  });
+}
+
+test('owner framing isolates fragmented, malformed, oversized and idle requests', async (t) => {
+  const f = await fixture(t);
+  const request = ownerEnvelope(f.runtime.record, { op: 'seal', body: {} });
+  const setTimeout = net.Socket.prototype.setTimeout;
+  t.mock.method(net.Socket.prototype, 'setTimeout', function (ms, callback) {
+    return setTimeout.call(this, ms === 5000 ? 100 : ms, callback);
+  });
+  const raw = (send) =>
+    new Promise((resolve, reject) => {
+      const socket = net.createConnection(f.runtime.record.socket);
+      let reply = '';
+      socket.setEncoding('utf8');
+      socket.on('error', (error) => {
+        if (error.code !== 'ECONNRESET' && error.code !== 'EPIPE') reject(error);
+      });
+      socket.on('data', (chunk) => {
+        reply += chunk;
+      });
+      socket.on('close', () => resolve(reply));
+      socket.on('connect', () => send(socket));
+    });
+  const fragmented = await raw((socket) => {
+    const [server] = f.connections;
+    server.once('data', () => socket.end(request.slice(9)));
+    socket.write(request.slice(0, 9));
+  });
+  assert.deepEqual(JSON.parse(fragmented).data, { sealed: true });
+  for (const input of ['{\n', request.slice(0, -1), 'x'.repeat(MAX_ATTACHMENT_REQUEST_BYTES + 1)])
+    assert.equal(await raw((socket) => socket.end(input)), '');
+  assert.equal(await raw((socket) => socket.write(request.slice(0, 9))), '');
+  assert.equal(f.requests.length, 1);
+  assert.deepEqual(await f.runtime.seal(), { sealed: true });
+});
+
 test(
   'owned compact cancels an expired pre-write request without later dispatch',
   { timeout: 5000 },
@@ -135,24 +193,10 @@ test(
     const entered = Promise.withResolvers(),
       resume = Promise.withResolvers();
     t.after(() => resume.resolve());
-    const request = AttachedRuntime.prototype.request;
-    t.mock.method(
-      AttachedRuntime.prototype,
-      'request',
-      function (op, body, wait, _check, transport) {
-        return request.call(
-          this,
-          op,
-          body,
-          wait,
-          async () => {
-            entered.resolve();
-            await resume.promise;
-          },
-          transport,
-        );
-      },
-    );
+    beforeWrite(t, () => {
+      entered.resolve();
+      return resume.promise;
+    });
     const pending = rpc.dispatch(idleCompact, 1000);
     const rejected = assert.rejects(pending, { code: 'ACK_TIMEOUT', uncertain: false });
     await entered.promise;
@@ -195,21 +239,10 @@ test('owned compact rechecks Stop synchronously at the socket write boundary', a
   const f = await fixture(t),
     rpc = ownedRpc(f);
   let stopped = false;
-  const request = AttachedRuntime.prototype.request;
-  t.mock.method(AttachedRuntime.prototype, 'request', function (op, body, wait, check, transport) {
-    return request.call(
-      this,
-      op,
-      body,
-      wait,
-      async () => {
-        await check?.();
-        queueMicrotask(() => {
-          stopped = true;
-        });
-      },
-      transport,
-    );
+  beforeWrite(t, () => {
+    queueMicrotask(() => {
+      stopped = true;
+    });
   });
   await assert.rejects(
     rpc.dispatch(idleCompact, 5000, undefined, () => {

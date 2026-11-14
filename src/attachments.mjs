@@ -3,6 +3,8 @@ import {
   MAX_ATTACHMENT_SNAPSHOT_BYTES,
   ownerEnvelope,
   validNativeSnapshot,
+  nativeBusy,
+  pendingMessages,
   requiresCurrentControl,
 } from './attachment-protocol.mjs';
 import { readLfLines } from './lf-lines.mjs';
@@ -667,6 +669,16 @@ export class AttachedRuntime {
     )
       throw new AttachmentFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
     return state;
+  }
+  async idleSnapshot() {
+    const state = await this.state();
+    const idle = state.activity?.idle ?? state.isIdle;
+    const busy = idle === false || state.activity?.pending_messages === true || nativeBusy(state);
+    return {
+      state,
+      status: busy ? 'busy' : idle === true ? 'idle' : 'unknown',
+      pending: pendingMessages(state),
+    };
   }
   async readFeatures() {
     if (this.record.readContract !== READ_CONTRACT)

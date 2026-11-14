@@ -4,7 +4,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import { publicError } from './errors.mjs';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
 
-import { compactInputSchema, compactMetadata } from './compact.mjs';
+import { parseCompactInput, compactMetadata } from './compact.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { assertReadFeatures } from './read-features.mjs';
 import { unavailableObservation } from './context-observation.mjs';
@@ -23,6 +23,8 @@ import {
   ownerSnapshot,
   validNativeSnapshot,
   parseOwnerRequest,
+  nativeBusy,
+  pendingMessages,
 } from './attachment-protocol.mjs';
 import {
   reserveOwner,
@@ -188,10 +190,7 @@ export async function reserveHostSession({
           (!Number.isInteger(args.timeout_ms) || args.timeout_ms < 50 || args.timeout_ms > 30000)))
     )
       fail('INVALID_ARGUMENTS');
-    const pendingMessageCount =
-      Number.isSafeInteger(observed.pendingMessageCount) && observed.pendingMessageCount >= 0
-        ? observed.pendingMessageCount
-        : null;
+    const pendingMessageCount = pendingMessages(observed);
     let data;
     const beforeDispatch = () => {
       if (stoppingAtEntry || stopping || entryStopSequence !== stopSequence)
@@ -254,18 +253,7 @@ export async function reserveHostSession({
     } else if (request.op === 'reload') {
       if (typeof callbacks.reload !== 'function') fail('RELOAD_UNSUPPORTED');
       if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
-      if (
-        bashing ||
-        stopping ||
-        settingModel ||
-        compacting ||
-        submitting ||
-        observed.isIdle === false ||
-        observed.isStreaming === true ||
-        observed.isCompacting === true ||
-        observed.isBashRunning === true ||
-        pendingMessageCount > 0
-      )
+      if (bashing || stopping || settingModel || compacting || submitting || nativeBusy(observed))
         fail('RELOAD_BUSY');
       beforeDispatch();
       reloading = true;
@@ -316,15 +304,14 @@ export async function reserveHostSession({
       }
     } else if (request.op === 'compact') {
       if (typeof callbacks.compact !== 'function') fail('COMPACT_UNSUPPORTED');
-      const input = compactInputSchema.safeParse(args);
-      if (!input.success) fail('INVALID_ARGUMENTS');
+      const input = parseCompactInput(args);
       if (compacting) fail('COMPACTION_PENDING');
       beforeDispatch();
       compacting = true;
       try {
         data = compactMetadata(
           await callbacks.compact({
-            ...input.data,
+            ...input,
             sessionFile: target.file,
             sessionId: target.header.id,
             beforeDispatch,

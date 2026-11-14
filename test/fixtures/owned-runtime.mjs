@@ -1,4 +1,5 @@
 import { PiRpc } from '../../src/rpc.mjs';
+import { nativeBusy, pendingMessages } from '../../src/attachment-protocol.mjs';
 // Minimal Bridge-owned runtime double. Like PiRpc, status sampling reads
 // idleSnapshot(); here it derives from the double's own state().
 export function ownedRuntime(members) {
@@ -11,7 +12,13 @@ export function ownedRuntime(members) {
       const state = await this.state();
       return {
         state,
-        status: state.isStreaming ? 'busy' : state.isIdle === true ? 'idle' : 'unconfirmed',
+        status:
+          this.hasUnsettledWork() || nativeBusy(state)
+            ? 'busy'
+            : state.isIdle === true
+              ? 'idle'
+              : 'unknown',
+        pending: pendingMessages(state),
       };
     },
     ...members,

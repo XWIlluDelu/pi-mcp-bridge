@@ -29,18 +29,18 @@ export function parseOwnerRequest(frame, checkIdentity) {
 
 export const ownerIdentity = ({ file, sessionId }) => ({ sessionFile: file, sessionId });
 
-export function attachedActivity(state) {
-  const idle = state.activity?.idle ?? state.isIdle;
-  const busy =
-    idle === false ||
-    state.activity?.pending_messages === true ||
-    state.hasPendingMessages === true ||
-    state.isBashRunning === true ||
-    state.isStreaming === true ||
-    state.isCompacting === true ||
-    (Number.isSafeInteger(state.pendingMessageCount) && state.pendingMessageCount > 0);
-  return { state, status: busy ? 'busy' : idle === true ? 'idle' : 'unknown' };
-}
+export const pendingMessages = (state) =>
+  Number.isSafeInteger(state.pendingMessageCount) && state.pendingMessageCount >= 0
+    ? state.pendingMessageCount
+    : null;
+
+export const nativeBusy = (state) =>
+  state.isIdle === false ||
+  state.isBashRunning === true ||
+  state.isStreaming === true ||
+  state.isCompacting === true ||
+  state.hasPendingMessages === true ||
+  pendingMessages(state) > 0;
 
 export function ownerReadFeatures(binding, features) {
   return { ...ownerIdentity(binding), contract: READ_CONTRACT, ...features };

@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { sessionMetadata, runtimeMetadata } from '../src/session-metadata.mjs';
+import { AttachedRuntime } from '../src/attachments.mjs';
+import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('title cache reuses only unchanged files; append, incomplete record, truncation and replacement invalidate', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-metadata-');
@@ -53,7 +55,8 @@ test('live status, model and capability reports are sanitized independently of i
   const model = { provider: 'p', id: 'm', apiKey: 'SECRET' };
   const status = async (runtime) =>
     (await runtimeMetadata({ forRead: async () => runtime }, { model })).status;
-  const companion = (state) => ({ attached: true, record: { kind: 'extension' }, state });
+  const companion = (state) =>
+    Object.assign(new AttachedRuntime({}, {}, { kind: 'extension' }), { state });
   for (const [observed, expected] of [
     [{ activity: { idle: true } }, 'idle'],
     [{ activity: { pending_messages: true } }, 'busy'],
@@ -65,10 +68,12 @@ test('live status, model and capability reports are sanitized independently of i
     assert.equal(value.thinking_level, 'xhigh');
     assert.equal(value.capabilities.stop, false);
   }
-  const owned = await status({
-    hasUnsettledWork: () => true,
-    idleSnapshot: () => ({ state: { pendingMessageCount: 0 }, status: 'unconfirmed' }),
-  });
+  const owned = await status(
+    ownedRuntime({
+      hasUnsettledWork: () => true,
+      state: () => ({ pendingMessageCount: 0 }),
+    }),
+  );
   assert.equal(owned.state, 'busy');
   assert.equal(owned.pending_messages, 0);
   assert.equal(owned.capabilities.stop, true);

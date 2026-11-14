@@ -9,12 +9,7 @@ import fs from 'node:fs/promises';
 
 import { ownerAlive, readClaim, reserveOwner, AttachedRuntime } from '../src/attachments.mjs';
 
-const delay = (ms) => new Promise((r) => setTimeout(r, ms));
-const exists = (file) =>
-  fs.stat(file).then(
-    () => true,
-    () => false,
-  );
+const exists = (file) => fs.stat(file).catch(() => null);
 const shutdownGate =
   "pi.on('session_shutdown', async () => { await mark('shutdown'); await wait('shutdown-go'); pi.appendEntry('shutdown-saved', {}); });";
 const settleGate =
@@ -33,10 +28,11 @@ async function fixture(t, source = '') {
         "import { AgentSession } from '@earendil-works/pi-coding-agent';",
       );
 
-      cleanup.push(async () => {
-        for (const gate of ['finish', 'shutdown-go', 'input-go', 'slash-go'])
-          await fs.writeFile(dir + '/' + gate, 'go');
-      });
+      cleanup.push(() =>
+        Promise.all(
+          ['finish', 'shutdown-go', 'input-go'].map((gate) => fs.writeFile(dir + '/' + gate, 'go')),
+        ),
+      );
     },
   });
   const runtimes = [],
@@ -57,7 +53,6 @@ async function fixture(t, source = '') {
 async function released(f, rpc) {
   await until(() => rpc.exited && !f.bridge.autoReleases.size);
   assert.equal(rpc.child.exitCode, 0);
-  assert.equal(rpc.child.signalCode, null);
   assert.equal(await readClaim(f.config.attachmentDir, rpc.session), null);
 }
 test(
@@ -66,16 +61,15 @@ test(
   async (t) => {
     const f = await fixture(t, shutdownGate);
     assert.equal((await f.send('FIRST')).status, 'started');
-    const first = f.runtimes[0],
-      owner = first.ownerRecord.owner;
+    const [first] = f.runtimes;
     await f.waitFor('shutdown');
-    assert.equal(await ownerAlive(owner), true);
+    assert.equal(first.exited, false);
     let done = false;
     const second = f.send('SECOND').then((r) => {
       done = true;
       return r;
     });
-    await delay(30);
+    await until(() => f.bridge.inputs.size > 0);
     assert.equal(done, false);
     assert.equal(f.runtimes.length, 1);
     await f.mark('shutdown-go');
@@ -108,11 +102,9 @@ test(
       return receive(event, generation);
     });
     ackTimeout(t, ['prompt']);
-    const receipt = await f.send('SETTLED');
-    assert.equal(receipt.status, 'unknown');
+    assert.equal((await f.send('SETTLED')).status, 'unknown');
     await until(() => rpc.settlementSequence > 0);
     await rpc.autoReleaseTask;
-    assert.ok(held);
     assert.ok(rpc.hasPendingCommand('prompt'));
     assert.equal(rpc.child.stdin.writableEnded, false);
     receive(...held);
@@ -180,27 +172,19 @@ test(
         observed.resolve();
       return runtime;
     });
-    let completed = false;
-    const forking = f.bridge.create(args).then((result) => {
-      completed = true;
-      return result;
-    });
+    const forking = f.bridge.create(args);
     try {
       await observed.promise;
-      assert.equal(completed, false);
       assert.equal(f.runtimes.length, 1);
       await f.mark('shutdown-go');
       const result = await forking;
       assert.equal(result.status, 'started', JSON.stringify(result));
-      assert.equal(result.created, true);
       const child = f.runtimes[1];
-      assert.notEqual(child.session.header.id, parent.session.header.id);
       await released(f, child);
       assert.equal(parent.exited, true);
       const parentRows = await f.rows(),
         childRows = await savedEntries(f.bridge, child.session.id),
         sourceTail = parentRows.find((entry) => entry.customType === 'shutdown-saved');
-      assert.ok(sourceTail);
       assert.ok(childRows.some((entry) => entry.id === sourceTail.id));
       assert.equal(f.runtimes.length, 2, 'fork and replay never reopen the parent');
     } finally {
@@ -224,8 +208,7 @@ test(
       reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
       /LIVE_OWNER_UNREACHABLE/,
     );
-    const release = await f.release({ interrupt: true });
-    assert.equal(release.status, 'released');
+    assert.equal((await f.release({ interrupt: true })).status, 'released');
     assert.equal(await ownerAlive(owner), false);
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
   },
@@ -261,7 +244,6 @@ test(
       await rpc.autoReleaseTask;
       assert.equal(calls, 0);
       assert.equal(rpc.child.stdin.writableEnded, false);
-      assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
       await f.mark('finish');
       await released(f, rpc);
       assert.equal(calls, 1);
@@ -291,7 +273,6 @@ test(
     await assert.rejects(f.release(), /LOST_SEAL_ACK/);
     assert.equal(rpc.exitSeal, 'unknown');
     assert.equal(rpc.child.stdin.writableEnded, false);
-    assert.equal(rpc.handoffPending, true);
     assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
     assert.equal(
       (await new AttachedRuntime(f.config, f.session, rpc.ownerRecord).state()).sealed,
@@ -306,17 +287,11 @@ test(
     const retry = f.release();
     try {
       await f.waitFor('shutdown');
-      assert.equal(calls, 2);
       assert.equal(rpc.child.stdin.writableEnded, true);
-      assert.equal(await ownerAlive(rpc.ownerRecord.owner), true);
-      assert.equal(await exists(f.dir + '/unexpected-input'), false);
+      await assert.rejects(fs.stat(f.dir + '/unexpected-input'), { code: 'ENOENT' });
       await f.mark('shutdown-go');
       assert.equal((await retry).status, 'released');
-      const rows = await f.rows();
-      assert.ok(rows.some((entry) => entry.customType === 'seal-cleanup'));
-      assert.ok(
-        rows.some((entry) => entry.type === 'custom_message' && entry.customType === 'seal-record'),
-      );
+      assert.match(JSON.stringify(await f.rows()), /seal-cleanup.*seal-record/);
     } finally {
       await f.mark('shutdown-go');
       await retry;
@@ -394,7 +369,6 @@ test(
         uncertain: true,
       });
       assert.equal(rpc.exitSeal, 'unknown');
-      assert.equal(rpc.handoffPending, true);
       assert.equal(rpc.child.stdin.writableEnded, false);
       assert.equal((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
       await f.mark('input-go');

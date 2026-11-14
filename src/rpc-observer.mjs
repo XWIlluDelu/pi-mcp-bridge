@@ -18,7 +18,7 @@ import {
   ownerReadFeatures,
   ownerRead,
 } from './attachment-protocol.mjs';
-import { compactInputSchema, compactMetadata, nativeCompactReason } from './compact.mjs';
+import { parseCompactInput, compactMetadata, nativeCompactReason } from './compact.mjs';
 import { publicError } from './errors.mjs';
 export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
@@ -108,13 +108,13 @@ export default async function rpcObserver(pi) {
             throw new Error('RUNTIME_SESSION_CHANGED');
         });
         if (request.op === 'compact') {
-          const input = compactInputSchema.safeParse(request.body);
-          if (!input.success || input.data.interrupt) throw new Error('INVALID_ARGUMENTS');
+          const input = parseCompactInput(request.body);
+          if (input.interrupt) throw new Error('INVALID_ARGUMENTS');
           const value = await admission.compact(context.sessionManager, context, () => {
             connection.setTimeout(0);
             return new Promise((resolve, reject) =>
               context.compact({
-                customInstructions: input.data.instructions,
+                customInstructions: input.instructions,
                 onComplete: resolve,
                 onError: (error) =>
                   reject(
