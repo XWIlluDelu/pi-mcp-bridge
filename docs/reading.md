@@ -143,8 +143,9 @@ native history recorded; missing child output is not synthesized.
 Reader items retain provenance and may supply concise previews. A reader can
 include current native progress alongside its stored summaries and memories.
 `reader.coverage`, such as `{type:"memory",selected:3,total:12}`, describes its
-own source scope: total items before branch/content selection, captured selected
-items before pagination, and optional `excluded` items removed by source rules.
+own source scope: total items before branch/content selection, items selected by
+the reader before search and pagination, and optional `excluded` items removed
+by source rules.
 To change that capture, adjust the relevant content count or use search. Cursor
 pages and refs do not recover unselected items.
 
@@ -295,12 +296,11 @@ exceeding the shared budget returns an item budget error; read it separately.
 
 ## Frozen bounded snapshots
 
-The cache retains detached sanitized units, at most 16 snapshots and approximately
-32 MiB of accounted memory. Excess selected data returns `READ_SNAPSHOT_TOO_LARGE`
-without narrowing the requested content. References and cursors are issued only
-after successful caching. Browse/search results with refs are cached even when
-they fit on one page; a complete expansion without further refs needs no cache entry. Batch pins needed snapshots
-through assembly; temporary pressure returns `READ_CACHE_BUSY`.
+The cache retains detached, sanitized documents, with at most 16 snapshots and
+about 32 MiB of accounted memory. Search applies its budget to matches and their
+related sources. If selected data exceeds the limit, Bridge returns
+`READ_SNAPSHOT_TOO_LARGE`. Batch pins snapshots through assembly and reports
+`READ_CACHE_BUSY` when the remaining cache cannot fit another capture.
 
 There is no inactivity expiry. LRU/capacity eviction or Bridge restart produces
 `STALE_CURSOR` or `STALE_READ_REFERENCE`; start a fresh read/search. References

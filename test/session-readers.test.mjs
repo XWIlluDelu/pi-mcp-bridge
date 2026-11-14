@@ -158,6 +158,35 @@ test('a reader capture survives store changes and later pages reauthorize', asyn
   await assert.rejects(f.bridge.read(request), /NOT_FOUND_OR_DENIED/);
 });
 
+test('search budgets only matching reader content and its related refs', async (t) => {
+  const { bridge, id } = await nativeOwner(t, { factory: () => assert.fail('Search started Pi') });
+  bridge.compatibilityServices.sessionReaders.register('fixture', {
+    matches: () => true,
+    read: () => ({
+      items: [
+        { id: 'large', kind: 'memory', text: 'x'.repeat(9 * 1024 * 1024) },
+        {
+          id: 'summary',
+          kind: 'summary',
+          text: 'captured answer',
+          preview: 'search marker',
+          related: [{ id: 'related', relation: 'memory' }],
+        },
+        { id: 'related', kind: 'memory', text: 'related evidence' },
+      ],
+    }),
+  });
+  await assert.rejects(bridge.read({ session_id: id }), /READ_SNAPSHOT_TOO_LARGE/);
+  const found = await bridge.search({ session_id: id, query: 'search marker' });
+  assert.equal(found.matches, 1);
+  const [row] = found.items;
+  const expanded = await bridge.read({ refs: [row.ref, row.related[0].ref] });
+  assert.deepEqual(
+    expanded.items.map(({ message }) => message.content),
+    ['captured answer', 'related evidence'],
+  );
+});
+
 test('reader routing rechecks live capabilities and the owner that appears during a saved capture', async (t) => {
   const f = await fixture(t),
     { session, bridge } = f;

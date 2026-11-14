@@ -314,11 +314,10 @@ a shared host returns `DELETE_SHARED_OWNER`.
 Owner reads transfer selected, sanitized snapshots; saved reads need no writer.
 [Reading](reading.md) defines turn ranges, content selection, search, references and frozen capture behavior.
 
-Fork uses `{sessionFile,sessionId,entries,leafId}` from the cooperating owner's
-`snapshot()` while leaving its writer in place. These raw native records retain
-state and image bytes excluded from public reads. Attached snapshots are bounded
-at 32 MiB; oversized/unsupported hosts fail rather than falling back to disk
-while a live owner exists. Owned fork uses native `get_entries`.
+Fork leaves the writer in place. Bridge pairs the cooperating owner's raw
+`snapshot()` or the owned child's `get_entries` with the current native header.
+The copy retains native state and image bytes. Attached snapshots are bounded
+at 32 MiB. A live writer must supply its own snapshot.
 
 ## Verification
 

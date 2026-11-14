@@ -7,7 +7,7 @@ import path from 'node:path';
 
 import { ContextReadCache } from '../src/read-cache.mjs';
 import { prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/context-read.mjs';
-import { navigationDocuments, navigationRows } from '../src/read-navigation.mjs';
+import { navigationDocuments, navigationOrder, navigationRow } from '../src/read-navigation.mjs';
 import { contextSelection, ALL_CONTENT } from '../src/read-schema.mjs';
 
 import { jsonBytes } from '../src/response-budget.mjs';
@@ -42,7 +42,10 @@ const snapshot = (units, extra = {}) => ({
   units,
   ...extra,
 });
-const rows = (snap, options) => navigationRows(snap, navigationDocuments(snap), (i) => i, options);
+const rows = (snap, { query } = {}, documents = navigationDocuments(snap)) =>
+  navigationOrder(documents, query).map((index) =>
+    navigationRow(documents, index, (i) => i, query),
+  );
 
 test('codemode overview groups by canonical tool identity and surfaces nested failures despite long code', () => {
   const toolId = 'canonical-first';
@@ -250,7 +253,7 @@ test('adapter items expose related memory and source-boundary navigation without
     { view: 'adapted' },
   );
   const documents = navigationDocuments(snap);
-  const overview = navigationRows(snap, documents, (i) => i);
+  const overview = rows(snap, {}, documents);
   assert.equal(overview.length, 2);
   assert.equal(overview[0].text, 'Condensed memory');
   const summary = overview[0].related.find((r) => r.relation === 'summary');

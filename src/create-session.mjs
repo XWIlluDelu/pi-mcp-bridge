@@ -13,11 +13,12 @@ const exec = promisify(execFile);
 // Fork committed native entries, never the Bridge read representation. An
 // in-memory manager forks the native branch and its current labels without opening a writer
 // on the parent's file or switching the parent's live runtime.
-export async function prepareSession(config, project, { name, parent, snapshot } = {}) {
+export async function prepareSession(config, project, { name, parentSession, captureFork } = {}) {
   const { env: baseEnv } = launchProfile(config);
   const installation = await resolvePiInstallation(config, baseEnv);
   const env = await piLaunchEnvironment(installation, baseEnv, project);
   const { SessionManager, CURRENT_SESSION_VERSION } = await loadPiSdk(installation);
+  const snapshot = await captureFork?.(CURRENT_SESSION_VERSION);
   const { stdout } = await exec(
     process.execPath,
     [
@@ -26,7 +27,7 @@ export async function prepareSession(config, project, { name, parent, snapshot }
         sdkEntry: installation.sdkEntry,
         roots: config.sessionRoots,
         args: config.piArgs ?? [],
-        parentSession: parent?.file,
+        parentSession,
       }),
     ],
     { cwd: project, env, timeout: 10000, maxBuffer: 65536 },
@@ -35,13 +36,9 @@ export async function prepareSession(config, project, { name, parent, snapshot }
   if (error) throw new Error(error);
   const { id, timestamp } = header;
   let entries = [];
-  if (parent) {
-    if (!Array.isArray(snapshot?.entries)) throw new Error('INVALID_RUNTIME_ENTRIES');
-    // Saved snapshots already carry their normalized header. Live entries use
-    // Pi's current version, even when the discovery header predates writer open.
-    const sourceHeader = snapshot.header ?? { ...parent.header, version: CURRENT_SESSION_VERSION };
-    const manager = SessionManager.inMemory(sourceHeader.cwd || project, undefined, [
-      sourceHeader,
+  if (snapshot) {
+    const manager = SessionManager.inMemory(snapshot.header.cwd || project, undefined, [
+      snapshot.header,
       ...snapshot.entries,
     ]);
     if (

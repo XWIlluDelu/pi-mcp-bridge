@@ -69,7 +69,9 @@ test('current Pi can reopen a raw fork without changing the source', async (t) =
   const image = { type: 'image', mimeType: 'image/png', data: 'iVBORw0KGgo=' };
   const rows = [
     message('u', null, 'user', [text('source task'), image]),
-    message('a', 'u', 'assistant', [text('source answer')]),
+    { type: 'label', id: 'old', parentId: 'u', targetId: 'u', label: 'obsolete bookmark' },
+    { type: 'label', id: 'new', parentId: 'u', targetId: 'u', label: 'source bookmark' },
+    message('a', 'old', 'assistant', [text('source answer')]),
     {
       type: 'compaction',
       id: 'c',
@@ -78,7 +80,6 @@ test('current Pi can reopen a raw fork without changing the source', async (t) =
       tokensBefore: 100,
       firstKeptEntryId: 'a',
     },
-    { type: 'label', id: 'l', parentId: 'c', targetId: 'u', label: 'source bookmark' },
   ];
   await fs.appendFile(f.session.file, rows.map(JSON.stringify).join('\n') + '\n{"torn":');
   const before = await fs.readFile(f.session.file);
@@ -93,6 +94,7 @@ test('current Pi can reopen a raw fork without changing the source', async (t) =
   const first = entries.find((entry) => entry.message?.role === 'user');
   assert.deepEqual(first.message.content[1], image);
   assert.equal(manager.getLabel(first.id), 'source bookmark');
+  assert.ok(!entries.some((entry) => entry.label === 'obsolete bookmark'));
   const compact = entries.find((entry) => entry.type === 'compaction');
   const kept = entries.find((entry) => entry.id === compact.firstKeptEntryId);
   assert.equal(kept.message.content[0].text, 'source answer');

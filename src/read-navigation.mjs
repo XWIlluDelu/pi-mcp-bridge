@@ -1,7 +1,6 @@
 import { contentKind } from './read-schema.mjs';
 
-// Reading documents are indexes over already-authorized, sanitized units.
-// They never reconstruct provider data or run tools to recover missing results.
+// Reading documents own sanitized source atoms and their original positions.
 const compact = (value) =>
   String(value ?? '')
     .replace(/\r\n?/g, '\n')
@@ -105,22 +104,28 @@ function assistantFailure(units) {
     ? `assistant ${message.stopReason ?? 'error'}${message.errorMessage ? ': ' + message.errorMessage : ''}`
     : '';
 }
-export function documentUnits(snapshot, doc) {
-  const units = doc.indices.map((index) => snapshot.units[index]);
-  if (!doc.nested) return units;
-  const { source, ordinal } = doc.nested;
-  const call = units[0].message?.nestedCalls?.calls?.[ordinal] ?? units[0].nested_call;
-  return [
-    {
-      type: 'nested_call',
-      source: { ...source, nested_call_index: ordinal },
-      nested_call: call,
-    },
-  ];
+function nestedCall(documents, doc) {
+  return documents[doc.parent].atoms[doc.atom].unit.message.nestedCalls.calls[doc.ordinal];
 }
 
-export function documentText(snapshot, doc) {
-  const units = documentUnits(snapshot, doc);
+export function* documentAtoms(documents, doc) {
+  if (doc.parent === undefined) yield* doc.atoms;
+  else {
+    const { position, unit } = documents[doc.parent].atoms[doc.atom];
+    yield {
+      position,
+      child: doc.ordinal,
+      unit: {
+        type: 'nested_call',
+        source: { ...unit.source, nested_call_index: doc.ordinal },
+        nested_call: nestedCall(documents, doc),
+      },
+    };
+  }
+}
+
+function documentText(documents, doc) {
+  const units = [...documentAtoms(documents, doc)].map(({ unit }) => unit);
   const failure = doc.kind === 'thinking' ? '' : assistantFailure(units);
   return [failure, ...units.map((unit) => unitBodyText(unit, true))].filter(Boolean).join('\n');
 }
@@ -131,6 +136,11 @@ const messageKey = (source = {}) =>
     : `session:${source.entry_id}:${source.message_index ?? ''}`;
 const blockKey = (source = {}) =>
   `${messageKey(source)}:${source.block_index ?? source.content_index ?? ''}`;
+
+export const assistantBlockType = (block) =>
+  ({ text: 'text', thinking: 'thinking', toolCall: 'tool_call' })[block.type] ?? 'native';
+export const assistantFailed = (message) =>
+  ['error', 'aborted'].includes(message.stopReason) || Boolean(message.errorMessage);
 
 // Classify captured assistant blocks once, keeping original source order.
 export function runtimeUnits(atoms) {
@@ -150,14 +160,14 @@ export function runtimeUnits(atoms) {
     const { content, ...metadata } = message;
     for (const [index, block] of content.entries())
       units.push({
-        type: { text: 'text', thinking: 'thinking', toolCall: 'tool_call' }[block.type] ?? 'native',
+        type: assistantBlockType(block),
         metadata: block.type === 'text' ? metadata : undefined,
         block,
         source: { ...original.source, block_index: index },
         prompt_id: turn,
       });
     if (
-      (['error', 'aborted'].includes(message.stopReason) || message.errorMessage) &&
+      assistantFailed(message) &&
       !content.some((block) => block.type === 'text' && block.text?.trim())
     )
       units.push({ ...original, message: metadata, prompt_id: turn });
@@ -180,15 +190,19 @@ export function runtimeUnits(atoms) {
   return units;
 }
 
-function toolPreview(units) {
+function toolName(units) {
+  return (
+    units.find((unit) => unit.block?.type === 'toolCall')?.block.name ??
+    units.find((unit) => unit.message?.role === 'toolResult')?.message.toolName ??
+    'tool'
+  );
+}
+
+function toolPreview(documents, doc) {
+  const units = doc.atoms.map(({ unit }) => unit);
+  const rows = doc.children.map((i) => nestedCall(documents, documents[i]));
   const call = units.find((u) => u.block?.type === 'toolCall')?.block;
   const result = units.find((u) => u.message?.role === 'toolResult')?.message;
-  const children = new Map();
-  for (const u of units) {
-    for (const c of u.message?.nestedCalls?.calls ?? []) children.set(c.id, c);
-    if (u.nested_call) children.set(u.nested_call.id, u.nested_call);
-  }
-  const rows = [...children.values()];
   const errors = rows.filter((c) => c.status === 'error' || c.status === 'unfinished');
   const args = call?.arguments ?? {};
   const field = ['path', 'file', 'command', 'query', 'url'].find(
@@ -217,23 +231,13 @@ function toolPreview(units) {
   const failure = errors[0]
     ? `${errors[0].name}: ${errors[0].status}${errors[0].error ? ' ' + excerpt(inline(errors[0].error), 100) : ''}`
     : '';
-  return {
-    summary: [
-      excerpt(inline(call?.name ?? result?.toolName ?? 'tool'), 48),
-      target,
-      status,
-      operations,
-      diagnostic || failure,
-    ]
-      .filter(Boolean)
-      .join(' · '),
-    children: rows,
-    name: call?.name ?? result?.toolName ?? 'tool',
-  };
+  return [excerpt(inline(doc.title), 48), target, status, operations, diagnostic || failure]
+    .filter(Boolean)
+    .join(' · ');
 }
 
 // Acquisition and navigation share message/kind runs and logical tool pairs.
-// Grouping holds source indexes only, before any selected content is copied.
+// Keep one position per atom so a pair can straddle a steering input.
 export function navigationGroups(units, content) {
   const enabled = (kind) =>
     !content || Array.isArray(content)
@@ -272,158 +276,134 @@ export function navigationGroups(units, content) {
         source,
         prompt_id: unit.prompt_id,
         message,
-        indices: [],
+        atoms: [],
       });
-    const doc = grouped.get(id);
-    doc.indices.push(i);
+    grouped.get(id).atoms.push({ position: i, unit });
   }
   return [...grouped.values()];
 }
 
 export function navigationDocuments(snapshot) {
-  const { units } = snapshot;
-  const docs = navigationGroups(units, snapshot.request?.content);
-  for (const doc of [...docs]) {
-    const values = documentUnits(snapshot, doc);
-    const body = values[0];
-    doc.title = body.title;
-    doc.preview = body.preview;
-    // A reader preview can be separately stored wording (for example, a shorter
-    // summary tier). Search it with the item so visible rows remain findable.
-    doc.readerPreview = body.preview;
-    doc.related = body.related;
-    doc.branch_relation = body.branch_relation;
-    if (body.provenance) doc.source = { ...doc.source, ...body.provenance };
+  const docs = navigationGroups(snapshot.units, snapshot.request?.content);
+  const byId = new Map(docs.map((doc, index) => [doc.id, index]));
+  const latest = new Map();
+  for (const [parent, doc] of [...docs].entries()) {
+    const units = doc.atoms.map(({ unit }) => unit);
+    const { title, related, branch_relation, provenance } = units[0];
+    Object.assign(doc, { title, branch_relation, links: [] });
+    for (const { id, relation } of related ?? []) {
+      const target = byId.get(`item:${id}`);
+      if (target !== undefined) doc.links.push({ relation, target });
+    }
     if (
-      typeof body.provenance?.source_entry_id === 'string' &&
-      body.provenance.source_relation === 'history_leaf'
+      snapshot.view !== 'runtime' &&
+      doc.kind === 'assistant' &&
+      doc.prompt_id != null &&
+      units.some((unit) => unit.block?.type === 'text' && unit.block.text?.trim())
+    )
+      latest.set(doc.prompt_id, doc.message);
+    if (provenance) doc.source = { ...doc.source, ...provenance };
+    if (
+      typeof provenance?.source_entry_id === 'string' &&
+      provenance.source_relation === 'history_leaf'
     ) {
-      doc.sourceIndex = docs.length;
+      doc.links.push({ relation: 'source_context', target: docs.length });
       docs.push({
-        id: `${doc.id}:source`,
         kind: 'source',
-        parent: docs.indexOf(doc),
-        title: 'Session context at the source boundary',
-        indices: [],
-        source: doc.source,
+        parent,
         request: {
           session_id: snapshot.session_id,
           view: 'session',
-          leaf_id: body.provenance.source_entry_id,
+          leaf_id: provenance.source_entry_id,
           range: { recent: 3 },
         },
       });
     }
-    if (doc.kind === 'tool') {
-      const tool = toolPreview(values);
-      doc.title = tool.name;
-      doc.preview = tool.summary;
-      doc.children = [];
-      for (const child of tool.children) {
-        const index = docs.length;
-        const sourceIndex = doc.indices.find((i) =>
-          units[i].message?.nestedCalls?.calls?.some((call) => call.id === child.id),
-        );
-        const source = units[sourceIndex]?.source ?? doc.source;
-        const ordinal = units[sourceIndex]?.message?.nestedCalls.calls.findIndex(
-          (call) => call.id === child.id,
-        );
+    if (doc.kind !== 'tool') continue;
+    const calls = new Map();
+    for (const [atom, unit] of units.entries())
+      for (const [ordinal, call] of (unit.message?.nestedCalls?.calls ?? []).entries())
+        calls.set(call.id, { atom, ordinal, call });
+    const children = [...calls.values()];
+    doc.title = toolName(units);
+    doc.children = children.map(
+      ({ atom, ordinal, call }) =>
         docs.push({
-          id: `${doc.id}:nested:${child.id}`,
-          parent: docs.indexOf(doc),
+          parent,
+          atom,
+          ordinal,
           kind: 'tool',
-          title: child.name,
-          source: doc.source,
-          preview: `${child.name} · ${child.status}${child.error ? ': ' + excerpt(inline(child.error), 140) : ''}`,
-          indices: [sourceIndex ?? doc.indices[0]],
-          nested: { source, ordinal },
-        });
-        doc.children.push(index);
-      }
-    }
+          title: call.name,
+          source: units[atom].source,
+          links: [{ relation: 'parent', target: parent }],
+        }) - 1,
+    );
+    const errors = doc.children.filter((i) => nestedCall(docs, docs[i]).status === 'error');
+    for (const target of new Set([...errors.slice(0, 2), ...doc.children.slice(-2)]))
+      doc.links.push({ relation: 'operation', target });
   }
+  for (const doc of docs)
+    if (
+      doc.kind === 'assistant' &&
+      doc.prompt_id != null &&
+      latest.get(doc.prompt_id) === doc.message
+    )
+      doc.latest = true;
   return docs;
 }
 
 const includesQuery = (text, query) => text.toLocaleLowerCase().includes(query.toLocaleLowerCase());
 
-export function documentMatches(snapshot, doc, query) {
-  return includesQuery(
-    `${doc.title ?? ''}\n${doc.readerPreview ?? ''}\n${documentText(snapshot, doc)}`,
-    query,
+export function matchesReadText(title, preview, text, query) {
+  return [title, preview, text].some((value) => value && includesQuery(value, query));
+}
+
+export function documentMatches(documents, doc, query) {
+  return (
+    doc.kind !== 'source' &&
+    matchesReadText(doc.title, doc.atoms?.[0].unit.preview, documentText(documents, doc), query)
   );
 }
 
 // A match found only in a reader preview is shown from that preview.
-function searchedText(snapshot, doc, query) {
-  const text = documentText(snapshot, doc);
-  return doc.readerPreview && !includesQuery(text, query) && includesQuery(doc.readerPreview, query)
-    ? doc.readerPreview
-    : text;
+function searchedText(documents, doc, query) {
+  const text = documentText(documents, doc);
+  const preview = doc.atoms?.[0].unit.preview;
+  return preview && !includesQuery(text, query) && includesQuery(preview, query) ? preview : text;
 }
 
-export function navigationRows(snapshot, documents, ref, { query, content } = {}) {
-  const matching = documents
-    .map((doc, index) => ({ doc, index }))
-    .filter(
-      ({ doc }) =>
-        (!content?.length || content.includes(contentKind(doc.kind))) &&
-        (query ? documentMatches(snapshot, doc, query) : doc.parent === undefined),
-    );
-  const parents = new Set(matching.map(({ doc }) => doc.parent).filter((x) => x !== undefined));
-  const selected = matching.filter(({ index }) => !query || !parents.has(index));
+export function navigationOrder(documents, query) {
+  const order = [...documents.keys()];
+  if (!query) return order.filter((index) => documents[index].parent === undefined);
+  const matching = order.filter((index) => documentMatches(documents, documents[index], query));
+  const parents = new Set(matching.map((index) => documents[index].parent));
   // Child operations occupy their parent's source position, even though their
   // reference documents are appended after the top-level document index.
-  if (query)
-    selected.sort(
-      (a, b) => (a.doc.parent ?? a.index) - (b.doc.parent ?? b.index) || a.index - b.index,
-    );
-  const latest = new Map();
-  if (!query && snapshot.view !== 'runtime')
-    for (const { doc } of selected)
-      if (
-        doc.kind === 'assistant' &&
-        documentUnits(snapshot, doc).some(
-          (u) => u.block?.type === 'text' && u.block.text?.trim().length,
-        )
-      )
-        latest.set(doc.prompt_id, doc.message);
-  return selected.map(({ doc, index }) => {
-    const related = (doc.related ?? [])
-      .map((link) => {
-        const target = documents.findIndex((d) => d.id === `item:${link.id}`);
-        return target >= 0 ? { relation: link.relation, ref: ref(target) } : null;
-      })
-      .filter(Boolean);
-    if (doc.parent !== undefined) related.push({ relation: 'parent', ref: ref(doc.parent) });
-    if (doc.sourceIndex !== undefined)
-      related.push({ relation: 'source_context', ref: ref(doc.sourceIndex) });
-    const children = doc.children ?? [];
-    const salient = children.filter((i) =>
-      documentText(snapshot, documents[i]).includes('"status":"error"'),
-    );
-    for (const i of [...new Set([...salient.slice(0, 2), ...children.slice(-2)])])
-      related.push({ relation: 'operation', ref: ref(i) });
-    const isLatest =
-      doc.kind === 'assistant' &&
-      doc.prompt_id != null &&
-      latest.get(doc.prompt_id) === doc.message;
-    const full = compact(
-      query ? searchedText(snapshot, doc, query) : (doc.preview ?? documentText(snapshot, doc)),
-    );
-    let text;
-    if (query) text = excerpt(full, 640, query);
-    else if (doc.kind === 'tool') text = full;
-    else text = excerpt(full, isLatest ? 3000 : 900);
-    return {
-      type: doc.kind,
-      ref: ref(index),
-      text,
-      ...(doc.title ? { title: doc.title } : {}),
-      ...(text !== full ? { truncated: true } : {}),
-      ...(doc.source ? { source: doc.source } : {}),
-      ...(doc.branch_relation ? { branch_relation: doc.branch_relation } : {}),
-      ...(related.length ? { related } : {}),
-    };
-  });
+  return matching
+    .filter((index) => !parents.has(index))
+    .sort((a, b) => (documents[a].parent ?? a) - (documents[b].parent ?? b) || a - b);
+}
+
+export function navigationRow(documents, index, ref, query) {
+  const doc = documents[index];
+  const related = doc.links.map(({ relation, target }) => ({ relation, ref: ref(target) }));
+  const tool = !query && doc.kind === 'tool';
+  const full = compact(
+    query
+      ? searchedText(documents, doc, query)
+      : tool
+        ? toolPreview(documents, doc)
+        : (doc.atoms[0].unit.preview ?? documentText(documents, doc)),
+  );
+  const text = tool ? full : excerpt(full, query ? 640 : doc.latest ? 3000 : 900, query);
+  return {
+    type: doc.kind,
+    ref: ref(index),
+    text,
+    ...(doc.title ? { title: doc.title } : {}),
+    ...(text !== full ? { truncated: true } : {}),
+    ...(doc.source ? { source: doc.source } : {}),
+    ...(doc.branch_relation ? { branch_relation: doc.branch_relation } : {}),
+    ...(related.length ? { related } : {}),
+  };
 }

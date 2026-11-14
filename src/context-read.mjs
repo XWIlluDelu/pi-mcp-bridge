@@ -8,6 +8,8 @@ import {
   navigationGroups,
   navigationDocuments,
   documentMatches,
+  assistantBlockType,
+  assistantFailed,
 } from './read-navigation.mjs';
 
 // Change only when the live read request/snapshot semantics become incompatible.
@@ -87,22 +89,15 @@ function timeline(projection, readAdapters) {
         const { content, ...metadata } = message;
         if (Array.isArray(content) && content.length) {
           for (const [blockIndex, block] of content.entries()) {
-            const type =
-              block.type === 'text'
-                ? 'text'
-                : block.type === 'thinking'
-                  ? 'thinking'
-                  : block.type === 'toolCall'
-                    ? 'tool_call'
-                    : 'native';
-            add(type, { ...source, block_index: blockIndex }, { block, metadata });
+            add(
+              assistantBlockType(block),
+              { ...source, block_index: blockIndex },
+              { block, metadata },
+            );
           }
           // A failed message can contain only thinking or an unfinished call.
           // Its status belongs to assistant selection, not to those other kinds.
-          if (
-            !content.some((block) => block.type === 'text') &&
-            (['error', 'aborted'].includes(metadata.stopReason) || metadata.errorMessage)
-          )
+          if (!content.some((block) => block.type === 'text') && assistantFailed(metadata))
             add('native', source, { message: { ...metadata, content: [] } });
         } else add('native', source, { message });
       } else if (message.role === 'toolResult') {
@@ -166,10 +161,6 @@ function selectTimeline(projected, selection, readAdapters) {
   };
   const included = Object.fromEntries(Object.keys(totals).map((key) => [key, 0]));
   included.turns = selectedPrompts.size;
-  const failure = (record) => {
-    const message = record.metadata ?? record.message;
-    return message && (['error', 'aborted'].includes(message.stopReason) || message.errorMessage);
-  };
   const assistantRecord = (record) =>
     record.type === 'text' || (record.type === 'native' && record.message?.role === 'assistant');
   // Each content kind selects messages independently. Once a message qualifies,
@@ -188,7 +179,7 @@ function selectTimeline(projected, selection, readAdapters) {
       const value = kind === 'assistant' ? record.block?.text : record.block?.thinking;
       message.readable ||=
         (typeof value === 'string' && value.trim().length > 0) ||
-        (kind === 'assistant' && Boolean(failure(record)));
+        (kind === 'assistant' && assistantFailed(record.metadata ?? record.message ?? {}));
       messages.set(key, message);
     }
     const groups = new Map();
@@ -608,7 +599,10 @@ function omittedUnit(unit) {
   };
 }
 export function appendUnits(target, record) {
-  const unit = cleanRecord(record);
+  appendCleanUnit(target, cleanRecord(record));
+}
+
+function appendCleanUnit(target, unit) {
   target.accountedBytes += jsonBytes(unit) * 4 + 256;
   if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
   target.units.push(structuredClone(unit));
@@ -673,22 +667,25 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
       validateReadAdapters(readAdapters),
     ),
     target = { units: [], accountedBytes: 0 };
-  let records = selected.records;
-  if (search_query !== undefined) {
-    const matches = new Set();
-    for (const group of navigationGroups(records)) {
-      // Match the same readable document that navigation will expose, including
-      // adjacent assistant blocks and nested tools. Clean one group at a time;
-      // unmatched history never enters the bounded detached snapshot.
-      const candidate = { units: group.indices.map((index) => cleanRecord(records[index])) };
-      if (
-        navigationDocuments(candidate).some((doc) => documentMatches(candidate, doc, search_query))
-      )
-        for (const index of group.indices) matches.add(records[index]);
+  if (search_query === undefined) {
+    for (const record of selected.records) appendUnits(target, record);
+  } else {
+    const matches = [];
+    for (const group of navigationGroups(selected.records)) {
+      const units = group.atoms.map(({ unit }) => cleanRecord(unit));
+      const documents = navigationDocuments({ units });
+      if (documents.some((doc) => documentMatches(documents, doc, search_query))) {
+        for (const [i, { position }] of group.atoms.entries()) {
+          appendCleanUnit(target, units[i]);
+          matches.push(position);
+        }
+      }
     }
-    records = records.filter((record) => matches.has(record));
+    target.units = target.units
+      .map((unit, i) => ({ unit, position: matches[i] }))
+      .sort((a, b) => a.position - b.position)
+      .map(({ unit }) => unit);
   }
-  for (const record of records) appendUnits(target, record);
   return {
     contract: READ_CONTRACT,
     view: 'session',
@@ -809,13 +806,13 @@ function smallLive(live, budget) {
 export function renderPreparedContextRead(
   snapshot,
   args,
-  { cursor, encode, resultBudget, live, runtimeEvents } = {},
+  { cursor, encode, resultBudget, live, runtimeEvents, rows } = {},
 ) {
   const start = cursor?.offset ?? 0,
     firstPart = cursor?.part ?? 0,
     max = args.max_bytes ?? DEFAULT_READ_BYTES;
-  if (start < 0 || start > snapshot.units.length) throw new Error('INVALID_CURSOR');
-  const navigation = Boolean(snapshot.navigation);
+  const units = rows ?? snapshot.units;
+  if (start < 0 || start > units.length) throw new Error('INVALID_CURSOR');
   const base = {
     session_id: snapshot.session_id,
     view: snapshot.view ?? 'session',
@@ -826,7 +823,7 @@ export function renderPreparedContextRead(
     selection: snapshot.selection,
     ...(snapshot.presentation ? { presentation: snapshot.presentation } : {}),
     ...(snapshot.query ? { query: snapshot.query } : {}),
-    ...(snapshot.matches !== undefined ? { matches: snapshot.matches } : {}),
+    ...(snapshot.query ? { matches: units.length } : {}),
     ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
@@ -841,19 +838,19 @@ export function renderPreparedContextRead(
   const page = (items, offset, part = 0) => ({
     ...base,
     items,
-    next_cursor: offset < snapshot.units.length ? encode(offset, part) : null,
+    next_cursor: offset < units.length ? encode(offset, part) : null,
     omissions: {
       selection: snapshot.omissions,
-      capacity: { remaining_units: snapshot.units.length - offset, previous_units: start },
+      capacity: { remaining_units: units.length - offset, previous_units: start },
     },
   });
   const fits = (value) => jsonBytes(value) <= max && fitsResult(value, resultBudget);
   const items = [];
   let offset = start;
   let part = firstPart;
-  render: while (offset < snapshot.units.length) {
-    const atom = snapshot.units[offset];
-    const parts = navigation ? [atom].values() : pageParts(atom);
+  render: while (offset < units.length) {
+    const atom = units.at(offset);
+    const parts = rows ? [atom].values() : pageParts(atom);
     let next = parts.next();
     for (let i = 0; i < part && !next.done; i++) next = parts.next();
     if (next.done) throw new Error('INVALID_CURSOR');
@@ -871,7 +868,7 @@ export function renderPreparedContextRead(
       }
       if (!items.length && !fits(withUnit(unit))) {
         if (metadataUnit(unit)) unit = fitMetadata(unit, (value) => fits(withUnit(value)));
-        else if (navigation) unit = fitNavigationRow(unit, (value) => fits(withUnit(value)));
+        else if (rows) unit = fitNavigationRow(unit, (value) => fits(withUnit(value)));
       }
       const maximum = { ...withUnit(unit), items: [unit], live: null };
       delete maximum.runtime_events;

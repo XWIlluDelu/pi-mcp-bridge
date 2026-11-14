@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { contextSelection } from './read-schema.mjs';
 import { jsonBytes } from './response-budget.mjs';
 import { READ_SNAPSHOT_LIMIT, renderPreparedContextRead } from './context-read.mjs';
-import { navigationDocuments, navigationRows, documentUnits } from './read-navigation.mjs';
+import {
+  navigationDocuments,
+  navigationOrder,
+  navigationRow,
+  documentAtoms,
+} from './read-navigation.mjs';
 
 function decode(value) {
   try {
@@ -37,11 +42,7 @@ export class ContextReadCache {
     const position = decode(cursor),
       entry = this.entries.get(position.token);
     if (!entry) throw new Error('STALE_CURSOR');
-    const { navigation, units } = entry.snapshot;
-    if (
-      position.offset >= (navigation?.rows.length ?? units.length) ||
-      (navigation && position.part)
-    )
+    if (position.offset >= entry.length || (entry.snapshot.documents && position.part))
       throw new Error('INVALID_CURSOR');
     return { position, entry };
   }
@@ -63,7 +64,7 @@ export class ContextReadCache {
         throw new Error('INVALID_READ_REFERENCE');
       const entry = this.entries.get(token);
       if (!entry) throw new Error('STALE_READ_REFERENCE');
-      const document = entry.snapshot.navigation?.documents[index];
+      const document = entry.snapshot.documents?.[index];
       if (!document) throw new Error('INVALID_READ_REFERENCE');
       return { token, index, entry, document };
     } catch (error) {
@@ -86,36 +87,19 @@ export class ContextReadCache {
       throw new Error('INVALID_READ_REFERENCE');
     this.entries.delete(first.token);
     this.entries.set(first.token, first.entry);
-    const snapshot = first.entry.snapshot;
+    const { documents, order, query, ...snapshot } = first.entry.snapshot;
     const selected = new Map();
-    const selectedDocuments = new Set(resolved.map(({ index }) => index));
-    const parentAtoms = new Set(
-      resolved.flatMap(({ document }) => (document.nested ? [] : document.indices)),
-    );
-    for (const index of selectedDocuments) {
-      const document = snapshot.navigation.documents[index];
-      if (document.nested && parentAtoms.has(document.indices[0])) continue;
-      documentUnits(snapshot, document).forEach((unit, i) => {
-        const position = document.indices[i];
-        selected.set(document.nested ? document.id : position, {
-          position,
-          child: document.nested?.ordinal ?? -1,
-          unit,
-        });
-      });
-    }
+    for (const { document } of resolved)
+      for (const atom of documentAtoms(documents, document))
+        selected.set(
+          atom.child === undefined ? atom.position : `${atom.position}:${atom.child}`,
+          atom,
+        );
     const units = [...selected.values()]
+      .filter(({ position, child }) => child === undefined || !selected.has(position))
       .sort((a, b) => a.position - b.position || a.child - b.child)
       .map(({ unit }) => unit);
-    return {
-      ...snapshot,
-      units,
-      navigation: undefined,
-      presentation: 'source',
-      request: snapshot.request,
-      expanded_refs: refs,
-      selection: snapshot.selection,
-    };
+    return { ...snapshot, units, presentation: 'source', expanded_refs: refs };
   }
   get(args, identity) {
     const { position, entry } = this.lookup(args.cursor),
@@ -144,8 +128,8 @@ export class ContextReadCache {
     if (entry) this.accountedBytes -= entry.accountedBytes;
     this.entries.delete(token);
   }
-  insert(token, snapshot, identity) {
-    const accountedBytes = jsonBytes(snapshot) * 4 + snapshot.units.length * 256;
+  insert(token, snapshot, identity, length) {
+    const accountedBytes = jsonBytes(snapshot) * 4 + length * 256;
     if (accountedBytes > this.maxBytes || this.maxEntries < 1)
       throw new Error('READ_SNAPSHOT_TOO_LARGE');
     while (
@@ -160,6 +144,7 @@ export class ContextReadCache {
       snapshot,
       identity,
       accountedBytes,
+      length,
       pins: 0,
     });
     this.accountedBytes += accountedBytes;
@@ -169,34 +154,27 @@ export class ContextReadCache {
     args,
     { token = randomUUID(), cursor, identity, resultBudget, live, runtimeEvents, readPins } = {},
   ) {
-    let rendered = snapshot;
-    if (snapshot.navigation) {
-      const reference = (index) =>
+    let rows;
+    if (snapshot.documents) {
+      const ref = (index) =>
         Buffer.from(JSON.stringify(['ref', token, index])).toString('base64url');
-      rendered = {
-        ...snapshot,
-        presentation: 'preview',
-        ...(snapshot.navigation.query
-          ? { query: snapshot.navigation.query, matches: snapshot.navigation.rows.length }
-          : {}),
-        units: snapshot.navigation.rows.map((row) => ({
-          ...row,
-          ref: reference(row.ref),
-          ...(row.related
-            ? { related: row.related.map((link) => ({ ...link, ref: reference(link.ref) })) }
-            : {}),
-        })),
+      const { documents, order, query } = snapshot;
+      rows = {
+        length: order.length,
+        at: (offset) => navigationRow(documents, order[offset], ref, query),
       };
     }
-    const result = renderPreparedContextRead(rendered, args, {
+    const result = renderPreparedContextRead(snapshot, args, {
+      rows,
       cursor,
       encode: (offset, part) => encode(token, offset, part),
       resultBudget,
       live,
       runtimeEvents,
     });
-    if (result.next_cursor || (snapshot.navigation && rendered.units.length)) {
-      if (!this.entries.has(token)) this.insert(token, snapshot, identity);
+    if (result.next_cursor || rows?.length) {
+      if (!this.entries.has(token))
+        this.insert(token, snapshot, identity, rows?.length ?? snapshot.units.length);
       if (readPins) {
         const entry = this.entries.get(token);
         entry.pins++;
@@ -208,29 +186,20 @@ export class ContextReadCache {
     return result;
   }
   navigate(snapshot, args, options, query) {
-    const indexed = {
-      ...snapshot,
-      request: args,
-      presentation: 'preview',
-      navigation: {
-        documents: navigationDocuments(snapshot),
-        ...(query ? { query } : {}),
-        ...(query
-          ? {
-              content: Object.entries(args.content ?? {})
-                .filter(([, value]) => value !== 0 && value !== false)
-                .map(([kind]) => kind),
-            }
-          : {}),
+    const { units, ...capture } = snapshot;
+    const documents = navigationDocuments({ units, ...capture, request: args });
+    return this.render(
+      {
+        ...capture,
+        request: args,
+        documents,
+        order: navigationOrder(documents, query),
+        presentation: 'preview',
+        query,
       },
-    };
-    indexed.navigation.rows = navigationRows(
-      indexed,
-      indexed.navigation.documents,
-      (index) => index,
-      indexed.navigation,
+      args,
+      options,
     );
-    return this.render(indexed, args, options);
   }
   clear() {
     this.entries.clear();

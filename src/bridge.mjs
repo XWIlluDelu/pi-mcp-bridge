@@ -654,7 +654,7 @@ export class Bridge {
           };
           const reader = await this.compatibilityServices.sessionReaders.select(context);
           if (reader) {
-            const result = await captureSessionRead(reader, context, args);
+            const result = await captureSessionRead(reader, context, args, searchQuery);
             // Recheck applicability, including an owner that appeared during
             // a saved read. Existing live endpoints also recheck their identity.
             const currentReader = await this.compatibilityServices.sessionReaders.select({
@@ -973,22 +973,26 @@ export class Bridge {
     };
     try {
       await validateExecutionCwd(folder.path);
-      let parent, snapshot;
+      let parent, captureFork;
       if (args.fork_from) {
         parent = await this.session(args.fork_from, requestContext);
         this.check('read', parent, requestContext);
         let runtime;
         ({ session: parent, runtime } = await this.#readableOwner(parent, requestContext));
-        snapshot = runtime?.attached
-          ? await runtime.snapshot()
-          : runtime
-            ? await runtime.entries()
-            : await loadSavedSession(parent, { config: this.config });
+        captureFork = async (version) => {
+          if (!runtime) return loadSavedSession(parent, { config: this.config });
+          const { entries, leafId } = runtime.attached
+            ? await runtime.snapshot()
+            : await runtime.entries();
+          if (!Array.isArray(entries)) throw new Error('INVALID_RUNTIME_ENTRIES');
+          // A live writer supplies current entries even if discovery saw an older header.
+          return { header: { ...parent.header, version }, entries, leafId };
+        };
       }
       child = await prepareSession({ ...this.config, ...requestContext.scope }, folder.path, {
         name: args.name,
-        parent,
-        snapshot,
+        parentSession: parent?.file,
+        captureFork,
       });
       // Keep the chosen child identity in partial failure responses.
 

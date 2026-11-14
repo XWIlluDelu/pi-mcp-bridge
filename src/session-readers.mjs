@@ -6,6 +6,7 @@ import {
 } from './context-read.mjs';
 import { jsonBytes } from './response-budget.mjs';
 import { CONTENT_KINDS, contentKind, contextSelection } from './read-schema.mjs';
+import { matchesReadText } from './read-navigation.mjs';
 
 // A distinct capability under the shared module lifecycle, not a replacement
 // for input mappings. Each reader assesses the target session's own evidence.
@@ -41,7 +42,7 @@ export class SessionReaders {
   }
 }
 
-export async function captureSessionRead(reader, context, args) {
+export async function captureSessionRead(reader, context, args, query) {
   let nativeCapture, entryIds;
   const nativeRead = (options) => {
     if (
@@ -99,14 +100,15 @@ export async function captureSessionRead(reader, context, args) {
     throw new Error('INVALID_SESSION_READ');
   const target = { units: [], accountedBytes: 0 };
   const { content } = contextSelection(args);
-  const ids = new Set();
+  const items = new Map();
+  const keep = new Set();
   for (const item of result.items) {
     if (
       !item ||
       typeof item.id !== 'string' ||
       !item.id ||
       item.id.length > 256 ||
-      ids.has(item.id) ||
+      items.has(item.id) ||
       typeof item.kind !== 'string' ||
       !item.kind ||
       item.kind.length > 64 ||
@@ -119,7 +121,7 @@ export async function captureSessionRead(reader, context, args) {
         (!Array.isArray(item.related) ||
           item.related.length > 32 ||
           item.related.some(
-            (link) => typeof link.id !== 'string' || typeof link.relation !== 'string',
+            (link) => typeof link?.id !== 'string' || typeof link.relation !== 'string',
           )))
     )
       throw new Error('INVALID_SESSION_READ');
@@ -131,32 +133,37 @@ export async function captureSessionRead(reader, context, args) {
         jsonBytes(item.source) > 8192)
     )
       throw new Error('INVALID_SESSION_READ');
-    ids.add(item.id);
     const kind = contentKind(item.kind);
-    // Readers own item counts and ordering. Core only enforces the shared kind
-    // switches before serialization, so omitted content cannot fill the cache.
-    if (content[kind] === false || content[kind] === 0) continue;
+    const title = item.title?.slice(0, 256);
+    const preview = item.preview?.slice(0, 4096);
+    const enabled = content[kind] !== false && content[kind] !== 0;
+    items.set(item.id, { item, kind, title, preview, enabled });
+    if (enabled && (!query || matchesReadText(title, preview, item.text, query))) keep.add(item.id);
+  }
+  for (const { item } of items.values())
+    if (item.related?.some((link) => !items.has(link.id))) throw new Error('INVALID_SESSION_READ');
+  // A matching item must keep the sources reachable through its related refs.
+  for (const id of keep)
+    for (const link of items.get(id).item.related ?? [])
+      if (items.get(link.id).enabled) keep.add(link.id);
+  for (const { item, kind, title, preview } of items.values()) {
+    if (!keep.has(item.id)) continue;
     const originalKind =
       !CONTENT_KINDS.includes(item.kind) && kind === 'native' ? { content_kind: item.kind } : {};
-    const start = target.units.length;
     appendUnits(target, {
       type: kind,
       source: { reader_item: item.id, ...originalKind },
       message: { role: 'custom', customType: item.kind, content: item.text },
     });
-    for (const unit of target.units.slice(start)) {
-      unit.kind = kind;
-      if (item.title) unit.title = item.title.slice(0, 256);
-      if (item.source) unit.provenance = { ...structuredClone(item.source), ...originalKind };
-      if (item.branch_relation) unit.branch_relation = item.branch_relation;
-    }
-    if (target.units[start]) {
-      if (item.preview) target.units[start].preview = item.preview.slice(0, 4096);
-      if (item.related) target.units[start].related = structuredClone(item.related);
-    }
+    Object.assign(target.units.at(-1), {
+      kind,
+      title: title || undefined,
+      preview: preview || undefined,
+      provenance: item.source && { ...structuredClone(item.source), ...originalKind },
+      branch_relation: item.branch_relation,
+      related: item.related && structuredClone(item.related),
+    });
   }
-  for (const item of result.items)
-    if (item.related?.some((link) => !ids.has(link.id))) throw new Error('INVALID_SESSION_READ');
   const native = result.native ? await nativeRead() : nativeCapture ? await nativeCapture : null;
   if (result.native) target.units.push(...native.units);
   if (jsonBytes(target.units) > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
