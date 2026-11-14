@@ -1,4 +1,4 @@
-import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
+import { z } from 'zod';
 import packageInfo from '../package.json' with { type: 'json' };
 import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
@@ -7,17 +7,14 @@ import { publicError } from './errors.mjs';
 import { EventError } from './events.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
-// Earlier session-based versions are served by the pinned MCP SDK server.
-export const SDK_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
-const SUPPORTED_VERSIONS = [MODERN_VERSION, ...SDK_VERSIONS];
-export const SERVER_INFO = { name: 'pi-session-bridge', version: packageInfo.version };
+const SUPPORTED_VERSIONS = [MODERN_VERSION];
+const SERVER_INFO = { name: 'pi-session-bridge', version: packageInfo.version };
 export const META = 'io.modelcontextprotocol/';
 import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
-export { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
 // Descriptions state the permission, the outcome contract and retry safety.
 // Detailed semantics live in docs/api.md and in error recovery hints.
-export const descriptions = {
+const descriptions = {
   list: 'List authorized sessions, newest activity first, with project, name and sampled runtime status (state, model, thinking level, capabilities). Filters combine. Also returns creatable_projects for create. Requires list permission; never starts Pi.',
   read: 'Read a Pi session in source order; requires read and never starts Pi. Default: the last three input turns with input, all assistant text, the latest thinking and one tool operation per turn. range:{recent,earliest} selects turns (-1 = all); content sets per-kind counts. Items carry refs: read({refs:[...]}) expands up to eight from one result. Continue with read({cursor}), optionally changing max_bytes. Omit view for the session’s default source; where a configured reader applies, results add stored summaries/memories as view:"adapted" with reader.coverage counts. view:"session" forces native context; view:"runtime" reads the captured request context. Stale cursors or refs need a fresh read.',
   search:
@@ -45,16 +42,16 @@ export const descriptions = {
   health:
     'Diagnose the permission configuration; a healthy setup returns a short ok. Optional session_id limits the diagnosis to that session. Unscoped calls also report settings awaiting restart and unavailable event storage. Changes nothing.',
 };
-export const toolNames = Object.keys(descriptions);
+const toolNames = Object.keys(descriptions);
 export function toolDefinitions() {
   return toolNames.map((name) => ({
     name,
     description: descriptions[name],
-    inputSchema: toJsonSchemaCompat(publicSchemas[name], { pipeStrategy: 'input' }),
+    inputSchema: z.toJSONSchema(publicSchemas[name], { target: 'draft-7', io: 'input' }),
     ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
     ...(publicOutputSchemas[name]
       ? {
-          outputSchema: toJsonSchemaCompat(publicOutputSchemas[name], { pipeStrategy: 'output' }),
+          outputSchema: z.toJSONSchema(publicOutputSchemas[name], { target: 'draft-7' }),
         }
       : {}),
   }));
@@ -83,7 +80,12 @@ function toolError(code, extra = {}) {
     structuredContent: result,
   };
 }
-export async function callBridgeTool(bridge, name, input, options) {
+export async function callBridgeTool(
+  bridge,
+  name,
+  input,
+  { requestId, execute = (run) => run() } = {},
+) {
   const schema = Object.hasOwn(publicSchemas, name) ? publicSchemas[name] : null;
   if (!schema) return toolError('UNKNOWN_TOOL');
   const parsed = schema.safeParse(input ?? {});
@@ -93,14 +95,7 @@ export async function callBridgeTool(bridge, name, input, options) {
         .map((issue) => ({ path: issue.path, message: issue.message }))
         .slice(0, 12),
     });
-  return executeBridgeTool(bridge, name, parsed.data, options);
-}
-export function executeBridgeTool(
-  bridge,
-  name,
-  args,
-  { requestId, execute = (run) => run() } = {},
-) {
+  const args = parsed.data;
   // Start at the authoritative receive boundary, not when a delayed executor runs.
   const context = bridge.captureRequestContext?.();
   // A delayed/rejected executor must not leave an early policy failure unhandled.
@@ -153,10 +148,6 @@ export function isRpcRequest(body) {
       (typeof body.id === 'string' && Buffer.byteLength(body.id) <= 1024))
   );
 }
-export const modernMessage = (body) =>
-  ['protocolVersion', 'clientCapabilities', 'clientInfo'].some(
-    (field) => body?.params?._meta?.[META + field] !== undefined,
-  ) || body?.method === 'server/discover';
 export function rpcError(id, code, message, data) {
   return {
     jsonrpc: '2.0',
@@ -179,33 +170,22 @@ function unsupportedVersion(id, requested) {
 }
 // Applies to the entire serialized JSON-RPC envelope, including escaped text
 // duplication, metadata and request ID. Never truncates JSON.
-export function boundMessage(message, limit = MCP_RESPONSE_LIMIT) {
-  if (Buffer.byteLength(JSON.stringify(message), 'utf8') <= limit) return message;
-  const modern = message.result?.resultType !== undefined;
-  const result = toolError('RESPONSE_TOO_LARGE', {
-    recovery:
-      'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
-  });
-  const replacement = {
-    jsonrpc: '2.0',
-    id: message.id,
-    ...(message.result
-      ? { result: modern ? complete(result) : result }
-      : { error: { code: -32603, message: 'RESPONSE_TOO_LARGE' } }),
+function boundedResult(id, result) {
+  const message = { jsonrpc: '2.0', id, result: complete(result) };
+  if (Buffer.byteLength(JSON.stringify(message), 'utf8') <= MCP_RESPONSE_LIMIT) return message;
+  return {
+    ...message,
+    result: complete(
+      toolError('RESPONSE_TOO_LARGE', {
+        recovery:
+          'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
+      }),
+    ),
   };
-  if (Buffer.byteLength(JSON.stringify(replacement), 'utf8') > limit)
-    throw new Error('RESPONSE_BUDGET_TOO_SMALL');
-  return replacement;
 }
 export async function dispatchModern(bridge, body, options = {}) {
   const id = body?.id;
-  if (
-    !object(body) ||
-    body.jsonrpc !== '2.0' ||
-    typeof body.method !== 'string' ||
-    !(typeof id === 'string' || (typeof id === 'number' && Number.isSafeInteger(id))) ||
-    (typeof id === 'string' && Buffer.byteLength(id) > 1024)
-  )
+  if (!isRpcRequest(body) || id === undefined)
     return { status: 400, message: rpcError(null, -32600, 'Invalid request') };
   const meta = body.params?._meta;
   if (
@@ -277,7 +257,7 @@ export async function dispatchModern(bridge, body, options = {}) {
     default:
       return { status: 404, message: rpcError(id, -32601, 'Method not found') };
   }
-  return { status: 200, message: boundMessage({ jsonrpc: '2.0', id, result: complete(result) }) };
+  return { status: 200, message: boundedResult(id, result) };
 }
 
 // Modern HTTP bindings require mirrored fields; reject duplicate headers too.

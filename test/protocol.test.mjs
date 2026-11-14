@@ -77,7 +77,7 @@ test('modern requests are self-contained; discovery and tool list carry required
   const discovery = await dispatchModern(stub, message('server/discover'));
   assert.equal(discovery.status, 200);
   assert.equal(discovery.message.result.resultType, 'complete');
-  assert.ok(discovery.message.result.supportedVersions.includes(MODERN_VERSION));
+  assert.deepEqual(discovery.message.result.supportedVersions, [MODERN_VERSION]);
   assert.equal(discovery.message.result.ttlMs, 0);
   assert.equal(discovery.message.result.cacheScope, 'private');
   assert.equal(discovery.message.result._meta[META + 'serverInfo'].name, 'pi-session-bridge');
@@ -131,7 +131,7 @@ test('modern versions, required metadata and unknown methods use official error 
   assert.equal(rejected.status, 400);
   assert.equal(rejected.message.error.code, -32022);
   assert.equal(rejected.message.error.data.requested, '2099-01-01');
-  assert.ok(rejected.message.error.data.supported.includes(MODERN_VERSION));
+  assert.deepEqual(rejected.message.error.data.supported, [MODERN_VERSION]);
   for (const key of [META + 'protocolVersion', META + 'clientCapabilities']) {
     const body = message('tools/list');
     delete body.params._meta[key];
@@ -238,9 +238,11 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   await transport.drain();
   assert.equal(lines.length, 0);
   input.write('x'.repeat(MCP_INPUT_LIMIT + 1) + '\n');
+  input.write('{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}\n');
   input.write(JSON.stringify(message('ping', {}, 43)) + '\n');
   await transport.drain();
   assert.equal(lines[0].error.message, 'INPUT_TOO_LARGE');
-  assert.equal(lines[1].id, 43);
+  assert.equal(lines.find((line) => line.id === 44).error.code, -32602);
+  assert.ok(lines.find((line) => line.id === 43).result);
   await transport.close();
 });

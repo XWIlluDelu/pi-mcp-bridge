@@ -1,40 +1,17 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
 import { Bridge } from './bridge.mjs';
-import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
-import { toolNames, descriptions, executeBridgeTool, SERVER_INFO } from './protocol.mjs';
 import { publicError } from './errors.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { readOwnerConfig } from './owner-config.mjs';
-export function makeServer(bridge, { execute = (run) => run() } = {}) {
-  const server = new McpServer(SERVER_INFO);
-  for (const name of toolNames)
-    server.registerTool(
-      name,
-      {
-        description: descriptions[name],
-        inputSchema: publicSchemas[name],
-        ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
-        ...(publicOutputSchemas[name] ? { outputSchema: publicOutputSchemas[name] } : {}),
-      },
-      (args, extra) =>
-        executeBridgeTool(bridge, name, args, {
-          execute,
-          requestId: extra.requestId,
-        }),
-    );
-  return server;
-}
 async function main() {
   const configFile = process.argv[2];
   if (!configFile)
     throw new Error('Usage: node src/server.mjs /absolute/path/to/owner-config.json');
   const { config } = await readOwnerConfig(path.resolve(configFile));
   const bridge = new Bridge(config, undefined, { configFile: path.resolve(configFile) });
-  let server,
-    transport,
+  let transport,
     initializing,
     closing,
     exitCode = 0;
@@ -55,11 +32,7 @@ async function main() {
         exitCode = 1;
         console.error('SHUTDOWN_FAILED');
       }
-      try {
-        await server?.close();
-      } catch {
-        exitCode = 1;
-      }
+      transport?.close();
       process.exit(exitCode);
     })();
     return closing;
@@ -89,18 +62,9 @@ async function main() {
     initializing = bridge.init();
     await initializing;
     if (closing) return closing;
-    server = makeServer(bridge, {
-      execute: (run) => {
-        const task = Promise.resolve().then(run);
-        transport.track(task);
-        return task;
-      },
-    });
-    server.server.onclose = () => {
-      void close();
-    };
     transport = new BridgeStdioTransport(bridge);
-    await server.connect(transport);
+    transport.onerror = () => void close(1);
+    transport.start();
     diagnostics.emit('service.ready', { transport: 'stdio' });
   } catch (error) {
     console.error(publicError(error));

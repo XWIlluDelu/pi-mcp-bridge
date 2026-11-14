@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { setTimeout as pause } from 'node:timers/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { launchStdio } from './fixtures/stdio-client.mjs';
 import { nativeOwner, nativeTui } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 
@@ -11,17 +10,9 @@ test('a native permission menu edit changes the next MCP read decision', async (
   const f = await nativeOwner(t, { prefix: 'menu' });
   const extension = new URL('../src/owner-permissions-extension.mjs', import.meta.url).pathname;
   const tui = await nativeTui(f, f.session, ['-e', extension]);
-  const client = new Client({ name: 'owner-menu-fixture', version: '1' });
-  f.cleanup.unshift(() => client.close());
   await f.bridge.close();
-  await client.connect(
-    new StdioClientTransport({
-      command: process.execPath,
-      args: [new URL('../src/server.mjs', import.meta.url).pathname, f.configFile],
-      env: f.env,
-    }),
-  );
-  const read = () => client.callTool({ name: 'read', arguments: { session_id: f.id } });
+  const client = launchStdio(f);
+  const read = () => client.call('read', { session_id: f.id });
   assert.equal(Boolean((await read()).isError), false);
 
   tui.type('\x1b\x10');

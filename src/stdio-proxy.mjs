@@ -1,7 +1,8 @@
 import { pathToFileURL } from 'node:url';
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
 import { BridgeStdioTransport } from './protocol-stdio.mjs';
-import { META, modernMessage, isRpcRequest, rpcError, MCP_RESPONSE_LIMIT } from './protocol.mjs';
+import { META, isRpcRequest, rpcError } from './protocol.mjs';
+import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
 // queue or automatic retries live here. HTTP authentication stays owner-local.
@@ -43,43 +44,40 @@ export function createStdioProxy({
         this.track(this.write(rpcError(null, -32600, 'Invalid request')));
         return;
       }
-      if (body.method === 'notifications/cancelled' && controllers.has(body.params?.requestId)) {
-        controllers.get(body.params.requestId).abort();
+      if (body.id === undefined) {
+        if (body.method === 'notifications/cancelled')
+          controllers.get(body.params?.requestId)?.abort();
         return;
       }
       this.track(this.forward(body));
     }
     async forward(body) {
-      // Notifications have no correlation ID and must never share a request slot.
-      const key = body.id === undefined ? Symbol() : body.id;
-      if (controllers.has(key)) {
-        await this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID'));
+      const { id } = body;
+      if (controllers.has(id)) {
+        await this.write(rpcError(id, -32600, 'Duplicate in-flight request ID'));
         return;
       }
       if (controllers.size >= 16) {
-        if (body.id !== undefined)
-          await this.write(rpcError(body.id, -32000, 'PROXY_BUSY', { recovery: 'NOT_FORWARDED' }));
+        await this.write(rpcError(id, -32000, 'PROXY_BUSY', { recovery: 'NOT_FORWARDED' }));
         return;
       }
       const controller = new AbortController();
-      controllers.set(key, controller);
+      controllers.set(id, controller);
       try {
         const headers = {
           'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
+          accept: 'application/json',
           [TOKEN_HEADER]: token,
+          'Mcp-Method': body.method,
         };
-        if (modernMessage(body)) {
-          const version = body.params?._meta?.[META + 'protocolVersion'];
-          if (typeof version === 'string') headers['MCP-Protocol-Version'] = version;
-          headers['Mcp-Method'] = body.method;
-          const name = body.params?.[body.method === 'resources/read' ? 'uri' : 'name'];
-          if (
-            ['tools/call', 'prompts/get', 'resources/read'].includes(body.method) &&
-            typeof name === 'string'
-          )
-            headers['Mcp-Name'] = encode(name);
-        }
+        const version = body.params?._meta?.[META + 'protocolVersion'];
+        if (typeof version === 'string') headers['MCP-Protocol-Version'] = version;
+        const name = body.params?.[body.method === 'resources/read' ? 'uri' : 'name'];
+        if (
+          ['tools/call', 'prompts/get', 'resources/read'].includes(body.method) &&
+          typeof name === 'string'
+        )
+          headers['Mcp-Name'] = encode(name);
         const response = await fetchImpl(target, {
           method: 'POST',
           headers,
@@ -87,7 +85,6 @@ export function createStdioProxy({
           redirect: 'error',
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(40000)]),
         });
-        if (response.status === 202 && body.id === undefined) return;
         if (!/application\/json/i.test(response.headers.get('content-type') ?? ''))
           throw new Error('INVALID_BACKEND_RESPONSE');
         let size = 0;
@@ -100,46 +97,40 @@ export function createStdioProxy({
         const result = JSON.parse(
           new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
         );
-        if (body.id !== undefined) {
-          if (
-            result !== null &&
-            typeof result === 'object' &&
-            !Array.isArray(result) &&
-            Object.keys(result).length === 1 &&
-            Object.hasOwn(NOT_ADMITTED, result.error) &&
-            NOT_ADMITTED[result.error] === response.status
-          ) {
-            await this.write(
-              rpcError(body.id, -32000, result.error, {
-                http_status: response.status,
-                recovery: 'NOT_ADMITTED',
-              }),
-            );
-            return;
-          }
-          if (
-            result.jsonrpc !== '2.0' ||
-            result.id !== body.id ||
-            (!result.result && !result.error)
-          )
-            throw new Error('INVALID_BACKEND_RESPONSE');
-          await this.write(result);
-        }
-      } catch {
-        if (body.id !== undefined && !controller.signal.aborted)
+        if (
+          result !== null &&
+          typeof result === 'object' &&
+          !Array.isArray(result) &&
+          Object.keys(result).length === 1 &&
+          Object.hasOwn(NOT_ADMITTED, result.error) &&
+          NOT_ADMITTED[result.error] === response.status
+        ) {
           await this.write(
-            rpcError(body.id, -32000, 'BRIDGE_CONNECTION_LOST', {
+            rpcError(id, -32000, result.error, {
+              http_status: response.status,
+              recovery: 'NOT_ADMITTED',
+            }),
+          );
+          return;
+        }
+        if (result?.jsonrpc !== '2.0' || result.id !== id || (!result.result && !result.error))
+          throw new Error('INVALID_BACKEND_RESPONSE');
+        await this.write(result);
+      } catch {
+        if (!controller.signal.aborted)
+          await this.write(
+            rpcError(id, -32000, 'BRIDGE_CONNECTION_LOST', {
               recovery:
                 'OUTCOME_UNKNOWN; no automatic replay was attempted. Inspect list/read before deciding whether to submit again.',
             }),
           );
       } finally {
-        controllers.delete(key);
+        controllers.delete(id);
       }
     }
-    async close() {
+    close() {
       for (const controller of controllers.values()) controller.abort();
-      await super.close();
+      super.close();
     }
   }
   return new ProxyTransport(null, { input, output });

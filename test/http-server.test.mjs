@@ -14,30 +14,15 @@ import { loadHttpConfig, TOKEN_HEADER } from '../src/http-config.mjs';
 import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
 
 const token = 'synthetic-http-test-token-never-a-real-credential';
-const rpc = (name, args = {}, id = 1) => ({
-  jsonrpc: '2.0',
-  id,
-  method: 'tools/call',
-  params: { name, arguments: args },
-});
-const initialize = {
-  jsonrpc: '2.0',
-  id: 1,
-  method: 'initialize',
-  params: {
-    protocolVersion: '2025-11-25',
-    capabilities: {},
-    clientInfo: { name: 'offline-test', version: '1' },
-  },
-};
+const rpc = (name, args = {}) => modern('tools/call', { name, arguments: args });
 function request(url, message, options = {}) {
   const body = typeof message === 'string' ? message : JSON.stringify(message);
   return new Promise((resolve, reject) => {
     const values = {
       Host: new URL(url).host,
-      Accept: 'application/json, text/event-stream',
       'Content-Type': 'application/json',
       [TOKEN_HEADER]: token,
+      ...(message?.params?._meta ? modernHeaders(message) : {}),
       ...options.headers,
     };
     const rawHeaders = Object.entries(values).flatMap(([name, value]) =>
@@ -87,8 +72,8 @@ async function fixture(t, serviceOptions = {}) {
   const service = createHttpService(f.bridge, { token, ...serviceOptions });
   f.cleanup.push(() => service.close());
   const url = await service.listen();
-  const call = async (name, args, id) => {
-    const response = await request(url, rpc(name, args, id));
+  const call = async (name, args) => {
+    const response = await request(url, rpc(name, args));
     assert.equal(response.status, 200, response.text);
     assert.equal(response.body.result.isError, undefined, response.text);
     return response.body.result.structuredContent;
@@ -111,16 +96,15 @@ const modernHeaders = (body) => ({
   'Mcp-Method': body.method,
   ...(body.method === 'tools/call' ? { 'Mcp-Name': body.params.name } : {}),
 });
-test('modern HTTP has no handshake, required discovery/meta, mirrored headers and precise version errors', async (t) => {
+test('HTTP uses per-request metadata and rejects the old handshake and versions', async (t) => {
   const f = await fixture(t);
   for (const method of ['server/discover', 'tools/list']) {
-    const body = modern(method),
-      response = await request(f.url, body, { headers: modernHeaders(body) });
+    const response = await request(f.url, modern(method));
     assert.equal(response.status, 200, response.text);
     assert.equal(response.headers['mcp-session-id'], undefined);
   }
   const body = modern('tools/call', { name: 'list', arguments: {} });
-  const success = await request(f.url, body, { headers: modernHeaders(body) });
+  const success = await request(f.url, body);
   assert.equal(success.status, 200);
   assert.equal(success.body.result.structuredContent.sessions[0].session_id, f.id);
   for (const bad of [
@@ -128,17 +112,28 @@ test('modern HTTP has no handshake, required discovery/meta, mirrored headers an
     { 'Mcp-Name': 'read' },
     { 'Mcp-Method': ['tools/call', 'tools/call'] },
   ]) {
-    const response = await request(f.url, body, { headers: { ...modernHeaders(body), ...bad } });
+    const response = await request(f.url, body, { headers: bad });
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, -32020);
   }
   const unsupported = modern('tools/list');
-  unsupported.params._meta[META + 'protocolVersion'] = '2099-01-01';
-  const version = await request(f.url, unsupported, { headers: modernHeaders(unsupported) });
+  unsupported.params._meta[META + 'protocolVersion'] = '2025-11-25';
+  const version = await request(f.url, unsupported);
   assert.equal(version.status, 400);
   assert.equal(version.body.error.code, -32022);
+  assert.deepEqual(version.body.error.data.supported, [MODERN_VERSION]);
+  const initialize = await request(f.url, {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2025-11-25' },
+  });
+  assert.equal(initialize.status, 400);
+  assert.equal(initialize.body.error.code, -32020);
   const unknown = modern('unknown/method');
-  assert.equal((await request(f.url, unknown, { headers: modernHeaders(unknown) })).status, 404);
+  assert.equal((await request(f.url, unknown)).status, 404);
+  for (const method of ['GET', 'DELETE', 'OPTIONS'])
+    assert.equal((await request(f.url, '', { method })).status, 405);
 });
 test('HTTP response deadline reports uncertainty and does not replay admitted work', async (t) => {
   const f = await fixture(t, { waitTimeoutMs: 30 }),
@@ -155,7 +150,7 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
     name: 'send',
     arguments: { session_id: f.id, text: 'fixture' },
   });
-  const pending = request(f.url, body, { headers: modernHeaders(body) });
+  const pending = request(f.url, body);
   await entered.promise;
   const expired = await pending;
   assert.equal(expired.status, 504);
@@ -166,19 +161,6 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
   release.resolve();
   await Promise.allSettled([...f.bridge.pendingMutations]);
   assert.equal(f.runtime.calls.length, 1);
-});
-
-test('HTTP initialize and independent requests use JSON without MCP sessions or SSE', async (t) => {
-  const f = await fixture(t);
-  const response = await request(f.url, initialize);
-  assert.equal(response.status, 200);
-  assert.equal(response.body.result.protocolVersion, '2025-11-25');
-  assert.equal(response.headers['mcp-session-id'], undefined);
-  assert.match(response.headers['content-type'], /application\/json/);
-  assert.equal(response.headers['access-control-allow-origin'], undefined);
-  assert.equal((await f.call('list')).sessions[0].session_id, f.id);
-  for (const method of ['GET', 'DELETE', 'OPTIONS'])
-    assert.equal((await request(f.url, '', { method })).status, 405);
 });
 
 test('HTTP enforces exact Host, denies every Origin, and authenticates before parsing', async (t) => {
@@ -204,7 +186,7 @@ test('HTTP enforces exact Host, denies every Origin, and authenticates before pa
     ['{bad json', {}, 400],
     [[rpc('list')], {}, 400],
     [rpc('list'), { 'Content-Encoding': 'gzip' }, 415],
-    [rpc('list'), { 'MCP-Protocol-Version': MODERN_VERSION }, 400],
+    [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }, {}, 400],
   ])
     assert.equal((await request(f.url, body, { headers })).status, status);
 });

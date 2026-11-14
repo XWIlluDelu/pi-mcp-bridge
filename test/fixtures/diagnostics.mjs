@@ -4,6 +4,7 @@ import { TOKEN_HEADER } from '../../src/http-config.mjs';
 import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
 import { PiRpc } from '../../src/rpc.mjs';
 import { nativeOwner } from './native-owner.mjs';
+import { META, MODERN_VERSION } from '../../src/protocol.mjs';
 
 const cleanup = [];
 try {
@@ -20,14 +21,20 @@ try {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': MODERN_VERSION,
+        'Mcp-Method': 'tools/call',
+        'Mcp-Name': 'read',
         ...headers,
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: 'PRIVATE_REQUEST',
         method: 'tools/call',
-        params: { name: 'read', arguments: { session_id: f.id } },
+        params: {
+          name: 'read',
+          arguments: { session_id: f.id },
+          _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
+        },
       }),
     });
   await f.bridge.pool.resolve(f.session);

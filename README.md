@@ -43,7 +43,7 @@ For one stdio MCP client:
 }
 ```
 
-For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for stdio-only clients. [Transport setup](docs/transports.md) covers tokens, tunnels and protocol versions.
+For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for stdio-only clients. [Transport setup](docs/transports.md) covers tokens, tunnels and the current protocol.
 
 ### Verify the first connection
 

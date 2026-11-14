@@ -5,8 +5,6 @@ import { knownErrorCode } from './errors.mjs';
 
 const enums = {
   method: [
-    'initialize',
-    'notifications/initialized',
     'ping',
     'server/discover',
     'tools/list',

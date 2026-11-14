@@ -19,10 +19,20 @@ function fixture(fetchImpl) {
     fetchImpl,
   });
   const send = (id, method, params) =>
-    input.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+    input.write(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method,
+        params: {
+          ...params,
+          _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
+        },
+      }) + '\n',
+    );
   return { input, lines, proxy, send };
 }
-test('stdio proxy forwards modern metadata and SDK initialization without runtime or retry', async () => {
+test('stdio proxy forwards per-request metadata and encodes the mirrored tool name', async () => {
   const received = [];
   const f = fixture(async (url, options) => {
     const body = JSON.parse(options.body);
@@ -36,19 +46,13 @@ test('stdio proxy forwards modern metadata and SDK initialization without runtim
   f.send(1, 'tools/call', {
     name: '命令',
     arguments: {},
-    _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
   });
-  f.send(2, 'initialize', { protocolVersion: '2025-11-25' });
   await f.proxy.drain();
-  assert.equal(received.length, 2);
+  assert.equal(received.length, 1);
   assert.equal(received[0].headers['MCP-Protocol-Version'], MODERN_VERSION);
   assert.equal(received[0].headers['Mcp-Method'], 'tools/call');
   assert.match(received[0].headers['Mcp-Name'], /^=\?base64\?/);
-  assert.equal(received[1].headers['Mcp-Method'], undefined);
-  assert.deepEqual(
-    f.lines.map((x) => x.id),
-    [1, 2],
-  );
+  assert.deepEqual(f.lines, [{ jsonrpc: '2.0', id: 1, result: { marker: 'tools/call' } }]);
   await f.proxy.close();
 });
 test('proxy preserves exact backend rejections as not admitted without retrying input', async (t) => {
@@ -82,10 +86,6 @@ test('proxy preserves exact backend rejections as not admitted without retrying 
           },
         },
       ]);
-      f.input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-      await f.proxy.drain();
-      assert.equal(forwards, 2);
-      assert.equal(f.lines.length, 1, 'rejected notifications receive no JSON-RPC response');
     });
 });
 
@@ -109,7 +109,7 @@ test('proxy reports a lost connection once, never resubmits a mutation, and clos
       ),
   );
   await blocked.proxy.start();
-  blocked.input.write(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'ping' }) + '\n');
+  blocked.send(8, 'ping');
   await blocked.proxy.close();
   await blocked.proxy.drain();
   assert.equal(blocked.lines.length, 0);

@@ -1,14 +1,6 @@
-import {
-  boundMessage,
-  dispatchModern,
-  modernMessage,
-  isRpcRequest,
-  rpcError,
-  MCP_INPUT_LIMIT,
-} from './protocol.mjs';
+import { dispatchModern, isRpcRequest, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
-// One bounded newline transport serves per-request MCP and the pinned MCP SDK.
-// It never instantiates another Bridge or replays application work.
+// Bound each newline-delimited request before decoding UTF-8.
 export class BridgeStdioTransport {
   constructor(bridge, { input = process.stdin, output = process.stdout } = {}) {
     this.bridge = bridge;
@@ -18,16 +10,12 @@ export class BridgeStdioTransport {
     this.bufferLength = 0;
     this.discarding = false;
     this.tasks = new Set();
-    this.modern = new Map();
-    this.sdkInitialized = false;
+    this.requests = new Map();
     this.data = (chunk) => this.read(chunk);
   }
-  async start() {
+  start() {
     this.input.on('data', this.data);
     this.input.resume();
-  }
-  async send(message) {
-    await this.write(boundMessage(message));
   }
   async write(message) {
     if (this.output.destroyed || this.output.writableEnded) return;
@@ -37,10 +25,9 @@ export class BridgeStdioTransport {
       ),
     );
   }
-  async close() {
+  close() {
     this.input.off('data', this.data);
-    for (const request of this.modern.values()) request.cancelled = true;
-    this.onclose?.();
+    for (const request of this.requests.values()) request.cancelled = true;
   }
   async drain() {
     await Promise.allSettled([...this.tasks]);
@@ -97,28 +84,23 @@ export class BridgeStdioTransport {
       this.track(this.write(rpcError(null, -32700, 'Parse error')));
       return;
     }
-    if (body?.method === 'notifications/cancelled' && this.modern.has(body.params?.requestId)) {
-      const record = this.modern.get(body.params.requestId);
-      record.cancelled = true;
-      return;
-    }
-    if (body?.method === 'notifications/cancelled' && !this.sdkInitialized) return;
     if (!isRpcRequest(body)) {
       this.track(this.write(rpcError(null, -32600, 'Invalid request')));
       return;
     }
-    if (body?.method === 'initialize') this.sdkInitialized = true;
-    if (!modernMessage(body) && this.sdkInitialized) {
-      this.onmessage?.(body);
+    if (body.id === undefined) {
+      if (body.method === 'notifications/cancelled') {
+        const record = this.requests.get(body.params?.requestId);
+        if (record) record.cancelled = true;
+      }
       return;
     }
-    if (body.id === undefined) return; // JSON-RPC notifications never receive responses.
-    if (this.modern.has(body.id)) {
+    if (this.requests.has(body.id)) {
       this.track(this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID')));
       return;
     }
     const record = { cancelled: false };
-    this.modern.set(body.id, record);
+    this.requests.set(body.id, record);
     const task = (async () => {
       try {
         const { message } = await dispatchModern(this.bridge, body);
@@ -126,7 +108,7 @@ export class BridgeStdioTransport {
       } catch (error) {
         if (!record.cancelled) await this.write(rpcError(body?.id, -32603, 'REQUEST_FAILED'));
       } finally {
-        this.modern.delete(body.id);
+        this.requests.delete(body.id);
       }
     })();
     this.track(task);

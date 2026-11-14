@@ -2,7 +2,6 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import { toJsonSchemaCompat } from '@modelcontextprotocol/sdk/server/zod-json-schema-compat.js';
 import { utf16String } from './schema.mjs';
 import { atomicJson, readPrivateFile, hash } from './storage.mjs';
 import { permitted } from './permissions.mjs';
@@ -84,7 +83,7 @@ const payloadSchema = z
   })
   .strict();
 function jsonSchema(schema) {
-  const { $schema, ...value } = toJsonSchemaCompat(schema, { pipeStrategy: 'output' });
+  const { $schema, ...value } = z.toJSONSchema(schema, { target: 'draft-7' });
   return value;
 }
 const settledEventDefinition = {

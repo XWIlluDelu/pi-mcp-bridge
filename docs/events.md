@@ -7,8 +7,7 @@ subscribe and react in the subscribing chat through outbound signed HTTPS webhoo
 ## Before subscribing
 
 - Connect ChatGPT to the authenticated Bridge endpoint using the
-  [transport setup](transports.md). Events require the `2026-07-28` protocol path;
-  a client that can call tools through an older SDK protocol may not support events.
+  [transport setup](transports.md).
 - Obtain the target's `session_id` and grant `read`. Sending work separately
   requires `send`; subscription does not grant execution access. For a new task,
   `create` without input gives you a saved ID to subscribe to before the first send.

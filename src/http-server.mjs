@@ -2,17 +2,12 @@ import http from 'node:http';
 import { publicError } from './errors.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { Bridge } from './bridge.mjs';
-import { makeServer } from './server.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import {
-  SDK_VERSIONS,
-  modernMessage,
   isRpcRequest,
   dispatchModern,
   validateModernHeaders,
-  boundMessage,
   rpcError,
   MCP_INPUT_LIMIT,
 } from './protocol.mjs';
@@ -93,8 +88,6 @@ async function parseBody(req) {
   }
 }
 
-// The caller initializes one Bridge. Only this service's close(), never an HTTP
-// connection or request transport, owns its shutdown.
 export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
   if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 300000)
     throw new Error('INVALID_WAIT_TIMEOUT');
@@ -148,11 +141,9 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > MCP_INPUT_LIMIT))
       return refuse(res, 'BODY_TOO_LARGE');
     const record = {
-      req,
       res,
       pending: 0,
       disconnected: false,
-      server: null,
     };
     requests.add(record);
     const release = () => {
@@ -160,7 +151,6 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     };
     res.once('close', () => {
       record.disconnected = true;
-      void record.server?.close().catch(() => {});
       release();
     });
     let body;
@@ -174,19 +164,19 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     try {
       if (record.disconnected) return;
       diagnostics.emit('http.request', { method: body.method });
-      if (!isRpcRequest(body))
+      if (!isRpcRequest(body) || body.id === undefined)
         return jsonResponse(res, 400, rpcError(null, -32600, 'Invalid request'));
+      const mismatch = validateModernHeaders(body, (name) => headers(req, name));
+      if (mismatch) return jsonResponse(res, 400, mismatch);
       const deadline = setTimeout(() => {
-        if (body.id !== undefined)
-          jsonResponse(
-            res,
-            504,
-            rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
-              recovery:
-                'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
-            }),
-          );
-        else reject(res, 504, 'REQUEST_WAIT_EXPIRED');
+        jsonResponse(
+          res,
+          504,
+          rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
+            recovery:
+              'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
+          }),
+        );
       }, waitTimeoutMs);
       deadline.unref();
       res.once('close', () => clearTimeout(deadline));
@@ -194,8 +184,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       if (stopping) return refuse(res, 'SERVICE_STOPPING');
       const execute = (run) => {
         if (stopping || record.disconnected) throw new Error('REQUEST_NOT_ADMITTED');
-        // Track the entire tool (including every batch item). Transport close
-        // may abort SDK response delivery; it never cancels this operation.
+        // Keep admitted tools tracked until they finish, even after disconnect.
         record.pending++;
         const task = Promise.resolve().then(run);
         operations.add(task);
@@ -208,36 +197,8 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
           .catch(() => {});
         return task;
       };
-      const versions = headers(req, 'mcp-protocol-version');
-      const modern =
-        modernMessage(body) || versions.some((version) => !SDK_VERSIONS.includes(version));
-      if (modern) {
-        const mismatch = validateModernHeaders(body, (name) => headers(req, name));
-        if (mismatch) return jsonResponse(res, 400, mismatch);
-        const response = await dispatchModern(bridge, body, {
-          execute,
-        });
-        if (!record.disconnected) jsonResponse(res, response.status, response.message);
-        return;
-      }
-      record.server = makeServer(bridge, { execute });
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
-      });
-      const send = transport.send.bind(transport);
-      transport.send = (message) => {
-        const bounded = boundMessage(message);
-        logRpcResponse(bounded); // The SDK owns HTTP status; http.closed records it.
-        return send(bounded);
-      };
-      await record.server.connect(transport);
-      if (record.disconnected) {
-        await record.server.close();
-        return;
-      }
-      res.setHeader('Cache-Control', 'no-store');
-      await transport.handleRequest(req, res, body);
+      const response = await dispatchModern(bridge, body, { execute });
+      if (!record.disconnected) jsonResponse(res, response.status, response.message);
     } catch {
       reject(res, 500, 'REQUEST_FAILED');
     }
@@ -272,10 +233,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
           await Promise.allSettled([...operations]);
           await bridge.close();
         } finally {
-          for (const record of requests) {
-            await record.server?.close().catch(() => {});
-            record.res.destroy();
-          }
+          for (const record of requests) record.res.destroy();
           listener.closeAllConnections();
           await stopped;
         }
