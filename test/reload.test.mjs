@@ -6,16 +6,10 @@ import fs from 'node:fs/promises';
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fixture, until, savedEntries } from './fixtures/model-runtime.mjs';
+import { fixture, until } from './fixtures/model-runtime.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
 import { atomicJson } from '../src/storage.mjs';
-import {
-  reserveOwner,
-  updateOwner,
-  readClaim,
-  claimFile,
-  AttachedRuntime,
-} from '../src/attachments.mjs';
+import { reserveOwner, updateOwner, readClaim, claimFile } from '../src/attachments.mjs';
 
 test('reload requires send and leaves saved sessions and explicit local pauses unopened', async (t) => {
   const f = await fixture(t),
@@ -30,56 +24,6 @@ test('reload requires send and leaves saved sessions and explicit local pauses u
   assert.equal(f.bridge.pool.instances.size, 0);
   await fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants: [] }));
   await assert.rejects(f.bridge.reload(args), /NOT_FOUND_OR_DENIED/);
-});
-
-test('idle owned reload confirms a fresh worker without sending input or rewriting saved history', async (t) => {
-  const f = await fixture(t);
-  const { session } = f;
-  const old = await f.bridge.pool.resolve(session);
-  const before = await savedEntries(f.bridge, f.id);
-  const start = f.bridge.pool.factory;
-  let fresh;
-  f.bridge.pool.factory = async (...args) => (fresh = await start(...args));
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
-    status: 'completed',
-    owner_version: packageInfo.version,
-    read_compatible: true,
-  });
-  assert.equal(old.exited, true);
-  assert.ok(fresh && fresh.child.pid !== old.child.pid);
-  assert.notEqual(fresh.generation, old.generation);
-  await until(() => !f.bridge.pool.get(f.id));
-  const after = await savedEntries(f.bridge, f.id);
-  assert.deepEqual(after.slice(0, before.length), before);
-  // A native reopen may append restored model/thinking settings, never a prompt.
-  assert.ok(
-    after
-      .slice(before.length)
-      .every((e) => ['model_change', 'thinking_level_change'].includes(e.type)),
-  );
-});
-
-test('reload cancellation after seal closes the old writer without starting a successor', async (t) => {
-  const f = await fixture(t),
-    session = f.session,
-    rpc = await f.bridge.pool.resolve(session),
-    seal = AttachedRuntime.prototype.seal;
-  let starts = 0;
-  const factory = f.bridge.pool.factory;
-  f.bridge.pool.factory = (...args) => {
-    starts++;
-    return factory(...args);
-  };
-  t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
-    const result = await seal.apply(this, args);
-    if (result.sealed) f.bridge.handoffs.get(f.id).controller.abort();
-    return result;
-  });
-  assert.equal((await f.bridge.reload({ session_id: f.id })).status, 'unknown');
-  assert.equal(rpc.exited, true);
-  assert.equal(rpc.child.exitCode, 0);
-  assert.equal(starts, 0);
-  assert.equal(await readClaim(f.bridge.pool.attachmentDir, session), null);
 });
 
 // Exercise the actual owner socket, loss of its ACK, and generation publication.

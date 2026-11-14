@@ -1,8 +1,10 @@
 import { nativeOwner, fauxArgs, gatedExtension } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { savedEntries } from './fixtures/saved-session.mjs';
+import { append, message, text } from './fixtures/native-history.mjs';
 
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
+import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -55,36 +57,126 @@ async function released(f, rpc) {
   assert.equal(rpc.child.exitCode, 0);
   assert.equal(await readClaim(f.config.attachmentDir, rpc.session), null);
 }
-test(
-  'completed send releases only after normal shutdown; the next send reconnects and preserves history',
-  { timeout: 15000 },
-  async (t) => {
-    const f = await fixture(t, shutdownGate);
-    assert.equal((await f.send('FIRST')).status, 'started');
-    const [first] = f.runtimes;
-    await f.waitFor('shutdown');
-    assert.equal(first.exited, false);
-    let done = false;
-    const second = f.send('SECOND').then((r) => {
-      done = true;
-      return r;
-    });
-    await until(() => f.bridge.inputs.size > 0);
-    assert.equal(done, false);
-    assert.equal(f.runtimes.length, 1);
-    await f.mark('shutdown-go');
-    assert.equal((await second).status, 'started');
-    const next = f.runtimes[1];
-    assert.notEqual(next.child.pid, first.child.pid);
-    await released(f, next);
-    const rows = await f.rows();
-    assert.deepEqual(
-      rows.filter((e) => e.message?.role === 'user').map((e) => e.message.content[0].text),
-      ['FIRST', 'SECOND'],
-    );
-    assert.equal(rows.filter((e) => e.customType === 'shutdown-saved').length, 2);
-  },
-);
+
+for (const policy of ['auto release', 'explicit release', 'reload', 'cancelled reload'])
+  test(
+    `${policy} seals the idle writer before EOF and preserves its shutdown tail`,
+    { timeout: 15000 },
+    async (t) => {
+      const f = await fixture(t, shutdownGate);
+      const { bridge, session, id } = f;
+      const args = { session_id: id };
+      await append(session, [message('saved', null, 'user', [text('SAVED')])]);
+      const rpc = await bridge.pool.resolve(session);
+      const before = await f.rows();
+      const { owner, generation } = rpc.ownerRecord;
+      const claim = () => readClaim(f.config.attachmentDir, session);
+      const kill = t.mock.method(rpc.child, 'kill');
+      const idleSnapshot = rpc.idleSnapshot.bind(rpc);
+      let idleConfirmed = false;
+      t.mock.method(rpc, 'idleSnapshot', async () => {
+        const snapshot = await idleSnapshot();
+        idleConfirmed = snapshot.status === 'idle';
+        return snapshot;
+      });
+      const seal = AttachedRuntime.prototype.seal;
+      const seals = [];
+      t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
+        const reply = await seal.apply(this, args);
+        if (this.record.generation === generation) {
+          seals.push({
+            idle: idleConfirmed,
+            sealed: reply.sealed,
+            eof: rpc.child.stdin.writableEnded,
+          });
+          if (policy === 'cancelled reload' && reply.sealed)
+            bridge.handoffs.get(id).controller.abort();
+        }
+        return reply;
+      });
+
+      let operation;
+      if (policy === 'auto release') {
+        assert.equal((await f.send('FIRST')).status, 'started');
+      } else if (policy === 'explicit release') {
+        f.config.grants[0].command = true;
+        const entered = Promise.withResolvers(),
+          stop = Promise.withResolvers();
+        const stopping = bridge.locked('stop:' + id, () => {
+          entered.resolve();
+          return stop.promise;
+        });
+        await entered.promise;
+        operation = f.release();
+        void operation.catch(() => {});
+        try {
+          const blocked = await Promise.all([
+            f.send('NEVER'),
+            bridge.command({ ...args, command: 'printf NEVER' }),
+            bridge.stop(args),
+          ]);
+          for (const result of blocked)
+            assert.match(result.reason, /^(HANDOFF_PENDING|STOP_IN_PROGRESS)$/);
+          await assert.rejects(f.release({ interrupt: true }), /HANDOFF_PENDING/);
+          assert.deepEqual(seals, []);
+          assert.equal(rpc.child.stdin.writableEnded, false);
+        } finally {
+          stop.resolve();
+          await stopping;
+        }
+      } else {
+        operation = bridge.reload(args);
+      }
+
+      await f.waitFor('shutdown');
+      assert.deepEqual(seals, [{ idle: true, sealed: true, eof: false }]);
+      assert.equal(rpc.child.stdin.writableEnded, true);
+      assert.equal(await ownerAlive(owner), true);
+      assert.equal((await claim()).generation, generation);
+      if (policy === 'auto release') {
+        operation = f.send('SECOND');
+        await until(() => bridge.inputs.size > 0);
+      }
+      assert.equal(f.runtimes.length, 1);
+      await f.mark('shutdown-go');
+      const result = await operation;
+      assert.equal(rpc.child.exitCode, 0);
+      assert.equal(kill.mock.callCount(), 0);
+      assert.equal(await ownerAlive(owner), false);
+
+      if (policy === 'auto release' || policy === 'reload') {
+        if (policy === 'auto release') assert.equal(result.status, 'started');
+        else
+          assert.deepEqual(result, {
+            status: 'completed',
+            owner_version: packageInfo.version,
+            read_compatible: true,
+          });
+        assert.equal(f.runtimes.length, 2);
+        const replacement = f.runtimes[1];
+        assert.notEqual(replacement.generation, rpc.generation);
+        await released(f, replacement);
+      } else {
+        assert.equal(f.runtimes.length, 1);
+        if (policy === 'explicit release') {
+          assert.equal(result.status, 'released');
+          assert.equal((await claim()).noColdReacquire, true);
+          assert.equal((await f.send('NEVER')).reason, 'COLD_REACQUIRE_BLOCKED');
+        } else {
+          assert.equal(result.status, 'unknown');
+          assert.equal(await claim(), null);
+        }
+      }
+      assert.equal(bridge.handoffs.has(id), false);
+      const rows = await f.rows();
+      assert.deepEqual(rows.slice(0, before.length), before);
+      assert.equal(rows.filter((e) => e.customType === 'shutdown-saved').length, f.runtimes.length);
+      assert.deepEqual(
+        rows.filter((e) => e.message?.role === 'user').map((e) => e.message.content[0].text),
+        policy === 'auto release' ? ['SAVED', 'FIRST', 'SECOND'] : ['SAVED'],
+      );
+    },
+  );
 
 test(
   'settlement cannot release a prompt whose matching ACK is still missing',
