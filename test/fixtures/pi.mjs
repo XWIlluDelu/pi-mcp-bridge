@@ -14,15 +14,12 @@ export const {
   createAgentSession,
   createAgentSessionServices,
   createAgentSessionFromServices,
-  createExtensionRuntime,
   SessionManager,
   DefaultResourceLoader,
   SettingsManager,
   ModelRuntime,
   RpcClient,
   buildSessionProjection,
-  parseSessionEntries,
-  migrateSessionEntries,
 } = sdk;
 export const { fauxProvider, fauxAssistantMessage, fauxToolCall, InMemoryCredentialStore } =
   await import(aiEntry);

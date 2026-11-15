@@ -7,16 +7,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import net from 'node:net';
-
 import { Bridge } from '../src/bridge.mjs';
-import {
-  AttachedRuntime,
-  readClaim,
-  reserveOwner,
-  ownerAlive,
-  registryTransaction,
-} from '../src/attachments.mjs';
+import { readClaim, reserveOwner, ownerAlive, registryTransaction } from '../src/attachments.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
 
 const fixture = (t) =>
@@ -49,81 +41,6 @@ test('overlong attachment path prevents bridge startup and official TUI exits on
   await until(() => launched.child.exitCode !== null);
   assert.ok(await fs.stat(f.session.file));
   assert.equal(f.bridge.pool.instances.size, 0);
-});
-
-test('delayed shutdown flush cannot call a replaced or invalidated Pi context', async (t) => {
-  const f = await fixture(t),
-    handlers = await companionHooks(f),
-    callbacks = [];
-  let shutdowns = 0;
-  const originalEnd = net.Socket.prototype.end;
-  t.mock.method(net.Socket.prototype, 'end', function (...args) {
-    if (
-      typeof args[0] === 'string' &&
-      args[0].includes('"shutdown":"requested"') &&
-      typeof args[1] === 'function'
-    ) {
-      callbacks.push(args[1]);
-      args.splice(1, 1);
-    }
-    return originalEnd.apply(this, args);
-  });
-  const manager = {
-    getSessionFile: () => f.session.file,
-    getHeader: () => f.session.header,
-    getSessionId: () => f.session.header.id,
-  };
-  const context = () => {
-    const state = { valid: true };
-    const check = () => {
-      if (!state.valid) throw new Error('Pi extension context is no longer active');
-    };
-    const ctx = {
-      mode: 'tui',
-      get sessionManager() {
-        check();
-        return manager;
-      },
-      shutdown: () => {
-        check();
-        shutdowns++;
-      },
-    };
-    return { state, ctx };
-  };
-  let current = context();
-  try {
-    await handlers.session_start({ reason: 'startup' }, current.ctx);
-    let runtime = new AttachedRuntime(
-      f.config,
-      f.session,
-      await readClaim(f.config.attachmentDir, f.session),
-    );
-    assert.equal((await runtime.request('shutdown')).shutdown, 'requested');
-    assert.equal(callbacks.length, 1);
-    await handlers.session_shutdown({ reason: 'reload' }, current.ctx);
-    current.state.valid = false;
-    current = context();
-    await handlers.session_start({ reason: 'reload' }, current.ctx);
-    assert.doesNotThrow(() => callbacks.shift()());
-    assert.equal(shutdowns, 0);
-    runtime = new AttachedRuntime(
-      f.config,
-      f.session,
-      await readClaim(f.config.attachmentDir, f.session),
-    );
-    await runtime.request('shutdown');
-    current.state.valid = false;
-    assert.doesNotThrow(() => callbacks.shift()());
-    assert.equal(shutdowns, 0);
-    current.state.valid = true;
-    await runtime.request('shutdown');
-    callbacks.shift()();
-    assert.equal(shutdowns, 1);
-  } finally {
-    await handlers.session_shutdown({ reason: 'quit' }, current.ctx);
-    t.mock.restoreAll();
-  }
 });
 
 test('registry failure during shutdown still closes old socket and retains blocking ownership', async (t) => {

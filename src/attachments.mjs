@@ -440,7 +440,6 @@ const MUTATING_OPS = new Set([
   'compact',
   'reload',
   'seal',
-  'shutdown',
   'release',
 ]);
 export class AttachedRuntime {
@@ -740,14 +739,9 @@ export class AttachedRuntime {
       await this.request('send', { text, images, mode }, undefined, authorize),
     );
   }
-  async executeBash({ command, max_chars, timeout_ms = 5000, beforeDispatch }) {
+  async executeBash({ command, max_chars, beforeDispatch }) {
     await beforeDispatch?.();
-    const result = await this.request(
-      'bash',
-      { command, max_chars, timeout_ms },
-      timeout_ms,
-      beforeDispatch,
-    );
+    const result = await this.request('bash', { command, max_chars }, undefined, beforeDispatch);
     try {
       return inlineBashResult(result);
     } catch (error) {
@@ -837,8 +831,8 @@ export class AttachedRuntime {
   compact(body, timeout, beforeDispatch) {
     return this.request('compact', body, timeout, beforeDispatch);
   }
-  async stopExecution({ max_chars, timeout_ms = 5000 } = {}) {
-    const result = await this.request('stop', { max_chars, timeout_ms }, timeout_ms);
+  async stopExecution({ max_chars } = {}) {
+    const result = await this.request('stop', { max_chars });
     try {
       return { ...stopReceipt(result), withdrawal: inlineWithdrawal(result?.withdrawal) };
     } catch (error) {

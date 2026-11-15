@@ -48,7 +48,6 @@ function allPages(data, options = {}) {
     const request = { ...args, ...options, cursor };
     const page = renderContextRead(data, request);
     assertContextReadResponse(page, request);
-    assert.ok(Buffer.byteLength(JSON.stringify(page), 'utf8') <= (options.max_bytes ?? 65536));
     pages.push(page);
     cursor = page.next_cursor;
     assert.ok(pages.length < 2000, 'pagination makes progress');

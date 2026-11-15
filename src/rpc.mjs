@@ -743,7 +743,7 @@ export class PiRpc {
       beforeDispatch,
     );
   }
-  async executeBash({ command, timeout_ms = 5000, max_chars, beforeDispatch }) {
+  async executeBash({ command, max_chars, beforeDispatch }) {
     this.activeBashes++;
     const check = async () =>
       this.assertSessionIdentity(await this.dispatch({ type: 'get_state' }));
@@ -757,7 +757,7 @@ export class PiRpc {
       await beforeDispatch?.();
       let acknowledged = false;
       try {
-        const result = await this.dispatch({ type: 'bash', command }, timeout_ms, check);
+        const result = await this.dispatch({ type: 'bash', command }, undefined, check);
         acknowledged = true;
         await check();
         return limitBashResult(result, max_chars);
@@ -770,7 +770,7 @@ export class PiRpc {
       this.onIdleCandidate?.();
     }
   }
-  async stopExecution({ timeout_ms = 5000, max_chars } = {}) {
+  async stopExecution({ max_chars } = {}) {
     const check = async () =>
       this.assertSessionIdentity(await this.dispatch({ type: 'get_state' }));
     try {
@@ -784,11 +784,11 @@ export class PiRpc {
       const receipt = await requestStop(
         {
           clearQueue: () =>
-            this.dispatch({ type: 'clear_queue' }, timeout_ms, async () => {
+            this.dispatch({ type: 'clear_queue' }, undefined, async () => {
               await check(); // Validate received late ACKs, without retaining a result for lookup.
             }),
-          abort: () => this.dispatch({ type: 'abort' }, timeout_ms),
-          abortBash: () => this.dispatch({ type: 'abort_bash' }, timeout_ms),
+          abort: () => this.dispatch({ type: 'abort' }),
+          abortBash: () => this.dispatch({ type: 'abort_bash' }),
         },
         async (value) => {
           await check();

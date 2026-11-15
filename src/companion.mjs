@@ -528,18 +528,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             // prior draft), but no public context API aborts independent bash.
             // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
             throw new AttachmentFailure('STOP_UNSUPPORTED');
-          } else if (request.op === 'shutdown') {
-            if (ctx.mode === 'rpc') throw new AttachmentFailure('HOST_RELEASE_UNSUPPORTED');
-            data = { shutdown: 'requested' };
-            socket.end(ownerEnvelope(record, { data }), () => {
-              try {
-                check(request);
-                ctx.shutdown();
-              } catch {
-                /* Reload/replacement may invalidate the captured context before the flush callback. */
-              }
-            });
-            return;
           } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
           socket.end(ownerEnvelope(record, { data }));
         } catch (error) {

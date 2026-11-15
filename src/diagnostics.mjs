@@ -73,7 +73,6 @@ const enums = {
     'abort',
     'abort_bash',
     'clear_queue',
-    'shutdown',
     'release',
   ],
   status: [

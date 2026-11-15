@@ -75,10 +75,6 @@ test('one module lifecycle supports independent capabilities, options and revers
   const starting = manager.start();
   assert.strictEqual(manager.start(), starting);
   await starting;
-  assert.deepEqual(
-    manager.active.map((m) => m.id),
-    ['input', 'listener'],
-  );
   assert.deepEqual(entries[0].options.types, ['fixture-input']);
   const mappings = ports.readInputs.snapshot();
   mappings[0].inputCustomTypes.push('snapshot-only');

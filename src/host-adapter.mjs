@@ -177,17 +177,10 @@ export async function reserveHostSession({
     if (
       ['bash', 'stop'].includes(request.op) &&
       (Object.keys(args).some(
-        (key) =>
-          !(
-            request.op === 'bash'
-              ? ['command', 'max_chars', 'timeout_ms']
-              : ['max_chars', 'timeout_ms']
-          ).includes(key),
+        (key) => !(request.op === 'bash' ? ['command', 'max_chars'] : ['max_chars']).includes(key),
       ) ||
         (args.max_chars !== undefined &&
-          (!Number.isInteger(args.max_chars) || args.max_chars < 256 || args.max_chars > 32768)) ||
-        (args.timeout_ms !== undefined &&
-          (!Number.isInteger(args.timeout_ms) || args.timeout_ms < 50 || args.timeout_ms > 30000)))
+          (!Number.isInteger(args.max_chars) || args.max_chars < 256 || args.max_chars > 32768)))
     )
       fail('INVALID_ARGUMENTS');
     const pendingMessageCount = pendingMessages(observed);
@@ -436,8 +429,7 @@ export async function reserveHostSession({
       server = attachmentServer(sockets, async (line, socket) => {
         try {
           const request = parseOwnerRequest(line, validateRequest);
-          if (['stop', 'bash'].includes(request.op) && Number.isInteger(request.body?.timeout_ms))
-            socket.setTimeout(Math.min(30000, Math.max(50, request.body.timeout_ms)));
+          if (['stop', 'bash'].includes(request.op)) socket.setTimeout(5000);
           if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
           let data;
           if (request.op === 'release') data = await release();

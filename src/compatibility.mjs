@@ -65,7 +65,7 @@ export class CompatibilityModules {
       for (const { module, options } of loaded) {
         if (this.closing) throw new Error('COMPATIBILITY_MODULES_CLOSED');
         const cleanups = [];
-        this.active.push({ id: module.id, cleanups });
+        this.active.push(cleanups);
         await module.start(
           Object.freeze({
             id: module.id,
@@ -90,7 +90,7 @@ export class CompatibilityModules {
   }
   async dispose() {
     const errors = [];
-    for (const { cleanups } of this.active.splice(0).reverse())
+    for (const cleanups of this.active.splice(0).reverse())
       for (const cleanup of cleanups.reverse())
         try {
           await cleanup();
