@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
-import { syncDir } from './storage.mjs';
+import { syncDir, NATIVE_TRASH_DIR } from './storage.mjs';
 
 async function privateTrashDirectory(dir, io) {
   await io.mkdir(dir, { recursive: true, mode: 0o700 });
@@ -24,7 +24,7 @@ async function privateTrashDirectory(dir, io) {
 export async function prepareTrash(config, session, { io = fs, sync = syncDir } = {}) {
   const source = await assertSingleSessionFile(session.file);
   const parent = path.dirname(session.file);
-  const local = path.join(parent, '.pi-mcp-trash');
+  const local = path.join(parent, NATIVE_TRASH_DIR);
   const index = path.join(config.stateDir, 'trash');
   const token = randomUUID();
   const trashPath = path.join(local, `${token}.jsonl`);

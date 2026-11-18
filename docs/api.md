@@ -140,7 +140,8 @@ Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 
 - `steer` (default): start input when idle; use the native steering queue while busy.
 - `idle_only`: submit through an idle admission check. A saved session may
-  cold-start. The supplied RPC host binding returns `HOST_ADMISSION_UNSUPPORTED`.
+  cold-start. A host must advertise a writer-local gate or the request returns
+  `HOST_ADMISSION_UNSUPPORTED`.
 - `follow_up`: use the native follow-up queue while busy.
 
 A tracked submission returns `submission_id` and an admission status. Native ACKs

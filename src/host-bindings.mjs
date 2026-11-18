@@ -92,6 +92,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       return { ...before, entries, leafId };
     },
     supportsImages: true,
+    supportsIdleOnly: true,
     reload: async ({ beforeDispatch, ...expected }) => {
       const before = identity(session);
       assertIdentity(expected, before);

@@ -2,11 +2,12 @@
 
 ## Component versions
 
-`package.json` defines the product version. The current owner control envelope
-binds requests and replies to the generation, canonical file and native session ID.
-Mutations require matching components. State and reload can locate and refresh an
-owner using the current envelope. Live reads use the independent `READ_CONTRACT`
-and report `OWNER_READ_REFRESH_REQUIRED` when the owner's read contract differs.
+`package.json` defines the product version. The control envelope binds requests
+and replies to the generation, canonical file and native session ID. Bridge puts
+the target's advertised release in the existing wire `version` slot so running
+owners recognize the request. Operations depend on the current envelope,
+request and reply shapes, and the required owner capability. Live reads use
+`READ_CONTRACT` and report `OWNER_READ_REFRESH_REQUIRED` when it differs.
 The writer claim remains in force through interface mismatches. See
 [AGENTS.md](../AGENTS.md) for the release and ownership rules.
 

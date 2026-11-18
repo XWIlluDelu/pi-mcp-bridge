@@ -36,13 +36,14 @@ export async function savedSessionName(session, cache) {
 function runtimeCapabilities(runtime, state) {
   if (runtime.attached) {
     const host = runtime.record?.kind === 'host';
+    const { command, stop } = state.capabilities ?? {};
     // Companions and hosts require a send path. Optional host controls must be
     // declared by the owner; AttachedRuntime's wrappers do not prove support.
     return {
       send: true,
       reload: runtime.record?.reloadSupported === true,
-      command: host ? state.capabilities.command : false,
-      stop: host ? state.capabilities.stop : false,
+      command: host ? (typeof command === 'boolean' ? command : null) : false,
+      stop: host ? (typeof stop === 'boolean' ? stop : null) : false,
     };
   }
   // Bridge-owned RPC implements every control natively.

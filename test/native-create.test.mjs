@@ -143,7 +143,7 @@ for (const scenario of [
     globalDir: 'global',
     projectDir: 'project-store',
     envDir: 'env-store',
-    cliDir: 'selected',
+    cliDir: 'selected/.sessions',
   },
   {
     name: 'an out-of-root destination',
@@ -176,7 +176,7 @@ for (const scenario of [
           ? { globalDir: path.join(dir, scenario.globalDir), root: selected }
           : {}),
         ...(scenario.projectDir ? { projectDir: path.join(dir, scenario.projectDir) } : {}),
-        ...(scenario.cliDir ? { cliDir: selected } : {}),
+        ...(scenario.cliDir ? { cliDir: path.join(dir, scenario.cliDir) } : {}),
       };
       const { stdout } = await exec(
         process.execPath,
@@ -218,7 +218,7 @@ for (const scenario of [
       assert.ok(
         out.file.startsWith(
           scenario.globalDir
-            ? selected + path.sep
+            ? (data.cliDir ?? selected) + path.sep
             : path.join(dir, scenario.agentOverride ? 'profile' : '.pi/agent', 'sessions') +
                 path.sep,
         ),

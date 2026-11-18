@@ -9,22 +9,24 @@ export const MAX_ATTACHMENT_REQUEST_BYTES = 8 * 1024 * 1024;
 // Raw cooperative native snapshots are for fork, never a public read fallback.
 export const MAX_ATTACHMENT_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 
-// Read snapshots have their own contract. State and reload also provide the
-// identity/recovery path for refreshing a live owner at a safe boundary.
-export const requiresCurrentControl = (op) =>
-  !['state', 'read', 'read_features', 'reload'].includes(op);
-
-export function ownerEnvelope({ generation, file, sessionId }, payload) {
+// The version slot identifies the endpoint to already-running owners of
+// this wire format. Operations and replies define control compatibility.
+export function ownerEnvelope({ generation, file, sessionId, bridgeVersion }, payload) {
   return (
-    JSON.stringify({ generation, file, sessionId, version: packageInfo.version, ...payload }) + '\n'
+    JSON.stringify({
+      generation,
+      file,
+      sessionId,
+      version: bridgeVersion ?? packageInfo.version,
+      ...payload,
+    }) + '\n'
   );
 }
 
 export function parseOwnerRequest(frame, checkIdentity) {
   const request = JSON.parse(frame);
   checkIdentity(request);
-  if (requiresCurrentControl(request.op) && request.version !== packageInfo.version)
-    throw new Error('OWNER_COMPONENT_UPDATE_REQUIRED');
+  if (typeof request.version !== 'string') throw new Error('ATTACHMENT_PROTOCOL_MISMATCH');
   return request;
 }
 

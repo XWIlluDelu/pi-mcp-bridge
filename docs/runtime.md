@@ -54,8 +54,9 @@ close before reopening. See [component versions](architecture.md#component-versi
 Custom hosts expose the callbacks they implement. An RPC host supplies its own
 reload callback. Its supplied binding rejects `idle_only` with
 `HOST_ADMISSION_UNSUPPORTED`. RPC state samples are advisory. A custom host
-can support this mode with a writer-local gate that observes asynchronous
-preparation and fences new input. Use `list.status.capabilities` to inspect send,
+can declare `supportsIdleOnly:true` when its submit callback has a writer-local
+gate that observes asynchronous preparation and fences new input. Use
+`list.status.capabilities` to inspect send,
 command, stop and reload paths.
 
 For cold-start and dispatch outcomes, see the [tool API](api.md#sessions-and-mutations).
@@ -194,10 +195,11 @@ companion and initial `/bridge-join ps_SESSION_ID` command. It uses the owner's
 `PI_MCP_OWNER_CONFIG` and `PI_MCP_ATTACH_DIR`.
 
 The launcher cannot start with `--session TARGET`: native open/migration precedes
-extension loading and ownership negotiation. `piArgs --session-dir DIR` may set
-the fresh session's storage directory; existing-session selectors (`--session`,
-`--session-id`, `--continue`, `--resume`, `--fork`) and noninteractive arguments
-reject. An already-running companion TUI can invoke `/bridge-join` manually.
+extension loading and ownership negotiation. Bridge uses the selected Pi's
+argument parser to reject session selectors and mode changes. Option values
+such as `--system-prompt --continue` keep their native meaning.
+`piArgs --session-dir DIR` sets the fresh session's storage directory. An
+already-running companion TUI can invoke `/bridge-join` manually.
 
 ### Handoff behavior
 

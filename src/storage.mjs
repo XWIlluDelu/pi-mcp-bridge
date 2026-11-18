@@ -4,6 +4,8 @@ import path from 'node:path';
 import { constants } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 
+export const NATIVE_TRASH_DIR = '.pi-mcp-trash';
+
 export const hash = (value) =>
   createHash('sha256')
     .update(typeof value === 'string' ? value : JSON.stringify(value))
@@ -42,7 +44,7 @@ export async function syncDir(dir) {
 // Path integrity is shared by control and native storage. A private ancestor
 // protects native umask descendants; a sticky ancestor such as /tmp protects
 // owner-controlled entries, but an ordinary writable ancestor can replace them.
-async function directoryIntegrity(dir, { allowMissing = false, code } = {}) {
+async function directoryIntegrity(dir, code) {
   const reject = () => {
     throw new Error(code);
   };
@@ -53,14 +55,9 @@ async function directoryIntegrity(dir, { allowMissing = false, code } = {}) {
     stat;
   for (let index = 0; index <= components.length; index++) {
     if (index) current = path.join(current, components[index - 1]);
-    try {
-      stat = await fs.lstat(current);
-    } catch (error) {
-      if (allowMissing && error.code === 'ENOENT') return { protectedPath };
-      throw error;
-    }
+    stat = await fs.lstat(current);
     const owned = stat.uid === process.getuid();
-    if (!stat.isDirectory() || stat.isSymbolicLink()) reject();
+    if (!stat.isDirectory()) reject();
     if (!protectedPath) {
       if (!owned && stat.uid !== 0) reject();
       const stickyAncestor = index < components.length && Boolean(stat.mode & 0o1000);
@@ -74,13 +71,13 @@ async function directoryIntegrity(dir, { allowMissing = false, code } = {}) {
 }
 export async function assertPrivateDirectory(
   dir,
-  { allowMissing = false, code = 'STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY' } = {},
+  { code = 'STORAGE_NOT_PRIVATE_CANONICAL_DIRECTORY' } = {},
 ) {
-  const { stat } = await directoryIntegrity(dir, { allowMissing, code });
-  if (stat && stat.mode & 0o077) throw new Error(code);
+  const { stat } = await directoryIntegrity(dir, code);
+  if (stat.mode & 0o077) throw new Error(code);
 }
 export async function assertNativeDirectory(dir) {
-  return directoryIntegrity(dir, { code: 'UNSAFE_NATIVE_SESSION_STORAGE' });
+  return directoryIntegrity(dir, 'UNSAFE_NATIVE_SESSION_STORAGE');
 }
 export async function readPrivateFile(
   file,

@@ -10,13 +10,7 @@ import fs from 'node:fs/promises';
 import net from 'node:net';
 import { reserveHostSession } from '../src/host-adapter.mjs';
 import { READ_CONTRACT } from '../src/context-read.mjs';
-import {
-  readClaim,
-  claimFile,
-  reserveOwner,
-  updateOwner,
-  AttachedRuntime,
-} from '../src/attachments.mjs';
+import { readClaim, claimFile, reserveOwner, AttachedRuntime } from '../src/attachments.mjs';
 
 const gate = () => Promise.withResolvers();
 async function fixture(t) {
@@ -118,39 +112,14 @@ test('two-phase host reservation blocks another writer before ready and exposes 
     'INVALID_ATTACHED_SEND',
   );
   assert.equal(
-    (await request(f, 'send', { text: 'fixture', mode: 'steer' })).data.status,
+    (await request(f, 'send', { text: 'fixture', mode: 'steer' }, { version: '0.8.0-dev.17' })).data
+      .status,
     'accepted',
   );
   assert.equal(
     (await request(f, 'send', { text: 'fixture', mode: 'steer' }, { generation: 'stale' })).error,
     'RUNTIME_SESSION_CHANGED',
   );
-});
-
-test('host state requires the current boolean capability declaration', async (t) => {
-  const f = await fixture(t);
-  let capabilities;
-  const server = net.createServer((socket) => {
-    socket.setEncoding('utf8');
-    socket.once('data', () =>
-      socket.end(
-        ownerEnvelope(f.controller.record, { data: { ...f.callbacks.state(), capabilities } }),
-      ),
-    );
-  });
-  await new Promise((resolve) => server.listen(f.controller.record.socket, resolve));
-  await updateOwner(f.attachmentDir, f.session, f.controller.record, { phase: 'ready' });
-  const { runtime } = f;
-  try {
-    for (const declared of [undefined, { send: true, command: 'true', stop: 1 }]) {
-      capabilities = declared;
-      await assert.rejects(runtime.state(), /OWNER_COMPONENT_UPDATE_REQUIRED/);
-    }
-    capabilities = { send: true, command: false, stop: true };
-    assert.deepEqual((await runtime.state()).capabilities, capabilities);
-  } finally {
-    await new Promise((resolve) => server.close(resolve));
-  }
 });
 
 test('host cancel drains preparation and native bash without a remote stop callback', async (t) => {

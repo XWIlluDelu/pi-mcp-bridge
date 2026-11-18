@@ -19,20 +19,18 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   const env = await piLaunchEnvironment(executable, baseEnv, session.cwd);
   env.PI_MCP_OWNER_CONFIG = configFile;
   env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  // --session-dir only chooses storage for the fresh session. Owner piArgs
-  // may set that directory, a provider or resources, but may not select or
-  // fork any saved session before the safe /bridge-join reservation.
   const extra = config.piArgs ?? [];
-  validateLaunchArgs(extra, 'UNSAFE_OPEN_PI_ARGS');
-  // No --session TARGET: Pi migrates/opens it before loading extensions.
+  await validateLaunchArgs(executable, extra, 'text');
+  // The companion and join must reach Pi before owner flags can consume
+  // a positional argument or end option parsing.
   return {
     command: executable.command,
     args: [
-      ...toolArgs,
-      ...extra,
       '-e',
       fileURLToPath(new URL('./attach-extension.mjs', import.meta.url)),
       `/bridge-join ${sessionId}`,
+      ...toolArgs,
+      ...extra,
     ],
     cwd: session.cwd,
     env,

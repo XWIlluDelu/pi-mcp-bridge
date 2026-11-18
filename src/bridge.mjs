@@ -628,17 +628,7 @@ export class Bridge {
             nativeRead,
           };
           const reader = await this.compatibilityServices.sessionReaders.select(context);
-          if (reader) {
-            const result = await captureSessionRead(reader, context, args, searchQuery);
-            // Recheck applicability, including an owner that appeared during
-            // a saved read. Existing live endpoints also recheck their identity.
-            const currentReader = await this.compatibilityServices.sessionReaders.select({
-              ...context,
-              owner: await ownerReadFeatures(runtime ?? (await this.pool.forRead(s))),
-            });
-            if (currentReader?.id !== reader.id) throw new Error('READ_SOURCE_CHANGED');
-            return result;
-          }
+          if (reader) return captureSessionRead(reader, context, args, searchQuery);
         }
         return nativeRead();
       };
@@ -1192,10 +1182,8 @@ export class Bridge {
           runtime.handoffPending = true;
           const previousNoCold = runtime.ownerRecord?.noColdReacquire === true;
           try {
-            if (interrupt) {
-              await runtime.state();
-              await runtime.assertProcessIdentity();
-            } else if (!runtime.exitSeal) await runtime.assertReleasable();
+            if (interrupt) await runtime.assertProcessIdentity();
+            else if (!runtime.exitSeal) await runtime.assertReleasable();
             await runtime.drainAcks();
             release.controller.signal.throwIfAborted();
             await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });

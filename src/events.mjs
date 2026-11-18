@@ -10,7 +10,6 @@ import { knownErrorCode } from './errors.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { settledResultSchema } from './settled-result.mjs';
 import { ownerSocket } from './owner-runtime.mjs';
-import { READ_CONTRACT } from './context-read.mjs';
 import {
   callbackUrl,
   signingSecret,
@@ -134,7 +133,6 @@ export class EventSubscriptions {
     return (
       !runtime?.attached ||
       (['tui', 'extension'].includes(runtime.record?.kind) &&
-        runtime.record.readContract === READ_CONTRACT &&
         runtime.record.completionSocket === ownerSocket(this.bridge.config))
     );
   }

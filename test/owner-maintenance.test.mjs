@@ -39,6 +39,9 @@ test(
       ownerRequest(f.config, { op: 'release', session_id: f.id }),
       /RUNTIME_BUSY/,
     );
+    t.mock.method(runtime, 'state', () =>
+      assert.fail('Interrupt only needs exact writer identity'),
+    );
     const kill = t.mock.method(runtime.child, 'kill');
     const release = ownerRequest(f.config, {
       op: 'release',

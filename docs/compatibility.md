@@ -215,8 +215,5 @@ Any explicit continuation range or content fields must agree with the capture.
 Native turn equivalence alone does not establish equivalence of reader background
 selection; summary and memory counts are part of the frozen request. See the [read arguments](reading.md#browse-find-and-expand).
 Multiple matches report `SESSION_READER_CONFLICT`; reader exceptions report
-`SESSION_READER_FAILED` without substituting native content. Before publication,
-Bridge rechecks native identity and applicability, including an owner that appeared
-during a saved read. A changed applicable reader reports `READ_SOURCE_CHANGED`.
-Unsupported live contracts require matching components to be updated together;
-modules must not translate obsolete Bridge control formats.
+`SESSION_READER_FAILED`. Each fresh read selects a reader once for its capture.
+Bridge rechecks native identity before returning it.

@@ -93,7 +93,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   };
   const delayed = await f.bridge.send(delayedArgs);
   assert.equal(delayed.status, 'unknown');
-  assert.equal(submissions, 3);
+  assert.equal(submissions, 2);
   gate.resolve();
   await until(async () => !(await client.getState()).isStreaming);
   const entries = await client.getEntries();
@@ -106,7 +106,6 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     ).length,
     1,
   );
-  assert.equal(submissions, 3);
   assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, pid);
 });
 
@@ -164,6 +163,7 @@ test('two official SDK sessions in one host PID release independently without sh
   const sentA = await f.bridge.send({
     session_id: savedA.id,
     text: 'PUBLIC_A_INPUT',
+    mode: 'idle_only',
   });
   assert.equal(sentA.status, 'dispatched');
   await until(() => !hosts[0].session.isStreaming && faux.state.callCount === 1);

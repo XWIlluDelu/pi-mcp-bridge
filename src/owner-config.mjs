@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
 import { hash, syncDir, readPrivateFile } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
+import { loadPiSdk } from './pi-installation.mjs';
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
@@ -19,30 +20,36 @@ export function validatePiRuntime(profile = {}) {
     ) ||
     !Array.isArray(profile.tools ?? []) ||
     (profile.tools ?? []).some(
-      (name) => !['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'].includes(name),
+      (selector) => typeof selector !== 'string' || !selector.trim() || selector.includes('\0'),
     ) ||
     (profile.agentDir !== undefined && !absolute(profile.agentDir))
   )
     throw new Error('INVALID_PI_RUNTIME');
   return profile;
 }
-// Both launchers own session selection and mode. Native resource/model/storage
-// options remain available; a saved session may only be opened after reservation.
-export function validateLaunchArgs(args = [], code = 'UNSAFE_PI_ARGS') {
+// Owner arguments follow the launcher's complete arguments. Use the selected
+// Pi's parsing rules to distinguish a selector from an option's value.
+export async function validateLaunchArgs(installation, args = [], mode) {
+  if (!args.length) return;
+  const { parseArgs } = await loadPiSdk(installation);
+  const parsed = parseArgs(args);
   if (
-    !Array.isArray(args) ||
-    args.some(
-      (arg) =>
-        typeof arg !== 'string' ||
-        arg.includes('\0') ||
-        /^(?:--(?:session(?:-id)?|continue|resume|fork|no-session|mode|print|export)|-[crp])(?:=|$)/.test(
-          arg,
-        ) ||
-        arg.startsWith('@') ||
-        arg === '--',
-    )
+    parsed.session !== undefined ||
+    parsed.sessionId !== undefined ||
+    parsed.fork !== undefined ||
+    parsed.continue ||
+    parsed.resume ||
+    parsed.noSession ||
+    (parsed.mode !== undefined && parsed.mode !== mode) ||
+    parsed.print ||
+    parsed.export !== undefined ||
+    parsed.help ||
+    parsed.version ||
+    parsed.listModels !== undefined ||
+    parsed.fileArgs.length ||
+    parsed.diagnostics.some(({ type }) => type === 'error')
   )
-    throw new Error(code);
+    throw new Error(mode === 'rpc' ? 'UNSAFE_PI_ARGS' : 'UNSAFE_OPEN_PI_ARGS');
 }
 // Shape validation is shared by initialization, file reload and both transports.
 // Filesystem existence/privacy and execution-time cwd checks remain separate.
@@ -84,10 +91,6 @@ export function validateOwnerConfig(config) {
     paths.add(folder.path);
   }
   validatePermissionValues(config.defaults);
-  // An explicit baseline for every right distinguishes shell from stop without
-  // interpreting an incomplete policy from a different permission vocabulary.
-  if (ACTIONS.some((action) => !Object.hasOwn(config.defaults, action)))
-    throw new Error('INVALID_OWNER_CONFIG');
   validateGrants(config.grants);
   validateCompatibilityModules(config.compatibilityModules);
   if (
@@ -159,8 +162,6 @@ export function validateGrants(grants = []) {
   return grants;
 }
 export async function readOwnerConfig(file) {
-  if (typeof file !== 'string' || !path.isAbsolute(file))
-    throw new Error('INVALID_OWNER_CONFIG_PATH');
   const { text: raw, mode } = await readPrivateFile(file, 1024 * 1024, {
     pathError: 'INVALID_OWNER_CONFIG_PATH',
     privacyError: 'OWNER_CONFIG_NOT_PRIVATE',

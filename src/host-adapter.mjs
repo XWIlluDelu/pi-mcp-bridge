@@ -288,7 +288,7 @@ export async function reserveHostSession({
         const actual = await state();
         if (!sameModel(value.model, actual.model) || value.thinking_level !== actual.thinkingLevel)
           fail('MODEL_SELECTION_CHANGED');
-        data = value;
+        return value;
       } finally {
         settingModel = false;
       }
@@ -395,24 +395,8 @@ export async function reserveHostSession({
     if (callbacks || closed) fail('HOST_ADAPTER_ALREADY_STARTED');
     if (
       !value ||
-      Object.keys(value).some(
-        (key) =>
-          ![
-            'state',
-            'snapshot',
-            'readFeatures',
-            'submit',
-            'supportsImages',
-            'release',
-            'cancel',
-            'stop',
-            'bash',
-            'setModel',
-            'compact',
-            'reload',
-          ].includes(key),
-      ) ||
       (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
+      (value.supportsIdleOnly !== undefined && typeof value.supportsIdleOnly !== 'boolean') ||
       !['state', 'snapshot', 'submit'].every((name) => typeof value[name] === 'function') ||
       ['release', 'cancel', 'stop', 'bash', 'setModel', 'compact', 'reload', 'readFeatures'].some(
         (name) => value[name] !== undefined && typeof value[name] !== 'function',
@@ -453,6 +437,7 @@ export async function reserveHostSession({
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
         imagesSupported: callbacks.supportsImages === true,
+        idleOnlySupported: callbacks.supportsIdleOnly === true,
         bridgeVersion: packageInfo.version,
         readContract: READ_CONTRACT,
         reloadSupported: typeof callbacks.reload === 'function',

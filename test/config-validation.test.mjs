@@ -1,4 +1,3 @@
-import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -16,7 +15,7 @@ async function fixture(t) {
     file = path.join(dir, 'owner.json');
   await fs.writeFile(tokenFile, 'T'.repeat(48), { mode: 0o600 });
   const config = {
-    defaults: denyAllPermissions(),
+    defaults: {},
     stateDir: path.join(dir, 'state'),
     sessionRoots: [path.join(dir, 'sessions')],
     folders: [{ path: dir }],

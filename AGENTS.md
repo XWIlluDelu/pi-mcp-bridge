@@ -1,14 +1,12 @@
 # Development principles
 
 This is an early-stage project. Support only the current per-request MCP
-protocol, the current Bridge control protocol and matching companion/host
-components. Remove obsolete protocol versions, requests, responses, configuration
-and parameters along with their tests, fixtures and documentation. Report a clear
-mismatch when using an unsupported live endpoint and require the components to be
-updated together.
+protocol and the current Bridge control protocol. Judge live compatibility by
+the wire contract and the operation's required capability. Remove obsolete
+protocol versions and their code, fixtures and documentation.
 
-Use `package.json` as the single Bridge product version source. Owner read
-compatibility uses the explicit current read contract in `src/context-read.mjs`;
+Use `package.json` as the single Bridge product version source. Product releases
+identify components. Owner reads use the explicit contract in `src/context-read.mjs`;
 change it only for incompatible read semantics, never for a product release alone.
 Keep control-interface checks independent. Main releases use a plain semantic
 version and a matching Git tag.

@@ -62,7 +62,7 @@ canonical paths; there is no caller `principal` field.
 | `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete) and service-exclusivity namespace.                           |
 | `sessionRoots`            | Nonempty array of absolute native session-storage directories.                                                           |
 | `folders`                 | Configured creation targets, each `{path}` with an absolute project cwd. Inclusion grants no rights.                     |
-| `defaults`                | All seven permission keys, each boolean or `null`; `null` denies.                                                        |
+| `defaults`                | Default rights as booleans or `null`. Omitted and null rights deny.                                                      |
 | `grants`                  | Project/session permission overrides.                                                                                    |
 | `attachmentDir`           | Shared private registry directory; defaults to `stateDir/ipc`. Cooperating owners must use the same canonical directory. |
 | `attachmentExitTimeoutMs` | Owner-exit budget, 50–30000 ms, default 5000. Delete uses it as the SIGTERM grace period before SIGKILL.                 |
@@ -133,8 +133,8 @@ modules.
 - `inheritEnv`: environment-variable allowlist. Omission inherits normally; an
   empty list removes inherited variables except PATH, which is preserved or
   defaults to `/usr/bin:/bin`.
-- `tools`: subset of native read/write/edit/bash/grep/find/ls. Omission uses
-  native defaults; an empty array disables built-in tools.
+- `tools`: selectors passed to Pi's native `--tools`, including extension
+  tools. Omission uses native defaults. An empty array passes `--no-tools`.
 
 These settings change the runtime, not its permission grants. Model tools and
 extensions can access files, shell and network: denying the direct Bridge

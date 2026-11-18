@@ -105,16 +105,15 @@ test('ownership survives control mismatch; only using the live endpoint requires
   const f = await fixture(t);
   const record = {
     ...f.record,
-    kind: 'extension',
+    kind: 'unsupported-control-owner',
     socket: path.join(f.dir, 'fixture.sock'),
     phase: 'ready',
-    unexpected: true,
   };
   await fs.writeFile(f.file, JSON.stringify(record));
   await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
   await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), /LIVE_OWNER_UNREACHABLE/);
   await assert.rejects(
-    new AttachedRuntime({ attachmentDir: f.dir }, f.session, record).start(),
+    new AttachedRuntime({ attachmentDir: f.dir }, f.session, record).state(),
     /ATTACHMENT_PROTOCOL_MISMATCH/,
   );
   const differentOwner = { ...f.record.owner, start: 'different-process-start' };

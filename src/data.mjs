@@ -2,17 +2,12 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { nativeSdk } from './pi-installation.mjs';
 import path from 'node:path';
-import { opaqueId, assertNativeDirectory } from './storage.mjs';
+import { opaqueId, assertNativeDirectory, NATIVE_TRASH_DIR } from './storage.mjs';
 import { scanSavedLines } from './lf-lines.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
 export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
-  if (
-    typeof file !== 'string' ||
-    !path.isAbsolute(file) ||
-    path.resolve(file) !== file ||
-    (await fs.realpath(path.dirname(file))) !== path.dirname(file)
-  )
+  if (typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file)
     throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
   const { protectedPath } = await assertNativeDirectory(path.dirname(file));
   let stat;
@@ -22,12 +17,7 @@ export async function assertSingleSessionFile(file, { allowMissing = false } = {
     if (allowMissing && error.code === 'ENOENT') return null;
     throw error;
   }
-  if (
-    !stat.isFile() ||
-    stat.isSymbolicLink() ||
-    stat.nlink !== 1 ||
-    (await fs.realpath(file)) !== file
-  )
+  if (!stat.isFile() || stat.nlink !== 1 || (await fs.realpath(file)) !== file)
     throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
   if (stat.uid !== process.getuid() || (!protectedPath && stat.mode & 0o022))
     throw new Error('UNSAFE_NATIVE_SESSION_STORAGE');
@@ -215,7 +205,7 @@ export async function discover(config) {
   const found = [];
   async function walk(dir) {
     for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
-      if (ent.isSymbolicLink() || ent.name.startsWith('.')) continue;
+      if (ent.name === NATIVE_TRASH_DIR) continue;
       const file = path.join(dir, ent.name);
       if (ent.isDirectory()) await walk(file);
       else if (ent.isFile() && ent.name.endsWith('.jsonl')) {

@@ -170,7 +170,7 @@ test('missing targets do not bypass canonical parent or observed-file checks', a
     getHeader: () => header,
   };
   const start = (ctx) => handlers.session_start({ reason: 'startup' }, ctx);
-  await assert.rejects(start(context(alias)), /SESSION_FILE_ALIAS_NOT_ALLOWED/);
+  await assert.rejects(start(context(alias)), /UNSAFE_NATIVE_SESSION_STORAGE/);
   const ctx = context(manager);
   await start(ctx);
   persist(manager);

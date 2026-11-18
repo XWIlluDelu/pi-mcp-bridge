@@ -105,14 +105,14 @@ export class PiRpc {
   }
   async startRuntime(signal) {
     signal?.throwIfAborted();
-    validateLaunchArgs(this.config.piArgs);
+    const { env: baseEnv, toolArgs } = launchProfile(this.config);
+    const executable = await resolvePiInstallation(this.config, baseEnv);
+    await validateLaunchArgs(executable, this.config.piArgs, 'rpc');
     await assertSingleSessionFile(this.session.file);
     const attachmentDir = registryPath(this.config);
     this.config = { ...this.config, attachmentDir };
-    const { env: baseEnv, toolArgs } = launchProfile(this.config);
     if (this.config.piRuntime?.agentDir)
       await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
-    const executable = await resolvePiInstallation(this.config, baseEnv);
     const env = await piLaunchEnvironment(executable, baseEnv, this.session.cwd);
     signal?.throwIfAborted();
     try {
@@ -452,10 +452,7 @@ export class PiRpc {
       return Promise.reject(new RpcFailure('INVALID_ARGUMENTS'));
     const { idleOnly, ...nativeCommand } = command;
     const guardedCompact = command.type === 'compact' && idleOnly === true;
-    if (
-      guardedCompact &&
-      (!this.ownerRecord || this.ownerRecord.bridgeVersion !== packageInfo.version)
-    )
+    if (guardedCompact && !this.ownerRecord)
       return Promise.reject(new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED'));
     const serialized = `${JSON.stringify({ ...nativeCommand, id })}\n`;
     return new Promise((resolve, reject) => {
@@ -1051,17 +1048,13 @@ export class RuntimePool {
       if (existing?.attached && existing.alive && existing.record.generation === claim.generation)
         return existing;
       if (existing) await existing.stop();
-      const attached = await diagnostics.measure(
-        'runtime.attach',
-        { kind: 'attached', generation: claim.generation },
-        () =>
-          new AttachedRuntime(
-            { ...this.config, attachmentDir: this.attachmentDir },
-            session,
-            claim,
-            { compatibility: this.compatibility },
-          ).start(),
+      const attached = new AttachedRuntime(
+        { ...this.config, attachmentDir: this.attachmentDir },
+        session,
+        claim,
+        { compatibility: this.compatibility },
       );
+      diagnostics.emit('runtime.attach', { kind: 'attached', generation: claim.generation });
       this.instances.set(session.id, attached);
       return attached;
     }

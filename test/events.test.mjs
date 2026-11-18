@@ -10,7 +10,6 @@ import { EventSubscriptions } from '../src/events.mjs';
 import { ownerSocket, ownerRequest } from '../src/owner-runtime.mjs';
 import { reserveOwner, updateOwner, releaseOwner } from '../src/attachments.mjs';
 import { SettledObserver } from '../src/settled-observer.mjs';
-import { READ_CONTRACT } from '../src/context-read.mjs';
 import { hash } from '../src/storage.mjs';
 
 import { dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
@@ -284,7 +283,7 @@ async function settledOwner(f, session) {
   const claim = await reserveOwner(dir, session, 'extension');
   await updateOwner(dir, session, claim, {
     phase: 'ready',
-    readContract: READ_CONTRACT,
+    readContract: 'different-reader-contract',
     completionSocket: ownerSocket(f.config),
   });
   return {

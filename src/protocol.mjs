@@ -68,7 +68,7 @@ function toolError(code, extra = {}) {
         : ['ATTACHMENT_PROTOCOL_MISMATCH', 'OWNER_COMPONENT_UPDATE_REQUIRED'].includes(code)
           ? {
               recovery:
-                'Update Bridge and the session owner component together; use a safe native reload at an idle boundary where supported. Do not delete a live claim or start a fallback writer.',
+                'Use a session owner that supports the current control protocol and operation. A safe native reload can update the endpoint at an idle boundary.',
             }
           : {}),
       ...extra,

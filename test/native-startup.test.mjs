@@ -23,8 +23,14 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
       );
       await fs.writeFile(
         path.join(extensions, 'probe.js'),
-        "export default pi => pi.on('session_start', () => pi.appendEntry('profile-probe', { tools: pi.getActiveTools() }));",
+        `export default pi => {
+          pi.registerFlag('probe-label', { type: 'string' });
+          pi.on('session_start', (_event, ctx) => pi.appendEntry('profile-probe', {
+            tools: pi.getActiveTools(), label: pi.getFlag('probe-label'), system: ctx.getSystemPrompt(),
+          }));
+        };`,
       );
+      config.piArgs.push('--system-prompt', '--continue', '--probe-label=--resume');
       delete config.piRuntime.tools;
     },
   });
@@ -34,6 +40,8 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
   assert.equal((await claim()).kind, 'rpc');
   const probe = (await rpc.entries()).entries.find((row) => row.customType === 'profile-probe');
   for (const tool of ['read', 'bash', 'edit', 'write']) assert.ok(probe.data.tools.includes(tool));
+  assert.match(probe.data.system, /--continue/);
+  assert.equal(probe.data.label, '--resume');
   await rpc.gracefulExit();
 
   const local = new RpcClient({

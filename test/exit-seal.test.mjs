@@ -10,7 +10,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 
-import packageInfo from '../package.json' with { type: 'json' };
 import { AttachedRuntime, claimFile, processIdentity } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 
@@ -25,7 +24,7 @@ async function fixture(t) {
       phase: 'ready',
       owner: await processIdentity(),
       socket: path.join(dir, 'observer.sock'),
-      bridgeVersion: packageInfo.version,
+      bridgeVersion: '0.8.0-dev.17',
     },
     requests = [],
     connections = new Set();
@@ -54,7 +53,7 @@ async function fixture(t) {
   };
 }
 
-test('owned seal uses the current version and accepts only definite sealed or busy outcomes', async (t) => {
+test('owned seal addresses the live endpoint and accepts definite sealed or busy outcomes', async (t) => {
   const f = await fixture(t);
   let dispatched = 0;
   assert.deepEqual(await f.runtime.seal(() => dispatched++), { sealed: true });
@@ -63,7 +62,7 @@ test('owned seal uses the current version and accepts only definite sealed or bu
   assert.deepEqual(f.requests[0], {
     op: 'seal',
     body: {},
-    version: packageInfo.version,
+    version: f.runtime.record.bridgeVersion,
     generation: f.runtime.record.generation,
     file: f.runtime.session.file,
     sessionId: f.runtime.session.header.id,
@@ -87,7 +86,7 @@ test('written seal failures remain uncertain and are never replayed', async (t) 
     [{ data: { sealed: false } }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, partial: true }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, error: 'INVALID_ARGUMENTS' }, 'INVALID_ATTACHMENT_RESPONSE'],
-    [{ data: { sealed: true }, version: 'unsupported' }, 'OWNER_COMPONENT_UPDATE_REQUIRED'],
+    [{ data: { sealed: true }, version: 1 }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, generation: 'another' }, 'RUNTIME_SESSION_CHANGED'],
     [{ data: { sealed: true }, sessionId: 'another' }, 'RUNTIME_SESSION_CHANGED'],
     [{ data: { sealed: true }, file: '/another/session.jsonl' }, 'RUNTIME_SESSION_CHANGED'],
@@ -111,17 +110,15 @@ test('seal rejects unsupported owners and cancellation before writing without se
     (error) => error === failure,
   );
   assert.equal(f.requests.length, 0);
-  for (const replacement of [{ kind: 'host' }, { bridgeVersion: 'unsupported' }]) {
-    const runtime = new AttachedRuntime(f.runtime.config, f.runtime.session, {
-      ...f.runtime.record,
-      ...replacement,
-    });
-    await assert.rejects(runtime.seal(), {
-      code: 'OWNER_COMPONENT_UPDATE_REQUIRED',
-      uncertain: false,
-    });
-    assert.equal(f.requests.length, 0);
-  }
+  const runtime = new AttachedRuntime(f.runtime.config, f.runtime.session, {
+    ...f.runtime.record,
+    kind: 'host',
+  });
+  await assert.rejects(runtime.seal(), {
+    code: 'OWNER_COMPONENT_UPDATE_REQUIRED',
+    uncertain: false,
+  });
+  assert.equal(f.requests.length, 0);
 });
 
 const ownedRpc = (f) => {
@@ -224,7 +221,6 @@ test('owned compact keeps its control connection and fence for a matching late r
     },
   );
   assert.equal(f.requests.length, 1);
-  assert.equal(f.requests[0].version, packageInfo.version);
   assert.equal(rpc.pending.size, 1);
   assert.ok(rpc.hasPendingCommand('compact'));
   await rpc.drainAcks(); // Missing replies are not received ACK tasks.
@@ -261,7 +257,6 @@ test('owned compact validates reply identity and metadata before releasing its f
   for (const result of [
     { data: compacted, sessionId: 'another' },
     { data: compacted, generation: 'another' },
-    { data: compacted, version: 'unsupported' },
     { data: null },
     null,
   ]) {

@@ -187,60 +187,35 @@ test('search budgets only matching reader content and its related refs', async (
   );
 });
 
-test('reader routing rechecks live capabilities and the owner that appears during a saved capture', async (t) => {
+test('reader routing uses the captured capabilities and selects again for a new read', async (t) => {
   const f = await fixture(t),
     { session, bridge } = f;
-  let features = { available: true, tools: [], commands: ['fixture-memory'], leaf_id: 'a' };
-  let captures = 0;
-  async function owner(snapshot) {
-    const controller = await reserveHostSession({
-      buildSessionProjection,
-      attachmentDir: f.config.attachmentDir,
-      session,
-    });
-    f.cleanup.push(() => controller.close());
-    const state = () => ({ sessionFile: session.file, sessionId: session.header.id });
-    await controller.ready({
-      state,
-      readFeatures: () => features,
-      snapshot:
-        snapshot ??
-        (() => {
-          captures++;
-          return { ...state(), entries: [], leafId: null };
-        }),
-      submit: () => assert.fail('Read must not submit work'),
-      release: async () => ({ released: true }),
-    });
-    return controller;
-  }
-  const controller = await owner();
+  let commands = ['fixture-memory'],
+    disableDuringRead = false;
+  const state = () => ({ sessionFile: session.file, sessionId: session.header.id });
+  const controller = await reserveHostSession({
+    buildSessionProjection,
+    attachmentDir: f.config.attachmentDir,
+    session,
+  });
+  f.cleanup.push(() => controller.close());
+  await controller.ready({
+    state,
+    readFeatures: () => ({ available: true, tools: [], commands, leaf_id: null }),
+    snapshot: () => {
+      if (disableDuringRead) commands = [];
+      return { ...state(), entries: [], leafId: null };
+    },
+    submit: () => assert.fail('Read must not submit work'),
+  });
   const read = () => bridge.read({ session_id: session.id });
-  assert.equal((await read()).reader.id, 'fixture-memory');
-  assert.equal(captures, 1);
-  const readers = bridge.compatibilityServices.sessionReaders;
-  const unregister = readers.register('conflict', {
+  const unregister = bridge.compatibilityServices.sessionReaders.register('conflict', {
     matches: () => true,
     read: () => ({ items: [] }),
   });
   await assert.rejects(read(), /SESSION_READER_CONFLICT/);
   unregister();
-
-  const reader = readers.readers.get('fixture-memory'),
-    original = reader.read;
-  reader.read = async (ctx) => {
-    const result = await original(ctx);
-    features = { ...features, commands: [] };
-    return result;
-  };
-  await assert.rejects(read(), /READ_SOURCE_CHANGED/);
-  await controller.release();
-  await controller.close();
-  reader.read = async (ctx) => {
-    assert.equal(ctx.owner.available, false);
-    const result = await original(ctx);
-    await owner(() => assert.fail('Source recheck must not reacquire history'));
-    return result;
-  };
-  await assert.rejects(read(), /READ_SOURCE_CHANGED/);
+  disableDuringRead = true;
+  assert.equal((await read()).reader.id, 'fixture-memory');
+  assert.equal((await read()).view, 'session');
 });
