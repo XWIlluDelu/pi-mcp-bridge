@@ -125,6 +125,13 @@ function identity(sessionId, url) {
 function requireName(name) {
   if (name !== NAME) throw new EventError(-32023, 'NotFound', { kind: 'event' });
 }
+function assertRoom(records, id) {
+  if (!records.has(id) && records.size >= MAX_SUBSCRIPTIONS)
+    throw new EventError(-32025, 'ResourceExhausted', {
+      limit: 'subscriptions',
+      max: MAX_SUBSCRIPTIONS,
+    });
+}
 
 // Subscription records are durable; occurrences/retries are deliberately not a
 // replay log. The Bridge's existing state-directory lock owns this store.
@@ -152,6 +159,7 @@ export class EventSubscriptions {
     this.retryDelays = retryDelays;
     this.records = new Map();
     this.deliveries = new Map();
+    this.requests = new Map();
     this.changes = Promise.resolve();
     this.shutdown = new AbortController();
   }
@@ -205,12 +213,15 @@ export class EventSubscriptions {
     if (this.storeError)
       throw new EventError(-32603, 'EventSubscriptionsUnavailable', { reason: this.storeError });
   }
-  async change(fn) {
+  activeRecords(now = this.now()) {
+    return new Map([...this.records].filter(([, record]) => record.expiresAt > now));
+  }
+  change(fn) {
     const task = this.changes.then(async () => {
       this.bridge.assertOpen();
       this.assertAvailable();
-      const next = new Map([...this.records].filter(([, r]) => r.expiresAt > this.now()));
-      const result = await fn(next);
+      const next = this.activeRecords();
+      const result = fn(next);
       if (result) {
         await atomicJson(this.file, [...next.values()]);
         this.records = next;
@@ -257,14 +268,30 @@ export class EventSubscriptions {
           : [],
       };
     }
-    if (method === 'events/unsubscribe') {
-      // Same authenticated owner can always stop its subscription after revocation.
-      const id = identity(request.arguments.session_id, request.delivery.url);
-      await this.change((next) => next.delete(id));
-      for (const delivery of this.deliveries.values())
-        if (delivery.id === id) delivery.controller.abort();
-      return {};
+    const id = identity(request.arguments.session_id, request.delivery.url);
+    const run = () => {
+      this.bridge.assertOpen();
+      return method === 'events/subscribe'
+        ? this.subscribe(id, request, requestContext)
+        : this.unsubscribe(id);
+    };
+    const previous = this.requests.get(id);
+    const task = previous ? previous.then(run, run) : Promise.resolve().then(run);
+    this.requests.set(id, task);
+    try {
+      return await task;
+    } finally {
+      if (this.requests.get(id) === task) this.requests.delete(id);
     }
+  }
+  async unsubscribe(id) {
+    // The authenticated owner can stop its subscription after read revocation.
+    await this.change((next) => next.delete(id));
+    for (const delivery of this.deliveries.values())
+      if (delivery.id === id) delivery.controller.abort();
+    return {};
+  }
+  async subscribe(id, request, requestContext) {
     let session;
     try {
       session = await this.authorize(request.arguments.session_id, requestContext);
@@ -276,52 +303,41 @@ export class EventSubscriptions {
     const runtime = await this.bridge.pool.forRead(session);
     if (!this.supports(runtime))
       throw new EventError(-32026, 'Unsupported', { feature: 'externalOwner' });
-    const id = identity(session.id, request.delivery.url);
-    return this.change(async (next) => {
-      if (!next.has(id) && next.size >= MAX_SUBSCRIPTIONS)
-        throw new EventError(-32025, 'ResourceExhausted', {
-          limit: 'subscriptions',
-          max: MAX_SUBSCRIPTIONS,
+    const active = this.activeRecords();
+    assertRoom(active, id);
+    const { url, secret } = request.delivery;
+    const record = { id, owner: OWNER, session_id: session.id, url, secret, verifiedUntil: 0 };
+    // Consent is cached per callback URL. Only the store update is serialized
+    // across subscriptions; a slow receiver holds its own request lane.
+    for (const candidate of active.values())
+      if (candidate.url === url)
+        record.verifiedUntil = Math.max(record.verifiedUntil, candidate.verifiedUntil);
+    if (record.verifiedUntil <= this.now()) {
+      if (process.env.PI_MCP_LOG_CALLBACK_HOST === '1')
+        diagnostics.emit('events.callback_target', {
+          callback_hostname: callbackUrl(url).hostname,
         });
-      const previous = next.get(id);
-      const record = {
-        id,
-        owner: OWNER,
-        session_id: session.id,
-        url: request.delivery.url,
-        secret: request.delivery.secret,
-        expiresAt: 0,
-      };
-      // Consent is cached per owner and exact callback URL.
-      record.verifiedUntil = [...next.values()].reduce(
-        (latest, candidate) =>
-          candidate.url === record.url ? Math.max(latest, candidate.verifiedUntil) : latest,
-        0,
-      );
-      if (record.verifiedUntil <= this.now()) {
-        // Explicit, temporary hostname-only troubleshooting; never emit the URL.
-        if (process.env.PI_MCP_LOG_CALLBACK_HOST === '1')
-          diagnostics.emit('events.callback_target', {
-            callback_hostname: callbackUrl(record.url).hostname,
-          });
-        try {
-          await verifyCallback(record, this.post, this.shutdown.signal);
-        } catch (error) {
-          throw new EventError(-32015, 'CallbackEndpointError', {
-            reason: error instanceof CallbackError ? error.reason : 'connection_refused',
-          });
-        }
-        record.verifiedUntil = this.now() + 300000;
+      try {
+        await verifyCallback(record, this.post, this.shutdown.signal);
+      } catch (error) {
+        throw new EventError(-32015, 'CallbackEndpointError', {
+          reason: error instanceof CallbackError ? error.reason : 'connection_refused',
+        });
       }
-      record.expiresAt = this.now() + Math.min(request.ttlMs ?? DEFAULT_TTL, MAX_TTL);
+      record.verifiedUntil = this.now() + 300000;
+    }
+    return this.change((next) => {
+      assertRoom(next, id);
+      const previous = next.get(id);
+      const now = this.now();
+      record.expiresAt = now + Math.min(request.ttlMs ?? DEFAULT_TTL, MAX_TTL);
       if (previous?.secret && previous.secret !== record.secret) {
         record.previousSecret = previous.secret;
-        record.rotateUntil = this.now() + ROTATION_MS;
-      } else if (previous?.rotateUntil > this.now()) {
+        record.rotateUntil = now + ROTATION_MS;
+      } else if (previous?.rotateUntil > now) {
         record.previousSecret = previous.previousSecret;
         record.rotateUntil = previous.rotateUntil;
       }
-      this.bridge.assertOpen();
       next.set(id, record);
       return {
         id,
@@ -429,7 +445,6 @@ export class EventSubscriptions {
   }
   async close() {
     this.shutdown.abort();
-    await this.changes;
-    await Promise.allSettled([...this.deliveries.keys()]);
+    await Promise.allSettled([this.changes, ...this.requests.values(), ...this.deliveries.keys()]);
   }
 }

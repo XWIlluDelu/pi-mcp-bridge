@@ -83,6 +83,7 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
   return {
     dir,
     config,
+    cleanup: f.cleanup,
     session,
     sent,
     call,
@@ -163,6 +164,45 @@ test('event subscriptions verify consent, persist, rotate signing keys and expir
   await f.settle();
   assert.equal(f.sent.length, before);
 });
+
+test(
+  'verification orders one subscription without blocking another',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await fixture(t);
+    const slow = request(f.session.id);
+    const fast = { ...slow, delivery: { ...slow.delivery, url: 'https://callback.example/fast' } };
+    const entered = Promise.withResolvers(),
+      release = Promise.withResolvers();
+    f.cleanup.unshift(release.resolve);
+    const post = f.bridge.events.post;
+    f.bridge.events.post = async (url, ...args) => {
+      if (url === slow.delivery.url) {
+        entered.resolve();
+        await release.promise;
+      }
+      return post(url, ...args);
+    };
+    const subscribe = (input) => f.call('events/subscribe', input);
+    const creating = subscribe(slow);
+    await entered.promise;
+    const refreshing = subscribe({ ...slow, ttlMs: 90000 });
+    const cancelling = f.call('events/unsubscribe', {
+      ...slow,
+      delivery: { mode: 'webhook', url: slow.delivery.url },
+    });
+    const fastId = (await subscribe(fast)).message.result.id;
+    release.resolve();
+    const [created, refreshed, cancelled] = await Promise.all([creating, refreshing, cancelling]);
+    assert.equal(created.message.result.id, refreshed.message.result.id);
+    assert.ok(cancelled.message.result);
+    const records = JSON.parse(await fs.readFile(f.bridge.events.file, 'utf8'));
+    assert.deepEqual(
+      records.map(({ id }) => id),
+      [fastId],
+    );
+  },
+);
 
 test('event admission uses receive-time authorization and delivery reauthorizes', async (t) => {
   const f = await fixture(t),

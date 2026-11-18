@@ -145,6 +145,9 @@ JSON-RPC `-32603 EventSubscriptionsUnavailable` with a content-free `data.reason
 Health reports `events:{status:"unavailable",reason:"…"}`; diagnostics emit
 `events.store_unavailable`. Repair the file/privacy and restart to reload it.
 
+Refresh and unsubscribe run in order for each subscription. Other subscriptions
+can verify and commit while a callback is pending.
+
 Callback verification sends a signed challenge and requires a matching response
 of at most 4096 bytes. Verification is cached by owner/URL for five minutes. Secrets decode to
 24–64 bytes. Standard Webhooks signatures cover the exact serialized body.

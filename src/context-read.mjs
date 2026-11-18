@@ -365,6 +365,21 @@ function cleanRecord(record) {
 
 // Split only for the response. Keep source text intact and use stable part
 // boundaries so a continuation can change its page budget.
+function jsonTextEnd(text, start, end) {
+  let bytes = 2; // Quotes.
+  for (let index = start; index < end;) {
+    const code = text.codePointAt(index);
+    if (code < 32) bytes += code >= 8 && code <= 13 && code !== 11 ? 2 : 6;
+    else if (code < 128) bytes += code === 34 || code === 92 ? 2 : 1;
+    else if (code < 2048) bytes += 2;
+    else if (code > 0xffff) bytes += 4;
+    else bytes += code >= 0xd800 && code <= 0xdfff ? 6 : 3; // Lone surrogates escape.
+    if (bytes > UNIT_TARGET) return index;
+    index += code > 0xffff ? 2 : 1;
+  }
+  return end;
+}
+
 function* textParts(text) {
   if (typeof text !== 'string' || !text.length) {
     yield text;
@@ -374,20 +389,10 @@ function* textParts(text) {
     // Each UTF-16 unit takes at least one encoded byte. Align the slice
     // to a code point before measuring, since JSON escapes lone surrogates.
     let end = Math.min(text.length, start + UNIT_TARGET - 2);
-    const slice = (index) =>
-      text.slice(start, text.codePointAt(index - 1) > 0xffff ? index - 1 : index);
-    let part = slice(end);
-    if (jsonBytes(part) > UNIT_TARGET) {
-      let low = start;
-      while (low < end) {
-        const mid = Math.ceil((low + end) / 2);
-        if (jsonBytes(slice(mid)) <= UNIT_TARGET) low = mid;
-        else end = mid - 1;
-      }
-      part = slice(low);
-    }
-    yield part;
-    start += part.length;
+    if (text.codePointAt(end - 1) > 0xffff) end--;
+    if (jsonBytes(text.slice(start, end)) > UNIT_TARGET) end = jsonTextEnd(text, start, end);
+    yield text.slice(start, end);
+    start = end;
   }
 }
 function* splitText(record, text, replace) {
