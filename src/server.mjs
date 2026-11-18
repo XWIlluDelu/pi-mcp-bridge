@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { BridgeStdioTransport } from './protocol-stdio.mjs';
+import { StdioTransport } from './protocol-stdio.mjs';
+import { dispatchModern } from './protocol.mjs';
 import { Bridge } from './bridge.mjs';
 import { publicError } from './errors.mjs';
 import { diagnostics } from './diagnostics.mjs';
@@ -62,7 +63,8 @@ async function main() {
     initializing = bridge.init();
     await initializing;
     if (closing) return closing;
-    transport = new BridgeStdioTransport(bridge);
+    // A cancelled stdio reply does not cancel an admitted Bridge operation.
+    transport = new StdioTransport(async (body) => (await dispatchModern(bridge, body)).message);
     transport.onerror = () => void close(1);
     transport.start();
     diagnostics.emit('service.ready', { transport: 'stdio' });

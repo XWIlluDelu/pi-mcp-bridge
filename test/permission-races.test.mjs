@@ -121,6 +121,8 @@ test('list keeps parent references from its snapshot through slow child status',
     return { isIdle: true };
   };
   f.bridge.pool.instances.set(child.session_id, f.runtime);
+  // Targeted listing must find the parent even if only the child's ID is warm.
+  f.bridge.sessionFiles.delete(parent.session_id);
   const pending = f.bridge.list({ session_id: child.session_id });
   await entered.promise;
   const policy = {

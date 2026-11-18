@@ -174,11 +174,22 @@ test('native search does not join a phrase across messages or a different conten
       { buildSessionProjection },
     );
     assert.equal(rows(captured, { query }).length, 0, boundary);
+    const shared = 'ation.';
+    const matches = prepareContextRead(
+      { entries: manager.getEntries(), leafId: manager.getLeafId() },
+      { ...args, search_query: shared },
+      { buildSessionProjection },
+    );
+    assert.deepEqual(
+      rows(matches, { query: shared }).map((row) => row.text),
+      [first.text, second.text],
+      boundary,
+    );
   }
 });
 
 test('command output stays searchable and complete across changing page budgets', () => {
-  const output = 'diagnostic 😀 '.repeat(1900) + 'distinct final diagnostic';
+  const output = 'diagnostic 😃 "\\\r\n\u0018\uD800'.repeat(1900) + 'distinct final diagnostic';
   const entries = [
     {
       type: 'message',

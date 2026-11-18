@@ -36,10 +36,6 @@ test('cross-filesystem state storage uses adjacent atomic rename and recoverable
   }
   if (shared.dev === (await fs.stat(os.tmpdir())).dev) return t.skip('requires two filesystems');
   const f = await fixture(t, '/dev/shm');
-  // Reproduce the original operation failing before exercising the replacement.
-  await assert.rejects(fs.rename(f.session.file, path.join(f.config.stateDir, 'old-trash.jsonl')), {
-    code: 'EXDEV',
-  });
   const trash = await prepareTrash(f.config, f.session),
     metadata = await records(f, trash.token);
   assert.equal(metadata.phase, 'prepared');

@@ -18,10 +18,10 @@ function assertIdentity(before, after) {
     throw new Error('RUNTIME_SESSION_CHANGED');
 }
 function tracker(release, onError) {
-  const pending = new Map();
-  function track(work, kind) {
+  const pending = new Set();
+  function track(work) {
     const promise = Promise.resolve(work);
-    pending.set(promise, kind);
+    pending.add(promise);
     promise.then(
       () => pending.delete(promise),
       (error) => {
@@ -36,9 +36,6 @@ function tracker(release, onError) {
   }
   return {
     track,
-    get submitting() {
-      return [...pending.values()].includes('submit');
-    },
     ...(release
       ? {
           release: async () => {
@@ -46,7 +43,7 @@ function tracker(release, onError) {
             // the writer. Waiting only our dispatched promises cannot prove release.
             const outcome = await release();
             if (outcome?.released !== true) throw new Error('HOST_RELEASE_UNCONFIRMED');
-            await Promise.allSettled([...pending.keys()]);
+            await Promise.allSettled(pending);
             return { released: true };
           },
         }
@@ -68,10 +65,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     hasPendingMessages: () => session.pendingMessageCount > 0,
   };
   const isIdle = () =>
-    session.isIdle &&
-    !pendingBashes &&
-    !tracked.submitting &&
-    admission.idle(session.sessionManager);
+    nativeActivity.isIdle() && !pendingBashes && admission.idle(session.sessionManager);
   const state = async () => ({
     ...identity(session),
     ...modelState(session),
@@ -101,11 +95,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     reload: async ({ beforeDispatch, ...expected }) => {
       const before = identity(session);
       assertIdentity(expected, before);
-      const operation = admission.begin(
-        session.sessionManager,
-        nativeActivity,
-        tracked.submitting || pendingBashes > 0,
-      );
+      const operation = admission.begin(session.sessionManager, nativeActivity, pendingBashes > 0);
       try {
         beforeDispatch?.();
         await operation.run(() => tracked.track(session.reload()));
@@ -133,7 +123,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
             session.sessionManager,
             nativeActivity,
             compact,
-            tracked.submitting || pendingBashes > 0,
+            pendingBashes > 0,
           );
       assertIdentity(before, await state());
       return result;
@@ -153,10 +143,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       // Public prompt() returns the input call's Promise, not an admission
       // receipt. A synchronous throw after entry cannot prove no side effect.
       try {
-        tracked.track(
-          session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }),
-          'submit',
-        );
+        tracked.track(session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }));
       } catch (error) {
         try {
           onError?.(error);
@@ -194,8 +181,9 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
           );
         }
         assertIdentity(before, identity(session));
-        await onResult(nativeBashResult(result));
-        return nativeBashResult(result);
+        const output = nativeBashResult(result);
+        await onResult(output);
+        return output;
       } finally {
         pendingBashes--;
       }
@@ -313,11 +301,9 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
     submit: async ({ text, images, model, thinking_level, mode = 'steer', beforeDispatch }) => {
       if (hasPromptSettings({ model, thinking_level }))
         throw new Error('MODEL_SELECTION_UNSUPPORTED');
-      if (mode === 'idle_only') {
-        const observed = await state();
-        if (observed.isStreaming || observed.isCompacting || observed.pendingMessageCount > 0)
-          return { status: 'skipped', reason: 'busy' };
-      }
+      // getState excludes native preparation and cannot reserve idle admission
+      // across getState -> prompt. Only a host-side gate can offer idle_only.
+      if (mode === 'idle_only') return { status: 'rejected', reason: 'HOST_ADMISSION_UNSUPPORTED' };
       beforeDispatch?.();
       try {
         const disposition = await tracked.track(
@@ -325,7 +311,7 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
         );
         if (!['started', 'queued', 'handled'].includes(disposition)) return unknown();
         return { status: 'accepted', disposition };
-      } catch (error) {
+      } catch {
         // Official RpcClient exposes both negative ACKs and transport failures
         // as plain Errors. Never infer rejection by parsing a raw error string.
         return unknown();
@@ -337,8 +323,9 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
       beforeDispatch?.();
       const result = await tracked.track(client.bash(command));
       assertIdentity(before, await state());
-      await onResult(nativeBashResult(result));
-      return nativeBashResult(result);
+      const output = nativeBashResult(result);
+      await onResult(output);
+      return output;
     },
     stop: async ({ onWithdraw, ...expected } = {}) => {
       const before = await state();

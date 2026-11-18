@@ -5,10 +5,7 @@ environment, extensions and history. Start from a useful overview, send the next
 instruction, and read further only when the outcome needs explanation or evidence.
 
 Complete [local setup](../README.md#start-locally) and grant the intended
-[operations](configuration.md#seven-independent-rights) before this workflow.
-Discovery, history reading and execution have independent permissions; finding
-a session does not authorize sending to it, and a known ID can be usable even
-when discovery is denied.
+[operations](configuration.md#seven-independent-rights).
 
 ## Calling workflow
 
@@ -41,12 +38,6 @@ when discovery is denied.
    saved state alone does not establish the task's outcome. Review the result,
    then send the next instruction to the same session.
 
-Direct MCP calls and code orchestration use the same workflow. Code can retain
-IDs and choose the next call from the returned status; repeating a send or batch
-still repeats its mutations. See the [API](api.md) for arguments and outcomes,
-[reading](reading.md) for source selection and navigation, and [events](events.md)
-for subscriptions and delivery.
-
 ## Identity and result boundaries
 
 | Value                      | Identifies                                    | Use                                                         |
@@ -56,26 +47,10 @@ for subscriptions and delivery.
 | Event `leaf_id` and `read` | The native branch boundary when a run settled | Read that result after later work has started.              |
 
 Pi steering, follow-up queues and automatic continuations can consume several
-inputs in one run. A reading [input turn](reading.md#turn-range-and-content)
-groups an input with following projected content; it is not a completion unit.
-Admission receipts therefore describe delivery/admission; completion
-notifications describe a session run. Neither establishes success of
-the user's task. The notification's `stop_reason` is the final assistant message's
-native termination reason.
-
-The companion's public `sendUserMessage()` returns void; SDK `prompt()` can resolve
-after input handling or a full run. Confirmed invocation is useful evidence even
-without an admission callback. Owned RPC has matching native ACKs, so Bridge
-retains those receipts in a bounded memory cache. These choices let the caller
-resolve uncertainty without inferring delivery from conversation text. The
-[receipt contract](api.md#submission-receipt) defines retention and authorization.
-
-Completion excerpts and historical reading use the same native session
-projection. Capturing at settlement keeps later replies out of the notification.
-Explicit Session Context also avoids asking a current-memory reader to recreate
-a past native leaf. Runtime Context remains a request-stage snapshot; an
-extension reader can expose its current stored memory through the shared
-[module contract](compatibility.md).
+inputs in one run. A [receipt](api.md#submission-receipt) describes one submission.
+A [settlement event](events.md#scope-and-completion-meaning) describes the full
+native run. Reading groups content by [input turn](reading.md#turn-range-and-content)
+and can pin the leaf captured at settlement.
 
 ## Design references
 

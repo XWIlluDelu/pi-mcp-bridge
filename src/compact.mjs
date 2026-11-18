@@ -42,11 +42,12 @@ export function requireInterruptCompaction(input, state) {
 }
 export function compactMetadata(value) {
   compactReceipt(value);
-  return Object.fromEntries(
-    ['firstKeptEntryId', 'tokensBefore', 'estimatedTokensAfter']
-      .filter((key) => value[key] !== undefined)
-      .map((key) => [key, value[key]]),
-  );
+  const { firstKeptEntryId, tokensBefore, estimatedTokensAfter } = value;
+  return {
+    firstKeptEntryId,
+    tokensBefore,
+    ...(estimatedTokensAfter !== undefined ? { estimatedTokensAfter } : {}),
+  };
 }
 // Compaction summaries contain read-protected history. Return only a bounded
 // completion receipt; clients with read permission can inspect the native entry.

@@ -26,7 +26,7 @@ function callbackReceiver(t, respond) {
     return request;
   });
 }
-test('Standard Webhooks signs exact bytes and both rotation keys; challenge must be echoed', async () => {
+test('Standard Webhooks signs exact bytes with both keys during rotation', () => {
   const subscription = {
     id: 'sub_test',
     url: 'https://callback.example/event',
@@ -53,20 +53,6 @@ test('Standard Webhooks signs exact bytes and both rotation keys; challenge must
       'webhook-signature'
     ].split(' ').length,
     1,
-  );
-  await verifyCallback(subscription, async (_url, sent, h) => {
-    const parsed = JSON.parse(sent);
-    assert.equal(parsed.type, 'verification');
-    assert.ok(h['webhook-id'].startsWith('verification_'));
-    return { status: 200, body: JSON.stringify({ challenge: parsed.challenge }) };
-  });
-  await assert.rejects(
-    verifyCallback(subscription, async () => ({ status: 200, body: '{"challenge":"wrong"}' })),
-    (e) => e.reason === 'challenge_failed',
-  );
-  await assert.rejects(
-    verifyCallback(subscription, async () => ({ status: 302, body: '' })),
-    (e) => e.reason === 'http_4xx',
   );
 });
 

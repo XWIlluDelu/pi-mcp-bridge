@@ -313,17 +313,25 @@ test(
     assert.equal(await ownerAlive(toolOwner), false);
     await assertReaped(deleting);
     assert.equal(await deleting.child.scopeActive(), false);
-    // Final stdout/stderr can exceed socket buffers and arrive after the exit
-    // record on another channel. close must mean both streams were drained.
+    // Scope shutdown lets the native handler finish once. Its final output
+    // exceeds socket buffers and must arrive before close.
     const bytes = 256 * 1024;
     const drain = new HerdrRpcTransport(wrapper, {
       command: process.execPath,
       args: [
         '-e',
-        `process.stdin.resume(); process.stdin.on('end', () => {
-        process.stdout.write('o'.repeat(${bytes}));
-        process.stderr.write('e'.repeat(${bytes}));
-      });`,
+        `let stopping = false;
+        process.stdin.resume();
+        process.on('SIGTERM', () => {
+          if (stopping) process.exit(3);
+          stopping = true;
+          setTimeout(() => {
+            process.stdout.write('o'.repeat(${bytes}));
+            process.stderr.write('e'.repeat(${bytes}));
+            process.stdin.pause();
+          }, 100);
+        });
+        process.stdout.write('!');`,
       ],
       cwd: dir,
       env: { PATH: oldPath },
@@ -343,10 +351,11 @@ test(
       drain.once('exitError', reject);
     });
     await drain.ready;
-    drain.stdin.end();
-    await closed;
+    await until(() => outputBytes > 0);
+    await drain.terminate();
+    assert.equal(await closed, 0);
     assert.deepEqual(failures, []);
-    assert.equal(outputBytes, bytes);
+    assert.equal(outputBytes, bytes + 1);
     assert.equal(errorBytes, bytes);
     const snapshot = await finalChild.control.request('session.snapshot');
     assert.equal(snapshot.snapshot.panes.length, 0);

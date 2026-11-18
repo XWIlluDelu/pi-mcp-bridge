@@ -2,7 +2,7 @@
 import https from 'node:https';
 import dns from 'node:dns/promises';
 import { isIP } from 'node:net';
-import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import ipaddr from 'ipaddr.js';
 import { Webhook } from 'standardwebhooks';
 
@@ -149,12 +149,7 @@ export async function verifyCallback(subscription, post = postWebhook, signal) {
     throw new CallbackError(response.status >= 500 ? 'http_5xx' : 'http_4xx');
   let actual;
   try {
-    actual = JSON.parse(response.body).challenge;
+    actual = JSON.parse(response.body)?.challenge;
   } catch {}
-  if (
-    typeof actual !== 'string' ||
-    Buffer.byteLength(actual) !== Buffer.byteLength(challenge) ||
-    !timingSafeEqual(Buffer.from(actual), Buffer.from(challenge))
-  )
-    throw new CallbackError('challenge_failed');
+  if (actual !== challenge) throw new CallbackError('challenge_failed');
 }

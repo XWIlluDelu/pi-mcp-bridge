@@ -1,5 +1,5 @@
 import { readSchema, contextSelection, DEFAULT_READ_BYTES } from './read-schema.mjs';
-import { jsonBytes, fitsResult } from './response-budget.mjs';
+import { jsonBytes, resultSize } from './response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { sessionEntryIndex } from './data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
@@ -295,7 +295,7 @@ function boundedFields(value) {
       result[key + '_omitted'] = true;
       result.complete = false;
       result.reason = 'oversized_indivisible_content';
-    } else result[key] = structuredClone(field);
+    } else result[key] = field;
   }
   return result;
 }
@@ -330,7 +330,7 @@ function cleanMessage(message) {
     result.content = Array.isArray(message.content)
       ? message.content.map(cleanBlock)
       : message.content;
-  if (message?.nestedCalls !== undefined) result.nestedCalls = structuredClone(message.nestedCalls);
+  if (message?.nestedCalls !== undefined) result.nestedCalls = message.nestedCalls;
   // Known system sections/tool declarations are splittable reading content.
   // They must not be discarded as one oversized metadata object.
   for (const key of ['summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'])
@@ -338,20 +338,18 @@ function cleanMessage(message) {
   return result;
 }
 function cleanRecord(record) {
-  const result = {
-    ...pick(record, [
-      'type',
-      'prompt_id',
-      'source',
-      'synthetic',
-      'reason',
-      'tool_id',
-      'call_id',
-      'pairing',
-      'call_source',
-      'in_model_context',
-    ]),
-  };
+  const result = pick(record, [
+    'type',
+    'prompt_id',
+    'source',
+    'synthetic',
+    'reason',
+    'tool_id',
+    'call_id',
+    'pairing',
+    'call_source',
+    'in_model_context',
+  ]);
   const sourceFields = [
     'entry_id',
     'entry_index',
@@ -390,24 +388,29 @@ function cleanRecord(record) {
 // Split only for the response. Keep source text intact and use stable part
 // boundaries so a continuation can change its page budget.
 function* textParts(text) {
-  if (typeof text !== 'string' || jsonBytes(text) <= UNIT_TARGET) {
+  if (typeof text !== 'string' || !text.length) {
     yield text;
     return;
   }
-  let start = 0;
-  let bytes = 2;
-  let end = 0;
-  for (const point of text) {
-    const size = jsonBytes(point) - 2;
-    if (bytes + size > UNIT_TARGET) {
-      yield text.slice(start, end);
-      start = end;
-      bytes = 2;
+  for (let start = 0; start < text.length;) {
+    // Each UTF-16 unit takes at least one encoded byte. Align the slice
+    // to a code point before measuring, since JSON escapes lone surrogates.
+    let end = Math.min(text.length, start + UNIT_TARGET - 2);
+    const slice = (index) =>
+      text.slice(start, text.codePointAt(index - 1) > 0xffff ? index - 1 : index);
+    let part = slice(end);
+    if (jsonBytes(part) > UNIT_TARGET) {
+      let low = start;
+      while (low < end) {
+        const mid = Math.ceil((low + end) / 2);
+        if (jsonBytes(slice(mid)) <= UNIT_TARGET) low = mid;
+        else end = mid - 1;
+      }
+      part = slice(low);
     }
-    bytes += size;
-    end += point.length;
+    yield part;
+    start += part.length;
   }
-  if (end > start) yield text.slice(start, end);
 }
 function* splitText(record, text, replace) {
   const parts = textParts(text),
@@ -764,7 +767,7 @@ function cleanLive(raw, selection, selected) {
   for (const index of [...indices].sort((a, b) => a - b)) {
     const block = cleanBlock(message.content[index]),
       type = block.type === 'toolCall' ? 'tool_call' : block.type;
-    result.items.push({ type, block });
+    result.items.push({ type, block: structuredClone(block) });
   }
   return smallLive(result, READ_PAGE_LIMIT);
 }
@@ -782,12 +785,7 @@ function smallLive(live, budget) {
       const text = item.block[key],
         make = (length) => {
           let start = text.length - length;
-          if (
-            start > 0 &&
-            /[\uDC00-\uDFFF]/.test(text[start]) &&
-            /[\uD800-\uDBFF]/.test(text[start - 1])
-          )
-            start++;
+          if (text.codePointAt(start - 1) > 0xffff) start++;
           return { ...item, truncated: true, block: { ...item.block, [key]: text.slice(start) } };
         };
       let low = 0,
@@ -844,8 +842,14 @@ export function renderPreparedContextRead(
       capacity: { remaining_units: units.length - offset, previous_units: start },
     },
   });
-  const fits = (value) => jsonBytes(value) <= max && fitsResult(value, resultBudget);
+  const maxBytes = Math.min(max, resultBudget?.maxBytes ?? max);
+  const maxWireBytes = resultBudget?.maxWireBytes ?? Infinity;
+  const size = (value) => resultSize(value, Boolean(resultBudget));
+  const fits = ({ bytes, wireBytes }) => bytes <= maxBytes && wireBytes <= maxWireBytes;
+  const emptyArray = size([]);
   const items = [];
+  let itemBytes = 0;
+  let itemWireBytes = 0;
   let offset = start;
   let part = firstPart;
   render: while (offset < units.length) {
@@ -860,37 +864,63 @@ export function renderPreparedContextRead(
       next = parts.next();
       const nextOffset = next.done ? atomOffset + 1 : atomOffset;
       const nextPart = next.done ? 0 : part + 1;
-      const withUnit = (candidate) => page([...items, candidate], nextOffset, nextPart);
-      if (!items.length && !fits(withUnit(unit))) {
+      let frame = size(page([], nextOffset, nextPart));
+      const comma = items.length ? 1 : 0;
+      // JSON array items add only their serialized bytes and a comma. The
+      // escaped text copy adds the same comma and the escaped item bytes.
+      const unitSize = (candidate) => {
+        const { bytes, wireBytes } = size([candidate]);
+        return {
+          bytes: bytes - emptyArray.bytes + comma,
+          wireBytes: wireBytes - emptyArray.wireBytes + comma * 2,
+        };
+      };
+      const pageWith = (cost) => ({
+        bytes: frame.bytes + itemBytes + cost.bytes,
+        wireBytes: frame.wireBytes + itemWireBytes + cost.wireBytes,
+      });
+      let cost = unitSize(unit);
+      if (!items.length && !fits(pageWith(cost))) {
         base.live = smallLive(base.live, 256);
         delete base.runtime_events;
-        if (!fits(withUnit(unit))) base.live = null;
+        frame = size(page([], nextOffset, nextPart));
+        if (!fits(pageWith(cost))) {
+          base.live = null;
+          frame = size(page([], nextOffset, nextPart));
+        }
       }
-      if (!items.length && !fits(withUnit(unit))) {
-        if (metadataUnit(unit)) unit = fitMetadata(unit, (value) => fits(withUnit(value)));
-        else if (rows) unit = fitNavigationRow(unit, (value) => fits(withUnit(value)));
+      if (!items.length && !fits(pageWith(cost))) {
+        const fitsUnit = (value) => fits(pageWith(unitSize(value)));
+        if (metadataUnit(unit)) unit = fitMetadata(unit, fitsUnit);
+        else if (rows) unit = fitNavigationRow(unit, fitsUnit);
+        cost = unitSize(unit);
       }
-      const maximum = { ...withUnit(unit), items: [unit], live: null };
-      delete maximum.runtime_events;
-      if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
-        if (items.length && metadataUnit(unit)) break render;
-        unit = omittedUnit(unit);
+      if (frame.bytes + cost.bytes > READ_PAGE_LIMIT) {
+        const maximum = { ...page([unit], nextOffset, nextPart), live: null };
+        delete maximum.runtime_events;
+        if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
+          if (items.length && metadataUnit(unit)) break render;
+          unit = omittedUnit(unit);
+          cost = unitSize(unit);
+        }
       }
-      if (!fits(withUnit(unit))) {
+      const measured = pageWith(cost);
+      if (!fits(measured)) {
         if (items.length) break render;
-        if (jsonBytes(withUnit(unit)) <= max && resultBudget)
-          throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
+        if (measured.bytes <= max && resultBudget) throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
         const error = new Error('READ_BUDGET_TOO_SMALL');
-        error.minimum_max_bytes = jsonBytes(withUnit(unit));
+        error.minimum_max_bytes = measured.bytes;
         throw error;
       }
       items.push(unit);
+      itemBytes += cost.bytes;
+      itemWireBytes += cost.wireBytes;
       part = nextPart;
     }
     offset = atomOffset + 1;
   }
   const result = page(items, offset, part);
-  if (!fits(result)) throw new Error('READ_BUDGET_TOO_SMALL');
+  if (!fits(size(result))) throw new Error('READ_BUDGET_TOO_SMALL');
   return structuredClone(result);
 }
 export function assertReadSnapshot(value, args) {

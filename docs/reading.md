@@ -77,12 +77,9 @@ Continue browse, search or expanded content by passing its `next_cursor` to
 Search accepts `session_id`, nonempty `query` up to 2048 UTF-16 units, and optional
 `view`, `content`, `leaf_id`, `max_bytes`. Runtime search rejects `leaf_id`.
 
-A continuation inherits its capture's source, leaf and content range. Repeated
-arguments must agree with that capture; changing them requires a fresh read.
-The simplest continuation is cursor-only. Each page and ref expansion takes a
-new [permission snapshot](configuration.md#request-permission-snapshots) and
-validates native identity. A cursor or reference does not grant access or cross
-Bridge instances.
+A continuation inherits its capture's source, leaf and content range. Any
+repeated selection arguments must agree with that capture. Use cursor-only or
+adjust `max_bytes`; a different selection requires a fresh read.
 
 `next_cursor:null` ends the selected result's page sequence. It does not mean
 all history was selected or every preview contains its full source; expand a
@@ -272,11 +269,8 @@ disabling it and restarting restores ordinary custom-message reading.
 
 ## Capacity and continuation
 
-Browse, search and reference pages advance in source order. A cursor resumes
-the same frozen capture, including its position within a long source item.
-Changing `max_bytes` changes how much fits on the next page. Long text splits
-during rendering at Unicode code-point boundaries. Each piece preserves its
-source and tool links.
+Pages advance in source order, including within long text. Rendering splits text
+at Unicode code-point boundaries and preserves source and tool links.
 
 `omissions.selection` counts content excluded by turn or kind selection.
 `omissions.capacity` reports source items remaining and the position reached
@@ -297,16 +291,17 @@ exceeding the shared budget returns an item budget error; read it separately.
 ## Frozen bounded snapshots
 
 The cache retains detached, sanitized documents, with at most 16 snapshots and
-about 32 MiB of accounted memory. Search applies its budget to matches and their
-related sources. If selected data exceeds the limit, Bridge returns
+about 32 MiB of accounted memory. Session and adapted search keep matches and
+related sources. Runtime search budgets the entire provider-request capture.
+If selected data exceeds the limit, Bridge returns
 `READ_SNAPSHOT_TOO_LARGE`. Batch pins snapshots through assembly and reports
 `READ_CACHE_BUSY` when the remaining cache cannot fit another capture.
 
-There is no inactivity expiry. LRU/capacity eviction or Bridge restart produces
-`STALE_CURSOR` or `STALE_READ_REFERENCE`; start a fresh read/search. References
-are bounded capture handles, not permanent session URLs. Appends, owner exit, release and replacement
-otherwise leave the frozen capture intact. Every continuation and expansion rechecks permission and native identity,
-including header cwd; identity changes invalidate access to the capture.
+Appends and owner changes leave a capture intact. Every page and expansion takes
+a new [permission snapshot](configuration.md#request-permission-snapshots) and
+checks canonical file, native ID and recorded cwd. Capacity eviction or a Bridge
+restart produces `STALE_CURSOR` or `STALE_READ_REFERENCE`; start a fresh read or
+search. Captures have no inactivity timeout.
 
 ## Live output and runtime extension events
 
@@ -336,9 +331,7 @@ sanitize before transfer, so read IPC limits apply to cleaned snapshots rather
 than unselected history. Continuations use only the cache, without fetching
 entries or computing history fingerprints.
 
-Fork uses a separate [raw snapshot contract](runtime.md#read-and-fork-boundaries).
-Read never falls back to it. Live owners use their bound native projection,
-including historical leaves; changing PATH or a launch configuration does not
-change an already-running reader. See [component versions](architecture.md#component-versions)
-for read-contract checks and [owner reload](runtime.md#remote-reload) for refresh
-support and lifecycle.
+Live owners project current and historical leaves with their loaded Pi SDK.
+See [component versions](architecture.md#component-versions) and
+[owner reload](runtime.md#remote-reload). Fork uses a separate
+[raw snapshot](runtime.md#read-and-fork-boundaries).

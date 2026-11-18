@@ -50,15 +50,14 @@ export function resolvePermission(config, action, target = {}) {
 }
 
 export function permitted(config, action, session) {
-  // Native identities retain projectCwd; project-only targets supply cwd.
   return resolvePermission(config, action, {
     session_id: session.id,
-    cwd: session.projectCwd ?? session.cwd,
+    cwd: session.cwd,
   }).allowed;
 }
 
 // Diagnostics do not add dependencies between permissions or change admission.
-export function permissionWarnings(config, target = {}) {
+function permissionWarnings(config, target = {}) {
   const effective = Object.fromEntries(
     ACTIONS.map((action) => [action, resolvePermission(config, action, target)]),
   );

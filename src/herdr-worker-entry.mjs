@@ -18,10 +18,16 @@ async function run() {
     launch,
     stopping = false;
   const stop = () => {
+    if (stopping) return;
     stopping = true;
     if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
   };
-  for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, stop);
+  process.on('SIGTERM', () => {
+    // Bridge sends SIGTERM to the entire scope. Pi receives it directly;
+    // forwarding it would make Pi exit before its shutdown hooks finish.
+    stopping = true;
+  });
+  for (const signal of ['SIGINT', 'SIGHUP']) process.on(signal, stop);
   try {
     for (const channel of ['control', 'rpc', 'stderr']) {
       const socket = connect({ path: ticket.address, allowHalfOpen: true });

@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { ALL_CONTENT, DEFAULT_READ_BYTES } from './read-schema.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
-import { sessionMetadata, runtimeMetadata } from './session-metadata.mjs';
+import { savedSessionName, runtimeMetadata } from './session-metadata.mjs';
 import { prepareSession, persistSession } from './create-session.mjs';
 import { promptInput, promptResult } from './prompt-input.mjs';
 import { ContextReadCache } from './read-cache.mjs';
@@ -274,18 +274,12 @@ export class Bridge {
     requestContext = await (requestContext ?? this.captureRequestContext());
     this.assertOpen();
     const session = await this.session(args.session_id, requestContext);
-    if (
-      !['read', 'send', 'create'].some((action) =>
-        permitted(requestContext.permissions, action, session),
-      )
-    )
+    const policy = requestContext.permissions;
+    const canInspect = permitted(policy, 'read', session) || permitted(policy, 'send', session);
+    if (!canInspect && !permitted(policy, 'create', session))
       throw new Error('NOT_FOUND_OR_DENIED');
     const record = this.submissions.get(session.id, args.submission_id);
-    if (
-      !['read', 'send'].some((action) => permitted(requestContext.permissions, action, session)) &&
-      !(record.operation === 'create' && permitted(requestContext.permissions, 'create', session))
-    )
-      throw new Error('NOT_FOUND_OR_DENIED');
+    if (!canInspect && record.operation !== 'create') throw new Error('NOT_FOUND_OR_DENIED');
     return record;
   }
   create(args, options) {
@@ -432,85 +426,66 @@ export class Bridge {
           },
         )
       : await this.sessions(requestContext);
-    if (args.session_id && sessions[0]?.header.parentSession) {
-      const parentId = [...this.sessionFiles].find(
-        ([, file]) => file === sessions[0].header.parentSession,
-      )?.[0];
-      const parent = parentId && (await this.session(parentId, requestContext).catch(() => null));
-      if (parent) sessions.push(parent);
-    }
-    const matches = (value, query) =>
-      !query || (value ?? '').toLocaleLowerCase().includes(query.toLocaleLowerCase());
-    const candidates = [];
-    for (const session of sessions) {
-      if (!permitted(requestContext.permissions, 'list', session)) continue;
-      if (args.session_id && session.id !== args.session_id) continue;
-      if (!matches(session.header.cwd, args.project)) continue;
-      let stat;
-      try {
-        stat = await fs.stat(session.file);
-      } catch {
-        continue;
-      }
-      const activity = new Date(stat.mtimeMs).toISOString();
-      if (args.active_after && activity < new Date(args.active_after).toISOString()) continue;
-      if (args.active_before && activity > new Date(args.active_before).toISOString()) continue;
-      candidates.push({ session, last_activity: activity });
-    }
-    candidates.sort(
-      (a, b) =>
-        b.last_activity.localeCompare(a.last_activity) || a.session.id.localeCompare(b.session.id),
-    );
+    const matches = (value, query) => !query || (value ?? '').toLocaleLowerCase().includes(query);
+    const project = args.project?.toLocaleLowerCase(),
+      title = args.name?.toLocaleLowerCase(),
+      after = args.active_after ? Date.parse(args.active_after) : -Infinity,
+      before = args.active_before ? Date.parse(args.active_before) : Infinity;
+    const candidates = sessions
+      .filter(
+        (session) =>
+          session.mtimeMs >= after &&
+          session.mtimeMs <= before &&
+          matches(session.header.cwd, project) &&
+          permitted(requestContext.permissions, 'list', session),
+      )
+      .sort((a, b) => b.mtimeMs - a.mtimeMs || a.id.localeCompare(b.id));
     const offset = args.offset ?? 0,
       limit = args.limit ?? 30,
       selected = [];
-    let matching = 0,
+    let matching = title ? 0 : offset,
       hasMore = false;
-    // Keep status polling concurrent across the ordinary page, as before name
-    // and status began sharing the same native observation.
     const observations = new Map();
-    if (!args.name)
-      for (const { session } of candidates.slice(offset, offset + limit))
-        observations.set(session.id, runtimeMetadata(this.pool, session));
-    for (const [index, candidate] of candidates.entries()) {
-      // Only native state is prefetched. Saved metadata is read in result order,
-      // and scanning stops after the page plus one additional matching row.
-      if (args.name)
-        for (const next of candidates.slice(index, index + 4))
-          if (!observations.has(next.session.id))
-            observations.set(next.session.id, runtimeMetadata(this.pool, next.session));
-      // With no title filter, earlier pages need no transcript scan at all.
-      if (!args.name && matching++ < offset) continue;
-      if (!args.name && selected.length === limit) {
+    const byFile = new Map(sessions.map((session) => [session.file, session]));
+    // Poll just the requested page, or use a small lookahead when filtering by title.
+    const observe = (start, count) => {
+      for (const session of candidates.slice(start, start + count))
+        if (!observations.has(session.id))
+          observations.set(session.id, runtimeMetadata(this.pool, session));
+    };
+    if (!title) observe(offset, limit);
+    for (let index = matching; index < candidates.length; index++) {
+      if (!title && selected.length === limit) {
         hasMore = true;
         break;
       }
-      const session = candidate.session;
-      let metadata;
-      const observed = await (observations.get(session.id) ?? runtimeMetadata(this.pool, session));
+      if (title) observe(index, 4);
+      const session = candidates[index];
+      const observed = await observations.get(session.id);
       observations.delete(session.id);
-      try {
-        metadata =
-          observed.name !== undefined
-            ? { name: observed.name }
-            : await sessionMetadata(session, this.titleCache);
-      } catch {
-        continue;
-      }
-      if (!matches(metadata.name, args.name)) continue;
-      if (args.name && matching++ < offset) continue;
+      const name = Object.hasOwn(observed, 'name')
+        ? observed.name
+        : await savedSessionName(session, this.titleCache).catch(() => null);
+      if (!matches(name, title) || matching++ < offset) continue;
       if (selected.length === limit) {
         hasMore = true;
         break;
       }
-      const parent = sessions.find((other) => other.file === session.header.parentSession);
+      const parentFile = session.header.parentSession;
+      let parent = byFile.get(parentFile);
+      if (
+        args.session_id &&
+        typeof parentFile === 'string' &&
+        requestContext.scope.sessionRoots.some((root) => inside(parentFile, root))
+      )
+        parent = await readSessionIdentity(parentFile).catch(() => null);
       selected.push({
         session_id: session.id,
         project: session.header.cwd || null,
-        name: metadata.name,
+        name,
         parent_session_id:
           parent && permitted(requestContext.permissions, 'list', parent) ? parent.id : null,
-        last_activity: candidate.last_activity,
+        last_activity: new Date(session.mtimeMs).toISOString(),
         status: observed.status,
       });
     }
@@ -539,7 +514,7 @@ export class Bridge {
       }));
       return permissionsHealth(
         { ...requestContext.permissions, folders: requestContext.scope.folders },
-        { session_id, cwd: target.projectCwd ?? target.cwd },
+        { session_id, cwd: target.cwd },
       );
     }
     return {
@@ -1092,7 +1067,7 @@ export class Bridge {
           ...(failure ? { reason: safeReason(failure) } : {}),
           ...(trash?.moved ? { recoverable: true, restore_token: trash.token } : {}),
         },
-        { project: target?.projectCwd ?? target?.cwd ?? null },
+        { project: target?.cwd ?? null },
         resultBudget,
       );
     });

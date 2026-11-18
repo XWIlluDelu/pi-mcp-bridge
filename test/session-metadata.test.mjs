@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { sessionMetadata, runtimeMetadata } from '../src/session-metadata.mjs';
+import { savedSessionName, runtimeMetadata } from '../src/session-metadata.mjs';
 import { AttachedRuntime } from '../src/attachments.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
@@ -13,22 +13,21 @@ test('title cache reuses only unchanged files; append, incomplete record, trunca
     cache = new Map();
   const title = (name) => JSON.stringify({ type: 'session_info', name }) + '\n';
   await fs.writeFile(session.file, title('first'));
-  const first = await sessionMetadata(session, cache);
-  assert.strictEqual(await sessionMetadata(session, cache), first);
+  assert.equal(await savedSessionName(session, cache), 'first');
   await fs.appendFile(session.file, '{"type":"session_info","name":"se');
-  assert.equal((await sessionMetadata(session, cache)).name, 'first');
+  assert.equal(await savedSessionName(session, cache), 'first');
   await fs.appendFile(session.file, 'cond"}\n');
-  assert.equal((await sessionMetadata(session, cache)).name, 'second');
+  assert.equal(await savedSessionName(session, cache), 'second');
   await fs.writeFile(session.file, title('tiny'));
-  assert.equal((await sessionMetadata(session, cache)).name, 'tiny');
+  assert.equal(await savedSessionName(session, cache), 'tiny');
   const before = await fs.stat(session.file),
     temp = session.file + '.new';
   await fs.writeFile(temp, title('swap'));
   await fs.utimes(temp, before.atime, before.mtime);
   await fs.rename(temp, session.file);
-  assert.equal((await sessionMetadata(session, cache)).name, 'swap');
+  assert.equal(await savedSessionName(session, cache), 'swap');
   await fs.unlink(session.file);
-  await assert.rejects(sessionMetadata(session, cache), { code: 'ENOENT' });
+  await assert.rejects(savedSessionName(session, cache), { code: 'ENOENT' });
 });
 
 test('title cache has a fixed retention bound and never retains history', async (t) => {
@@ -44,7 +43,7 @@ test('title cache has a fixed retention bound and never retains history', async 
         JSON.stringify({ type: 'session_info', name: String(i) }) +
         '\n',
     );
-    await sessionMetadata({ file }, cache);
+    await savedSessionName({ file }, cache);
   }
   assert.equal(cache.size, 256);
   assert.equal(cache.has(path.join(dir, '0.jsonl')), false);

@@ -41,8 +41,7 @@ test('warm known-ID lookup and listing avoid discovery but revalidate identity a
   const header = { ...f.session.header, cwd: '/unavailable' };
   await fs.writeFile(f.session.file, JSON.stringify(header) + '\n');
   const moved = await f.bridge.session(f.session.id);
-  assert.equal(moved.cwd, null);
-  assert.equal(moved.projectCwd, '/unavailable');
+  assert.equal(moved.cwd, '/unavailable');
   assert.deepEqual((await f.bridge.list({ session_id: f.session.id })).sessions, []);
   assert.equal(scans, 0);
   await fs.writeFile(f.session.file, JSON.stringify({ ...header, id: 'replacement' }) + '\n');
@@ -93,8 +92,7 @@ test('missing cwd retains project history and deletion rights without permitting
   assert.match(JSON.stringify(previous.items), /preserved workspace history/);
   await fs.rename(f.cwd, f.cwd + '-moved');
   const identity = await readSessionIdentity(f.session.file);
-  assert.equal(identity.cwd, null);
-  assert.equal(identity.projectCwd, f.cwd);
+  assert.equal(identity.cwd, f.cwd);
   assert.equal(identity.header.cwd, f.cwd);
   assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
   assert.deepEqual(

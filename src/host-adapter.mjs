@@ -2,7 +2,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import { publicError } from './errors.mjs';
-import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
+import { readSessionIdentity } from './data.mjs';
 
 import { parseCompactInput, compactMetadata } from './compact.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
@@ -86,12 +86,11 @@ export async function reserveHostSession({
     closePromise;
   const sockets = new Set(),
     operations = new Set();
-  async function assertIdentity(value) {
-    if (
-      value !== undefined &&
-      (value.sessionFile !== target.file || value.sessionId !== target.header.id)
-    )
+  function assertNativeIdentity(value) {
+    if (value?.sessionFile !== target.file || value.sessionId !== target.header.id)
       fail('RUNTIME_SESSION_CHANGED');
+  }
+  async function assertIdentity() {
     const current = await readClaim(attachmentDir, target);
     if (
       current?.generation !== record.generation ||
@@ -99,14 +98,13 @@ export async function reserveHostSession({
       !(await ownerAlive(record.owner))
     )
       fail('RUNTIME_SESSION_CHANGED');
-    await assertSingleSessionFile(target.file);
     if ((await readSessionIdentity(target.file)).header.id !== target.header.id)
       fail('RUNTIME_SESSION_CHANGED');
   }
   async function state() {
     const value = await callbacks.state();
-    if (!value || typeof value !== 'object') fail('RUNTIME_SESSION_CHANGED');
-    await assertIdentity(value);
+    assertNativeIdentity(value);
+    await assertIdentity();
     return value;
   }
   async function retire() {
@@ -191,7 +189,7 @@ export async function reserveHostSession({
       if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
     };
     if (request.op === 'state')
-      data = {
+      return {
         sessionFile: target.file,
         sessionId: target.header.id,
         generation: record.generation,
@@ -215,11 +213,10 @@ export async function reserveHostSession({
           stop: typeof callbacks.stop === 'function',
         },
       };
-    else if (request.op === 'read_features') {
+    if (request.op === 'read_features') {
       const features = callbacks.readFeatures
         ? assertReadFeatures(await callbacks.readFeatures())
         : { available: false, tools: [], commands: [], leaf_id: null };
-      await assertIdentity();
       data = ownerReadFeatures(record, features);
     } else if (request.op === 'read' && args.view === 'runtime')
       data = {
@@ -229,7 +226,7 @@ export async function reserveHostSession({
     else if (['read', 'snapshot'].includes(request.op)) {
       const observed = await callbacks.snapshot();
       const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
-      await assertIdentity(snapshot);
+      assertNativeIdentity(snapshot);
       if (!validNativeSnapshot(snapshot)) fail('INVALID_HOST_SNAPSHOT');
       data =
         request.op === 'snapshot'

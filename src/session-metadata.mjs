@@ -2,16 +2,16 @@ import fs from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { uiSnapshot } from './rpc-ui.mjs';
 import { modelState } from './models.mjs';
+import { scanSavedLines } from './lf-lines.mjs';
 
 // Metadata scanning retains at most one JSONL record, never a second full history.
-export async function sessionMetadata(session, cache) {
+export async function savedSessionName(session, cache) {
   const stat = await fs.stat(session.file);
   const signature = [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
   const previous = cache?.get(session.file);
-  if (previous?.signature === signature) return previous.metadata;
-  let name = null,
-    fragments = [];
-  const consume = (line) => {
+  if (previous?.signature === signature) return previous.name;
+  let name = null;
+  await scanSavedLines(createReadStream(session.file, { encoding: 'utf8' }), (line) => {
     // Metadata is authorized by list, not read. Ignore incomplete/corrupt body
     // records here; content reads validate identity and the selected branch.
     if (!line.includes('"session_info"')) return;
@@ -22,28 +22,15 @@ export async function sessionMetadata(session, cache) {
     } catch {
       /* A live writer may still be finishing the final record. */
     }
-  };
-  for await (const chunk of createReadStream(session.file, { encoding: 'utf8' })) {
-    let start = 0,
-      end;
-    while ((end = chunk.indexOf('\n', start)) !== -1) {
-      fragments.push(chunk.slice(start, end));
-      consume(fragments.join(''));
-      fragments = [];
-      start = end + 1;
-    }
-    if (start < chunk.length) fragments.push(chunk.slice(start));
-  }
-  if (fragments.length) consume(fragments.join(''));
-  const metadata = { name, last_activity: new Date(stat.mtimeMs).toISOString() };
+  });
   // Bound retained names, not the accepted name or history size. No transcript
   // bytes enter this cache; append, replacement and truncation invalidate it.
   if (cache && (name?.length ?? 0) <= 4096) {
     cache.delete(session.file);
-    cache.set(session.file, { signature, metadata });
+    cache.set(session.file, { signature, name });
     if (cache.size > 256) cache.delete(cache.keys().next().value);
   }
-  return metadata;
+  return name;
 }
 
 function runtimeCapabilities(runtime, state) {

@@ -163,10 +163,10 @@ export class HerdrRpcTransport extends EventEmitter {
         await drained;
       } catch (error) {
         this.emit('error', error);
-        await this.terminateScope();
         result = { code: null, signal: 'SIGTERM' };
       }
-      // Pi is gone; reap any native tool descendants before releasing authority.
+      // After reply, reap native tool descendants. With a lost reply, terminate
+      // and confirm the whole scope before treating the writer as gone.
       await this.terminateScope();
       this.emit('exit', result.code, result.signal);
       await this.cleanup();

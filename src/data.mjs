@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { nativeSdk } from './pi-installation.mjs';
 import path from 'node:path';
 import { opaqueId, assertNativeDirectory } from './storage.mjs';
+import { scanSavedLines } from './lf-lines.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
 export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
@@ -55,7 +56,7 @@ export function sameSessionIdentity(a, b) {
 export async function readSessionIdentity(file) {
   const expected = await assertSingleSessionFile(file);
   const fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  let header;
+  let header, mtimeMs;
   try {
     const opened = await fd.stat();
     if (
@@ -65,7 +66,8 @@ export async function readSessionIdentity(file) {
       opened.dev !== expected.dev
     )
       throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
-    const bytes = Buffer.alloc(65537);
+    mtimeMs = opened.mtime.getTime();
+    const bytes = Buffer.allocUnsafe(65537);
     let length = 0;
     while (length < bytes.length) {
       // Most headers fit in one small read; extend only while looking for LF.
@@ -76,33 +78,22 @@ export async function readSessionIdentity(file) {
         null,
       );
       if (!bytesRead) break;
-      length += bytesRead;
-      if (bytes.subarray(0, length).includes(10)) break;
+      const newline = bytes.subarray(length, length + bytesRead).indexOf(10);
+      length += newline < 0 ? bytesRead : newline;
+      if (newline >= 0) break;
     }
-    const text = bytes.subarray(0, length).toString('utf8');
-    const end = text.indexOf('\n');
-    if (end < 0 && length === bytes.length) throw new Error('INVALID_SESSION_HEADER');
+    if (length === bytes.length) throw new Error('INVALID_SESSION_HEADER');
     try {
-      header = validateHeader(JSON.parse(end < 0 ? text : text.slice(0, end)));
+      header = validateHeader(JSON.parse(bytes.toString('utf8', 0, length)));
     } catch {
       throw new Error('INVALID_SESSION_HEADER');
     }
   } finally {
     await fd.close();
   }
-  // A saved session belongs to its recorded project even after workspace
-  // cleanup. Current symlinks cannot retarget that authorization identity.
-  const projectCwd = header.cwd ? path.resolve(header.cwd) : null;
-  let cwd = null;
-  if (projectCwd) {
-    try {
-      const resolved = await fs.realpath(projectCwd);
-      if (resolved === projectCwd && (await fs.stat(resolved)).isDirectory()) cwd = resolved;
-    } catch {
-      /* Only a new writer requires a currently usable canonical directory. */
-    }
-  }
-  return { header, file, id: opaqueId(`${file}\0${header.id}`), projectCwd, cwd };
+  // Authorize against the recorded project, even after it goes offline.
+  const cwd = header.cwd ? path.resolve(header.cwd) : null;
+  return { header, file, id: opaqueId(`${file}\0${header.id}`), cwd, mtimeMs };
 }
 export async function validateExecutionCwd(cwd) {
   try {
@@ -124,8 +115,7 @@ export async function loadSession(file, { omitImageData = false, config } = {}) 
   const expected = await assertSingleSessionFile(file),
     fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK),
     records = [];
-  let fragments = [],
-    skipped = 0,
+  let skipped = 0,
     unterminated = false;
   const parse = (line) => {
     if (!line.trim()) return;
@@ -159,20 +149,10 @@ export async function loadSession(file, { omitImageData = false, config } = {}) 
       throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
     // Native pure parsing skips malformed records; never call a loader which
     // repairs a missing LF or opens/migrates the user's file for writing.
-    for await (const chunk of fd.createReadStream({ encoding: 'utf8', autoClose: false })) {
-      let start = 0,
-        end;
-      while ((end = chunk.indexOf('\n', start)) !== -1) {
-        fragments.push(chunk.slice(start, end));
-        parse(fragments.join(''));
-        fragments = [];
-        start = end + 1;
-      }
-      if (start < chunk.length) fragments.push(chunk.slice(start));
-    }
-    const tail = fragments.join('');
-    unterminated = Boolean(tail);
-    parse(tail);
+    unterminated = await scanSavedLines(
+      fd.createReadStream({ encoding: 'utf8', autoClose: false }),
+      parse,
+    );
     const current = await assertSingleSessionFile(file);
     if (current.ino !== opened.ino || current.dev !== opened.dev)
       throw new Error('RUNTIME_SESSION_CHANGED');

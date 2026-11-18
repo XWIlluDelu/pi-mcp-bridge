@@ -32,17 +32,20 @@ export function excerpt(value, limit = 640, query = '') {
 // A brief row is a disposable preview; its reference retains the captured source.
 export function fitNavigationRow(row, fits) {
   const base = { ...row };
-  if (!fits({ ...base, text: '' })) delete base.source;
-  if (!fits({ ...base, text: '' })) delete base.related;
+  const shorten = (limit) => {
+    const text = excerpt(row.text, limit);
+    return { ...base, text, ...(text !== row.text ? { truncated: true } : {}) };
+  };
+  if (!fits(shorten(0))) delete base.source;
+  if (!fits(shorten(0))) delete base.related;
   let low = 0,
     high = row.text.length;
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
-    if (fits({ ...base, text: excerpt(row.text, mid) })) low = mid;
+    if (fits(shorten(mid))) low = mid;
     else high = mid - 1;
   }
-  const text = excerpt(row.text, low);
-  return { ...base, text, ...(text !== row.text ? { truncated: true } : {}) };
+  return shorten(low);
 }
 
 function messageText(message, { metadata = false } = {}) {
@@ -94,11 +97,7 @@ function assistantFailure(units) {
       unit.message,
       ...(unit.parts ?? []).map((part) => part.message),
     ])
-    .filter(
-      (message) =>
-        message?.role === 'assistant' &&
-        (['error', 'aborted'].includes(message.stopReason) || message.errorMessage),
-    );
+    .filter((message) => message?.role === 'assistant' && assistantFailed(message));
   const message = messages.find((value) => value.errorMessage) ?? messages[0];
   return message
     ? `assistant ${message.stopReason ?? 'error'}${message.errorMessage ? ': ' + message.errorMessage : ''}`
@@ -134,9 +133,6 @@ const messageKey = (source = {}) =>
   source.observation_index !== undefined
     ? `runtime:${source.observation_index}`
     : `session:${source.entry_id}:${source.message_index ?? ''}`;
-const blockKey = (source = {}) =>
-  `${messageKey(source)}:${source.block_index ?? source.content_index ?? ''}`;
-
 export const assistantBlockType = (block) =>
   ({ text: 'text', thinking: 'thinking', toolCall: 'tool_call' })[block.type] ?? 'native';
 export const assistantFailed = (message) =>
@@ -175,7 +171,7 @@ export function runtimeUnits(atoms) {
   const open = new Map();
   for (const unit of units) {
     if (unit.block?.type === 'toolCall') {
-      const id = `runtime:${blockKey(unit.source)}`;
+      const id = `runtime:${messageKey(unit.source)}:${unit.source.block_index}`;
       unit.tool_id = id;
       const stack = open.get(unit.block.id) ?? [];
       stack.push(unit);
@@ -239,36 +235,30 @@ function toolPreview(documents, doc) {
 // Acquisition and navigation share message/kind runs and logical tool pairs.
 // Keep one position per atom so a pair can straddle a steering input.
 export function navigationGroups(units, content) {
-  const enabled = (kind) =>
-    !content || Array.isArray(content)
-      ? !content?.length || content.includes(kind)
-      : content[kind] !== false && content[kind] !== 0;
-  const grouped = new Map(),
-    runs = new Map(),
-    keys = new Map();
+  const grouped = new Map();
+  let run;
   for (const [i, unit] of units.entries()) {
     const source = unit.source ?? {};
     const toolId = unit.tool_id;
     let kind = toolId ? 'tool' : contentKind(unit.kind ?? unit.type);
     if (unit.message?.role === 'assistant' && kind === 'native') kind = 'assistant';
     const message = messageKey(source);
-    let id;
-    if (toolId) {
-      id = `tool:${toolId}`;
-      runs.set(message, { kind: 'tool', index: (runs.get(message)?.index ?? 0) + 1 });
-    } else if (source.reader_item !== undefined) id = `item:${source.reader_item}`;
+    let id = `unit:${i}`;
+    if (toolId) id = `tool:${toolId}`;
+    else if (source.reader_item !== undefined) id = `item:${source.reader_item}`;
     else if (source.entry_id !== undefined || source.observation_index !== undefined) {
-      const block = blockKey(source);
-      id = keys.get(block);
-      if (!id) {
-        const previous = runs.get(message);
-        const run = previous?.kind === kind ? previous.index : (previous?.index ?? 0) + 1;
-        runs.set(message, { kind, index: run });
-        id = `${message}:${kind}:${run}`;
-        keys.set(block, id);
-      }
-    } else id = `unit:${i}`;
-    if (!enabled(contentKind(kind))) continue;
+      const block = source.block_index ?? source.content_index;
+      // An owner may have pruned nonmatching blocks before transfer. Use the
+      // original positions so this does not join formerly disjoint runs.
+      if (
+        run?.message === message &&
+        run.kind === kind &&
+        (block === undefined || block === run.block || block === run.block + 1)
+      )
+        id = run.id;
+      run = { message, kind, block, id };
+    }
+    if (content?.[kind] === false || content?.[kind] === 0) continue;
     if (!grouped.has(id))
       grouped.set(id, {
         id,

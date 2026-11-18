@@ -2,6 +2,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import net from 'node:net';
 import fs from 'node:fs/promises';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
+import { readLfLines } from './lf-lines.mjs';
 
 // Includes JSON escaping and envelope fields, not just prompt characters.
 export const MAX_ATTACHMENT_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -72,23 +73,26 @@ export function attachmentServer(connections, onRequest) {
       return;
     }
     connections.add(socket);
-    socket.setEncoding('utf8');
     socket.setTimeout(5000, () => socket.destroy());
     socket.on('error', () => {});
-    socket.on('close', () => connections.delete(socket));
-    let buffer = '';
-    const read = (chunk) => {
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > MAX_ATTACHMENT_REQUEST_BYTES) {
+    let bytes = 0;
+    const bound = (chunk) => {
+      bytes += chunk.length;
+      if (bytes > MAX_ATTACHMENT_REQUEST_BYTES) {
+        lines.close();
         socket.destroy();
-        return;
       }
-      const end = buffer.indexOf('\n');
-      if (end < 0) return;
-      socket.off('data', read);
-      Promise.resolve(onRequest(buffer.slice(0, end), socket)).catch(() => socket.destroy());
     };
-    socket.on('data', read);
+    socket.on('data', bound);
+    const lines = readLfLines(socket, (line) => {
+      socket.off('data', bound);
+      lines.close();
+      Promise.resolve(onRequest(line, socket)).catch(() => socket.destroy());
+    });
+    socket.on('close', () => {
+      lines.close();
+      connections.delete(socket);
+    });
   });
 }
 export async function listenPrivate(server, socketPath) {

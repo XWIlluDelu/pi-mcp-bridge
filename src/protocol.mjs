@@ -260,16 +260,19 @@ export async function dispatchModern(bridge, body, options = {}) {
   return { status: 200, message: boundedResult(id, result) };
 }
 
-// Modern HTTP bindings require mirrored fields; reject duplicate headers too.
-// No x-mcp-header tool parameters are advertised.
-export function validateModernHeaders(body, getHeaders) {
+export function modernHeaderFields(body) {
   const expected = {
     'mcp-protocol-version': body?.params?._meta?.[META + 'protocolVersion'],
     'mcp-method': body?.method,
   };
   if (['tools/call', 'prompts/get', 'resources/read'].includes(body?.method))
     expected['mcp-name'] = body?.params?.[body.method === 'resources/read' ? 'uri' : 'name'];
-  for (const [name, value] of Object.entries(expected)) {
+  return expected;
+}
+
+// Modern HTTP bindings require mirrored fields and reject duplicate headers.
+export function validateModernHeaders(body, getHeaders) {
+  for (const [name, value] of Object.entries(modernHeaderFields(body))) {
     const values = getHeaders(name);
     if (values.length !== 1 || typeof value !== 'string')
       return rpcError(body?.id, -32020, 'Header mismatch');

@@ -93,16 +93,13 @@ export function stopReceipt(value) {
 export async function requestStop(client, onWithdraw) {
   if (!['clearQueue', 'abort', 'abortBash'].every((name) => typeof client[name] === 'function'))
     throw new Error('STOP_UNSUPPORTED');
-  const cleared = client.clearQueue();
-  const cancellation = Promise.allSettled([client.abort(), client.abortBash()]);
-  try {
-    await onWithdraw(await cleared);
-  } finally {
-    // Capture failure cannot settle Stop while its dispatched aborts still run.
-    await cancellation;
-  }
-  const results = await cancellation,
-    failed = results.find((result) => result.status === 'rejected');
+  // Capture failure cannot settle Stop while its dispatched aborts still run.
+  const results = await Promise.allSettled([
+    Promise.resolve(client.clearQueue()).then(onWithdraw),
+    client.abort(),
+    client.abortBash(),
+  ]);
+  const failed = results.find((result) => result.status === 'rejected');
   if (failed) throw failed.reason;
   await onWithdraw(await client.clearQueue());
   return stopReceipt({

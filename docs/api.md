@@ -139,22 +139,16 @@ component loading lifecycle. See [reload integration](runtime.md#remote-reload).
 Requires `send` and text or images. Text is 1–100000 UTF-16 code units. Modes:
 
 - `steer` (default): start input when idle; use the native steering queue while busy.
-- `idle_only`: skip if busy/pending; a saved session may first cold-start.
+- `idle_only`: submit through an idle admission check. A saved session may
+  cold-start. The supplied RPC host binding returns `HOST_ADMISSION_UNSUPPORTED`.
 - `follow_up`: use the native follow-up queue while busy.
 
-Bridge waits for native input admission where observable, not model completion.
-A tracked submission returns `submission_id` and `status`. Native ACKs establish
-`started`, `queued` or `handled`; `skipped` and `rejected` mean input was not
-submitted.
-
-An external companion/SDK owner that successfully invokes Pi returns
-`dispatched, admission:"unobservable"`: delivery to the Pi API is confirmed, but
-input hooks may still transform, handle or reject it. It is unnecessary to read
-history merely to confirm that dispatch, and it is unsafe to resend it
-automatically. A synchronous exception or transport uncertainty remains `unknown`.
-A handled command can still have reported a native extension error. Read
-[runtime events](reading.md#live-output-and-runtime-extension-events) for owned
-RPC errors and notifications.
+A tracked submission returns `submission_id` and an admission status. Native ACKs
+establish `started`, `queued` or `handled`. Companion and SDK dispatch can return
+`dispatched, admission:"unobservable"`; native hooks may still transform, handle
+or reject input. On `unknown`, check the [receipt](#submission-receipt) for late
+evidence. A command handled by an extension may report an error in owned
+[runtime events](reading.md#live-output-and-runtime-extension-events).
 
 Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
 
@@ -201,12 +195,13 @@ Requires `command` permission. Pass the command without `!`; it uses Pi's native
 
 The result includes captured output, exit status, cancellation/truncation flags and generation. `status:"completed"` means the native command returned a result; inspect `exitCode` and `cancelled` to determine how it ended. If the internal acknowledgement wait expires, the outcome is `unknown`: the command can still complete and store its result in native history. A separate authorized stop can interrupt a long command.
 
-`max_chars` is 256–32768, default 12000, measured in UTF-16 units. Two independent flags describe output coverage:
+`max_chars` is 256–32768, default 12000. It budgets UTF-16 code units of
+`{"output":"…"}` after JSON encoding, including escapes. Two flags describe coverage:
 
 - `native_truncated`: Pi truncated the original shell output. Its native result may be a tail and may include `fullOutputPath` for the full output.
 - `response_complete`: Bridge returned all of that native result's output. False means `max_chars` or a batch response budget shortened its prefix. This is output coverage, not command completion or final acknowledgement.
 
-Thus native truncation can coexist with a complete response (`true`/`true`), and Bridge can shorten either intact or natively truncated output (`false`/`false` or `true`/`false`). There is no continuation. Use read with command selection for native history instead of rerunning a command to retrieve output.
+Use read with command selection to inspect native history. Inline output has no continuation.
 
 ### Stop
 
@@ -214,7 +209,7 @@ Thus native truncation can coexist with a complete response (`true`/`true`), and
 { "session_id": "ps_…", "max_chars": 12000 }
 ```
 
-Requires only `stop`. It cancels native agent/bash activity, withdraws queued input in native order and returns `withdrawn_text`, including whether the capture contained an editor draft. Captured text can accompany an uncertain final acknowledgement. `max_chars` uses command's bounds; `withdrawn_complete:false` marks an incomplete prefix. Withdrawn unsent text may not exist in history, and there is no result continuation.
+Requires only `stop`. It cancels native agent/bash activity, withdraws queued input in native order and returns `withdrawn_text`, including whether the capture contained an editor draft. Captured text can accompany an uncertain final acknowledgement. `max_chars` uses the command's bounds, applied to the JSON-encoded `withdrawn_text` field. `withdrawn_complete:false` marks an incomplete prefix. Unsent text may be absent from history, and the result has no continuation.
 
 `status:"accepted"` confirms the stop callback returned. `acknowledgement:"native_ack"` records a native acknowledgement; `"requested"` records a host's cancellation request.
 

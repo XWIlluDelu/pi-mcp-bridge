@@ -75,6 +75,13 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
       return result;
     },
   });
+  const idleOnly = await f.bridge.send({
+    session_id: saved.id,
+    text: 'MUST_NOT_SEND',
+    mode: 'idle_only',
+  });
+  assert.equal(idleOnly.status, 'rejected');
+  assert.equal(idleOnly.reason, 'HOST_ADMISSION_UNSUPPORTED');
   const first = await f.bridge.send({ session_id: saved.id, text: 'PUBLIC_RPC_INPUT' });
   assert.equal(first.status, 'started');
   await until(async () => !(await client.getState()).isStreaming);
@@ -86,10 +93,11 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
   };
   const delayed = await f.bridge.send(delayedArgs);
   assert.equal(delayed.status, 'unknown');
-  assert.equal(submissions, 2);
+  assert.equal(submissions, 3);
   gate.resolve();
   await until(async () => !(await client.getState()).isStreaming);
   const entries = await client.getEntries();
+  assert.ok(!JSON.stringify(entries).includes('MUST_NOT_SEND'));
   assert.equal(
     entries.entries.filter(
       (e) =>
@@ -98,7 +106,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     ).length,
     1,
   );
-  assert.equal(submissions, 2);
+  assert.equal(submissions, 3);
   assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, pid);
 });
 

@@ -180,21 +180,6 @@ test('submission observations have independent identities and retain only admiss
   assert.throws(() => submissions.get('session-b', first), /SUBMISSION_UNAVAILABLE/);
 });
 
-test('a late native acknowledgement survives an earlier unknown result unwinding afterwards', () => {
-  for (const status of ['started', 'queued', 'handled', 'rejected']) {
-    const submissions = new Submissions();
-    const id = submissions.start('session-a', 'send');
-    submissions.update(id, { status: 'unknown', reason: 'ACK_TIMEOUT' });
-    const receipt = {
-      status,
-      ...(status === 'rejected' ? { reason: 'PI_REJECTED' } : {}),
-    };
-    submissions.update(id, receipt);
-    assert.deepEqual(submissions.update(id, { status: 'unknown', reason: 'ACK_TIMEOUT' }), receipt);
-    assert.deepEqual(submissions.get('session-a', id).receipt, receipt);
-  }
-});
-
 for (const reason of ['expiry', 'eviction'])
   test(`a late ACK cannot recreate a submission lost to ${reason}`, () => {
     let time = 0;

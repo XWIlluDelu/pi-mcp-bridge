@@ -42,6 +42,7 @@ close before reopening. See [component versions](architecture.md#component-versi
 | Read context            | Session + runtime                    | Session + runtime                                     | Session projection; runtime unavailable |
 | Live text/thinking      | Cumulative extension events          | Cumulative extension events                           | When supplied by the host               |
 | Send text/images        | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
+| `idle_only` send        | Native admission check               | Native admission gate                                 | SDK gate; unsupported by RPC binding    |
 | Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
 | Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
 | Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
@@ -50,10 +51,12 @@ close before reopening. See [component versions](architecture.md#component-versi
 | TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 | Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
-The host column describes the supplied bindings; a custom host exposes only the
-callbacks it implements. In particular, an RPC host must provide its own reload
-callback. Use `list.status.capabilities` to inspect a connected owner's advertised
-send, command, stop and reload support.
+Custom hosts expose the callbacks they implement. An RPC host supplies its own
+reload callback. Its supplied binding rejects `idle_only` with
+`HOST_ADMISSION_UNSUPPORTED`. RPC state samples are advisory. A custom host
+can support this mode with a writer-local gate that observes asynchronous
+preparation and fences new input. Use `list.status.capabilities` to inspect send,
+command, stop and reload paths.
 
 For cold-start and dispatch outcomes, see the [tool API](api.md#sessions-and-mutations).
 
@@ -169,8 +172,9 @@ in-scope session, `saved` means Bridge found no cooperating live owner.
 2. Open the reserved session through the host's native API. Install
    `createSdkHostBinding(AgentSession)` before local input or use
    `createRpcHostBinding(RpcClient)` with the current native client.
-3. Publish via `controller.ready(binding)` when native state and snapshot both
-   identify the reserved session. A different session needs a fresh reservation.
+3. Publish via `controller.ready(binding)` after native state identifies the
+   reserved session. The controller verifies the snapshot on read and fork.
+   Reserve a different session before opening it.
 4. For remote release, provide the [session-local close contract](#explicit-deletion).
    `controller.close()` retires the endpoint while a live writer still holds its claim.
 
@@ -320,9 +324,3 @@ Fork leaves the writer in place. Bridge pairs the cooperating owner's raw
 `snapshot()` or the owned child's `get_entries` with the current native header.
 The copy retains native state and image bytes. Attached snapshots are bounded
 at 32 MiB. A live writer must supply its own snapshot.
-
-## Verification
-
-See [verification commands](architecture.md#verification). Runtime fixtures use
-isolated native environments and synthetic providers; the offline fixture
-extension is not a production dependency.

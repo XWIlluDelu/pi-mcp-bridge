@@ -1,6 +1,7 @@
 // Native extension events have no prompt correlation. Keep them outside history
 // and receipts, scoped to the RPC generation that actually emitted them.
-const bytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+import { jsonBytes } from './response-budget.mjs';
+
 const textFields = ['extension_path', 'event', 'error', 'message'];
 function clipped(event, limit) {
   const result = { ...event };
@@ -26,24 +27,24 @@ export function boundRuntimeEvents(snapshot, maxBytes) {
   const events = [];
   for (let i = snapshot.events.length - 1; i >= 0; i--) {
     const event = snapshot.events[i];
-    if (bytes(build([event, ...events])) <= maxBytes) events.unshift(event);
+    if (jsonBytes(build([event, ...events])) <= maxBytes) events.unshift(event);
     else {
       if (!events.length) {
         let low = 0,
           high = 2048;
         while (low < high) {
           const mid = Math.ceil((low + high) / 2);
-          if (bytes(build([clipped(event, mid)])) <= maxBytes) low = mid;
+          if (jsonBytes(build([clipped(event, mid)])) <= maxBytes) low = mid;
           else high = mid - 1;
         }
         const candidate = clipped(event, low);
-        if (bytes(build([candidate])) <= maxBytes) events.push(candidate);
+        if (jsonBytes(build([candidate])) <= maxBytes) events.push(candidate);
       }
       break;
     }
   }
   const result = build(events);
-  return bytes(result) <= maxBytes ? result : null;
+  return jsonBytes(result) <= maxBytes ? result : null;
 }
 
 export class RuntimeEvents {

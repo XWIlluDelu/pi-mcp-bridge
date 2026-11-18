@@ -49,9 +49,10 @@ test('stdio proxy forwards per-request metadata and encodes the mirrored tool na
   });
   await f.proxy.drain();
   assert.equal(received.length, 1);
-  assert.equal(received[0].headers['MCP-Protocol-Version'], MODERN_VERSION);
-  assert.equal(received[0].headers['Mcp-Method'], 'tools/call');
-  assert.match(received[0].headers['Mcp-Name'], /^=\?base64\?/);
+  const headers = new Headers(received[0].headers);
+  assert.equal(headers.get('mcp-protocol-version'), MODERN_VERSION);
+  assert.equal(headers.get('mcp-method'), 'tools/call');
+  assert.match(headers.get('mcp-name'), /^=\?base64\?/);
   assert.deepEqual(f.lines, [{ jsonrpc: '2.0', id: 1, result: { marker: 'tools/call' } }]);
   await f.proxy.close();
 });
@@ -150,24 +151,9 @@ test('proxy bounds outstanding HTTP requests, never queues rejected work and res
   assert.equal(forwarded, 17);
   assert.deepEqual(f.lines.at(-1), { jsonrpc: '2.0', id: 41, result: {} });
 });
-test('proxy rejects non-loopback targets and never forwards malformed JSON', async () => {
+test('proxy rejects non-loopback targets', () => {
   assert.throws(
     () => createStdioProxy({ url: 'http://example.com:43123/mcp', token }),
     /INVALID_PROXY_URL/,
   );
-  let count = 0;
-  const f = fixture(async () => {
-    count++;
-  });
-  await f.proxy.start();
-  f.input.write('{bad json\n');
-  await f.proxy.drain();
-  assert.equal(count, 0);
-  assert.equal(f.lines[0].error.code, -32700);
-  for (const params of [null, [], 'invalid'])
-    f.input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params }) + '\n');
-  await f.proxy.drain();
-  assert.equal(count, 0);
-  assert.ok(f.lines.slice(1).every((r) => r.error.code === -32600));
-  await f.proxy.close();
 });

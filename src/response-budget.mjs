@@ -4,11 +4,23 @@ export const MCP_RESPONSE_LIMIT = 256 * 1024;
 // metadata and framing overhead; never assume wire bytes equal string length.
 export const TOOL_RESULT_LIMIT = MCP_RESPONSE_LIMIT - 8192;
 export const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value), 'utf8');
+const toolResultFrameBytes =
+  jsonBytes({ content: [{ type: 'text', text: '' }], structuredContent: null }) - 4;
+
+export function resultSize(value, includeWire) {
+  const json = JSON.stringify(value);
+  const bytes = Buffer.byteLength(json, 'utf8');
+  return {
+    bytes,
+    wireBytes: includeWire
+      ? toolResultFrameBytes + bytes + Buffer.byteLength(JSON.stringify(json), 'utf8') - 2
+      : 0,
+  };
+}
 export function fitsResult(result, budget) {
-  return (
-    !budget ||
-    (jsonBytes(result) <= budget.maxBytes && toolResultBytes(result) <= budget.maxWireBytes)
-  );
+  if (!budget) return true;
+  const { bytes, wireBytes } = resultSize(result, true);
+  return bytes <= budget.maxBytes && wireBytes <= budget.maxWireBytes;
 }
 // Optional, repeatable metadata must not displace an operation's essential result.
 // Without a batch budget standalone renderers retain every existing field.
@@ -17,11 +29,5 @@ export function optionalResultFields(required, optional, budget) {
   return fitsResult(full, budget) ? full : required;
 }
 export function toolResultBytes(result) {
-  return Buffer.byteLength(
-    JSON.stringify({
-      content: [{ type: 'text', text: JSON.stringify(result) }],
-      structuredContent: result,
-    }),
-    'utf8',
-  );
+  return resultSize(result, true).wireBytes;
 }

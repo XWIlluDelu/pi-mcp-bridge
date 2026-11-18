@@ -1,5 +1,27 @@
 import { StringDecoder } from 'node:string_decoder';
 
+// Saved JSONL can have a valid final record without LF. Report that boundary
+// to the history reader while processing the last record in the usual way.
+export async function scanSavedLines(stream, consume) {
+  let fragments = [];
+  for await (const chunk of stream) {
+    let start = 0,
+      end;
+    while ((end = chunk.indexOf('\n', start)) !== -1) {
+      const part = chunk.slice(start, end);
+      if (fragments.length) {
+        fragments.push(part);
+        consume(fragments.join(''));
+        fragments = [];
+      } else consume(part);
+      start = end + 1;
+    }
+    if (start < chunk.length) fragments.push(chunk.slice(start));
+  }
+  if (fragments.length) consume(fragments.join(''));
+  return fragments.length > 0;
+}
+
 // Pi frames JSON with LF. Unicode line separators inside JSON strings are data.
 export function readLfLines(input, onLine) {
   const decoder = new StringDecoder('utf8');

@@ -11,9 +11,7 @@ subscribe and react in the subscribing chat through outbound signed HTTPS webhoo
 - Obtain the target's `session_id` and grant `read`. Sending work separately
   requires `send`; subscription does not grant execution access. For a new task,
   `create` without input gives you a saved ID to subscribe to before the first send.
-- Use a supported completion source as described below. An ordinary TUI/RPC
-  companion needs the [owner profile](runtime.md#daily-tui-and-ordinary-rpc-registration),
-  not only an IPC directory.
+- Connect a [supported owner](#scope-and-completion-meaning).
 - Allow outbound HTTPS from the Bridge host to the ChatGPT-provided callback.
   An authenticated incoming tunnel does not provide this outbound connection.
 
@@ -24,15 +22,10 @@ settlement excerpt is sufficient and when to read further.
 ## Scope and completion meaning
 
 The single event is `session.settled`, filtered by one known `session_id`.
-It observes Bridge-owned RPC execution, including Herdr, and ordinary TUI/RPC
-companions loaded with this Bridge's owner profile. The companion derives the
-local notification address from the existing owner configuration. No extra
-notification configuration is needed. Subscription never starts Pi.
-
-SDK host bindings and directory-only (`PI_MCP_ATTACH_DIR`) companions have no
-completion source and reject subscription with `Unsupported / externalOwner`.
-A subscription follows the saved session across supported owners, including a
-native reload or handoff; work under an unsupported owner is not observed.
+It follows a saved session across Bridge-owned RPCs and ordinary TUI/RPC
+companions loaded with this Bridge's [owner profile](runtime.md#daily-tui-and-ordinary-rpc-registration).
+SDK/RPC host bindings and directory-only companions reject subscription with
+`Unsupported / externalOwner`. Subscribing leaves Pi idle or running as it was.
 
 Pi's native `agent_settled` fires after automatic continuations finish, including
 aborted runs. Settlement describes the session run, not per-prompt success. A
@@ -128,14 +121,10 @@ Text preserves its formatting and written links, up to 2048 UTF-16 units and a
 `truncated:true`. No model generates a summary; no files are discovered, opened,
 uploaded or verified from paths in the text.
 
-When more detail is useful, pass `data.read` directly as the `read` tool arguments.
-Its explicit `view:"session"` reads the native boundary even when an enabled
-memory reader handles default reads. For example, the
-[Magic Context reader](../integrations/magic-context/README.md) exposes current
-stored content and does not reconstruct historical leaves.
-The leaf pins that round despite later work. A null leaf denotes an empty branch.
-Deletion or revoked read access can make deeper reading unavailable. The
-subscribing chat's user chooses the reaction; event payloads contain data only.
+Pass `data.read` directly to `read` for more detail. Its explicit
+`view:"session"` selects the historical native leaf even when a memory reader
+handles default reads. A null leaf denotes an empty branch. Reading still
+requires access to the saved session.
 
 ## Authorization, storage and delivery
 
@@ -164,9 +153,8 @@ Delivery acknowledges HTTP status only. Verification failures return `-32015 Cal
 
 Each connection resolves DNS anew, rejects nonpublic addresses, pins the validated
 address, and retains hostname-based TLS verification. No redirects are followed.
-Bridge uses native HTTPS without explicit HTTP/SOCKS proxy support; transparent
-TUN routing can provide outbound connectivity. See the [subscription
-prerequisites](#before-subscribing) for the separate incoming and outgoing paths.
+Bridge uses direct native HTTPS. Transparent TUN routing can provide outbound
+connectivity.
 
 Delivery is bounded to ten attempts, with 1/2/4/8/16/30/60/120/120-second
 backoff (361 seconds in total) and ten-second network deadlines per attempt.
@@ -192,16 +180,10 @@ with `data.reason:"blocked_address"` when DNS resolves the callback to a
 nonpublic address. Some proxies return synthetic fake-IP addresses, such as
 `198.18.0.0/15`, which Bridge rejects before connecting.
 
-1. Enable the diagnostics above and retry subscription to identify the callback
-   hostname. Check that hostname's system DNS result and confirm whether the
-   local proxy supplied a fake-IP address.
-2. If confirmed, obtain owner approval to add that exact hostname to the proxy's
-   persistent DNS exclusion configuration. Preserve existing entries, filter mode
-   and routing settings; apply the change through the proxy's native save/reload
-   path. Use the actual callback hostname rather than a wildcard domain.
-3. Confirm DNS now returns public addresses, then retry subscription in the
-   original chat. Keep Bridge's public-address checks, address pinning and TLS
-   validation enabled. Send work after subscription succeeds.
+Identify the callback hostname with the diagnostics above and check the system
+DNS result. If a local proxy supplied a fake IP, add the exact hostname to its
+persistent DNS exclusions and reload the proxy. Confirm DNS returns public
+addresses, then retry subscription in the original chat.
 
 ## Verify the ChatGPT workflow
 

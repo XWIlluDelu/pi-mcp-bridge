@@ -39,12 +39,7 @@ import {
   AttachedRuntime,
   AttachmentFailure,
 } from './attachments.mjs';
-const READ_COMMANDS = new Set([
-  'get_state',
-  'get_entries',
-  'get_available_models',
-  'get_available_thinking_levels',
-]);
+const READ_COMMANDS = new Set(['get_state', 'get_entries', 'get_available_models']);
 const MODEL_COMMANDS = new Set(['set_model', 'set_thinking_level']);
 const ADMISSION_COMMANDS = new Set(['prompt', 'compact', ...MODEL_COMMANDS]);
 function registryPath({ attachmentDir, stateDir }) {
@@ -143,7 +138,7 @@ export class PiRpc {
         resume: { file: this.session.file, sessionId: this.session.header.id, leafId },
       });
       // Recheck at the actual launch boundary: content preflight and owner
-      // reservation may have taken time since discovery verified this path.
+      // reservation may have taken time since the operation was admitted.
       await validateExecutionCwd(this.session.cwd);
       // Native environment/settings by default; only owner-selected overrides apply.
       const launch = {
@@ -305,30 +300,20 @@ export class PiRpc {
     }
     if (event.type !== 'response') return;
     const req = this.pending.get(event.id);
-    if (!req || req.generation !== generation || req.controller) return;
+    if (
+      !req ||
+      req.generation !== generation ||
+      req.controller ||
+      event.command !== req.commandType ||
+      typeof event.success !== 'boolean'
+    )
+      return;
     // Only the matching prompt ACK is evidence of completed admission. State,
     // timers, unrelated events and malformed responses cannot clear uncertainty.
     if (
       req.commandType === 'prompt' &&
-      (event.command !== 'prompt' ||
-        (event.success !== false &&
-          !(
-            event.success === true &&
-            ['started', 'queued', 'handled'].includes(event.data?.disposition)
-          )))
-    )
-      return;
-    if (
-      [
-        'set_model',
-        'set_thinking_level',
-        'compact',
-        'bash',
-        'clear_queue',
-        'abort',
-        'abort_bash',
-      ].includes(req.commandType) &&
-      (event.command !== req.commandType || typeof event.success !== 'boolean')
+      event.success &&
+      !['started', 'queued', 'handled'].includes(event.data?.disposition)
     )
       return;
     const ui = uiSnapshot(req.uiFacts);
@@ -414,8 +399,7 @@ export class PiRpc {
     const late =
       (ADMISSION_COMMANDS.has(command.type) || onLate) &&
       (async (result) => {
-        const state = await this.dispatch({ type: 'get_state' });
-        this.assertSessionIdentity(state);
+        await this.state();
         await onLate?.(result);
       });
     await beforeDispatch?.();

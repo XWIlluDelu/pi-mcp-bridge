@@ -1,9 +1,10 @@
-import { dispatchModern, isRpcRequest, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
+import { isRpcRequest, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
 // Bound each newline-delimited request before decoding UTF-8.
-export class BridgeStdioTransport {
-  constructor(bridge, { input = process.stdin, output = process.stdout } = {}) {
-    this.bridge = bridge;
+export class StdioTransport {
+  constructor(dispatch, { input = process.stdin, output = process.stdout, capacity } = {}) {
+    this.dispatch = dispatch;
+    this.capacity = capacity;
     this.input = input;
     this.output = output;
     this.buffer = Buffer.alloc(0);
@@ -27,7 +28,7 @@ export class BridgeStdioTransport {
   }
   close() {
     this.input.off('data', this.data);
-    for (const request of this.requests.values()) request.cancelled = true;
+    for (const request of this.requests.values()) request.abort();
   }
   async drain() {
     await Promise.allSettled([...this.tasks]);
@@ -89,24 +90,31 @@ export class BridgeStdioTransport {
       return;
     }
     if (body.id === undefined) {
-      if (body.method === 'notifications/cancelled') {
-        const record = this.requests.get(body.params?.requestId);
-        if (record) record.cancelled = true;
-      }
+      if (body.method === 'notifications/cancelled')
+        this.requests.get(body.params?.requestId)?.abort();
       return;
     }
     if (this.requests.has(body.id)) {
       this.track(this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID')));
       return;
     }
-    const record = { cancelled: false };
-    this.requests.set(body.id, record);
+    if (this.capacity && this.requests.size >= this.capacity.limit) {
+      this.track(
+        this.write(rpcError(body.id, -32000, this.capacity.code, { recovery: 'NOT_FORWARDED' })),
+      );
+      return;
+    }
+    const controller = new AbortController();
+    this.requests.set(body.id, controller);
     const task = (async () => {
       try {
-        const { message } = await dispatchModern(this.bridge, body);
-        if (!record.cancelled) await this.write(message);
-      } catch (error) {
-        if (!record.cancelled) await this.write(rpcError(body?.id, -32603, 'REQUEST_FAILED'));
+        let reply;
+        try {
+          reply = await this.dispatch(body, controller.signal);
+        } catch {
+          reply = rpcError(body.id, -32603, 'REQUEST_FAILED');
+        }
+        if (!controller.signal.aborted) await this.write(reply);
       } finally {
         this.requests.delete(body.id);
       }

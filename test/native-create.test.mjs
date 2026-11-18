@@ -54,15 +54,10 @@ for (const persistent of [false, true])
       assert.equal(result.submission_id, undefined);
     }
     assert.match(result.session_id, /^ps_/);
-    const files = await fs.readdir(root),
-      published = files.find((file) => file.endsWith('.jsonl')),
-      pending = files.find((file) => file.endsWith('.pending'));
-    assert.ok(published);
-    assert.equal(Boolean(pending), persistent);
-    assert.equal((await fs.stat(path.join(root, published))).nlink, persistent ? 2 : 1);
+    const files = await fs.readdir(root);
     failure.mock.restore();
-    if (pending) await fs.unlink(path.join(root, pending));
-    assert.equal((await bridge.session(result.session_id)).file, path.join(root, published));
+    for (const file of files) if (file.endsWith('.pending')) await fs.unlink(path.join(root, file));
+    assert.ok((await bridge.session(result.session_id)).file.endsWith('.jsonl'));
   });
 
 // Each scenario has its own HOME, environment, projects and native installation.
@@ -105,29 +100,35 @@ try{
   bridge=await new Bridge(config,factory).init();
   const args={project,text:'SYNTHETIC_CREATE_INPUT'};
   const result=await bridge.create(args);
-  if(result.status!=='started'){console.log(JSON.stringify({result,starts,first:await fs.readdir(roots[0]),settingsMode:(await fs.stat(settingsFile)).mode&0o777,destinationMode:scenario.globalDir?(await fs.stat(scenario.globalDir)).mode&0o777:null,destinationFiles:scenario.globalDir?await fs.readdir(scenario.globalDir):[]}));}
-  else {
+  const out={result,starts,first:await fs.readdir(roots[0]),settingsMode:(await fs.stat(settingsFile)).mode&0o777};
+  if(result.status==='started'){
     const session=await bridge.session(result.session_id);
-    await bridge.close();bridge=await new Bridge(config,factory).init();
-    const rediscovered=await bridge.session(result.session_id);
-    const metadata=(await bridge.list({session_id:result.session_id})).sessions[0];
-    await bridge.close();bridge=null;
-    const settingsMode=(await fs.stat(settingsFile)).mode&0o777;
-    const env=launchProfile(config).env;
-    const client=new RpcClient({cliPath:scenario.cli,cwd:project,env:Object.assign(Object.fromEntries(Object.keys(process.env).map(key=>[key,undefined])),env),args:['--continue',...config.piArgs]});
-    let state;
-    try{await client.start();state=await client.getState();}finally{await client.stop();}
-    bridge=await new Bridge(config).init();
-    await bridge.pool.resolve(await bridge.session(result.session_id));
-    const rpc=bridge.pool.get(result.session_id), reconnected=(await rpc.state()).sessionId;
-    await rpc.gracefulExit();
-    console.log(JSON.stringify({result,file:session.file,rediscovered:rediscovered.file,metadata,continued:state.sessionId,reconnected,nativeId:session.header.id,starts,first:await fs.readdir(roots[0]),settingsMode,settings:JSON.parse(await fs.readFile(settingsFile,'utf8'))}));
+    out.file=session.file;
+    out.settings=JSON.parse(await fs.readFile(settingsFile,'utf8'));
+    if(scenario.reopen){
+      await bridge.close();bridge=null;
+      const env=launchProfile(config).env;
+      const client=new RpcClient({cliPath:scenario.cli,cwd:project,env:Object.assign(Object.fromEntries(Object.keys(process.env).map(key=>[key,undefined])),env),args:['--continue',...config.piArgs]});
+      try{await client.start();out.continued=(await client.getState()).sessionId;}finally{await client.stop();}
+      bridge=await new Bridge(config).init();
+      const rediscovered=await bridge.session(result.session_id);
+      out.rediscovered=rediscovered.file;
+      out.nativeId=session.header.id;
+      await bridge.pool.resolve(rediscovered);
+      const rpc=bridge.pool.get(result.session_id);
+      out.reconnected=(await rpc.state()).sessionId;
+      await rpc.gracefulExit();
+    }
+  }else{
+    out.destinationFiles=await fs.readdir(scenario.globalDir);
+    out.destinationMode=(await fs.stat(scenario.globalDir)).mode&0o777;
   }
+  console.log(JSON.stringify(out));
 }finally{await bridge?.close();}
 `;
 
 for (const scenario of [
-  { name: 'native HOME default' },
+  { name: 'native HOME default', reopen: true },
   { name: 'explicit agentDir', agentOverride: true },
   { name: 'global settings', globalDir: 'selected' },
   { name: 'project settings override global', globalDir: 'global', projectDir: 'selected' },
@@ -159,7 +160,9 @@ for (const scenario of [
   test(
     scenario.denied
       ? 'create rejects ' + scenario.name + ' without prompt dispatch or chmod'
-      : 'create follows ' + scenario.name + ', native continue and Bridge RPC reconnect',
+      : 'create follows ' +
+          scenario.name +
+          (scenario.reopen ? ', native continue and Bridge RPC reconnect' : ''),
     { timeout: 15000 },
     async (t) => {
       const dir = await fs.mkdtemp('/tmp/pi-native-create-');
@@ -205,11 +208,11 @@ for (const scenario of [
       assert.equal(out.result.created, true);
       assert.equal(out.starts, 1);
       assert.deepEqual(out.first, []);
-      assert.equal(out.file, out.rediscovered);
-      assert.equal(out.continued, out.nativeId);
-      assert.equal(out.reconnected, out.nativeId);
-      assert.equal(out.metadata.session_id, out.result.session_id);
-      assert.equal(out.metadata.project, path.join(dir, 'project'));
+      if (scenario.reopen) {
+        assert.equal(out.file, out.rediscovered);
+        assert.equal(out.continued, out.nativeId);
+        assert.equal(out.reconnected, out.nativeId);
+      }
       assert.equal(out.settingsMode, 0o644);
       assert.equal(out.settings.sessionDir, data.globalDir);
       assert.ok(

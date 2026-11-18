@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { resolvePiInstallation, piLaunchEnvironment, loadPiSdk } from './pi-installation.mjs';
@@ -17,8 +19,8 @@ export async function prepareSession(config, project, { name, parentSession, cap
   const { env: baseEnv } = launchProfile(config);
   const installation = await resolvePiInstallation(config, baseEnv);
   const env = await piLaunchEnvironment(installation, baseEnv, project);
-  const { SessionManager, CURRENT_SESSION_VERSION } = await loadPiSdk(installation);
-  const snapshot = await captureFork?.(CURRENT_SESSION_VERSION);
+  const sdk = captureFork ? await loadPiSdk(installation) : null;
+  const snapshot = sdk ? await captureFork(sdk.CURRENT_SESSION_VERSION) : null;
   const { stdout } = await exec(
     process.execPath,
     [
@@ -36,21 +38,13 @@ export async function prepareSession(config, project, { name, parentSession, cap
   if (error) throw new Error(error);
   const { id, timestamp } = header;
   let entries = [];
-  if (snapshot) {
-    const manager = SessionManager.inMemory(snapshot.header.cwd || project, undefined, [
-      snapshot.header,
-      ...snapshot.entries,
-    ]);
-    if (
-      snapshot.leafId !== null &&
-      !manager.getEntries().some((entry) => entry.id === snapshot.leafId)
-    )
+  if (snapshot && snapshot.leafId !== null) {
+    const { header, entries: raw, leafId } = snapshot;
+    const manager = sdk.SessionManager.inMemory(header.cwd || project, undefined, [header, ...raw]);
+    if (!sessionEntryIndex(manager.getEntries(), leafId).has(leafId))
       throw new Error('INVALID_RUNTIME_ENTRIES');
-    if (snapshot.leafId !== null) {
-      sessionEntryIndex(manager.getEntries(), snapshot.leafId);
-      manager.createBranchedSession(snapshot.leafId);
-      entries = manager.getEntries();
-    }
+    manager.createBranchedSession(leafId);
+    entries = manager.getEntries();
   }
   if (name !== undefined)
     entries.push({
@@ -64,7 +58,6 @@ export async function prepareSession(config, project, { name, parentSession, cap
     id: opaqueId(`${file}\0${id}`),
     header,
     file,
-    projectCwd: path.resolve(header.cwd),
     cwd: project,
     entries,
   };
@@ -75,14 +68,13 @@ export async function persistSession(session) {
   const temporary = `${session.file}.${randomUUID()}.pending`;
   let published = false;
   try {
-    const fd = await fs.open(temporary, 'wx', 0o600);
-    try {
-      await fd.writeFile(JSON.stringify(session.header) + '\n');
-      for (const entry of session.entries) await fd.writeFile(JSON.stringify(entry) + '\n');
-      await fd.sync();
-    } finally {
-      await fd.close();
-    }
+    await pipeline(
+      function* () {
+        yield JSON.stringify(session.header) + '\n';
+        for (const entry of session.entries) yield JSON.stringify(entry) + '\n';
+      },
+      createWriteStream(temporary, { flags: 'wx', mode: 0o600, flush: true }),
+    );
     // Publish a complete immutable prefix without overwriting an existing file.
     // Discovery rejects the brief two-link interval until the temp is unlinked.
     await fs.link(temporary, session.file);

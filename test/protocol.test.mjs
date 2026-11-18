@@ -10,7 +10,7 @@ import {
   toolDefinitions,
   callBridgeTool,
 } from '../src/protocol.mjs';
-import { BridgeStdioTransport } from '../src/protocol-stdio.mjs';
+import { StdioTransport } from '../src/protocol-stdio.mjs';
 import { publicSchemas } from '../src/tool-schemas.mjs';
 import { CONTENT_KINDS } from '../src/read-schema.mjs';
 import { MAX_IMAGES } from '../src/prompt-input.mjs';
@@ -223,7 +223,13 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
       return { sessions: [] };
     },
   };
-  const transport = new BridgeStdioTransport(bridge, { input, output });
+  const transport = new StdioTransport(
+    async (body) => (await dispatchModern(bridge, body)).message,
+    {
+      input,
+      output,
+    },
+  );
   await transport.start();
   input.write(JSON.stringify(message('tools/call', { name: 'list', arguments: {} }, 42)) + '\n');
   await entered.promise;

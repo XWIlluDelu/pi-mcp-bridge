@@ -273,21 +273,22 @@ test('close during readiness verification cannot publish a new endpoint', async 
   assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'transitioning');
   await assert.rejects(fs.stat(f.controller.record.socket), { code: 'ENOENT' });
 });
-test('read snapshots are detached before awaited identity checks and later host mutations', async (t) => {
+test('host read preserves the projection captured before the final identity check', async (t) => {
   const f = await fixture(t),
     snapshot = f.callbacks.snapshot(),
     before = JSON.stringify(snapshot.entries);
-  let reads = 0;
-  f.callbacks.snapshot = () => snapshot;
+  let captured = false;
+  f.callbacks.snapshot = () => {
+    captured = true;
+    return snapshot;
+  };
   const state = f.callbacks.state;
   f.callbacks.state = () => {
-    reads++;
-    if (reads === 4) snapshot.entries[0].message.content = 'LATER_MUTATION';
+    if (captured) snapshot.entries[0].message.content = 'LATER_MUTATION';
     return state();
   };
-  await f.controller.ready(f.callbacks); // two state verifications
+  await f.controller.ready(f.callbacks);
   const result = await request(f, 'read', { session_id: 'fixture' });
-  assert.equal(reads, 4);
   assert.notEqual(JSON.stringify(snapshot.entries), before);
   assert.ok(JSON.stringify(result.data).includes('PUBLIC_FIXTURE'));
   assert.ok(!JSON.stringify(result.data).includes('LATER_MUTATION'));

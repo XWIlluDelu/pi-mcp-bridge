@@ -9,28 +9,19 @@ import {
   documentAtoms,
 } from './read-navigation.mjs';
 
-function decode(value) {
+const encodeHandle = (...parts) => Buffer.from(JSON.stringify(parts)).toString('base64url');
+const validToken = (token) => typeof token === 'string' && /^[0-9a-f-]{36}$/.test(token);
+const validIndex = (index) => Number.isSafeInteger(index) && index >= 0;
+
+function decodeHandle(value, error) {
   try {
-    if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error();
-    const [token, offset, part, ...extra] = JSON.parse(Buffer.from(value, 'base64url').toString());
-    if (
-      extra.length ||
-      typeof token !== 'string' ||
-      !/^[0-9a-f-]{36}$/.test(token) ||
-      !Number.isSafeInteger(offset) ||
-      offset < 0 ||
-      !Number.isSafeInteger(part) ||
-      part < 0 ||
-      (!offset && !part)
-    )
-      throw new Error();
-    return { token, offset, part };
-  } catch {
-    throw new Error('INVALID_CURSOR');
-  }
+    if (/^[A-Za-z0-9_-]+$/.test(value)) {
+      const parts = JSON.parse(Buffer.from(value, 'base64url').toString());
+      if (Array.isArray(parts) && parts.length === 3) return parts;
+    }
+  } catch {}
+  throw new Error(error);
 }
-const encode = (token, offset, part) =>
-  Buffer.from(JSON.stringify([token, offset, part])).toString('base64url');
 
 // Immutable sanitized history, not a version-dependent acceleration cache.
 // Missing snapshots are never reacquired to reconstruct an old cursor.
@@ -39,38 +30,27 @@ export class ContextReadCache {
     Object.assign(this, { maxBytes, maxEntries, accountedBytes: 0, entries: new Map() });
   }
   lookup(cursor) {
-    const position = decode(cursor),
-      entry = this.entries.get(position.token);
-    if (!entry) throw new Error('STALE_CURSOR');
-    if (position.offset >= entry.length || (entry.snapshot.documents && position.part))
+    const [token, offset, part] = decodeHandle(cursor, 'INVALID_CURSOR');
+    if (!validToken(token) || !validIndex(offset) || !validIndex(part) || (!offset && !part))
       throw new Error('INVALID_CURSOR');
-    return { position, entry };
+    const entry = this.entries.get(token);
+    if (!entry) throw new Error('STALE_CURSOR');
+    if (offset >= entry.length || (entry.snapshot.documents && part))
+      throw new Error('INVALID_CURSOR');
+    return { position: { token, offset, part }, entry };
   }
   identity(cursor) {
     return this.lookup(cursor).entry.identity;
   }
   reference(ref) {
-    try {
-      if (typeof ref !== 'string' || !/^[A-Za-z0-9_-]+$/.test(ref)) throw new Error();
-      const [tag, token, index, ...extra] = JSON.parse(Buffer.from(ref, 'base64url').toString());
-      if (
-        extra.length ||
-        tag !== 'ref' ||
-        typeof token !== 'string' ||
-        !/^[0-9a-f-]{36}$/.test(token) ||
-        !Number.isSafeInteger(index) ||
-        index < 0
-      )
-        throw new Error('INVALID_READ_REFERENCE');
-      const entry = this.entries.get(token);
-      if (!entry) throw new Error('STALE_READ_REFERENCE');
-      const document = entry.snapshot.documents?.[index];
-      if (!document) throw new Error('INVALID_READ_REFERENCE');
-      return { token, index, entry, document };
-    } catch (error) {
-      if (['STALE_READ_REFERENCE', 'INVALID_READ_REFERENCE'].includes(error.message)) throw error;
+    const [tag, token, index] = decodeHandle(ref, 'INVALID_READ_REFERENCE');
+    if (tag !== 'ref' || !validToken(token) || !validIndex(index))
       throw new Error('INVALID_READ_REFERENCE');
-    }
+    const entry = this.entries.get(token);
+    if (!entry) throw new Error('STALE_READ_REFERENCE');
+    const document = entry.snapshot.documents?.[index];
+    if (!document) throw new Error('INVALID_READ_REFERENCE');
+    return { token, entry, document };
   }
   referenceIdentity(ref) {
     return this.reference(ref).entry.identity;
@@ -156,8 +136,7 @@ export class ContextReadCache {
   ) {
     let rows;
     if (snapshot.documents) {
-      const ref = (index) =>
-        Buffer.from(JSON.stringify(['ref', token, index])).toString('base64url');
+      const ref = (index) => encodeHandle('ref', token, index);
       const { documents, order, query } = snapshot;
       rows = {
         length: order.length,
@@ -167,7 +146,7 @@ export class ContextReadCache {
     const result = renderPreparedContextRead(snapshot, args, {
       rows,
       cursor,
-      encode: (offset, part) => encode(token, offset, part),
+      encode: (offset, part) => encodeHandle(token, offset, part),
       resultBudget,
       live,
       runtimeEvents,

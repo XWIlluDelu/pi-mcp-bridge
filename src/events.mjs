@@ -270,7 +270,8 @@ export class EventSubscriptions {
     let session;
     try {
       session = await this.authorize(request.arguments.session_id, requestContext);
-    } catch {
+    } catch (error) {
+      if (error.message !== 'NOT_FOUND_OR_DENIED') throw error;
       throw new EventError(-32024, 'Forbidden');
     }
     // Never start a writer to subscribe. A companion must target this Bridge.
@@ -292,13 +293,14 @@ export class EventSubscriptions {
         url: request.delivery.url,
         secret: request.delivery.secret,
         expiresAt: 0,
-        verifiedUntil: 0,
       };
-      // Consent is cached per owner + exact callback URL, not per event/filter.
-      const verified = [...next.values()].some(
-        (r) => r.url === record.url && r.verifiedUntil > this.now(),
+      // Consent is cached per owner and exact callback URL.
+      record.verifiedUntil = [...next.values()].reduce(
+        (latest, candidate) =>
+          candidate.url === record.url ? Math.max(latest, candidate.verifiedUntil) : latest,
+        0,
       );
-      if (!verified) {
+      if (record.verifiedUntil <= this.now()) {
         // Explicit, temporary hostname-only troubleshooting; never emit the URL.
         if (process.env.PI_MCP_LOG_CALLBACK_HOST === '1')
           diagnostics.emit('events.callback_target', {
@@ -311,12 +313,8 @@ export class EventSubscriptions {
             reason: error instanceof CallbackError ? error.reason : 'connection_refused',
           });
         }
+        record.verifiedUntil = this.now() + 300000;
       }
-      record.verifiedUntil = verified
-        ? Math.max(
-            ...[...next.values()].filter((r) => r.url === record.url).map((r) => r.verifiedUntil),
-          )
-        : this.now() + 300000;
       record.expiresAt = this.now() + Math.min(request.ttlMs ?? DEFAULT_TTL, MAX_TTL);
       if (previous?.secret && previous.secret !== record.secret) {
         record.previousSecret = previous.secret;
@@ -337,6 +335,11 @@ export class EventSubscriptions {
   }
   observe(session, occurrence) {
     if (this.storeError || this.shutdown.signal.aborted || this.bridge.closing) return;
+    const now = this.now();
+    const records = [...this.records.values()].filter(
+      (record) => record.session_id === session.id && record.expiresAt > now,
+    );
+    if (!records.length) return;
     const event = {
       eventId: 'evt_' + randomUUID(),
       name: NAME,
@@ -358,8 +361,7 @@ export class EventSubscriptions {
     };
     // Serialize ONCE. Each retry signs and transmits these exact bytes.
     const body = JSON.stringify(event);
-    for (const record of this.records.values()) {
-      if (record.session_id !== session.id || record.expiresAt <= this.now()) continue;
+    for (const record of records) {
       if (this.deliveries.size >= MAX_DELIVERIES) {
         diagnostics.emit('events.delivery_dropped', { session_ref: diagnosticRef(session.id) });
         continue;
