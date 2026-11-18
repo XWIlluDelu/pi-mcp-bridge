@@ -1,12 +1,11 @@
 // Owner-side configuration edits only. Not exposed as an MCP operation.
-import fs from 'node:fs/promises';
 import { validateCompatibilityModules } from './compatibility.mjs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
-import { hash, syncDir, readPrivateFile } from './storage.mjs';
+import { hash, atomicJson, readPrivateFile } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
 import { loadPiSdk } from './pi-installation.mjs';
+const MAX_OWNER_CONFIG_BYTES = 1024 * 1024;
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
@@ -162,7 +161,7 @@ export function validateGrants(grants = []) {
   return grants;
 }
 export async function readOwnerConfig(file) {
-  const { text: raw, mode } = await readPrivateFile(file, 1024 * 1024, {
+  const { text: raw, mode } = await readPrivateFile(file, MAX_OWNER_CONFIG_BYTES, {
     pathError: 'INVALID_OWNER_CONFIG_PATH',
     privacyError: 'OWNER_CONFIG_NOT_PRIVATE',
   });
@@ -198,23 +197,23 @@ export async function editPermission(file, revision, target, action, value) {
     : target.session_id
       ? { session_id: target.session_id }
       : { folder: target.folder };
-  if (target.default) validatePermissionValues({ [action]: value });
-  else validateGrants([{ ...scope, [action]: value }]);
+  if (!target.default) validateGrants([{ ...scope, [action]: value }]);
   // Project grants address the recorded identity, not the current filesystem.
   // Editing policy must remain possible after cleanup or symlink replacement.
   if (scope.folder) scope.folder = path.resolve(scope.folder);
-  await readOwnerConfig(file); // Validate the canonical private namespace first.
   const lock = await kernelLock('permissions:' + file, { busy: 'OWNER_CONFIG_BUSY' });
-  let temporary;
   try {
-    const current = await readOwnerConfig(file);
-    if (current.revision !== revision) throw new Error('OWNER_CONFIG_CHANGED');
-    const config = structuredClone(current.config);
-    config.grants ??= [];
+    const readCurrent = async () => {
+      const current = await readOwnerConfig(file);
+      if (current.revision !== revision) throw new Error('OWNER_CONFIG_CHANGED');
+      return current;
+    };
+    const { config, mode } = await readCurrent();
     let rule;
     if (target.default) {
       rule = config.defaults;
     } else {
+      config.grants ??= [];
       rule = config.grants.findLast((r) =>
         scope.session_id
           ? r.session_id === scope.session_id
@@ -226,23 +225,13 @@ export async function editPermission(file, revision, target, action, value) {
       }
     }
     rule[action] = value;
-    temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    const fd = await fs.open(temporary, 'wx', current.mode);
-    try {
-      await fd.writeFile(JSON.stringify(config, null, 2) + '\n');
-      await fd.sync();
-    } finally {
-      await fd.close();
-    }
-    // Detect non-cooperating editor changes during preparation as well.
-    if ((await readOwnerConfig(file)).revision !== revision)
-      throw new Error('OWNER_CONFIG_CHANGED');
-    await fs.rename(temporary, file);
-    temporary = null;
-    await syncDir(path.dirname(file));
+    await atomicJson(file, config, {
+      mode,
+      beforeRename: readCurrent,
+      maxBytes: MAX_OWNER_CONFIG_BYTES,
+    });
     return await readOwnerConfig(file);
   } finally {
-    if (temporary) await fs.unlink(temporary).catch(() => {});
     await lock.close();
   }
 }

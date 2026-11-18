@@ -10,11 +10,10 @@ try {
   const { SessionManager, SettingsManager, parseArgs } = await loadPiSdk({ sdkEntry });
   const cwd = process.cwd();
   const parsed = parseArgs(args);
-  const settings = SettingsManager.create(cwd);
   const sessionDir =
-    (parsed.sessionDir || undefined) ??
-    (process.env.PI_CODING_AGENT_SESSION_DIR || undefined) ??
-    settings.getSessionDir();
+    parsed.sessionDir ||
+    process.env.PI_CODING_AGENT_SESSION_DIR ||
+    SettingsManager.create(cwd).getSessionDir();
   // Native create chooses the directory, header, ID and filename but does not
   // write a session until conversation entries are appended. Preserve native
   // umask behavior and validate storage integrity without changing permissions.

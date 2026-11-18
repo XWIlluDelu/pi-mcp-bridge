@@ -2,13 +2,14 @@ import { message, text } from '../../test/fixtures/native-history.mjs';
 import assert from 'node:assert/strict';
 
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import module, { createMagicContextReader } from './index.mjs';
-import { captureSessionRead } from '../../src/session-readers.mjs';
+import { captureSessionRead, SessionReaders } from '../../src/session-readers.mjs';
 import { ContextReadCache } from '../../src/read-cache.mjs';
 import { prepareContextRead } from '../../src/context-read.mjs';
 import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
@@ -16,8 +17,6 @@ import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
 // Storage fields are based on MC 0.49.20; migration numbers are not a read contract.
 // Only the tables and columns it queries are needed in these isolated fixtures.
 const schema = `
-  CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
-  INSERT INTO schema_migrations VALUES(95);
   CREATE TABLE session_projects(session_id TEXT, harness TEXT, project_path TEXT, PRIMARY KEY(session_id,harness));
   CREATE TABLE session_meta(session_id TEXT PRIMARY KEY, harness TEXT, counter INTEGER, cached_m0_bytes BLOB);
   CREATE TABLE compartments(
@@ -114,30 +113,16 @@ test('explicit database, supported schema, and lifecycle registration are requir
     /MAGIC_CONTEXT_DATABASE_UNAVAILABLE/,
   );
   await assert.rejects(fs.stat(missing), { code: 'ENOENT' });
-  let registered, cleanup;
+  const sessionReaders = new SessionReaders();
+  let cleanup;
   module.start(
-    {
-      id: module.id,
-      services: {
-        sessionReaders: {
-          register(id, reader) {
-            registered = { id, reader };
-            return () => {
-              registered = null;
-            };
-          },
-        },
-      },
-      onStop(value) {
-        cleanup = value;
-      },
-    },
+    { id: module.id, services: { sessionReaders }, onStop: (fn) => (cleanup = fn) },
     { database: f.database },
   );
-  assert.equal(registered.id, 'magic-context');
-  assert.equal(typeof registered.reader.read, 'function');
+  f.compartment();
+  assert.equal((await sessionReaders.select(f.context)).id, module.id);
   cleanup();
-  assert.equal(registered, null);
+  assert.equal(await sessionReaders.select(f.context), undefined);
   f.db.exec('ALTER TABLE compartments DROP COLUMN rebase_status');
   assert.throws(
     () => createMagicContextReader({ database: f.database }),
@@ -189,6 +174,12 @@ test('live registration is target-specific and still requires the matching proje
     await reader.matches({ ...f.context, owner: { ...owner, commands: ['ctx-status'] } }),
     false,
   );
+  execFileSync('git', ['-C', f.cwd, 'init', '--quiet']);
+  assert.equal(await reader.matches({ ...f.context, owner }), true, 'unborn repository');
+  await fs.rename(path.join(f.cwd, '.git'), path.join(f.directory, 'original-git'));
+  await fs.writeFile(path.join(f.cwd, '.git'), 'gitdir: missing-worktree-metadata\n');
+  await assert.rejects(reader.matches({ ...f.context, owner }), /PROJECT_IDENTITY_UNAVAILABLE/);
+  await fs.unlink(path.join(f.cwd, '.git'));
   f.db.exec("UPDATE session_projects SET project_path='git:wrong'");
   assert.equal(await reader.matches({ ...f.context, owner }), false);
 });
@@ -206,7 +197,17 @@ test('stored summaries use existing MC tiers and source relationships without da
     content: 'Existing flat summary',
     end_message_id: 'synth-user-abc',
   });
-  f.compartment({ id: 4, sequence: 4, session_id: 'other-session', content: 'EXCLUDED_SESSION' });
+  f.compartment({
+    id: 4,
+    sequence: 4,
+    title: '',
+    content: '',
+    p1: null,
+    p2: '',
+    p3: '',
+    p4: 'Search anchor',
+  });
+  f.compartment({ id: 5, sequence: 5, session_id: 'other-session', content: 'EXCLUDED_SESSION' });
   f.memory();
   f.memory({ id: 2, importance: 50, status: 'permanent', content: 'Permanent convention' });
   f.memory({ id: 3, status: 'archived', content: 'EXCLUDED_ARCHIVED' });
@@ -223,7 +224,7 @@ test('stored summaries use existing MC tiers and source relationships without da
   assert.equal(result.native, true);
   assert.deepEqual(
     result.items.map((item) => item.id),
-    ['compartment:1', 'compartment:2', 'compartment:3', 'memory:2', 'memory:1'],
+    ['compartment:1', 'compartment:2', 'compartment:3', 'compartment:4', 'memory:2', 'memory:1'],
   );
   assert.equal(result.items[0].text, 'Detailed summary');
   assert.equal(result.items[0].preview, 'Brief with anchors');
@@ -236,11 +237,13 @@ test('stored summaries use existing MC tiers and source relationships without da
   assert.equal(result.items[1].source.source_entry_id, undefined);
   assert.equal(result.items[2].text, 'Existing flat summary');
   assert.equal(result.items[2].source.source_unavailable, 'no_native_history_leaf');
-  assert.equal(result.items[3].source.scope, 'own_project');
-  assert.equal(result.items[3].source.origin_session_id, 'origin-public');
-  assert.equal(result.items[3].source.source_entry_id, undefined);
+  assert.equal(result.items[3].text, 'Search anchor');
+  assert.equal(result.items[3].preview, 'Search anchor');
+  assert.equal(result.items[4].source.scope, 'own_project');
+  assert.equal(result.items[4].source.origin_session_id, 'origin-public');
+  assert.equal(result.items[4].source.source_entry_id, undefined);
   assert.deepEqual(result.coverage, [
-    { type: 'summary', selected: 3, total: 3 },
+    { type: 'summary', selected: 4, total: 4 },
     { type: 'memory', selected: 2, total: 2 },
   ]);
   assert.deepEqual(await fs.readFile(f.database), before);
@@ -289,14 +292,18 @@ test('default MC reads exclude known other-branch summaries before limiting, whi
   const reader = { id: module.id, ...createMagicContextReader({ database: f.database }) };
   const capture = async (summary) => {
     const request = { session_id: f.context.session.id, content: { summary } };
-    const nativeRead = (options) =>
-      prepareContextRead(
+    const nativeRead = (options) => {
+      if (summary === 0) assert.equal(options, undefined);
+      return prepareContextRead(
         { entries, leafId: 'latest-answer' },
         { ...request, ...options },
         { buildSessionProjection },
       );
+    };
     return captureSessionRead(reader, { ...f.context, request, nativeRead }, request);
   };
+  const omitted = await capture(0);
+  assert.deepEqual(omitted.reader.coverage[0], { type: 'summary', selected: 0, total: 6 });
   const recent = await capture(4);
   const summaries = recent.units.filter((item) =>
     item.source.reader_item?.startsWith('compartment:'),
@@ -356,19 +363,11 @@ test('read-only connections see committed live WAL data and detach each result',
   );
 });
 
-test('unrelated migrations preserve content while changed consumed representations reject', async (t) => {
+test('incompatible stored summaries and expiry values reject', async (t) => {
   const f = await fixture(t);
   f.compartment();
   f.memory();
   const reader = createMagicContextReader({ database: f.database });
-  const content = async () =>
-    (await reader.read(f.context)).items.map(({ source: { captured_at, ...source }, ...item }) => ({
-      ...item,
-      source,
-    }));
-  const before = await content();
-  f.db.exec('UPDATE schema_migrations SET version=96; CREATE TABLE unrelated_feature(value TEXT)');
-  assert.deepEqual(await content(), before);
   f.db.exec("UPDATE memories SET expires_at='2027-01-01T00:00:00Z'");
   await assert.rejects(reader.read(f.context), /MAGIC_CONTEXT_SCHEMA_MISMATCH/);
   f.db.exec("UPDATE memories SET expires_at=NULL; UPDATE compartments SET p1=x'0102'");

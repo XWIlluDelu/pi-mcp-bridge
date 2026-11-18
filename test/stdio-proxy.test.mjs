@@ -6,13 +6,13 @@ import { createStdioProxy } from '../src/stdio-proxy.mjs';
 import { META, MODERN_VERSION } from '../src/protocol.mjs';
 
 const token = 'synthetic-proxy-token-never-a-real-credential';
-function fixture(fetchImpl) {
+function fixture(fetchImpl, port = 43123) {
   const input = new PassThrough(),
     output = new PassThrough(),
     lines = [];
   readLfLines(output, (line) => lines.push(JSON.parse(line)));
   const proxy = createStdioProxy({
-    url: 'http://127.0.0.1:43123/mcp',
+    port,
     token,
     input,
     output,
@@ -41,7 +41,7 @@ test('stdio proxy forwards per-request metadata and encodes the mirrored tool na
       JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { marker: body.method } }),
       { headers: { 'content-type': 'application/json' } },
     );
-  });
+  }, 80);
   await f.proxy.start();
   f.send(1, 'tools/call', {
     name: '命令',
@@ -49,6 +49,7 @@ test('stdio proxy forwards per-request metadata and encodes the mirrored tool na
   });
   await f.proxy.drain();
   assert.equal(received.length, 1);
+  assert.equal(received[0].url, 'http://127.0.0.1/mcp');
   const headers = new Headers(received[0].headers);
   assert.equal(headers.get('mcp-protocol-version'), MODERN_VERSION);
   assert.equal(headers.get('mcp-method'), 'tools/call');
@@ -150,10 +151,4 @@ test('proxy bounds outstanding HTTP requests, never queues rejected work and res
   await f.proxy.drain();
   assert.equal(forwarded, 17);
   assert.deepEqual(f.lines.at(-1), { jsonrpc: '2.0', id: 41, result: {} });
-});
-test('proxy rejects non-loopback targets', () => {
-  assert.throws(
-    () => createStdioProxy({ url: 'http://example.com:43123/mcp', token }),
-    /INVALID_PROXY_URL/,
-  );
 });

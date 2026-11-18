@@ -19,13 +19,13 @@ const PROJECT = `
         AND (m.counter > 0 OR length(m.cached_m0_bytes) > 0)
     )
   )`;
-const COMPARTMENTS = `
-  SELECT id, sequence, title, content, p1, p2, p3, start_message_id, end_message_id,
-    start_block_index, end_block_index, rebase_status, created_at
+const sessionCompartments = `
   FROM compartments WHERE session_id = ? AND harness = 'pi'
-    AND (title <> '' OR content <> '' OR COALESCE(p1, '') <> ''
-      OR COALESCE(p2, '') <> '' OR COALESCE(p3, '') <> '' OR COALESCE(p4, '') <> '')
-  ORDER BY sequence ASC, id ASC`;
+    AND (title <> '' OR content <> '' OR p1 <> '' OR p2 <> '' OR p3 <> '' OR p4 <> '')`;
+const COMPARTMENTS = `
+  SELECT id, sequence, title, content, p1, p2, p3, p4, start_message_id, end_message_id,
+    start_block_index, end_block_index, rebase_status, created_at
+  ${sessionCompartments} ORDER BY sequence ASC, id ASC`;
 const MEMORIES = `
   SELECT id, category, content, status, verification_status, updated_at, source_type,
     source_session_id, expires_at, importance
@@ -45,6 +45,7 @@ const compartmentSchema = z.object({
   p1: text,
   p2: text,
   p3: text,
+  p4: text,
   start_message_id: text,
   end_message_id: text,
   start_block_index: integer.nullable(),
@@ -65,30 +66,16 @@ const memorySchema = z.object({
   source_session_id: text,
 });
 
-function fail(code, cause) {
-  return new Error(code, cause === undefined ? undefined : { cause });
-}
-
-function validateOptions(options) {
-  if (
-    !options ||
-    typeof options !== 'object' ||
-    Array.isArray(options) ||
-    Object.keys(options).some((key) => key !== 'database') ||
-    typeof options.database !== 'string' ||
-    !path.isAbsolute(options.database) ||
-    options.database.includes('\0')
-  )
-    throw fail('MAGIC_CONTEXT_INVALID_OPTIONS');
-  return options.database;
-}
+const optionsSchema = z.strictObject({
+  database: z.string().refine((value) => path.isAbsolute(value) && !value.includes('\0')),
+});
 
 function withDatabase(database, read) {
   let db;
   try {
     db = new DatabaseSync(database, { readOnly: true });
   } catch (cause) {
-    throw fail('MAGIC_CONTEXT_DATABASE_UNAVAILABLE', cause);
+    throw new Error('MAGIC_CONTEXT_DATABASE_UNAVAILABLE', { cause });
   }
   try {
     // These pragmas affect this connection only. BEGIN takes a coherent read
@@ -98,8 +85,8 @@ function withDatabase(database, read) {
   } catch (cause) {
     if (cause.message?.startsWith('MAGIC_CONTEXT_')) throw cause;
     if (/^no such (table|column):/.test(cause.message))
-      throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH', cause);
-    throw fail('MAGIC_CONTEXT_DATABASE_READ_FAILED', cause);
+      throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH', { cause });
+    throw new Error('MAGIC_CONTEXT_DATABASE_READ_FAILED', { cause });
   } finally {
     db.close();
   }
@@ -118,17 +105,15 @@ async function hasGitMetadata(directory) {
 }
 
 async function projectIdentity(cwd) {
-  if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw fail('MAGIC_CONTEXT_INVALID_SESSION');
+  if (typeof cwd !== 'string' || !path.isAbsolute(cwd))
+    throw new Error('MAGIC_CONTEXT_INVALID_SESSION');
   const directory = path.resolve(cwd);
   const fallback = `dir:${createHash('md5').update(directory, 'utf8').digest('hex').slice(0, 12)}`;
   try {
-    if (!(await fs.stat(directory)).isDirectory()) throw fail('MAGIC_CONTEXT_INVALID_SESSION');
-    const real = await fs.realpath(directory);
-    if (
-      !(await hasGitMetadata(directory)) &&
-      !(real !== directory && (await hasGitMetadata(real)))
-    ) {
-      return fallback;
+    if (!(await fs.stat(directory)).isDirectory()) throw new Error('MAGIC_CONTEXT_INVALID_SESSION');
+    if (!(await hasGitMetadata(directory))) {
+      const real = await fs.realpath(directory);
+      if (real === directory || !(await hasGitMetadata(real))) return fallback;
     }
     const env = { ...process.env, LC_ALL: 'C', LANG: 'C', GIT_OPTIONAL_LOCKS: '0' };
     for (const key of Object.keys(env)) {
@@ -146,30 +131,26 @@ async function projectIdentity(cwd) {
     try {
       const { stdout } = await git(['rev-list', '--max-parents=0', 'HEAD']);
       const roots = stdout.trim().split(/\s+/).sort();
-      if (!roots.length || roots.some((id) => !/^[0-9a-f]{40,64}$/.test(id))) {
-        throw fail('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE');
+      if (roots.some((id) => !/^[0-9a-f]{40,64}$/.test(id))) {
+        throw new Error('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE');
       }
       return `git:${roots[0]}`;
     } catch (cause) {
-      if (cause.code === 128 && /fatal: not a git repository/.test(cause.stderr ?? ''))
-        return fallback;
+      if (cause.code !== 128 || cause.killed) throw cause;
+      if (/fatal: not a git repository \(or any/.test(cause.stderr)) return fallback;
       // An unborn repository uses the current directory identity in MC. Other
       // Git failures do not justify borrowing another project's memories.
-      try {
-        await git(['symbolic-ref', '--quiet', 'HEAD']);
-      } catch {
-        throw fail('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE', cause);
-      }
+      await git(['symbolic-ref', '--quiet', 'HEAD']);
       try {
         await git(['rev-parse', '--verify', '--quiet', 'HEAD']);
       } catch (unborn) {
-        if (unborn.code === 1 && !unborn.killed) return fallback;
+        if (unborn.code === 1 && !unborn.stderr && !unborn.killed) return fallback;
       }
-      throw fail('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE', cause);
+      throw cause;
     }
   } catch (cause) {
     if (cause.message?.startsWith('MAGIC_CONTEXT_')) throw cause;
-    throw fail('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE', cause);
+    throw new Error('MAGIC_CONTEXT_PROJECT_IDENTITY_UNAVAILABLE', { cause });
   }
 }
 
@@ -188,8 +169,9 @@ function nativeEntryId(id) {
 }
 
 function compartmentItem(row, capturedAt) {
-  const text = row.p1?.trim() ? row.p1 : row.content;
-  const preview = row.p2?.trim() ? row.p2 : row.p3?.trim() ? row.p3 : text;
+  const concise = [row.p2, row.p3, row.p4].find((tier) => tier?.trim());
+  const text = [row.p1, row.content, concise].find((tier) => tier?.trim()) ?? '';
+  const preview = concise ?? text;
   const source = {
     provider: 'magic-context',
     state: 'stored',
@@ -238,7 +220,9 @@ function memoryItem(row, capturedAt) {
 }
 
 export function createMagicContextReader(options) {
-  const database = validateOptions(options);
+  const parsed = optionsSchema.safeParse(options);
+  if (!parsed.success) throw new Error('MAGIC_CONTEXT_INVALID_OPTIONS');
+  const { database } = parsed.data;
   // Prepare the actual queries to check the consumed schema at startup.
   withDatabase(database, (db) => {
     for (const sql of [PROJECT, COMPARTMENTS, MEMORIES]) db.prepare(sql);
@@ -252,21 +236,29 @@ export function createMagicContextReader(options) {
     },
     async read(context) {
       if (context.request.leaf_id !== undefined)
-        throw fail('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
+        throw new Error('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
       const identity = await projectIdentity(context.session.cwd);
-      const stored = withDatabase(database, (db) => {
-        if (sessionProject(db, context) !== identity) throw fail('MAGIC_CONTEXT_SESSION_MISMATCH');
+      const { content } = contextSelection(context.request);
+      const { capturedAt, compartments, summaryTotal, memories } = withDatabase(database, (db) => {
+        if (sessionProject(db, context) !== identity)
+          throw new Error('MAGIC_CONTEXT_SESSION_MISMATCH');
         const capturedAt = Date.now();
-        const compartments = db.prepare(COMPARTMENTS).all(context.session.native_id);
+        const id = context.session.native_id;
+        const compartments = content.summary === 0 ? [] : db.prepare(COMPARTMENTS).all(id);
+        const summaryTotal =
+          content.summary === 0
+            ? db.prepare(`SELECT count(*) AS total ${sessionCompartments}`).get(id).total
+            : compartments.length;
         const memories = db.prepare(MEMORIES).all(identity);
         if (
           compartments.some((row) => !compartmentSchema.safeParse(row).success) ||
           memories.some((row) => !memorySchema.safeParse(row).success)
         )
-          throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH');
+          throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
         return {
           capturedAt,
           compartments,
+          summaryTotal,
           // Validate timestamp types before comparing; SQLite's coercion
           // must not turn a changed storage representation into active memory.
           memories: memories.filter(
@@ -274,20 +266,18 @@ export function createMagicContextReader(options) {
           ),
         };
       });
-      const { capturedAt, compartments, memories } = stored;
       const summaries = compartments.map((row) => compartmentItem(row, capturedAt));
-      // Acquire once after releasing the read transaction. The same native
-      // capture supplies branch facts here and task/progress in the result.
-      const native = await context.nativeRead({
-        entry_ids: [
-          ...new Set(summaries.map((item) => item.source.source_entry_id).filter(Boolean)),
-        ],
-      });
+      const ids = [
+        ...new Set(summaries.map((item) => item.source.source_entry_id).filter(Boolean)),
+      ];
+      // Bridge appends the same native capture after read() returns.
+      const relations = ids.length
+        ? (await context.nativeRead({ entry_ids: ids })).entry_relations
+        : {};
       for (const item of summaries) {
         const end = item.source.source_entry_id;
-        item.branch_relation = end ? native.entry_relations[end] : 'unknown';
+        item.branch_relation = end ? relations[end] : 'unknown';
       }
-      const { content } = contextSelection(context.request);
       const eligible =
         content.summary === -1
           ? summaries
@@ -303,7 +293,7 @@ export function createMagicContextReader(options) {
           {
             type: 'summary',
             selected: selectedSummaries.length,
-            total: summaries.length,
+            total: summaryTotal,
             ...(excluded ? { excluded } : {}),
           },
           { type: 'memory', selected: selectedMemories.length, total: memories.length },

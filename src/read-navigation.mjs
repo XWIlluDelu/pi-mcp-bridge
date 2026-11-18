@@ -16,8 +16,7 @@ const slice = (text, start, end = text.length) => {
   if (/[\uD800-\uDBFF]/u.test(text[end - 1] ?? '')) end--;
   return text.slice(start, end);
 };
-function excerpt(value, limit = 640, query = '') {
-  const text = compact(value);
+function excerpt(text, limit = 640, query = '') {
   if (text.length <= limit) return text;
   if (limit < 8) return slice(text, 0, limit);
   const at = query ? text.toLocaleLowerCase().indexOf(query.toLocaleLowerCase()) : -1;
@@ -225,19 +224,7 @@ function toolPreview(documents, doc) {
     ? `${field}: ${excerpt(inline(typeof args[field] === 'string' ? args[field] : JSON.stringify(args[field])), 80)}`
     : '';
   const status = result?.isError ? 'error' : result ? 'returned' : 'result not recorded';
-  // Only explicit failure output is a diagnostic. Successful stdout stays in
-  // the tool reference, not in the default activity directory.
-  const diagnostic = result?.isError
-    ? excerpt(
-        inline(
-          units
-            .filter((u) => u.message?.role === 'toolResult')
-            .map((u) => messageText(u.message))
-            .join(''),
-        ),
-        100,
-      )
-    : '';
+  const diagnostic = result?.isError ? excerpt(inline(messageText(result)), 100) : '';
   const operations = rows.length
     ? `${rows.length} operations: ${[...new Set(rows.map((c) => excerpt(inline(c.name), 24)))].slice(0, 3).join(', ')}${errors.length ? `; ${errors.length} error/unfinished` : ''}`
     : '';
@@ -328,7 +315,7 @@ export function navigationDocuments(
         },
       });
     }
-    if (doc.kind !== 'tool') continue;
+    if (!units[0].tool_id) continue;
     const calls = new Map();
     for (const [atom, unit] of units.entries())
       for (const [ordinal, call] of (unit.message?.nestedCalls?.calls ?? []).entries())
@@ -396,7 +383,7 @@ export function navigationOrder(documents, query) {
 export function navigationRow(documents, index, ref, query) {
   const doc = documents[index];
   const related = doc.links.map(({ relation, target }) => ({ relation, ref: ref(target) }));
-  const tool = !query && doc.kind === 'tool';
+  const tool = !query && doc.children !== undefined;
   const full = compact(
     query
       ? searchedText(documents, doc, query)

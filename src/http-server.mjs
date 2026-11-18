@@ -59,7 +59,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     requests = new Map();
   let stopping = false,
     closing,
-    expectedHost;
+    allowedHosts;
   const listener = http.createServer(
     { maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 },
     (req, res) => {
@@ -84,7 +84,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
   async function handle(req, res) {
     const headers = req.headersDistinct;
     const host = headers.host;
-    if (host?.length !== 1 || host[0] !== expectedHost) return refuse(res, 'INVALID_HOST');
+    if (host?.length !== 1 || !allowedHosts.includes(host[0])) return refuse(res, 'INVALID_HOST');
     if (headers.origin) return refuse(res, 'ORIGIN_DENIED');
     const credentials = headers[TOKEN_HEADER];
     if (credentials?.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
@@ -159,9 +159,12 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
           resolve();
         });
       });
-      expectedHost = `127.0.0.1:${listener.address().port}`;
+      const authority = `127.0.0.1:${listener.address().port}`;
+      const endpoint = new URL(`http://${authority}/mcp`);
+      // HTTP clients normally omit the default port from Host.
+      allowedHosts = [authority, endpoint.host];
       diagnostics.emit('service.ready', { transport: 'http' });
-      return `http://${expectedHost}/mcp`;
+      return endpoint.href;
     },
     close() {
       if (closing) return closing;
@@ -219,12 +222,9 @@ async function main() {
     })();
     return closing;
   };
-  process.on('SIGINT', () => {
-    void close();
-  });
-  process.on('SIGTERM', () => {
-    void close();
-  });
+  const stop = () => void close();
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
   try {
     initializing = (async () => {
       await bridge.init();

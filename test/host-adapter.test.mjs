@@ -254,6 +254,9 @@ test('host history uses the snapshot identity without polling native state again
   );
   snapshot.sessionId = 'another-session';
   assert.equal((await request(f, 'snapshot')).error, 'RUNTIME_SESSION_CHANGED');
+  snapshot.sessionId = f.session.header.id;
+  await fs.writeFile(f.session.file, JSON.stringify({ ...f.session.header, cwd: f.dir }) + '\n');
+  assert.equal((await request(f, 'snapshot')).error, 'RUNTIME_SESSION_CHANGED');
 });
 test('publication failure after listening closes endpoint while retaining ownership', async (t) => {
   const f = await fixture(t),

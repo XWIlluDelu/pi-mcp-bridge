@@ -1,7 +1,7 @@
 import packageInfo from '../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
-import { readSessionIdentity } from './data.mjs';
+import { readSessionIdentity, sameSessionIdentity } from './data.mjs';
 
 import { parseCompactInput, compactMetadata } from './compact.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
@@ -95,7 +95,7 @@ export async function reserveHostSession({
       !(await ownerAlive(record.owner))
     )
       fail('RUNTIME_SESSION_CHANGED');
-    if ((await readSessionIdentity(target.file)).header.id !== target.header.id)
+    if (!sameSessionIdentity(await readSessionIdentity(target.file), target))
       fail('RUNTIME_SESSION_CHANGED');
   }
   async function state() {

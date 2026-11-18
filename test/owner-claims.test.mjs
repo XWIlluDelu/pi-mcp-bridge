@@ -12,13 +12,8 @@ import {
   readClaim,
   readOwnerRecord,
   reserveOwner,
-  releaseOwner,
   ownerAlive,
-  waitOwnerExit,
 } from '../src/attachments.mjs';
-import { RuntimePool } from '../src/rpc.mjs';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-owner-'));
@@ -103,19 +98,24 @@ test('ownership survives control mismatch; only using the live endpoint requires
   const f = await fixture(t);
   const record = {
     ...f.record,
+    sessionId: undefined,
     kind: 'unsupported-control-owner',
     socket: path.join(f.dir, 'fixture.sock'),
     phase: 'ready',
   };
   await fs.writeFile(f.file, JSON.stringify(record));
   await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), /LIVE_OWNER_UNREACHABLE/);
+  await assert.rejects(
+    assertNoOtherLiveOwner(f.dir, { file: f.session.file }),
+    /LIVE_OWNER_UNREACHABLE/,
+  );
   await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement), /LIVE_OWNER_UNREACHABLE/);
   await assert.rejects(
     new AttachedRuntime({ attachmentDir: f.dir }, f.session, record).state(),
     /ATTACHMENT_PROTOCOL_MISMATCH/,
   );
   const differentOwner = { ...f.record.owner, start: 'different-process-start' };
-  assert.equal(await readOwnerRecord(f.dir, f.file, undefined, { owner: differentOwner }), null);
+  assert.equal(await readOwnerRecord(f.file, { owner: differentOwner }), null);
 });
 
 test('known different paths do not inherit owner damage; ambiguous paths still block admission', async (t) => {
@@ -125,7 +125,7 @@ test('known different paths do not inherit owner damage; ambiguous paths still b
   await assertNoOtherLiveOwner(f.dir, unrelated);
   await assert.rejects(readClaim(f.dir, f.session), { code: 'INVALID_ATTACHMENT_RECORD' });
   // Killing a PID requires proving that it does not also own another session.
-  await assert.rejects(readOwnerRecord(f.dir, f.file, undefined, { owner: f.record.owner }), {
+  await assert.rejects(readOwnerRecord(f.file, { owner: f.record.owner }), {
     code: 'INVALID_ATTACHMENT_RECORD',
   });
   await fs.writeFile(f.file, JSON.stringify({ ...f.record, file: null }));
@@ -155,62 +155,14 @@ test('dead ownership can be replaced without its old control metadata; a local p
   await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), { code: 'COLD_REACQUIRE_BLOCKED' });
 });
 
-test('real proc stat open/read exit race returns ESRCH and is conclusively absent', async (t) => {
-  const f = await fixture(t);
-  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], {
-    env: { PATH: process.env.PATH },
-    stdio: 'ignore',
-  });
-  const exit = once(child, 'exit');
-  t.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-    await exit;
-  });
-  await once(child, 'spawn');
-  const owner = await processIdentity(child.pid),
-    file = `/proc/${child.pid}/stat`,
-    read = fs.readFile;
-  const reservation = { ...f.record, owner, kind: 'tui', phase: 'transitioning' };
-  await fs.writeFile(f.file, JSON.stringify(reservation));
-  const pool = new RuntimePool({ attachmentDir: f.dir }, () =>
-    assert.fail('live writer must block'),
-  );
-  await assert.rejects(pool.resolve(f.session), /LIVE_OWNER_UNREACHABLE/);
-  let code;
-  t.mock.method(fs, 'readFile', async function (target, ...args) {
-    if (target !== file) return read.call(fs, target, ...args);
-    const fd = await fs.open(target, 'r');
-    child.kill('SIGTERM');
-    await exit;
-    try {
-      return await fd.readFile(...args);
-    } catch (error) {
-      code = error.code;
-      throw error;
-    } finally {
-      await fd.close();
-    }
-  });
-  try {
-    assert.equal(await processIdentity(child.pid), null);
-    assert.equal(code, 'ESRCH');
-    t.mock.restoreAll();
-    assert.equal(await processIdentity(child.pid), null);
-    assert.equal(await ownerAlive(owner), false);
-    await waitOwnerExit(owner, 100);
-    const claimed = await reserveOwner(f.dir, f.session, 'rpc');
-    assert.notEqual(claimed.generation, reservation.generation);
-    await releaseOwner(f.dir, f.session, claimed);
-  } finally {
-    t.mock.restoreAll();
-  }
-});
-test('boot identity failures and other proc errors remain fail-closed with original cause', async (t) => {
+test('only disappearance of the exact PID stat proves process exit', async (t) => {
   const read = fs.readFile,
     statPath = `/proc/${process.pid}/stat`,
     bootPath = '/proc/sys/kernel/random/boot_id';
   const owner = await processIdentity();
   for (const [target, code] of [
+    [statPath, 'ENOENT'],
+    [statPath, 'ESRCH'],
     [bootPath, 'ENOENT'],
     [bootPath, 'ESRCH'],
     [statPath, 'EACCES'],
@@ -225,18 +177,14 @@ test('boot identity failures and other proc errors remain fail-closed with origi
       if (file === target) throw cause;
       return read.call(fs, file, ...args);
     });
-    try {
-      await assert.rejects(
-        processIdentity(),
-        (error) => error.code === 'PROCESS_IDENTITY_UNAVAILABLE' && error.cause === cause,
-      );
+    if (target === statPath && ['ENOENT', 'ESRCH'].includes(code))
+      assert.equal(await ownerAlive(owner), false);
+    else
       await assert.rejects(
         ownerAlive(owner),
         (error) => error.code === 'PROCESS_IDENTITY_UNAVAILABLE' && error.cause === cause,
       );
-    } finally {
-      t.mock.restoreAll();
-    }
+    t.mock.restoreAll();
   }
   t.mock.method(fs, 'readFile', async function (file, ...args) {
     if (file === statPath) return 'malformed stat';

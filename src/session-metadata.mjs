@@ -1,36 +1,35 @@
-import fs from 'node:fs/promises';
-import { createReadStream } from 'node:fs';
+import { withSessionFile, fileRevision } from './data.mjs';
 import { uiSnapshot } from './rpc-ui.mjs';
 import { modelState } from './models.mjs';
 import { scanSavedLines } from './lf-lines.mjs';
 
 // Metadata scanning retains at most one JSONL record, never a second full history.
 export async function savedSessionName(session, cache) {
-  const stat = await fs.stat(session.file);
-  const signature = [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
-  const previous = cache?.get(session.file);
-  if (previous?.signature === signature) return previous.name;
-  let name = null;
-  await scanSavedLines(createReadStream(session.file, { encoding: 'utf8' }), (line) => {
-    // Metadata is authorized by list, not read. Ignore incomplete/corrupt body
-    // records here; content reads validate identity and the selected branch.
-    if (!line.includes('"session_info"')) return;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'session_info')
-        name = typeof entry.name === 'string' ? entry.name.trim() || null : null;
-    } catch {
-      /* A live writer may still be finishing the final record. */
+  const previous = cache.get(session.file);
+  if (previous?.signature === session.fileRevision) return previous.name;
+  return withSessionFile(session.file, async (fd, stat) => {
+    // Bind the title to the same inode and revision as the authorized list row.
+    if (fileRevision(stat) !== session.fileRevision) return null;
+    let name = null;
+    const stream = fd.createReadStream({ encoding: 'utf8', autoClose: false, end: stat.size - 1 });
+    await scanSavedLines(stream, (line) => {
+      if (!line.includes('"session_info"')) return;
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'session_info')
+          name = typeof entry.name === 'string' ? entry.name.trim() || null : null;
+      } catch {
+        // A writer may still be finishing its last record.
+      }
+    });
+    if (fileRevision(await fd.stat()) !== session.fileRevision) return null;
+    if ((name?.length ?? 0) <= 4096) {
+      cache.delete(session.file);
+      cache.set(session.file, { signature: session.fileRevision, name });
+      if (cache.size > 256) cache.delete(cache.keys().next().value);
     }
+    return name;
   });
-  // Bound retained names, not the accepted name or history size. No transcript
-  // bytes enter this cache; append, replacement and truncation invalidate it.
-  if (cache && (name?.length ?? 0) <= 4096) {
-    cache.delete(session.file);
-    cache.set(session.file, { signature, name });
-    if (cache.size > 256) cache.delete(cache.keys().next().value);
-  }
-  return name;
 }
 
 function runtimeCapabilities(runtime, state) {
@@ -52,18 +51,12 @@ function runtimeCapabilities(runtime, state) {
 
 export async function runtimeMetadata(pool, session) {
   const observed_at = new Date().toISOString();
+  const inactive = (state) => ({
+    status: { state, observed_at, pending_messages: null, model: null, thinking_level: null },
+  });
   try {
     const runtime = await pool.forRead(session);
-    if (!runtime)
-      return {
-        status: {
-          state: 'saved',
-          observed_at,
-          pending_messages: null,
-          model: null,
-          thinking_level: null,
-        },
-      };
+    if (!runtime) return inactive('saved');
     const { state, status, pending } = await runtime.idleSnapshot();
     const selection = modelState(state);
     return {
@@ -81,14 +74,6 @@ export async function runtimeMetadata(pool, session) {
       },
     };
   } catch {
-    return {
-      status: {
-        state: 'unavailable',
-        observed_at,
-        pending_messages: null,
-        model: null,
-        thinking_level: null,
-      },
-    };
+    return inactive('unavailable');
   }
 }

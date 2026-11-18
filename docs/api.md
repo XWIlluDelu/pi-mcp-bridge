@@ -45,7 +45,7 @@ and pagination narrow the session rows:
 
 Filters combine with AND: case-insensitive project-directory/name substrings, inclusive RFC3339 activity bounds and exact `session_id`. Offset defaults to 0; limit is 1–100, default 30. Results sort by newest native file mtime, then session ID. `next_offset` is null at the end; concurrent activity can reorder later pages.
 
-Each row contains `session_id`, `project`, nullable `name` and `parent_session_id`, `last_activity` and `status`. A parent ID is disclosed only with its own list permission. Listing requires no read permission and never starts Pi.
+Each row contains `session_id`, `project`, nullable `name` and `parent_session_id`, `last_activity` and `status`. A live owner supplies its current name. A saved title comes from the file revision used to identify the row and can be null if that file changes during listing. Parent IDs require their own list permission. Listing never starts Pi.
 
 Status describes the sampled runtime:
 

@@ -2,8 +2,6 @@ import { nativeOwner } from './fixtures/native-owner.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import timersPromises from 'node:timers/promises';
-import { syncBuiltinESMExports } from 'node:module';
 import { Webhook } from 'standardwebhooks';
 import { Bridge } from '../src/bridge.mjs';
 import { EventSubscriptions } from '../src/events.mjs';
@@ -105,30 +103,6 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
       bridge = await new Bridge(config).init();
       wire();
       await bridge.events.init();
-    },
-  };
-}
-
-// Advance only the retry clock; real authorization and subscription storage still run.
-function retryClock(t, fixture) {
-  let elapsed = 0;
-  const waits = [];
-  const timer = t.mock.method(timersPromises, 'setTimeout', async (ms, value, { signal } = {}) => {
-    signal?.throwIfAborted();
-    waits.push(ms);
-    elapsed += ms;
-    fixture.advance(ms);
-    return value;
-  });
-  syncBuiltinESMExports();
-  t.after(() => {
-    timer.mock.restore();
-    syncBuiltinESMExports();
-  });
-  return {
-    waits,
-    get elapsed() {
-      return elapsed;
     },
   };
 }
@@ -254,11 +228,36 @@ test('delivery filters sessions and stops on permanent responses or unsubscribe'
   assert.equal(f.bridge.events.deliveries.size, 0);
 });
 
-test('default delivery retries exhaust a bounded window and do not replay after receiver recovery or restart', async (t) => {
+test('a fresh subscription after expiry does not inherit a pending delivery', async (t) => {
+  const f = await fixture(t);
+  const input = request(f.session.id);
+  const subscribe = (ttlMs) => f.call('events/subscribe', { ...input, ttlMs });
+  const id = (await subscribe(1)).message.result.id;
+  const verify = f.bridge.events.post;
+  let attempts = 0,
+    fresh;
+  f.bridge.events.post = async (url, body, headers) => {
+    if (JSON.parse(body).type === 'verification') return verify(url, body, headers);
+    if (++attempts === 1) {
+      f.advance(2);
+      fresh = await subscribe(60000);
+    }
+    return { status: 503 };
+  };
+  await f.settle();
+  assert.equal(fresh.message.result.id, id);
+  assert.equal(attempts, 1);
+});
+
+test('delivery retries exhaust a bounded window and do not replay after recovery or restart', async (t) => {
   const f = await fixture(t, {});
   await f.call('events/subscribe', request(f.session.id));
-  const clock = retryClock(t, f),
-    attempts = [];
+  const delays = f.bridge.events.retryDelays;
+  const elapsed = delays.reduce((sum, ms) => sum + ms, 0);
+  assert.ok(elapsed >= 300000 && elapsed <= 480000 && Math.max(...delays) <= 120000);
+  assert.ok(delays.length >= 4 && delays.length < 10);
+  f.bridge.events.retryDelays = delays.map(() => 0);
+  const attempts = [];
   let status = 503;
   const post = async (_url, body, headers) => {
     attempts.push({ body, headers });
@@ -266,12 +265,10 @@ test('default delivery retries exhaust a bounded window and do not replay after 
   };
   f.bridge.events.post = post;
   await f.settle();
-  assert.ok(clock.elapsed >= 300000 && clock.elapsed <= 480000);
-  assert.ok(attempts.length > 4 && attempts.length <= 10);
+  assert.equal(attempts.length, delays.length + 1);
   assert.equal(new Set(attempts.map(({ body }) => body)).size, 1);
   assert.equal(new Set(attempts.map(({ headers }) => headers['webhook-id'])).size, 1);
   assert.equal(attempts[0].headers['webhook-id'], JSON.parse(attempts[0].body).eventId);
-  assert.ok(Math.max(...clock.waits) <= 120000);
   assert.equal(f.bridge.events.deliveries.size, 0);
   const exhaustedCount = attempts.length;
   status = 204;

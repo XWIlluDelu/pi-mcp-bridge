@@ -30,7 +30,7 @@ export function scheduleAutoRelease(bridge, runtime) {
             !bridge.locks.has(`stop:${id}`) &&
             !bridge.locks.has(`bash:${id}`) &&
             !runtime.activeReads &&
-            !runtime.activeBashes;
+            !runtime.hasUnsettledWork();
           if (!eligible()) return;
           const idle = await runtime.idleSnapshot();
           if (idle.status !== 'idle' || !eligible()) return;

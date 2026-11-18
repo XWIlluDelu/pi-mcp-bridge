@@ -3,51 +3,31 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { savedSessionName, runtimeMetadata } from '../src/session-metadata.mjs';
+import { readSessionIdentity } from '../src/data.mjs';
 import { AttachedRuntime } from '../src/attachments.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('title cache reuses only unchanged files; append, incomplete record, truncation and replacement invalidate', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-metadata-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const session = { file: path.join(dir, 'session.jsonl') },
+  const file = path.join(dir, 'session.jsonl'),
     cache = new Map();
+  const header = JSON.stringify({ type: 'session', id: 'test', cwd: dir }) + '\n';
   const title = (name) => JSON.stringify({ type: 'session_info', name }) + '\n';
-  await fs.writeFile(session.file, title('first'));
-  assert.equal(await savedSessionName(session, cache), 'first');
-  await fs.appendFile(session.file, '{"type":"session_info","name":"se');
-  assert.equal(await savedSessionName(session, cache), 'first');
-  await fs.appendFile(session.file, 'cond"}\n');
-  assert.equal(await savedSessionName(session, cache), 'second');
-  await fs.writeFile(session.file, title('tiny'));
-  assert.equal(await savedSessionName(session, cache), 'tiny');
-  const before = await fs.stat(session.file),
-    temp = session.file + '.new';
-  await fs.writeFile(temp, title('swap'));
-  await fs.utimes(temp, before.atime, before.mtime);
-  await fs.rename(temp, session.file);
-  assert.equal(await savedSessionName(session, cache), 'swap');
-  await fs.unlink(session.file);
-  await assert.rejects(savedSessionName(session, cache), { code: 'ENOENT' });
-});
-
-test('title cache has a fixed retention bound and never retains history', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/pi-metadata-');
-  t.after(() => fs.rm(dir, { recursive: true, force: true }));
-  const cache = new Map();
-  for (let i = 0; i < 260; i++) {
-    const file = path.join(dir, i + '.jsonl');
-    await fs.writeFile(
-      file,
-      JSON.stringify({ type: 'message', content: 'NOT_A_TITLE' }) +
-        '\n' +
-        JSON.stringify({ type: 'session_info', name: String(i) }) +
-        '\n',
-    );
-    await savedSessionName({ file }, cache);
-  }
-  assert.equal(cache.size, 256);
-  assert.equal(cache.has(path.join(dir, '0.jsonl')), false);
-  assert.equal(JSON.stringify([...cache]).includes('NOT_A_TITLE'), false);
+  const readName = async () => savedSessionName(await readSessionIdentity(file), cache);
+  await fs.writeFile(file, header + title('first'));
+  assert.equal(await readName(), 'first');
+  await fs.appendFile(file, '{"type":"session_info","name":"se');
+  assert.equal(await readName(), 'first');
+  await fs.appendFile(file, 'cond"}\n');
+  assert.equal(await readName(), 'second');
+  await fs.writeFile(file, header + title('tiny'));
+  const row = await readSessionIdentity(file);
+  const replacement = file + '.new';
+  await fs.writeFile(replacement, header + title('swap'));
+  await fs.rename(replacement, file);
+  assert.equal(await savedSessionName(row, cache), null);
+  assert.equal(await readName(), 'swap');
 });
 
 test('live status, model and capability reports are sanitized independently of idle certainty', async () => {

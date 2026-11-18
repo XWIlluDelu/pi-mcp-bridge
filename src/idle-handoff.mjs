@@ -1,6 +1,5 @@
 // Owner-local transfer using the existing session lock and ownership registry.
 import { randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
 import { atomicJson } from './storage.mjs';
 import {
   ownerAlive,
@@ -8,6 +7,7 @@ import {
   readClaim,
   registryTransaction,
   claimFile,
+  retireClaim,
   assertNoOtherLiveOwner,
 } from './attachments.mjs';
 
@@ -66,8 +66,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
       signal?.throwIfAborted();
       const reservation = await registryTransaction(dir, async () => {
         signal?.throwIfAborted();
-        await assertNoOtherLiveOwner(dir, session);
-        const current = await readClaim(dir, session);
+        const current = await assertNoOtherLiveOwner(dir, session);
         if (current && (await ownerAlive(current.owner))) throw new Error('LIVE_OWNER_UNREACHABLE');
         if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
         // A future requester is not yet a writer. The companion marks opening
@@ -80,6 +79,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
           owner: requester,
           phase: 'reserved',
           handoffId: handoff_id,
+          ...(current?.noColdReacquire ? { noColdReacquire: true } : {}),
         };
         signal?.throwIfAborted();
         await atomicJson(claimFile(dir, session), record);
@@ -95,7 +95,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
         session_file: session.file,
         native_id: session.header.id,
         generation: reservation.generation,
-        no_cold_reacquire: false,
+        no_cold_reacquire: reservation.noColdReacquire === true,
         ...exitDetails,
       };
     });
@@ -126,7 +126,7 @@ export async function cancelHandoff(bridge, request) {
         !sameOwner(current.owner, owner)
       )
         return;
-      await fs.unlink(claimFile(dir, session));
+      await retireClaim(dir, session, current);
     });
   return { session_id: request.session_id, status: 'cancelled' };
 }

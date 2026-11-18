@@ -20,7 +20,7 @@ export async function prepareSession(config, project, { name, parentSession, cap
   const installation = await resolvePiInstallation(config, baseEnv);
   const env = await piLaunchEnvironment(installation, baseEnv, project);
   const sdk = captureFork ? await loadPiSdk(installation) : null;
-  const snapshot = sdk ? await captureFork(sdk.CURRENT_SESSION_VERSION) : null;
+  const snapshot = sdk ? await captureFork(sdk) : null;
   const { stdout } = await exec(
     process.execPath,
     [
@@ -40,9 +40,9 @@ export async function prepareSession(config, project, { name, parentSession, cap
   let entries = [];
   if (snapshot && snapshot.leafId !== null) {
     const { header, entries: raw, leafId } = snapshot;
-    const manager = sdk.SessionManager.inMemory(header.cwd || project, undefined, [header, ...raw]);
-    if (!sessionEntryIndex(manager.getEntries(), leafId).has(leafId))
+    if (!sessionEntryIndex(raw, leafId, snapshot.byId).has(leafId))
       throw new Error('INVALID_RUNTIME_ENTRIES');
+    const manager = sdk.SessionManager.inMemory(header.cwd || project, undefined, [header, ...raw]);
     manager.createBranchedSession(leafId);
     entries = manager.getEntries();
   }
@@ -55,15 +55,12 @@ export async function prepareSession(config, project, { name, parentSession, cap
       name,
     });
   return {
-    id: opaqueId(`${file}\0${id}`),
-    header,
-    file,
-    cwd: project,
+    session: { id: opaqueId(`${file}\0${id}`), header, file, cwd: project },
     entries,
   };
 }
 
-export async function persistSession(session) {
+export async function persistSession(session, entries) {
   await assertNativeDirectory(path.dirname(session.file));
   const temporary = `${session.file}.${randomUUID()}.pending`;
   let published = false;
@@ -71,7 +68,7 @@ export async function persistSession(session) {
     await pipeline(
       function* () {
         yield JSON.stringify(session.header) + '\n';
-        for (const entry of session.entries) yield JSON.stringify(entry) + '\n';
+        for (const entry of entries) yield JSON.stringify(entry) + '\n';
       },
       createWriteStream(temporary, { flags: 'wx', mode: 0o600, flush: true }),
     );

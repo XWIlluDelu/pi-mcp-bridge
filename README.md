@@ -22,7 +22,7 @@ cp deploy/owner.example.json /absolute/private/path/owner.json
 chmod 600 /absolute/private/path/owner.json
 ```
 
-Edit `owner.json` using [configure one project](docs/configuration.md#configure-one-project): select the native session storage and project, then add its permission grant. The example denies all operations until you grant them. That guide also explains how storage paths differ from project paths and which directories must be private.
+In `owner.json`, set the native storage roots, project directory and permission grant. The example denies all operations until you grant them. See [configure one project](docs/configuration.md#configure-one-project).
 
 If the target session is already open in Pi, [load its companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) before remote control. Bridge can resume an inactive saved session itself. Live operations use the owner's [control capabilities and read contract](docs/architecture.md#component-versions).
 
@@ -46,17 +46,11 @@ After your MCP client connects, call these tools with the indicated arguments:
 2. `list({})` discovers authorized saved sessions. An empty result can mean no saved sessions or no effective `list` grant; check the configured roots and [permission rules](docs/configuration.md#seven-independent-rights).
 3. `read({session_id:"<ID from list>"})` opens recent history without starting a writer. Use the returned Bridge ID, not the native Pi ID or session filename.
 
-These calls verify access to the configured data. To send work, create a session or follow a result, continue with [working with a session](docs/collaboration.md); the [API](docs/api.md) defines the exact arguments and outcomes.
-
-## Native Pi integration
-
-Bridge resumes saved sessions with the owner's native Pi environment. For live
-owners, see [companion registration, SDK hosts and terminal handoff](docs/runtime.md).
-
 ## Documentation
 
 - [Owner configuration and diagnostics](docs/configuration.md)
 - [MCP transports](docs/transports.md)
+- [Companion registration, SDK hosts and terminal handoff](docs/runtime.md)
 - [Reading and search](docs/reading.md), [model controls](docs/model-control.md) and [completion events](docs/events.md)
 - [Optional integrations](docs/compatibility.md) and [architecture](docs/architecture.md)
 

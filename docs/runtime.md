@@ -1,11 +1,6 @@
 # Native runtime, ownership and local entry
 
-Start with a working [owner configuration](configuration.md) and
-[MCP connection](transports.md). A **session** is a saved native Pi history;
-its **owner** is the live process permitted to write it. The MCP client and the
-Bridge service are separate from that writer.
-
-Choose the entry path that matches how you use Pi:
+A **session** is a saved native Pi history. Its **owner** is the process permitted to write it.
 
 | Starting point                                               | Setup                                                                                              |
 | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
@@ -51,27 +46,17 @@ close before reopening. See [component versions](architecture.md#component-versi
 | TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
 | Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
-Custom hosts expose the callbacks they implement. An RPC host supplies its own
-reload callback. Its supplied binding rejects `idle_only` with
-`HOST_ADMISSION_UNSUPPORTED`. RPC state samples are advisory. A custom host
-can declare `supportsIdleOnly:true` when its submit callback has a writer-local
-gate that observes asynchronous preparation and fences new input. Use
-`list.status.capabilities` to inspect send,
-command, stop and reload paths.
-
-For cold-start and dispatch outcomes, see the [tool API](api.md#sessions-and-mutations).
+Check `list.status.capabilities` for the current writer. A custom host may
+declare `supportsIdleOnly:true` when its submit callback fences new input
+and observes asynchronous preparation. The supplied RPC binding returns
+`HOST_ADMISSION_UNSUPPORTED` because a state sample cannot enforce idle admission.
 
 ## Remote reload
 
-[The public reload tool](api.md#reload) acts on a supported idle writer. Owned
-RPC reload seals and exits the old worker before starting a fresh one.
-Companion reload keeps the writer claim through shutdown and confirms the new
-ready generation and native completion for the same session. Pending input
-preparation and standalone bash block reload. Saved messages are preserved and
-extension-local capture state is reset.
-
-The SDK host binding calls `AgentSession.reload()` within its native admission
-gate. An RPC host can provide the same callback accepted by a custom controller:
+Owned RPC reload seals and exits the old worker before starting a fresh one.
+A companion retains its claim until the replacement generation confirms native
+completion. The SDK binding calls `AgentSession.reload()` under its admission
+gate. An RPC or custom host supplies this callback:
 
 ```text
 reload({sessionFile, sessionId, beforeDispatch}) -> Promise<{reloaded:true}>
@@ -87,12 +72,10 @@ See [model controls](model-control.md) for public behavior.
 
 ### Host model setter
 
-Supplied bindings call current native model and thinking setters. A custom host
-can expose `setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})`
-and return the actual `{model:{provider,id}, thinking_level}`. Preserve the prior
-effort during model-only changes, using the native setter for fallback. Check
-admission at dispatch and report actual settings after awaited identity checks.
-The controller fences overlapping settings/send and drains admitted setters.
+A custom `setModel({model?, thinking_level?, sessionFile, sessionId, beforeDispatch})`
+callback checks admission at dispatch, uses Pi's native setters, then verifies
+identity and returns the actual `{model:{provider,id}, thinking_level}`.
+For model-only changes, carry the prior effort through Pi's native fallback.
 
 ### Host compact callback
 
@@ -127,23 +110,14 @@ Use the same file as the installation's `open.mjs`; Pi deduplicates a settings
 entry and explicit `-e` for that canonical file. In a Bridge-owned child the
 companion defers to the existing RPC claim instead of publishing another endpoint.
 
-The daily companion reads
-`$XDG_CONFIG_HOME/pi-mcp-bridge/owner.json`, otherwise
-`$HOME/.config/pi-mcp-bridge/owner.json`; `PI_MCP_OWNER_CONFIG` selects another
-file. An absent default leaves it inactive. An explicitly selected missing,
-invalid or non-private file reports an extension-load error.
+The companion loads `pi-mcp-bridge/owner.json` under `$XDG_CONFIG_HOME` (default
+`$HOME/.config`). A missing default leaves it inactive. Set `PI_MCP_OWNER_CONFIG`
+to require a specific private owner file. Only sessions under the configured
+`sessionRoots` register. A new session reserves its path before Pi first writes
+the file and makes it discoverable.
 
-It uses the configured registry and registers only sessions under `sessionRoots`,
-checking path metadata before reading native headers/entries. No-session or
-out-of-scope runs get no endpoint. A fresh session may reserve its identity before
-first persistence; discovery begins when Pi writes the file. Reload publishes a
-fresh generation and switch-away retires that context's claim.
-[Configuration](configuration.md#request-permission-snapshots) defines scope
-updates and permissions.
-
-An ordinary RPC host sharing the native agent directory inherits the companion.
-The host retains its pipes and lifecycle; Bridge uses private IPC. For a one-off
-launch with the same owner scope:
+An ordinary RPC host can load the same companion while retaining its pipes and
+lifecycle. To enable it for one launch:
 
 ```sh
 PI_MCP_OWNER_CONFIG=/absolute/path/owner.json \
@@ -154,14 +128,10 @@ If also set, `PI_MCP_ATTACH_DIR` must agree with the owner file. Directory-only
 `PI_MCP_ATTACH_DIR` is the low-level path for hosts managing their own scope;
 use an owner profile for scoped daily access and [completion events](events.md).
 
-Existing processes need a safe TUI `/reload` or host-managed reopen to load a
-newly configured extension. Registration happens after native file open, so it
-cannot make blindly launching `--session` into an owned file safe. A GUI started
-first can expose its Pi through the companion; one opened after a Bridge-owned
-RPC needs shared control or an explicit handoff.
-
-Check owner status with [`list({session_id})`](api.md#list). For an active
-in-scope session, `saved` means Bridge found no cooperating live owner.
+Apply a new extension setting to a running TUI with `/reload`, or reopen through
+its host. Registration follows native file open. To open a session another
+writer owns, use handoff or shared control. [Session status](api.md#list) shows
+`saved` when Bridge finds no cooperating live owner.
 
 ## Host registration lifecycle
 
@@ -178,6 +148,12 @@ in-scope session, `saved` means Bridge found no cooperating live owner.
    Reserve a different session before opening it.
 4. For remote release, provide the [session-local close contract](#explicit-deletion).
    `controller.close()` retires the endpoint while a live writer still holds its claim.
+
+A custom `bash` callback returns native output. A `stop` callback returns
+`{status:"accepted",acknowledgement,coverage:"agent_and_bash"}`. The inline
+`onResult` and `onWithdraw` callbacks retain captured output if the final ACK is
+lost. Command support requires bash plus cancel or stop. Remote stop requires
+the complete stop callback.
 
 See the [SDK and RPC integration examples](../test/host-integration.test.mjs).
 
@@ -216,48 +192,29 @@ the reservation until confirmed closure or exact requester exit.
 
 ### Recover an explicit local pause
 
-Owner-local release keeps `noColdReacquire` for a possible unregistered manual
-writer. To clear it:
-
-1. Close the original writer and any unregistered Pi using the target.
-2. Confirm local closure through the running Bridge:
-
-   ```sh
-   node src/owner-runtime.mjs /absolute/path/owner.json reset ps_SESSION_ID --confirm-local-closed
-   ```
-
-3. Retry join or send a new authorized prompt.
-
-Reset refuses any registered live owner regardless of endpoint compatibility.
-The explicit confirmation covers unregistered writers the registry cannot see;
-deleting a claim does not establish closure.
-
-For deliberate idle release without opening a TUI:
+Release a Bridge-owned writer before using the file with an unregistered Pi:
 
 ```sh
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID
 ```
 
-This fences mutations and follows the
-[idle shutdown contract](#shutdown-and-in-flight-acks), including
-EOF and exact exit. The pause remains until a cooperative join or reset. To
-authorize interruption of running/unobservable preparation work:
+Normal release requires an idle writer and waits for its sealed EOF and exit.
+Append `--interrupt` to send SIGTERM to the verified child, including during
+shutdown. Pi can finish shutdown hooks, so a stalled hook can keep release
+pending. A caller timeout leaves the request in progress. Unfinished work in
+memory may be lost. Both forms can close a known owned writer whose saved file
+was removed, using its captured process identity and claim.
+
+Release pauses cold resume until a cooperative join registers a writer or the
+owner confirms local closure. A cancelled join preserves the pause. To reset it,
+close any local writer using the file and run:
 
 ```sh
-node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID --interrupt
+node src/owner-runtime.mjs /absolute/path/owner.json reset ps_SESSION_ID --confirm-local-closed
 ```
 
-The private control verifies the captured child, generation and PID/start/boot,
-including a child already exiting after EOF, then sends SIGTERM and waits. It
-keeps the claim while Pi finishes shutdown hooks, so a stalled hook can keep
-release pending after SIGTERM. It neither escalates to SIGKILL nor terminates
-a shared companion/host. Saved history remains; unfinished memory-only work
-may be lost. A client timeout does not cancel requested exit or release ownership.
-Failed delivery can be retried explicitly.
-
-Either release form can close a known owned child after its history file was
-removed, using captured identity and claim. Replacement or unsafe files still
-fail validation. After closing all local writers, reset permits cold resume.
+Reset refuses a live registered owner. The explicit confirmation covers
+unregistered writers.
 
 ## Shutdown and in-flight ACKs
 
@@ -277,21 +234,14 @@ are absent from Pi's current idle evidence. They can lose queued context or
 invalidate the seal during replacement. Arbitrary extension background work
 also sits outside observed operation lifetimes.
 
-Prompt ACKs establish admission. Timeouts may leave unknown outcomes. Use the
-[submission receipt](api.md#submission-receipt) for late evidence. Received ACKs
-are checked against command, generation and native identity before publication.
-Missing ACKs stay fenced until exact outcome or exit.
+Missing mutation ACKs keep the writer fenced until the matching ACK or exact
+exit. Received ACKs must match command, generation and native identity. Late
+prompt evidence appears in the [submission receipt](api.md#submission-receipt).
 
 Headless RPC cancels supported dialog methods while stdin is active and reports
 `EXTENSION_UI_CANCEL_SENT`. Startup can report `EXTENSION_UI_STARTUP_UNAVAILABLE`
 before stdin is ready. After EOF, normal exit can carry `ui.unavailable` for
 shutdown dialogs. Errors and notifications appear in [runtime events](reading.md#live-output-and-runtime-extension-events).
-
-A custom `bash` callback returns native output. A `stop` callback returns
-`{status:"accepted",acknowledgement,coverage:"agent_and_bash"}`. The inline
-`onResult` and `onWithdraw` callbacks retain captured output if the final ACK is
-lost. Command support requires bash plus cancel or stop. Remote stop requires
-the complete stop callback.
 
 ## Explicit deletion
 
@@ -319,10 +269,7 @@ a shared host returns `DELETE_SHARED_OWNER`.
 
 ## Read and fork boundaries
 
-Owner reads transfer selected, sanitized snapshots; saved reads need no writer.
-[Reading](reading.md) defines turn ranges, content selection, search, references and frozen capture behavior.
-
-Fork leaves the writer in place. Bridge pairs the cooperating owner's raw
-`snapshot()` or the owned child's `get_entries` with the current native header.
-The copy retains native state and image bytes. Attached snapshots are bounded
-at 32 MiB. A live writer must supply its own snapshot.
+[Reads](reading.md) expose selected, sanitized content. For fork, the live
+owner supplies raw `snapshot()` (32 MiB attached limit) or the owned child's
+`get_entries`. Bridge pairs that data with the current native header to
+preserve branch state and image bytes.

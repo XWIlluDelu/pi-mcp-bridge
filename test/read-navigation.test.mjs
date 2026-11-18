@@ -209,6 +209,13 @@ test('command output stays searchable and complete across changing page budgets'
   assert.match(found.items[0].text, /distinct final diagnostic/);
   const expanded = cache.expand([found.items[0].ref], identity);
   let page = cache.render(expanded, { max_bytes: 4096 }, { identity });
+  const nextPage = (cursor) => {
+    const next = { cursor, max_bytes: 8192 };
+    const saved = cache.get(next, identity);
+    return cache.render(saved.snapshot, next, { ...saved, identity });
+  };
+  const firstCursor = page.next_cursor;
+  let secondPage;
   const parts = [];
   while (true) {
     for (const item of page.items)
@@ -217,11 +224,11 @@ test('command output stays searchable and complete across changing page budgets'
         parts.push(item.message.output);
       }
     if (!page.next_cursor) break;
-    const next = { cursor: page.next_cursor, max_bytes: 8192 };
-    const saved = cache.get(next, identity);
-    page = cache.render(saved.snapshot, next, { ...saved, identity });
+    page = nextPage(page.next_cursor);
+    secondPage ??= page;
   }
   assert.equal(parts.join(''), output);
+  assert.deepEqual(nextPage(firstCursor), secondPage);
 });
 
 test('search filters before bounded capture and retains the complete matching logical tool pair', () => {
@@ -248,11 +255,12 @@ test('search filters before bounded capture and retains the complete matching lo
   assert.equal(rows(found, { query })[0].type, 'tool');
 });
 
-test('reader previews are independently searchable alongside long source text', () => {
+test('reader tool items preserve their title, preview and searchable source text', () => {
   const snap = snapshot(
     [
       {
-        type: 'memory',
+        type: 'tool',
+        title: 'Tool receipt',
         text: 'Background context. '.repeat(100) + 'memory evidence',
         preview: 'Preview-only marker',
         source: { reader_item: 'memory' },
@@ -261,6 +269,7 @@ test('reader previews are independently searchable alongside long source text', 
     { view: 'adapted' },
   );
   assert.equal(rows(snap)[0].text, 'Preview-only marker');
+  assert.equal(rows(snap, { query: 'receipt' })[0].title, 'Tool receipt');
   assert.equal(rows(snap, { query: 'preview-only' })[0].text, 'Preview-only marker');
   const [match] = rows(snap, { query: 'memory evidence' });
   assert.match(match.text, /memory evidence/);

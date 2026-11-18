@@ -61,7 +61,10 @@ test('discarded broken branches do not block native current context; traversed c
   const cyclic = structuredClone(rows);
   cyclic.at(-1).parentId = 'answer';
   await fs.writeFile(file, cyclic.map(JSON.stringify).join('\n') + '\n');
-  await assert.rejects(loadSession(file), /INVALID_SESSION_TREE/);
+  await assert.rejects(bridge.read({ session_id: id }), /INVALID_SESSION_TREE/);
+  const healthy = await bridge.read({ session_id: id, leaf_id: 'current' });
+  assert.equal(healthy.leaf_id, 'current');
+  assert.match(JSON.stringify(healthy.items), /CURRENT/);
 });
 
 test('current Pi can reopen a raw fork without changing the source', async (t) => {

@@ -38,34 +38,22 @@ async function main() {
     })();
     return closing;
   };
-  process.on('SIGINT', () => {
-    void close();
-  });
-  process.on('SIGTERM', () => {
-    void close();
-  });
-  process.stdin.on('end', () => {
-    void close();
-  });
-  process.stdin.on('close', () => {
-    void close();
-  });
-  process.stdin.on('error', () => {
-    void close(1);
-  });
-  process.stdout.on('error', () => {
-    void close(1);
-  });
-  process.stdout.on('close', () => {
-    void close(1);
-  });
+  const stop = () => void close();
+  const fail = () => void close(1);
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  process.stdin.on('end', stop);
+  process.stdin.on('close', stop);
+  process.stdin.on('error', fail);
+  process.stdout.on('error', fail);
+  process.stdout.on('close', fail);
   try {
     initializing = bridge.init();
     await initializing;
     if (closing) return closing;
     // A cancelled stdio reply does not cancel an admitted Bridge operation.
     transport = new StdioTransport(async (body) => (await dispatchModern(bridge, body)).message);
-    transport.onerror = () => void close(1);
+    transport.onerror = fail;
     transport.start();
     diagnostics.emit('service.ready', { transport: 'stdio' });
   } catch (error) {

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
+import { readLfLines } from '../src/lf-lines.mjs';
 import {
   dispatchModern,
   MODERN_VERSION,
@@ -23,11 +24,6 @@ const message = (method, params = {}, id = 1) => ({
   params: { ...params, _meta: { ...meta } },
 });
 const stub = { list: async (args) => ({ sessions: [], args }) };
-const deferred = () => {
-  let resolve;
-  const promise = new Promise((r) => (resolve = r));
-  return { promise, resolve };
-};
 
 test('oversized input collections reject before inspecting elements or admitting work', async () => {
   const bridge = { captureRequestContext: () => assert.fail('Invalid request reached admission') };
@@ -80,7 +76,6 @@ test('modern requests are self-contained; discovery and tool list carry required
   assert.deepEqual(discovery.message.result.supportedVersions, [MODERN_VERSION]);
   assert.equal(discovery.message.result.ttlMs, 0);
   assert.equal(discovery.message.result.cacheScope, 'private');
-  assert.equal(discovery.message.result._meta[META + 'serverInfo'].name, 'pi-session-bridge');
   const listed = (await dispatchModern(stub, message('tools/list'))).message.result;
   assert.deepEqual(discovery.message.result._meta[META + 'serverInfo'], {
     name: 'pi-session-bridge',
@@ -121,8 +116,9 @@ test('modern versions, required metadata and unknown methods use official error 
     delete body.params._meta[key];
     assert.equal((await dispatchModern(stub, body)).message.error.code, -32602);
   }
-  assert.equal((await dispatchModern(stub, message('not/a/method'))).status, 404);
-  assert.equal((await dispatchModern(stub, message('not/a/method'))).message.error.code, -32601);
+  const unknown = await dispatchModern(stub, message('not/a/method'));
+  assert.equal(unknown.status, 404);
+  assert.equal(unknown.message.error.code, -32601);
   assert.equal(
     (await dispatchModern(stub, message('tools/call', { name: 'missing_tool' }))).message.error
       .code,
@@ -181,24 +177,15 @@ test('owner read refresh is a lifecycle error in text and structured tool result
   assert.equal(result.structuredContent.error.code, 'OWNER_READ_REFRESH_REQUIRED');
   assert.match(result.structuredContent.error.recovery, /idle boundary/);
   assert.match(result.structuredContent.error.recovery, /Call reload/);
-  assert.match(result.structuredContent.error.recovery, /Changing read arguments will not/);
 });
 
 test('bounded stdio handles modern no-handshake calls, cancellation and oversized input', async () => {
   const input = new PassThrough(),
     output = new PassThrough(),
     lines = [];
-  let buffer = '';
-  output.on('data', (chunk) => {
-    buffer += chunk;
-    let at;
-    while ((at = buffer.indexOf('\n')) >= 0) {
-      lines.push(JSON.parse(buffer.slice(0, at)));
-      buffer = buffer.slice(at + 1);
-    }
-  });
-  const entered = deferred(),
-    release = deferred();
+  readLfLines(output, (line) => lines.push(JSON.parse(line)));
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
   const bridge = {
     list: async (_args, options) => {
       assert.equal(Object.hasOwn(options, 'signal'), false);
@@ -229,7 +216,8 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   assert.equal(lines.length, 0);
   input.write('x'.repeat(MCP_INPUT_LIMIT + 1) + '\n');
   input.write('{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}\n');
-  input.write(JSON.stringify(message('ping', {}, 43)) + '\n');
+  input.write(JSON.stringify(message('ping', {}, 43)));
+  input.write('\n');
   await transport.drain();
   assert.equal(lines[0].error.message, 'INPUT_TOO_LARGE');
   assert.equal(lines.find((line) => line.id === 44).error.code, -32602);

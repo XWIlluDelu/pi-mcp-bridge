@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { utf16String } from './schema.mjs';
-import { resolvePiInstallation, loadPiAi } from './pi-installation.mjs';
 
 const identifier = utf16String(256).min(1);
 export const modelSelectionSchema = z.object({ provider: identifier, id: identifier }).strict();
@@ -13,11 +12,10 @@ export const thinkingLevelSchema = z.enum([
   'xhigh',
   'max',
 ]);
-export async function assertThinkingLevel(model, level, config) {
-  if (level === undefined) return;
+export function assertThinkingLevel(model, level, ai) {
+  if (!ai) return;
   if (typeof model?.reasoning !== 'boolean') throw new Error('THINKING_SUPPORT_UNKNOWN');
-  const { getSupportedThinkingLevels } = await loadPiAi(await resolvePiInstallation(config));
-  if (!getSupportedThinkingLevels(model).includes(level))
+  if (!ai.getSupportedThinkingLevels(model).includes(level))
     throw new Error('THINKING_LEVEL_UNSUPPORTED');
 }
 export const modelsSchema = z

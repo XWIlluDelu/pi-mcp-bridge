@@ -9,7 +9,7 @@ import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
+import { assertSingleSessionFile, readSessionIdentity, sameSessionIdentity } from './data.mjs';
 import { atomicJson } from './storage.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { attachedPromptInput, remotePromptRejection } from './prompt-input.mjs';
@@ -32,13 +32,13 @@ import { nativeReadFeatures } from './read-features.mjs';
 import { SettledObserver } from './settled-observer.mjs';
 import { ownerSocket } from './owner-runtime.mjs';
 import {
-  privateDirectory,
   processIdentity,
   sameOwner,
   ownerAlive,
   registryTransaction,
   readClaim,
   claimFile,
+  retireClaim,
   updateOwner,
   assertNoOtherLiveOwner,
   AttachmentFailure,
@@ -101,8 +101,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           dir,
           { file: targetFile },
           {
-            allowSameProcess:
-              active?.session.file === targetFile && active.manager === ctx.sessionManager,
+            replacing: active?.manager === ctx.sessionManager ? active : undefined,
             completeHandoff: true,
           },
         ),
@@ -147,16 +146,8 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       return;
     const other = await readClaim(dir, replacement.session);
     const owner = replacement.record.owner;
-    if (
-      other &&
-      !['rpc', 'host', 'handoff'].includes(other.kind) &&
-      sameOwner(other.owner, owner)
-    ) {
-      const file = claimFile(dir, replacement.session);
-      if (other.noColdReacquire)
-        await atomicJson(file, { ...other, phase: 'released', owner: null });
-      else await fs.unlink(file);
-    }
+    if (other && !['rpc', 'host', 'handoff'].includes(other.kind) && sameOwner(other.owner, owner))
+      await retireClaim(dir, replacement.session, other);
   }
   async function closeServer(runtime) {
     if (!runtime) return;
@@ -166,28 +157,20 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
   }
   async function validateStorage(runtime) {
     try {
-      let stat = await assertSingleSessionFile(runtime.session.file, {
-        allowMissing: !runtime.fileObserved,
-      });
       if (
-        !stat &&
-        runtime.ctx.sessionManager
+        !runtime.fileObserved &&
+        !(await assertSingleSessionFile(runtime.session.file, { allowMissing: true })) &&
+        !runtime.ctx.sessionManager
           .getEntries()
           .some((e) => e.type === 'message' && ['user', 'assistant'].includes(e.message?.role))
       ) {
-        // First persistence can occur after the missing-file snapshot but
-        // before the in-memory snapshot. Recheck the now-required file before
-        // deciding that those observations represent a storage failure.
-        stat = await assertSingleSessionFile(runtime.session.file);
+        if (runtime.session.header.version !== 3)
+          throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
+        return;
       }
-      if (!stat && runtime.session.header.version !== 3)
-        throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
-      if (stat && !runtime.fileObserved) {
-        const saved = await readSessionIdentity(runtime.session.file);
-        if (saved.header.id !== runtime.session.header.id)
-          throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-        runtime.fileObserved = true;
-      }
+      if (!sameSessionIdentity(await readSessionIdentity(runtime.session.file), runtime.session))
+        throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+      runtime.fileObserved = true;
     } catch (error) {
       if (active === runtime) {
         runtime.ready = false;
@@ -248,8 +231,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           target: event.targetSessionFile,
         });
     }
-    // The identified claim blocks until exact death or successful switch-away.
-    // Keep the claim through quit/reload/replacement until exact process death or a fresh session_start.
   });
   pi.on('session_start', async (event, ctx) => {
     if (!['tui', 'rpc'].includes(ctx.mode)) return;
@@ -271,7 +252,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           });
         return;
       }
-      await privateDirectory(dir);
       const header = ctx.sessionManager.getHeader();
       if (!file || !header || !path.isAbsolute(file))
         throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
@@ -296,11 +276,10 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
         const replacement = replacementFor(event, manager);
         // The same path cannot be reserved under another live native identity,
         // whether first persistence has happened yet or not.
-        await assertNoOtherLiveOwner(dir, session, {
-          allowSameProcess: replacement?.session.file === file,
+        const old = await assertNoOtherLiveOwner(dir, session, {
+          replacing: replacement,
           completeHandoff: true,
         });
-        const old = await readClaim(dir, session);
         const sameProcess = sameOwner(old?.owner, owner);
         // Rebinding UI/actions emits session_start again in the same native
         // extension runtime. Keep its existing endpoint instead of replacing it.
@@ -324,7 +303,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           !(sameProcess && (opening || replacement?.session.file === file))
         )
           throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-        if (old?.noColdReacquire) record.noColdReacquire = true;
+        if (old?.noColdReacquire && !opening) record.noColdReacquire = true;
         await retirePreviousClaim(replacement, session);
         await atomicJson(claimFile(dir, session), record);
         ownership = { session, record, manager };
@@ -333,8 +312,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       });
       if (!registered) return;
       // Publish blocking ownership before socket setup or any later fallible initialization.
-      if (Buffer.byteLength(record.socket) > 100)
-        throw new AttachmentFailure('ATTACHMENT_SOCKET_PATH_TOO_LONG');
       const connections = new Set();
       const runtime = {
         session,

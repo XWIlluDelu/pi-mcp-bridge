@@ -1,5 +1,7 @@
 import { isRpcRequest, parseJson, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
+const EMPTY = Buffer.alloc(0);
+
 // Bound each newline-delimited request before decoding UTF-8.
 export class StdioTransport {
   constructor(dispatch, { input = process.stdin, output = process.stdout, capacity } = {}) {
@@ -7,7 +9,7 @@ export class StdioTransport {
     this.capacity = capacity;
     this.input = input;
     this.output = output;
-    this.buffer = Buffer.alloc(0);
+    this.buffer = EMPTY;
     this.bufferLength = 0;
     this.discarding = false;
     this.tasks = new Set();
@@ -47,10 +49,12 @@ export class StdioTransport {
       if (!this.discarding) {
         const size = this.bufferLength + part.length;
         if (size > MCP_INPUT_LIMIT) {
-          this.buffer = Buffer.alloc(0);
+          this.buffer = EMPTY;
           this.bufferLength = 0;
           this.discarding = true;
           this.track(this.write(rpcError(null, -32600, 'INPUT_TOO_LARGE')));
+        } else if (newline >= 0 && !this.bufferLength) {
+          if (part.length) this.line(part);
         } else if (part.length) {
           // Geometric growth bounds total copying, even for tiny input chunks.
           // Only the initialized prefix is parsed; capacity never exceeds the frame limit.
@@ -70,7 +74,7 @@ export class StdioTransport {
       if (newline < 0) return;
       if (!this.discarding && this.bufferLength)
         this.line(this.buffer.subarray(0, this.bufferLength));
-      this.buffer = Buffer.alloc(0);
+      this.buffer = EMPTY;
       this.bufferLength = 0;
       this.discarding = false;
       start = newline + 1;

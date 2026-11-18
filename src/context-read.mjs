@@ -31,15 +31,7 @@ function timeline(projection, readAdapters) {
     prompts = [];
   let prompt = null;
   function add(type, source, extra = {}, owner = prompt) {
-    const record = {
-      id: `${source.entry_id}:${source.message_index ?? 'boundary'}:${source.block_index ?? 'message'}:${type}`,
-      type,
-      prompt_id: owner,
-      source,
-      ...extra,
-    };
-    records.push(record);
-    return record;
+    records.push({ type, prompt_id: owner, source, ...extra });
   }
   function emptyPrompt(source, reason, role = 'user') {
     prompt = `empty:${source.entry_id}:${reason}`;
@@ -116,7 +108,8 @@ function timeline(projection, readAdapters) {
   const tools = toolOperations(records);
   for (const [first, result] of tools) {
     const call = first.type === 'tool_call';
-    first.tool_id = first.id;
+    const { entry_id, message_index, block_index = 'message' } = first.source;
+    first.tool_id = `${entry_id}:${message_index}:${block_index}:${first.type}`;
     first.call_id = call ? first.block.id : first.message.toolCallId;
     first.pairing = result ? 'paired' : call ? 'unresolved' : 'orphan_result';
     if (result)
@@ -315,35 +308,13 @@ function cleanMessage(message) {
     if (message?.[key] !== undefined) result[key] = message[key];
   return result;
 }
-function cleanRecord(record) {
-  const result = pick(record, [
-    'type',
-    'prompt_id',
-    'source',
-    'synthetic',
-    'reason',
-    'tool_id',
-    'call_id',
-    'pairing',
-    'call_source',
-    'in_model_context',
-  ]);
-  const sourceFields = [
-    'entry_id',
-    'entry_index',
-    'message_index',
-    'block_index',
-    'observation_index',
-    'reader_item',
-    'content_kind',
-    'read_adapter',
-  ];
-  if (record.source) result.source = pick(record.source, sourceFields);
-  if (record.call_source) result.call_source = pick(record.call_source, sourceFields);
-  if (record.block) {
-    result.block = cleanBlock(record.block);
-    const metadata = boundedFields(
-      pick(record.metadata, [
+// Source locators and pairing fields are built by Bridge. Native payloads pass
+// through their own field selection before entering the detached snapshot.
+function cleanRecord({ block, metadata, message, parts, ...unit }) {
+  if (block) {
+    unit.block = cleanBlock(block);
+    const fields = boundedFields(
+      pick(metadata, [
         'timestamp',
         'model',
         'provider',
@@ -352,15 +323,12 @@ function cleanRecord(record) {
         'errorMessage',
       ]),
     );
-    if (Object.keys(metadata).length) result.metadata = metadata;
+    if (Object.keys(fields).length) unit.metadata = fields;
   }
-  if (record.message) result.message = cleanMessage(record.message);
-  if (record.parts)
-    result.parts = record.parts.map(({ source, message }) => ({
-      source,
-      message: cleanMessage(message),
-    }));
-  return result;
+  if (message) unit.message = cleanMessage(message);
+  if (parts)
+    unit.parts = parts.map(({ source, message }) => ({ source, message: cleanMessage(message) }));
+  return unit;
 }
 
 // Split only for the response. Keep source text intact and use stable part
@@ -380,33 +348,21 @@ function jsonTextEnd(text, start, end) {
   return end;
 }
 
-function* textParts(text) {
-  if (typeof text !== 'string' || !text.length) {
-    yield text;
-    return;
-  }
-  for (let start = 0; start < text.length;) {
-    // Each UTF-16 unit takes at least one encoded byte. Align the slice
-    // to a code point before measuring, since JSON escapes lone surrogates.
-    let end = Math.min(text.length, start + UNIT_TARGET - 2);
-    if (text.codePointAt(end - 1) > 0xffff) end--;
-    if (jsonBytes(text.slice(start, end)) > UNIT_TARGET) end = jsonTextEnd(text, start, end);
-    yield text.slice(start, end);
-    start = end;
-  }
-}
 function* splitText(record, text, replace) {
-  const parts = textParts(text),
-    first = parts.next(),
-    second = parts.next();
-  if (second.done) {
+  if (typeof text !== 'string' || !text.length) {
     yield record;
     return;
   }
-  let index = 1;
-  yield { ...replace(first.value), part: index++ };
-  yield { ...replace(second.value), part: index++ };
-  for (const part of parts) yield { ...replace(part), part: index++ };
+  let part = 0;
+  for (let start = 0; start < text.length;) {
+    let end = Math.min(text.length, start + UNIT_TARGET - 2);
+    if (text.codePointAt(end - 1) > 0xffff) end--;
+    if (jsonBytes(text.slice(start, end)) > UNIT_TARGET) end = jsonTextEnd(text, start, end);
+    yield start === 0 && end === text.length
+      ? record
+      : { ...replace(text.slice(start, end)), part: ++part };
+    start = end;
+  }
 }
 // Shared message metadata is one complete unit, not copied into every text part.
 // Nested calls are saved native records, not fabricated tool results.
@@ -646,7 +602,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
           ? (data.entries.at(-1)?.id ?? null)
           : data.leafId
         : args.leaf_id;
-  const byId = sessionEntryIndex(data.entries, leaf);
+  const byId = sessionEntryIndex(data.entries, leaf, data.byId);
   if (leaf !== null && !byId.has(leaf)) throw new Error('ENTRY_NOT_FOUND');
   const selected = selectTimeline(
       buildSessionProjection(data.entries, leaf, byId),
@@ -783,6 +739,31 @@ function smallLive(live, budget) {
   }
   return jsonBytes(result) <= budget ? result : null;
 }
+// A frozen source may contain a single multi-megabyte message. Keep the next
+// unread part for forward paging; replay from source for a different cursor.
+const continuations = new WeakMap();
+function* pageItems(units, rows, offset, part) {
+  for (; offset < units.length; offset++) {
+    if (rows) {
+      yield { unit: rows.at(offset), nextOffset: offset + 1, nextPart: 0 };
+      continue;
+    }
+    const parts = pageParts(units[offset]);
+    let current = parts.next();
+    for (let i = 0; i < part && !current.done; i++) current = parts.next();
+    if (current.done) throw new Error('INVALID_CURSOR');
+    while (!current.done) {
+      const { value: unit } = current;
+      current = parts.next();
+      yield {
+        unit,
+        nextOffset: current.done ? offset + 1 : offset,
+        nextPart: current.done ? 0 : ++part,
+      };
+    }
+    part = 0;
+  }
+}
 export function renderPreparedContextRead(
   snapshot,
   args,
@@ -802,8 +783,7 @@ export function renderPreparedContextRead(
     leaf_id: snapshot.leaf_id,
     selection: snapshot.selection,
     ...(snapshot.presentation ? { presentation: snapshot.presentation } : {}),
-    ...(snapshot.query ? { query: snapshot.query } : {}),
-    ...(snapshot.query ? { matches: units.length } : {}),
+    ...(snapshot.query ? { query: snapshot.query, matches: units.length } : {}),
     ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
     ...(snapshot.history ? { history: snapshot.history } : {}),
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
@@ -834,75 +814,71 @@ export function renderPreparedContextRead(
   let itemWireBytes = 0;
   let offset = start;
   let part = firstPart;
-  render: while (offset < units.length) {
-    const atom = units.at(offset);
-    const parts = rows ? [atom].values() : pageParts(atom);
-    let next = parts.next();
-    for (let i = 0; i < part && !next.done; i++) next = parts.next();
-    if (next.done) throw new Error('INVALID_CURSOR');
-    const atomOffset = offset;
-    while (!next.done) {
-      let unit = next.value;
-      next = parts.next();
-      const nextOffset = next.done ? atomOffset + 1 : atomOffset;
-      const nextPart = next.done ? 0 : part + 1;
-      let frame = size(page([], nextOffset, nextPart));
-      const comma = items.length ? 1 : 0;
-      // JSON array items add only their serialized bytes and a comma. The
-      // escaped text copy adds the same comma and the escaped item bytes.
-      const unitSize = (candidate) => {
-        const { bytes, wireBytes } = size([candidate]);
-        return {
-          bytes: bytes - emptyArray.bytes + comma,
-          wireBytes: wireBytes - emptyArray.wireBytes + comma * 2,
-        };
+  const previous = continuations.get(snapshot);
+  const resume = previous?.offset === start && previous.part === firstPart;
+  const iterator = resume ? previous.iterator : pageItems(units, rows, start, firstPart);
+  let current = resume ? previous.current : iterator.next();
+  continuations.delete(snapshot);
+  while (!current.done) {
+    let { unit, nextOffset, nextPart } = current.value;
+    let frame = size(page([], nextOffset, nextPart));
+    const comma = items.length ? 1 : 0;
+    // JSON array items add only their serialized bytes and a comma. The
+    // escaped text copy adds the same comma and the escaped item bytes.
+    const unitSize = (candidate) => {
+      const { bytes, wireBytes } = size([candidate]);
+      return {
+        bytes: bytes - emptyArray.bytes + comma,
+        wireBytes: wireBytes - emptyArray.wireBytes + comma * 2,
       };
-      const pageWith = (cost) => ({
-        bytes: frame.bytes + itemBytes + cost.bytes,
-        wireBytes: frame.wireBytes + itemWireBytes + cost.wireBytes,
-      });
-      let cost = unitSize(unit);
-      if (!items.length && !fits(pageWith(cost))) {
-        base.live = smallLive(base.live, 256);
-        delete base.runtime_events;
+    };
+    const pageWith = (cost) => ({
+      bytes: frame.bytes + itemBytes + cost.bytes,
+      wireBytes: frame.wireBytes + itemWireBytes + cost.wireBytes,
+    });
+    let cost = unitSize(unit);
+    if (!items.length && !fits(pageWith(cost))) {
+      base.live = smallLive(base.live, 256);
+      delete base.runtime_events;
+      frame = size(page([], nextOffset, nextPart));
+      if (!fits(pageWith(cost))) {
+        base.live = null;
         frame = size(page([], nextOffset, nextPart));
-        if (!fits(pageWith(cost))) {
-          base.live = null;
-          frame = size(page([], nextOffset, nextPart));
-        }
       }
-      if (!items.length && !fits(pageWith(cost))) {
-        const fitsUnit = (value) => fits(pageWith(unitSize(value)));
-        if (metadataUnit(unit)) unit = fitMetadata(unit, fitsUnit);
-        else if (rows) unit = fitNavigationRow(unit, fitsUnit);
+    }
+    if (!items.length && !fits(pageWith(cost))) {
+      const fitsUnit = (value) => fits(pageWith(unitSize(value)));
+      if (metadataUnit(unit)) unit = fitMetadata(unit, fitsUnit);
+      else if (rows) unit = fitNavigationRow(unit, fitsUnit);
+      cost = unitSize(unit);
+    }
+    if (frame.bytes + cost.bytes > READ_PAGE_LIMIT) {
+      const maximum = { ...page([unit], nextOffset, nextPart), live: null };
+      delete maximum.runtime_events;
+      if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
+        if (items.length && metadataUnit(unit)) break;
+        unit = omittedUnit(unit);
         cost = unitSize(unit);
       }
-      if (frame.bytes + cost.bytes > READ_PAGE_LIMIT) {
-        const maximum = { ...page([unit], nextOffset, nextPart), live: null };
-        delete maximum.runtime_events;
-        if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
-          if (items.length && metadataUnit(unit)) break render;
-          unit = omittedUnit(unit);
-          cost = unitSize(unit);
-        }
-      }
-      const measured = pageWith(cost);
-      if (!fits(measured)) {
-        if (items.length) break render;
-        if (measured.bytes <= max && resultBudget) throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
-        const error = new Error('READ_BUDGET_TOO_SMALL');
-        error.minimum_max_bytes = measured.bytes;
-        throw error;
-      }
-      items.push(unit);
-      itemBytes += cost.bytes;
-      itemWireBytes += cost.wireBytes;
-      part = nextPart;
     }
-    offset = atomOffset + 1;
+    const measured = pageWith(cost);
+    if (!fits(measured)) {
+      if (items.length) break;
+      if (measured.bytes <= max && resultBudget) throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
+      const error = new Error('READ_BUDGET_TOO_SMALL');
+      error.minimum_max_bytes = measured.bytes;
+      throw error;
+    }
+    items.push(unit);
+    itemBytes += cost.bytes;
+    itemWireBytes += cost.wireBytes;
+    offset = nextOffset;
+    part = nextPart;
+    current = iterator.next();
   }
   const result = page(items, offset, part);
   if (!fits(size(result))) throw new Error('READ_BUDGET_TOO_SMALL');
+  if (!rows && !current.done) continuations.set(snapshot, { offset, part, iterator, current });
   return structuredClone(result);
 }
 export function assertReadSnapshot(value, args) {

@@ -98,7 +98,7 @@ an existing proxy. Changing only the file's contents also does not appear in
 and its proxies at a safe work boundary, and update the tunnel's injected token
 to match. Then repeat the discovery check above.
 
-Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend accepts only `Host: 127.0.0.1:PORT` and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
+Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend requires `Host: 127.0.0.1:PORT` (the port may be omitted for port 80) and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
 
 The backend returns `application/json` with `Cache-Control: no-store`. A disconnected client does not stop the shared service.
 
@@ -122,27 +122,9 @@ Multiple direct stdio services using the same state directory conflict on the se
 
 ## Protocol version
 
-Bridge uses MCP `2026-07-28` with [per-request metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
+Bridge uses MCP `2026-07-28`. Each request includes the protocol version and client capabilities in `params._meta`, as shown in the discovery example above. Clients can also supply `io.modelcontextprotocol/clientInfo` with a name and version. See [per-request metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "server/discover",
-  "params": {
-    "_meta": {
-      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-      "io.modelcontextprotocol/clientCapabilities": {},
-      "io.modelcontextprotocol/clientInfo": {
-        "name": "example-client",
-        "version": "1.0"
-      }
-    }
-  }
-}
-```
-
-Version and capabilities are required on every request; clientInfo is optional. `server/discover` returns supported versions and capabilities. Results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same authenticated endpoint and outbound HTTPS delivery.
+Results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same endpoint.
 
 HTTP requests also require:
 

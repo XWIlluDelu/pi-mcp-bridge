@@ -27,7 +27,7 @@ export function checkObservation(snapshot, data, { ownerActive = true } = {}) {
   if (!snapshot?.observation?.available) return snapshot;
   const input = snapshot.observation.input_leaf_id,
     current = data.leafId,
-    byId = sessionEntryIndex(data.entries, current);
+    byId = sessionEntryIndex(data.entries, current, data.byId);
   let leaf = current,
     later = 0;
   while (leaf !== input && leaf !== null) {

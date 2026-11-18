@@ -247,6 +247,7 @@ for (const action of ['cancel', 'delete'])
       release = Promise.withResolvers(),
       open = fs.open,
       file = claimFile(f.config.attachmentDir, f.session);
+    await f.bridge.releaseForLocal({ session_id: f.id });
     let gated = false,
       switches = 0;
     t.mock.method(fs, 'open', async function (target, ...args) {
@@ -281,7 +282,13 @@ for (const action of ['cancel', 'delete'])
       release.resolve();
       await joined;
       assert.equal(switches, 0);
-      assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
+      const claim = await readClaim(f.config.attachmentDir, f.session);
+      if (action === 'delete') assert.equal(claim, null);
+      else {
+        assert.equal(claim.phase, 'released');
+        assert.equal(claim.noColdReacquire, true);
+        await assert.rejects(f.bridge.pool.resolve(f.session), /COLD_REACQUIRE_BLOCKED/);
+      }
     } finally {
       release.resolve();
       t.mock.restoreAll();

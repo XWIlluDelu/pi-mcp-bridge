@@ -27,6 +27,7 @@ const DEFAULT_TTL = 3600000,
   MAX_TTL = 86400000,
   ROTATION_MS = 300000;
 const argsSchema = z.object({ session_id: z.string().regex(/^ps_[a-f0-9]{32}$/) }).strict();
+const listSchema = z.strictObject({});
 const deliverySchema = z
   .object({
     mode: z.string(),
@@ -121,9 +122,6 @@ function validateDestination(delivery, withSecret = true) {
 function identity(sessionId, url) {
   // The only argument is session_id: fixed property order is canonical here.
   return 'sub_' + hash([OWNER, url, NAME, { session_id: sessionId }]);
-}
-function requireName(name) {
-  if (name !== NAME) throw new EventError(-32023, 'NotFound', { kind: 'event' });
 }
 function assertRoom(records, id) {
   if (!records.has(id) && records.size >= MAX_SUBSCRIPTIONS)
@@ -241,12 +239,10 @@ export class EventSubscriptions {
     this.assertAvailable();
     const { _meta, ...input } = params;
     let request;
-    if (method === 'events/list') {
-      request = parse(z.object({ cursor: z.string().optional() }).strict(), input);
-      if (request.cursor !== undefined) invalid(); // One descriptor, no pagination.
-    } else {
+    if (method === 'events/list') request = parse(listSchema, input);
+    else {
       request = parse(method === 'events/unsubscribe' ? unsubscribeSchema : subscribeSchema, input);
-      requireName(request.name);
+      if (request.name !== NAME) throw new EventError(-32023, 'NotFound', { kind: 'event' });
       validateDestination(request.delivery, method !== 'events/unsubscribe');
       if (request.cursor != null)
         throw new EventError(-32026, 'Unsupported', { feature: 'replay' });
@@ -275,8 +271,8 @@ export class EventSubscriptions {
         ? this.subscribe(id, request, requestContext)
         : this.unsubscribe(id);
     };
-    const previous = this.requests.get(id);
-    const task = previous ? previous.then(run, run) : Promise.resolve().then(run);
+    const previous = this.requests.get(id) ?? Promise.resolve();
+    const task = previous.then(run, run);
     this.requests.set(id, task);
     try {
       return await task;
@@ -287,9 +283,12 @@ export class EventSubscriptions {
   async unsubscribe(id) {
     // The authenticated owner can stop its subscription after read revocation.
     await this.change((next) => next.delete(id));
+    this.cancelDeliveries(id);
+    return {};
+  }
+  cancelDeliveries(id) {
     for (const delivery of this.deliveries.values())
       if (delivery.id === id) delivery.controller.abort();
-    return {};
   }
   async subscribe(id, request, requestContext) {
     let session;
@@ -331,10 +330,12 @@ export class EventSubscriptions {
       const previous = next.get(id);
       const now = this.now();
       record.expiresAt = now + Math.min(request.ttlMs ?? DEFAULT_TTL, MAX_TTL);
-      if (previous?.secret && previous.secret !== record.secret) {
+      // The same public ID can be subscribed again after its old lifetime ends.
+      if (!previous) this.cancelDeliveries(id);
+      else if (previous.secret !== record.secret) {
         record.previousSecret = previous.secret;
         record.rotateUntil = now + ROTATION_MS;
-      } else if (previous?.rotateUntil > now) {
+      } else if (previous.rotateUntil > now) {
         record.previousSecret = previous.previousSecret;
         record.rotateUntil = previous.rotateUntil;
       }

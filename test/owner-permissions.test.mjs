@@ -67,6 +67,21 @@ test('owner edit refuses concurrent changes and writes only the selected permiss
   );
   assert.deepEqual((await readOwnerConfig(f.file)).config.piRuntime, { tools: [] });
 });
+test('permission edits respect the configuration read limit and preserve the last readable policy', async (t) => {
+  const f = await fixture(t);
+  f.config.piArgs = [''];
+  const room = 1024 * 1024 - Buffer.byteLength(JSON.stringify(f.config)) - 24;
+  f.config.piArgs[0] = '界'.repeat(Math.floor(room / 3));
+  await fs.writeFile(f.file, JSON.stringify(f.config));
+  const before = await readOwnerConfig(f.file);
+  const saved = await editPermission(f.file, before.revision, { default: true }, 'read', true);
+  assert.equal(saved.config.defaults.read, true);
+  await assert.rejects(
+    editPermission(f.file, saved.revision, { folder: f.child }, 'send', false),
+    /JSON_FILE_TOO_LARGE/,
+  );
+  assert.equal((await readOwnerConfig(f.file)).revision, saved.revision);
+});
 test('permission menu registers only a human TUI shortcut and aborts on lifecycle change', async (t) => {
   const f = await fixture(t),
     prior = process.env.PI_MCP_OWNER_CONFIG;

@@ -1,6 +1,11 @@
 import packageInfo from '../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
-import { resolvePiInstallation, piLaunchEnvironment } from './pi-installation.mjs';
+import {
+  resolvePiInstallation,
+  piLaunchEnvironment,
+  loadPiSdk,
+  loadPiAi,
+} from './pi-installation.mjs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { findHerdr } from './herdr-control.mjs';
@@ -20,7 +25,12 @@ import {
 import { modelSettings } from './set-model.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { assertSingleSessionFile, loadSavedSession, validateExecutionCwd } from './data.mjs';
+import {
+  loadSavedSession,
+  sameSessionIdentity,
+  sessionEntryIndex,
+  validateExecutionCwd,
+} from './data.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { nativeCompactReason } from './compact.mjs';
 import { uiFacts, uiSnapshot } from './rpc-ui.mjs';
@@ -108,8 +118,8 @@ export class PiRpc {
     signal?.throwIfAborted();
     const { env: baseEnv, toolArgs } = launchProfile(this.config);
     const executable = await resolvePiInstallation(this.config, baseEnv);
+    this.installation = executable;
     await validateLaunchArgs(executable, this.config.piArgs, 'rpc');
-    await assertSingleSessionFile(this.session.file);
     const attachmentDir = registryPath(this.config);
     this.config = { ...this.config, attachmentDir };
     if (this.config.piRuntime?.agentDir)
@@ -119,16 +129,11 @@ export class PiRpc {
     try {
       this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
       // Capture the committed leaf before native startup can append its defaults.
-      const { leafId } = await loadSavedSession(this.session, {
+      const { entries, leafId, byId } = await loadSavedSession(this.session, {
         omitImageData: true,
-        config: { piExecutable: executable.cliPath },
+        sdk: await loadPiSdk(executable),
       });
-      await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
-        socket: path.join(
-          this.config.attachmentDir,
-          `${process.pid}-${this.ownerRecord.generation.slice(0, 8)}.sock`,
-        ),
-      });
+      sessionEntryIndex(entries, leafId, byId);
       // An installed daily companion must use this writer's actual registry,
       // not an unrelated default owner profile, then defer to the RPC claim.
       env.PI_MCP_ATTACH_DIR = this.config.attachmentDir;
@@ -630,14 +635,14 @@ export class PiRpc {
     const models = model ? (await this.command({ type: 'get_available_models' })).models : null;
     const requested = models?.find((entry) => sameModel(entry, model));
     if (model && !requested) throw new RpcFailure('MODEL_UNAVAILABLE');
-    if (requested && !nativeThinking)
-      await assertThinkingLevel(requested, thinkingLevel, this.config);
+    const ai =
+      !nativeThinking && thinkingLevel !== undefined ? await loadPiAi(this.installation) : null;
+    if (requested) assertThinkingLevel(requested, thinkingLevel, ai);
     const state = idle ? await this.assertIdle() : await this.state();
     const target = requested ?? state.model;
     if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
     await beforeDispatch?.();
-    if (!requested && !nativeThinking)
-      await assertThinkingLevel(target, thinkingLevel, this.config);
+    if (!requested) assertThinkingLevel(target, thinkingLevel, ai);
     let level = thinkingLevel;
     if (model && !sameModel(state.model, target)) {
       // Keep current effort rather than model-switch defaults; Pi owns clamping.
@@ -656,7 +661,7 @@ export class PiRpc {
     let selected = idle ? await this.assertIdle() : await this.state();
     if (model && !sameModel(selected.model, target))
       throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
-    if (!nativeThinking) await assertThinkingLevel(selected.model, thinkingLevel, this.config);
+    assertThinkingLevel(selected.model, thinkingLevel, ai);
     if (level !== undefined && selected.thinkingLevel !== level) {
       await this.command(
         { type: 'set_thinking_level', level },
@@ -782,11 +787,14 @@ export class PiRpc {
   async waitForHandoff(signal) {
     for (;;) {
       signal?.throwIfAborted();
-      const result = await this.idleSnapshot();
-      if (result.status === 'unknown') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
-      if (result.status === 'idle') {
-        signal?.throwIfAborted();
-        return;
+      if (!this.alive) throw new RpcFailure('RUNTIME_DISCONNECTED');
+      if (!this.hasUnsettledWork()) {
+        const { status } = await this.idleSnapshot();
+        if (status === 'unknown') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+        if (status === 'idle') {
+          signal?.throwIfAborted();
+          return;
+        }
       }
       await delay(25, undefined, { signal });
     }
@@ -1021,12 +1029,12 @@ export class RuntimePool {
     if (claim && (await ownerAlive(claim.owner))) {
       if (claim.kind === 'rpc') {
         if (existing?.alive && existing.ownerRecord?.generation === claim.generation)
-          return existing;
+          return this.boundRuntime(existing, session);
         throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
       }
       if (claim.phase !== 'ready') throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
       if (existing?.attached && existing.alive && existing.record.generation === claim.generation)
-        return existing;
+        return this.boundRuntime(existing, session);
       if (existing) await existing.stop();
       const attached = new AttachedRuntime(
         { ...this.config, attachmentDir: this.attachmentDir },
@@ -1047,10 +1055,16 @@ export class RuntimePool {
       this.instances.delete(session.id);
       return null;
     }
-    return existing?.alive ? existing : null;
+    return existing?.alive ? this.boundRuntime(existing, session) : null;
+  }
+  boundRuntime(runtime, session) {
+    if (runtime.session && !sameSessionIdentity(runtime.session, session))
+      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+    return runtime;
   }
   async resolve(session) {
-    if (this.starting.has(session.id)) return this.starting.get(session.id).promise;
+    if (this.starting.has(session.id))
+      return this.boundRuntime(await this.starting.get(session.id).promise, session);
     const attached = await this.forRead(session);
     if (attached) {
       diagnostics.emit('runtime.reused', {
@@ -1062,9 +1076,10 @@ export class RuntimePool {
     const claim = await readClaim(this.attachmentDir, session);
     if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
     const existing = this.instances.get(session.id);
-    if (existing?.alive) return existing;
+    if (existing?.alive) return this.boundRuntime(existing, session);
     if (existing) await existing.stop();
-    if (this.starting.has(session.id)) return this.starting.get(session.id).promise;
+    if (this.starting.has(session.id))
+      return this.boundRuntime(await this.starting.get(session.id).promise, session);
     const start = { controller: new AbortController() };
     this.starting.set(session.id, start);
     start.promise = diagnostics

@@ -39,6 +39,7 @@ import {
   readClaim,
   readOwnerRecord,
   ownerAlive,
+  assertNoOtherLiveOwner,
   registryTransaction,
   updateOwner,
   claimFile,
@@ -219,12 +220,7 @@ export class Bridge {
     // Reuse the existing claim's identity, never a previous permission policy.
     if (!requestContext && !file && /^ps_[a-f0-9]{32}$/.test(id)) {
       await privateDirectory(this.pool.attachmentDir);
-      file = (
-        await readOwnerRecord(
-          this.pool.attachmentDir,
-          path.join(this.pool.attachmentDir, `${id}.owner.json`),
-        )
-      )?.file;
+      file = (await readOwnerRecord(path.join(this.pool.attachmentDir, `${id}.owner.json`)))?.file;
     }
     if (
       file &&
@@ -321,22 +317,17 @@ export class Bridge {
         },
       });
     };
-    const work = (async () => {
-      try {
-        return await (tracksInput
-          ? this.withInput(args.session_id, options?.pendingInput, run)
-          : run());
-      } finally {
-        if (releaseCandidate) {
-          releaseCandidate.autoReleaseWanted = true;
-          releaseCandidate.onIdleCandidate?.();
-        }
-      }
-    })();
+    const work = tracksInput ? this.withInput(args.session_id, options?.pendingInput, run) : run();
     this.pendingMutations.add(work);
-    const settled = () => this.pendingMutations.delete(work);
-    work.then(settled, settled);
-    return work;
+    try {
+      return await work;
+    } finally {
+      this.pendingMutations.delete(work);
+      if (releaseCandidate) {
+        releaseCandidate.autoReleaseWanted = true;
+        releaseCandidate.onIdleCandidate?.();
+      }
+    }
   }
   async #reload(args, { requestContext, markForAutoRelease, checkInput }) {
     const session = await this.session(args.session_id, requestContext);
@@ -787,6 +778,7 @@ export class Bridge {
       try {
         beforeDispatch();
         const s = await this.session(args.session_id, requestContext);
+        if (!sameSessionIdentity(s, target)) throw new Error('RUNTIME_SESSION_CHANGED');
         this.check('send', s, requestContext);
         runtime = await this.pool.forRead(s);
         if (!runtime) {
@@ -922,22 +914,32 @@ export class Bridge {
         this.check('read', parent, requestContext);
         let runtime;
         ({ session: parent, runtime } = await this.#readableOwner(parent, requestContext));
-        captureFork = async (version) => {
-          if (!runtime) return loadSavedSession(parent, { config: this.config });
+        captureFork = async (sdk) => {
+          if (!runtime) return loadSavedSession(parent, { sdk });
           const { entries, leafId } = runtime.attached
             ? await runtime.snapshot()
             : await runtime.entries();
           if (!Array.isArray(entries)) throw new Error('INVALID_RUNTIME_ENTRIES');
+          if (!sameSessionIdentity(parent, await readSessionIdentity(parent.file)))
+            throw new Error('RUNTIME_SESSION_CHANGED');
           // A live writer supplies current entries even if discovery saw an older header.
-          return { header: { ...parent.header, version }, entries, leafId };
+          return {
+            header: { ...parent.header, version: sdk.CURRENT_SESSION_VERSION },
+            entries,
+            leafId,
+          };
         };
       }
-      child = await prepareSession({ ...this.config, ...requestContext.scope }, folder.path, {
-        name: args.name,
-        parentSession: parent?.file,
-        captureFork,
-      });
-      // Keep the chosen child identity in partial failure responses.
+      const prepared = await prepareSession(
+        { ...this.config, ...requestContext.scope },
+        folder.path,
+        {
+          name: args.name,
+          parentSession: parent?.file,
+          captureFork,
+        },
+      );
+      child = prepared.session;
 
       this.assertOpen();
       return await this.locked(child.id, () =>
@@ -947,8 +949,9 @@ export class Bridge {
             if (this.handoffs.has(child.id)) throw new Error('HANDOFF_PENDING');
           };
           await beforeDispatch();
-          await persistSession(child);
+          await persistSession(child, prepared.entries);
           created = true;
+          this.sessionFiles.set(child.id, child.file);
           if (!input) return outcome({ status: 'created' });
           submissionId = this.submissions.start(child.id, 'create');
 
@@ -1016,7 +1019,10 @@ export class Bridge {
           failure ??= error;
         } finally {
           if (this.handoffs.get(args.session_id) === marker) this.handoffs.delete(args.session_id);
-          if (trash?.moved) this.completionSequences.delete(args.session_id);
+          if (trash?.moved) {
+            this.completionSequences.delete(args.session_id);
+            this.sessionFiles.delete(args.session_id);
+          }
         }
       }
       return optionalResultFields(
@@ -1178,7 +1184,7 @@ export class Bridge {
           }
         } else
           await registryTransaction(dir, async () => {
-            const current = await readClaim(dir, session);
+            const current = await assertNoOtherLiveOwner(dir, session);
             if (current && (await ownerAlive(current.owner)))
               throw new Error('LIVE_OWNER_UNREACHABLE');
             release.controller.signal.throwIfAborted();
@@ -1206,7 +1212,7 @@ export class Bridge {
       const session = await this.session(session_id),
         dir = this.pool.attachmentDir;
       await registryTransaction(dir, async () => {
-        const current = await readClaim(dir, session);
+        const current = await assertNoOtherLiveOwner(dir, session);
         if (current && (await ownerAlive(current.owner))) throw new Error('OWNER_STILL_ALIVE');
         // This confirms cooperative owners only; caller must close unregistered Pi too.
         if (current?.noColdReacquire) await fs.unlink(claimFile(dir, session));

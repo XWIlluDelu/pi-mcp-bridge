@@ -41,8 +41,8 @@ owner exit or switching; delivery still checks current read access. Pi waits at
 most two seconds for local acknowledgement, never for HTTPS delivery. A stopped
 or unreachable Bridge can lose the occurrence without interrupting local Pi work.
 
-Subscription has no catch-up delivery for work that already settled. Monitoring
-continues until cancelled or expired.
+A subscription receives new occurrences until cancellation or expiry. Subscribing
+again after expiry starts a fresh delivery lifetime.
 
 ## Protocol
 
@@ -109,72 +109,50 @@ Example delivery:
 }
 ```
 
-The excerpt can be enough to report a short outcome without another tool call.
-`result` is null when no current-run assistant remains in the native projection
-or the observer did not see the run start. It never substitutes an earlier run's
-answer. Only the last assistant's text blocks are included; an empty/error final
-response does not fall back to earlier prose. `stop_reason` is that message's
-native termination reason, not a claim that the user's task succeeded.
+The excerpt contains the text blocks of the last assistant response from the
+observed run. `result` is null if the observer missed the start or no assistant
+message from this run remains in the native projection. `stop_reason` records
+how Pi terminated that response.
 
-Text preserves its formatting and written links, up to 2048 UTF-16 units and a
+Text preserves formatting and written links, up to 2048 UTF-16 units and a
 4096-byte JSON result object. Longer text retains its beginning and end with
-`truncated:true`. No model generates a summary; no files are discovered, opened,
-uploaded or verified from paths in the text.
-
-Pass `data.read` directly to `read` for more detail. Its explicit
-`view:"session"` selects the historical native leaf even when a memory reader
-handles default reads. A null leaf denotes an empty branch. Reading still
-requires access to the saved session.
+`truncated:true`. Pass `data.read` directly to `read` for the native history at
+the observed leaf. Its explicit `view:"session"` also works when a memory reader
+handles default reads. A null leaf denotes an empty branch.
 
 ## Authorization, storage and delivery
 
 Discovery and subscription use the request's receive-time permission snapshot.
-Subscription requires `read`; each delivery attempt refreshes scope/read checks
-and validates session identity. Revocation removes the subscription. Project
-grants follow the recorded native project identity, including after workspace
-cleanup. The owner can always unsubscribe after revocation.
+Each delivery attempt verifies current read access and the saved session's native
+identity. A denied attempt removes the subscription. The owner can unsubscribe
+after revocation.
 
-Private `stateDir/event-subscriptions.json` stores subscriptions and secrets
-(mode 0600), protected by the existing service lock. Records survive restart.
-Expired records cannot deliver and are pruned on load or subscription changes.
-Occurrences and pending deliveries are held only in memory; there is no replay.
+The service lock protects `stateDir/event-subscriptions.json` (mode 0600),
+which stores subscriptions and signing secrets across restarts. Pending deliveries
+live in memory and end on shutdown. A malformed, unreadable or nonprivate store
+disables events, leaves the file intact and keeps the rest of Bridge available.
+Event methods return HTTP 500 / JSON-RPC `-32603 EventSubscriptionsUnavailable`.
+Use the reason in `health.events` or diagnostic `events.store_unavailable` to
+repair the file, then restart.
 
-A malformed, unreadable or nonprivate store disables events while core operations
-remain available. Event methods leave the file intact and return HTTP 500 /
-JSON-RPC `-32603 EventSubscriptionsUnavailable` with a content-free `data.reason`.
-Health reports `events:{status:"unavailable",reason:"…"}`; diagnostics emit
-`events.store_unavailable`. Repair the file/privacy and restart to reload it.
+Refresh and unsubscribe run in order per subscription. Other subscriptions can
+proceed during a slow verification. A receiver must echo a signed challenge in
+a response of at most 4096 bytes. Bridge caches consent by owner/URL for five
+minutes. Signing secrets decode to 24–64 bytes. Standard Webhooks signatures
+cover the exact body. Verification failures return `-32015 CallbackEndpointError`
+with a reason in `data.reason`.
 
-Refresh and unsubscribe run in order for each subscription. Other subscriptions
-can verify and commit while a callback is pending.
+Each HTTPS connection resolves DNS afresh, accepts only public addresses and
+pins one while verifying TLS against the hostname. Redirects are rejected.
+Transport failures and HTTP 408, 429 or 5xx responses trigger retries after
+1/2/4/8/16/30/60/120/120 seconds, with a ten-second deadline per attempt.
+Retries retain the event ID and body, and refresh the signature timestamp.
+A 2xx acknowledges receipt. Bridge supports up to 32 active subscriptions and
+64 pending deliveries. It drops excess deliveries and those that exhaust retries.
 
-Callback verification sends a signed challenge and requires a matching response
-of at most 4096 bytes. Verification is cached by owner/URL for five minutes. Secrets decode to
-24–64 bytes. Standard Webhooks signatures cover the exact serialized body.
-Delivery acknowledges HTTP status only. Verification failures return `-32015 CallbackEndpointError` with a content-free
-`data.reason`.
-
-Each connection resolves DNS anew, rejects nonpublic addresses, pins the validated
-address, and retains hostname-based TLS verification. No redirects are followed.
-Bridge uses direct native HTTPS. Transparent TUN routing can provide outbound
-connectivity.
-
-Delivery is bounded to ten attempts, with 1/2/4/8/16/30/60/120/120-second
-backoff (361 seconds in total) and ten-second network deadlines per attempt.
-Retries require Bridge to remain running and the subscription authorized and
-unexpired. They keep the event ID and body, refreshing the signature timestamp.
-Only transport failures, 408, 429 and 5xx retry; 410, 413 and redirects do not.
-At most 32 active subscriptions and 64 pending deliveries are retained. Overflow
-or exhausted delivery attempts are dropped. Incoming Tunnel reconnection does
-not affect the outbound retry loop.
-
-Polling, streaming, `gap` and `terminated` notifications are unsupported.
-Interruption can lose occurrences or pending deliveries. With
-[Bridge diagnostics enabled](configuration.md#diagnostics), delivery logs report
-success, failure and drops. For network troubleshooting, also set
-`PI_MCP_LOG_CALLBACK_HOST=1` in the launch environment to record the parsed
-callback hostname before verification. Full callback URLs and secrets remain
-excluded. Remove the hostname setting when troubleshooting ends.
+[Diagnostics](configuration.md#diagnostics) log delivery success, failure and
+drops. To diagnose routing, set `PI_MCP_LOG_CALLBACK_HOST=1` to record the
+hostname before verification. Remove it when troubleshooting ends.
 
 ## Troubleshooting fake-IP proxy DNS
 

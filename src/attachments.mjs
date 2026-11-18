@@ -24,7 +24,7 @@ import { assertReadFeatures } from './read-features.mjs';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { assertSingleSessionFile, readSessionIdentity } from './data.mjs';
-import { atomicJson, opaqueId, assertPrivateDirectory } from './storage.mjs';
+import { atomicJson, opaqueId, assertPrivateDirectory, readBoundedText } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
 export class AttachmentFailure extends Error {
   constructor(code, uncertain = false, options) {
@@ -100,26 +100,19 @@ export async function registryTransaction(dir, action) {
 }
 export async function readClaim(dir, session) {
   await privateDirectory(dir);
-  return readOwnerRecord(dir, claimFile(dir, session), session);
+  return readOwnerRecord(claimFile(dir, session), { expectedFile: session.file });
 }
-export async function readOwnerRecord(dir, file, session, scope = {}) {
+export async function readOwnerRecord(file, { expectedFile, target, owner } = {}) {
   let handle;
   try {
     // Validate the opened inode and bound the read itself, including growth after stat.
     // NONBLOCK also prevents a replaced special file from hanging registry scans.
     handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const stat = await handle.stat();
-    if (!stat.isFile() || stat.uid !== process.getuid() || stat.mode & 0o077 || stat.size > 8192)
-      throw new Error();
-    const bytes = Buffer.alloc(8193);
-    let length = 0;
-    while (length < bytes.length) {
-      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, null);
-      if (!bytesRead) break;
-      length += bytesRead;
-    }
-    if (length > 8192) throw new Error();
-    const record = JSON.parse(bytes.subarray(0, length).toString('utf8'));
+    if (!stat.isFile() || stat.uid !== process.getuid() || stat.mode & 0o077) throw new Error();
+    const record = JSON.parse(
+      await readBoundedText(handle, stat.size, 8192, 'INVALID_ATTACHMENT_RECORD'),
+    );
     const identified =
       Number.isSafeInteger(record?.owner?.pid) &&
       record.owner.pid > 0 &&
@@ -127,11 +120,7 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
       typeof record.owner.boot === 'string';
     // A known other process is irrelevant to an exact-PID scan. An unidentified
     // possible writer still prevents using such a scan as signal authority.
-    if (
-      scope.owner &&
-      (identified || isReleasedOwner(record)) &&
-      !sameOwner(record.owner, scope.owner)
-    )
+    if (owner && (identified || isReleasedOwner(record)) && !sameOwner(record.owner, owner))
       return null;
     if (
       typeof record?.file !== 'string' ||
@@ -142,9 +131,9 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
       throw new Error();
     // A known different path cannot own this target, even if its owner data is
     // damaged. Unsafe storage or an ambiguous target path still rejects access.
-    if (scope.file !== undefined && record.file !== scope.file) return null;
+    if (target !== undefined && record.file !== target) return null;
     if (!isReleasedOwner(record) && !identified) throw new Error();
-    if (session && record.file !== session.file) throw new Error();
+    if (expectedFile && record.file !== expectedFile) throw new Error();
     if (record.noColdReacquire !== undefined && typeof record.noColdReacquire !== 'boolean')
       throw new Error();
     // Ownership evidence is independent of endpoint metadata, even for a live
@@ -161,64 +150,70 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
 // Call while holding registryTransaction: a changed header must not bypass
 // an existing path owner merely because its claim has a different filename.
 // Without a header, check every claim on the path before native open. Only a
-// caller with native-context evidence may allowSameProcess; PID equality alone
+// caller with native-context evidence may replace its own claim; PID equality alone
 // does not prove replacement. This read does not reserve the target.
-export async function assertNoOtherLiveOwner(
-  dir,
-  session,
-  { allowSameProcess = false, completeHandoff = false } = {},
-) {
-  let opening = false;
+async function scanPathOwners(dir, session, { replacing, completeHandoff = false } = {}) {
+  const exact = session.header && claimFile(dir, session);
+  const replaced = replacing && claimFile(dir, replacing.session);
+  let current = null,
+    opening = false;
   for (const name of await fs.readdir(dir)) {
     if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
-    const other = await readOwnerRecord(dir, path.join(dir, name), undefined, {
-      file: session.file,
-    });
+    const file = path.join(dir, name);
+    const other = await readOwnerRecord(
+      file,
+      file === exact ? { expectedFile: session.file } : { target: session.file },
+    );
+    if (!other) continue;
+    if (file === exact) current = other;
     const completing =
       completeHandoff &&
-      other?.kind === 'handoff' &&
+      other.kind === 'handoff' &&
       other.phase === 'opening' &&
       other.owner.pid === process.pid &&
       (!session.header || other.sessionId === session.header.id) &&
       (await ownerAlive(other.owner));
     if (completing) opening = true;
     if (
-      other &&
-      other.sessionId !== session.header?.id &&
+      (file !== exact || other.sessionId !== session.header.id) &&
       !completing &&
-      (!allowSameProcess || other.owner?.pid !== process.pid) &&
+      !(file === replaced && sameOwner(other.owner, replacing.record.owner)) &&
       (await ownerAlive(other.owner))
     )
       throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
   }
+  return { current, opening };
+}
+export async function assertNoOtherLiveOwner(dir, session, options) {
+  const { current, opening } = await scanPathOwners(dir, session, options);
   // Deletion blocks new admission, not completion of this process's already
   // admitted native switch. It waits for that real writer before terminating.
   if (!opening) {
     const gate = await deletionGate(dir, session);
     await gate.close();
   }
+  return current;
 }
 export async function reserveOwner(dir, session, kind, owner = undefined) {
   return registryTransaction(dir, async () => {
     await assertSingleSessionFile(session.file);
-    await assertNoOtherLiveOwner(dir, session);
-    const old = await readClaim(dir, session);
+    const old = await assertNoOtherLiveOwner(dir, session);
     if (old && (await ownerAlive(old.owner))) throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
     // Only explicit owner-local release pauses cold resume. Ordinary join
     // reservations are protected by their exact live process identity.
     if (kind === 'rpc' && old?.noColdReacquire)
       throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
+    const generation = randomUUID();
     const record = {
       ...(old?.noColdReacquire ? { noColdReacquire: true } : {}),
       kind,
       file: session.file,
       sessionId: session.header.id,
-      generation: randomUUID(),
+      generation,
+      socket: path.join(dir, `${process.pid}-${generation.slice(0, 8)}.sock`),
       owner: owner ?? (await processIdentity()),
       phase: 'starting',
     };
-    if (['tui', 'host', 'extension'].includes(kind))
-      record.socket = path.join(dir, `${process.pid}-${record.generation.slice(0, 8)}.sock`);
     await atomicJson(claimFile(dir, session), record);
     return record;
   });
@@ -238,14 +233,17 @@ export async function updateOwner(dir, session, record, changes) {
     return record;
   });
 }
+// Call under the registry mutex after identifying the exact claim to retire.
+export async function retireClaim(dir, session, current) {
+  const file = claimFile(dir, session);
+  if (current.noColdReacquire)
+    await atomicJson(file, { ...current, phase: 'released', owner: null });
+  else await fs.unlink(file);
+}
 export async function releaseOwner(dir, session, record) {
   return registryTransaction(dir, async () => {
     const current = await readClaim(dir, session);
-    if (current?.generation === record.generation) {
-      if (current.noColdReacquire)
-        await atomicJson(claimFile(dir, session), { ...current, phase: 'released', owner: null });
-      else await fs.unlink(claimFile(dir, session));
-    }
+    if (current?.generation === record.generation) await retireClaim(dir, session, current);
   });
 }
 async function deletionGate(dir, session) {
@@ -265,21 +263,25 @@ async function deletionGate(dir, session) {
 export async function acquireDeletion(dir, session) {
   return registryTransaction(dir, async () => {
     await assertSingleSessionFile(session.file);
-    await assertNoOtherLiveOwner(dir, session);
-    let record = await readClaim(dir, session);
+    let { current: record } = await scanPathOwners(dir, session);
+    const gate = await deletionGate(dir, session);
     if (record?.kind === 'handoff' && record.phase === 'reserved') {
       // Revoke an unopened reservation without signalling its requester.
-      await fs.unlink(claimFile(dir, session));
+      try {
+        await retireClaim(dir, session, record);
+      } catch (error) {
+        await gate.close();
+        throw error;
+      }
       record = null;
     }
-    const gate = await deletionGate(dir, session);
     return {
       async writer() {
         // Pi cannot cancel an in-progress switch atomically. Keep the deletion
         // gate while that one admitted switch registers its writer, cancels,
         // or its requester exits. Do not turn it into a user retry requirement.
         while (record?.kind === 'handoff' && (await ownerAlive(record.owner))) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
+          await delay(25);
           record = await readClaim(dir, session);
         }
         return record?.kind === 'handoff' ? null : record;
@@ -305,7 +307,7 @@ export async function waitOwnerExit(owner, timeout = 5000) {
   const until = Date.now() + timeout;
   while (await ownerAlive(owner)) {
     if (Date.now() >= until) throw new AttachmentFailure('OWNER_STILL_ALIVE');
-    await new Promise((r) => setTimeout(r, 25));
+    await delay(25);
   }
 }
 // Delete is explicit authority to interrupt the writer, not an idle handoff.
@@ -331,12 +333,9 @@ async function terminateOwnerForDelete(config, session, record) {
       if (record.owner.pid === process.pid) throw new AttachmentFailure('DELETE_SHARED_OWNER');
       for (const name of await fs.readdir(config.attachmentDir)) {
         if (!/^ps_[a-f0-9]{32}\.owner\.json$/.test(name)) continue;
-        const other = await readOwnerRecord(
-          config.attachmentDir,
-          path.join(config.attachmentDir, name),
-          undefined,
-          { owner: record.owner },
-        );
+        const other = await readOwnerRecord(path.join(config.attachmentDir, name), {
+          owner: record.owner,
+        });
         if (
           other &&
           other.kind !== 'handoff' &&

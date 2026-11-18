@@ -131,6 +131,7 @@ export default function ownerPermissions(pi) {
             {
               OWNER_CONFIG_CHANGED: 'Configuration changed elsewhere. Reopen the menu.',
               OWNER_CONFIG_BUSY: 'Another permission edit is in progress. Try again.',
+              JSON_FILE_TOO_LARGE: 'This edit exceeds the 1 MiB owner configuration limit.',
               SESSION_FILE_ALIAS_NOT_ALLOWED: "This session's storage cannot be safely identified.",
               UNSAFE_NATIVE_SESSION_STORAGE: "This session's storage cannot be safely identified.",
             }[error.message] ?? 'Could not update permissions. Check the owner configuration.';

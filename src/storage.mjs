@@ -11,18 +11,24 @@ export const hash = (value) =>
     .update(typeof value === 'string' ? value : JSON.stringify(value))
     .digest('hex');
 export const opaqueId = (value) => `ps_${hash(value).slice(0, 32)}`;
-export async function atomicJson(file, value) {
+export async function atomicJson(file, value, { mode = 0o600, beforeRename, maxBytes } = {}) {
+  let json = JSON.stringify(value, null, 2) + '\n';
+  if (maxBytes !== undefined && Buffer.byteLength(json) > maxBytes) {
+    json = JSON.stringify(value);
+    if (Buffer.byteLength(json) > maxBytes) throw new Error('JSON_FILE_TOO_LARGE');
+  }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  const h = await fs.open(tmp, 'wx', 0o600);
+  const h = await fs.open(tmp, 'wx', mode);
   let published = false;
   try {
     try {
-      await h.writeFile(JSON.stringify(value, null, 2));
+      await h.writeFile(json);
       await h.sync();
     } finally {
       await h.close();
     }
+    if (beforeRename) await beforeRename();
     await fs.rename(tmp, file);
     published = true;
     await syncDir(path.dirname(file));
@@ -79,6 +85,24 @@ export async function assertPrivateDirectory(
 export async function assertNativeDirectory(dir) {
   return directoryIntegrity(dir, 'UNSAFE_NATIVE_SESSION_STORAGE');
 }
+// Size the common read to the opened inode. If it grows, keep reading up to the
+// caller's limit and probe one more byte so a truncated record is never accepted.
+export async function readBoundedText(fd, size, limit, code) {
+  if (size > limit) throw new Error(code);
+  let buffer = Buffer.allocUnsafe(size + 1);
+  let length = 0;
+  for (;;) {
+    const { bytesRead } = await fd.read(buffer, length, buffer.length - length, null);
+    if (!bytesRead) return buffer.toString('utf8', 0, length);
+    length += bytesRead;
+    if (length > limit) throw new Error(code);
+    if (length === buffer.length) {
+      const expanded = Buffer.allocUnsafe(limit + 1);
+      buffer.copy(expanded);
+      buffer = expanded;
+    }
+  }
+}
 export async function readPrivateFile(
   file,
   limit,
@@ -89,17 +113,12 @@ export async function readPrivateFile(
   const fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await fd.stat();
-    if (!stat.isFile() || stat.size > limit) throw new Error(pathError);
+    if (!stat.isFile()) throw new Error(pathError);
     if (stat.uid !== process.getuid() || stat.mode & 0o077) throw new Error(privacyError);
-    const buffer = Buffer.alloc(limit + 1);
-    let length = 0;
-    while (length < buffer.length) {
-      const { bytesRead } = await fd.read(buffer, length, buffer.length - length, null);
-      if (!bytesRead) break;
-      length += bytesRead;
-    }
-    if (length > limit) throw new Error(pathError);
-    return { text: buffer.subarray(0, length).toString('utf8'), mode: stat.mode & 0o777 };
+    return {
+      text: await readBoundedText(fd, stat.size, limit, pathError),
+      mode: stat.mode & 0o777,
+    };
   } finally {
     await fd.close();
   }

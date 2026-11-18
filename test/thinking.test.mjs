@@ -23,7 +23,14 @@ for (const [op, kind] of [
     async (t) => {
       const f = await fixture(t),
         { bridge } = f;
-      if (kind === 'thinking') f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
+      if (kind === 'thinking') {
+        f.config.piArgs[f.config.piArgs.indexOf('--model') + 1] = 'vision';
+        const launcher = f.dir + '/pi';
+        await fs.symlink(f.config.piExecutable, launcher);
+        f.config.piExecutable = launcher;
+        await bridge.pool.resolve(f.session);
+        await fs.unlink(launcher); // The running writer stays on its selected Pi installation.
+      }
       const defaults = await fs.readFile(f.settings, 'utf8');
       const args = {
         ...identity(op, f),

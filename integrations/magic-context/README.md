@@ -1,13 +1,7 @@
 # Magic Context reader
 
-This is an optional external Bridge module. Bridge core does not import it.
-Its consumed storage contract is based on Magic Context **0.49.20** and has been
-verified against an installed 0.49.43 store. Compatibility is checked against the
-queried tables/columns and interpreted row values, not MC's global migration number. Unrelated additive migrations do not require a
-reader update. It requires Node's built-in
-`node:sqlite` and the current Bridge item-reader contract.
-
-Enable it explicitly in owner configuration:
+This optional reader uses Node's built-in `node:sqlite` to read Magic Context's
+stored summaries and memories. Configure its module and database explicitly.
 
 ```json
 {
@@ -61,15 +55,14 @@ remain eligible. Project memories are not filtered by the session branch.
 `coverage` totals count this session's compartments with content and the
 own-project memories eligible below. MC's empty boundary markers do not consume
 summary slots. Summary coverage adds `excluded` when branch filtering removes
-stored summaries.
+stored summaries. With `summary:0` the reader counts stored summaries and skips
+the branch lookup.
 
-- Compartments contain their P1/full stored summary as `text`, P2 (or P3) as
-  `preview`, title and a historical native leaf when the ending entry is real.
-  MC folds tool results into subsequent user messages: its message/part boundaries
-  are kept as `mc_*` provenance, never represented as an exact native range.
-  Existing flat summaries in the
-  current schema retain their stored `content`. These are summaries, not raw
-  messages. Unresolved or synthetic ending coordinates do not produce a native leaf.
+- Summary text uses P1 or the flat stored content. Shorter tiers supply the
+  preview in P2, P3, P4 order, and also supply the text when all fuller content
+  is empty. A real ending entry can link to its historical native leaf. MC folds
+  tool results into subsequent user messages, so its `mc_*` coordinates describe
+  the store's boundaries. Unresolved or synthetic coordinates have no leaf link.
 - Memories include only active/permanent, unexpired, non-superseded rows belonging
   to the verified **own project**. The reader selects by importance and update time, then preserves the selected
   store order through forward pagination. Workspace
@@ -82,10 +75,8 @@ stored summaries.
 - Explicit historical `leaf_id` requests reject. Use Bridge's Session Context view
   for a particular historical branch; this module never reads or forks raw history.
 
-Every operation opens `DatabaseSync` with `readOnly:true`, enables `query_only`,
-and uses a read transaction. No plugin entry point, getters, migrations,
-telemetry, embedding, project registration or generation is invoked. It closes
-the connection after each operation, leaving live Magic Context writers alone.
+Each operation uses a read-only SQLite transaction. It closes the connection
+before acquiring native history, and reads committed updates on the next call.
 
 Missing/unreadable databases report `MAGIC_CONTEXT_DATABASE_UNAVAILABLE`.
 Missing consumed columns or incompatible row representations report

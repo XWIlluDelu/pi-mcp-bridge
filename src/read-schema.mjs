@@ -2,17 +2,6 @@ import { z } from 'zod';
 import { utf16String } from './schema.mjs';
 
 const count = z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER);
-export const CONTENT_KINDS = Object.freeze([
-  'input',
-  'assistant',
-  'thinking',
-  'tool',
-  'summary',
-  'memory',
-  'system',
-  'command',
-  'native',
-]);
 // Native source-unit names differ from public content controls. Extensions may
 // expose additional source kinds; they remain readable under the native switch.
 export function contentKind(kind) {
@@ -41,17 +30,12 @@ export const DEFAULT_CONTENT = Object.freeze({
   command: 0,
   native: true,
 });
-export const ALL_CONTENT = Object.freeze({
-  input: true,
-  assistant: -1,
-  thinking: -1,
-  tool: -1,
-  summary: -1,
-  memory: -1,
-  system: true,
-  command: -1,
-  native: true,
-});
+export const CONTENT_KINDS = Object.freeze(Object.keys(DEFAULT_CONTENT));
+export const ALL_CONTENT = Object.freeze(
+  Object.fromEntries(
+    CONTENT_KINDS.map((kind) => [kind, typeof DEFAULT_CONTENT[kind] === 'boolean' ? true : -1]),
+  ),
+);
 const rangeSchema = z
   .object({
     recent: count

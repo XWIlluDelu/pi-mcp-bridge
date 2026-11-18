@@ -7,24 +7,14 @@ import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
 // queue or automatic retries live here. HTTP authentication stays owner-local.
 export function createStdioProxy({
-  url,
+  port,
   token,
   input = process.stdin,
   output = process.stdout,
   fetchImpl = fetch,
 }) {
-  const target = new URL(url);
-  if (
-    target.protocol !== 'http:' ||
-    target.hostname !== '127.0.0.1' ||
-    !target.port ||
-    target.pathname !== '/mcp' ||
-    target.search ||
-    target.hash ||
-    target.username ||
-    target.password
-  )
-    throw new Error('INVALID_PROXY_URL');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('INVALID_HTTP_CONFIG');
+  const target = new URL(`http://127.0.0.1:${port}/mcp`);
   assertBackendToken(token);
   const encode = (value) =>
     /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && !value.startsWith('=?base64?')
@@ -85,23 +75,19 @@ export function createStdioProxy({
 async function main() {
   const file = process.argv[2];
   if (!file) throw new Error('OWNER_CONFIG_REQUIRED');
-  const { token, port } = await loadHttpConfig(file);
-  const proxy = createStdioProxy({ url: `http://127.0.0.1:${port}/mcp`, token });
-  let closing;
-  const close = () =>
-    (closing ??= (async () => {
-      process.stdin.pause();
-      await proxy.close();
-      await proxy.drain();
-    })());
-  process.on('SIGINT', () => void close());
-  process.on('SIGTERM', () => void close());
-  process.stdin.on('end', () => void close());
-  process.stdin.on('close', () => void close());
-  process.stdin.on('error', () => void close());
-  process.stdout.on('error', () => void close());
-  proxy.onerror = () => void close();
-  await proxy.start();
+  const proxy = createStdioProxy(await loadHttpConfig(file));
+  const close = () => {
+    process.stdin.pause();
+    proxy.close();
+  };
+  process.on('SIGINT', close);
+  process.on('SIGTERM', close);
+  process.stdin.on('end', close);
+  process.stdin.on('close', close);
+  process.stdin.on('error', close);
+  process.stdout.on('error', close);
+  proxy.onerror = close;
+  proxy.start();
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   main().catch(() => {

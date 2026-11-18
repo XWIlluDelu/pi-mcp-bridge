@@ -29,7 +29,7 @@ export async function assertSingleSessionFile(file, { allowMissing = false } = {
   return stat;
 }
 
-async function withSessionFile(file, read, directory) {
+export async function withSessionFile(file, read, directory) {
   directory ??= await sessionDirectory(file);
   const fd = await fs
     .open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -64,6 +64,9 @@ function validateHeader(header) {
 // recorded cwd are unchanged; any change invalidates operations bound to it.
 export function sameSessionIdentity(a, b) {
   return a.file === b.file && a.header.id === b.header.id && a.header.cwd === b.header.cwd;
+}
+export function fileRevision(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
 }
 export function readSessionIdentity(file) {
   return readIdentity(file);
@@ -102,6 +105,7 @@ function readIdentity(file, directory) {
         id: opaqueId(`${file}\0${header.id}`),
         cwd,
         mtimeMs: stat.mtime.getTime(),
+        fileRevision: fileRevision(stat),
       };
     },
     directory,
@@ -178,10 +182,10 @@ export async function loadSession(file, { omitImageData = false, config, sdk } =
       throw new Error('INVALID_SESSION');
     byId.set(entry.id, entry);
   }
-  sessionEntryIndex(entries, entries.at(-1)?.id ?? null, byId);
   return {
     header,
     entries,
+    byId,
     leafId: entries.at(-1)?.id ?? null,
     file,
     ...(skipped || unterminated
@@ -207,8 +211,7 @@ export function sessionEntryIndex(entries, leafId, byId) {
 }
 export async function loadSavedSession(session, options) {
   const data = await loadSession(session.file, options);
-  if (data.header.id !== session.header.id || data.header.cwd !== session.header.cwd)
-    throw new Error('RUNTIME_SESSION_CHANGED');
+  if (!sameSessionIdentity(data, session)) throw new Error('RUNTIME_SESSION_CHANGED');
   return { ...session, ...data };
 }
 export async function discover(config) {

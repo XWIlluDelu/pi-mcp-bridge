@@ -3,14 +3,12 @@ import { nativeOwner } from './fixtures/native-owner.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-
 import path from 'node:path';
 
 import { discover, loadSession } from '../src/data.mjs';
-import { reserveOwner, releaseOwner } from '../src/attachments.mjs';
+import { reserveOwner, releaseOwner, readClaim, AttachedRuntime } from '../src/attachments.mjs';
 import { PiRpc } from '../src/rpc.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
-import { readClaim, AttachedRuntime } from '../src/attachments.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
 
 const fixture = (t) => nativeOwner(t, { prefix: 'alias' });
@@ -48,6 +46,23 @@ test('changing a native ID at the same path cannot hide a live writer', async (t
   assert.equal((await readClaim(config.attachmentDir, session)).generation, claim.generation);
   await releaseOwner(config.attachmentDir, session, claim);
   await reserveOwner(config.attachmentDir, changed, 'rpc');
+});
+
+test('changing only the recorded project invalidates the live binding and leaves the writer claim in place', async (t) => {
+  const f = await fixture(t);
+  const handlers = await companionHooks(f);
+  const ctx = context(SessionManager.open(f.session.file), 'rpc');
+  await handlers.session_start({}, ctx);
+  const attached = await f.bridge.pool.forRead(f.session);
+  await fs.writeFile(f.session.file, JSON.stringify({ ...f.session.header, cwd: f.dir }) + '\n');
+  const [changed] = await discover(f.config);
+  assert.equal(changed.id, f.id);
+  await assert.rejects(attached.state(), /RUNTIME_SESSION_CHANGED/);
+  await assert.rejects(f.bridge.pool.resolve(changed), /RUNTIME_SESSION_CHANGED/);
+  assert.equal(
+    (await readClaim(f.config.attachmentDir, changed)).generation,
+    attached.record.generation,
+  );
 });
 
 test('initial attachment rechecks first persistence after a missing-file snapshot', async (t) => {
