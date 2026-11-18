@@ -243,7 +243,7 @@ test('a failing host release cannot authorize termination after its binding chan
   assert.ok(await fs.stat(target.file));
 });
 
-test('denied delete does not signal the owner or prepare trash', async (t) => {
+test('denied delete or replaced target leaves the live owner and history alone', async (t) => {
   const f = await fixture(t),
     target = f.session,
     a = await writer(t);
@@ -251,6 +251,22 @@ test('denied delete does not signal the owner or prepare trash', async (t) => {
   f.config.grants = [];
   const result = await f.bridge.delete({ session_id: target.id });
   assert.equal(result.reason, 'NOT_FOUND_OR_DENIED');
+
+  // Both projects allow deletion. The request must still target the identity
+  // admitted before it waited for the deletion lane.
+  f.config.defaults.delete = true;
+  const locked = f.bridge.locked.bind(f.bridge);
+  const replacement = { ...target.header, cwd: path.join(f.dir, 'replacement') };
+  t.mock.method(f.bridge, 'locked', async (key, run) => {
+    if (key === `delete:${target.id}`)
+      await fs.writeFile(target.file, JSON.stringify(replacement) + '\n');
+    return locked(key, run);
+  });
+  assert.equal(
+    (await f.bridge.delete({ session_id: target.id })).reason,
+    'RUNTIME_SESSION_CHANGED',
+  );
   assert.equal(await ownerAlive(a.owner), true);
+  assert.equal((await f.bridge.session(target.id)).header.cwd, replacement.cwd);
   await assert.rejects(fs.stat(path.join(f.config.stateDir, 'trash')), { code: 'ENOENT' });
 });

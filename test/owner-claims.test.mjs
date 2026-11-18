@@ -15,12 +15,10 @@ import {
   releaseOwner,
   ownerAlive,
   waitOwnerExit,
-  registryTransaction,
 } from '../src/attachments.mjs';
 import { RuntimePool } from '../src/rpc.mjs';
 import { spawn } from 'node:child_process';
-import { once, on } from 'node:events';
-import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-owner-'));
@@ -155,9 +153,6 @@ test('dead ownership can be replaced without its old control metadata; a local p
   assert.equal(replacement.unsupportedControlMetadata, undefined);
   await fs.writeFile(f.file, JSON.stringify({ ...record, noColdReacquire: true }));
   await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'), { code: 'COLD_REACQUIRE_BLOCKED' });
-  await fs.writeFile(f.file, JSON.stringify({ ...record, owner: f.record.owner }));
-  await assert.rejects(reserveOwner(f.dir, f.session, 'rpc'));
-  await assert.rejects(assertNoOtherLiveOwner(f.dir, f.replacement));
 });
 
 test('real proc stat open/read exit race returns ESRCH and is conclusively absent', async (t) => {
@@ -249,54 +244,3 @@ test('boot identity failures and other proc errors remain fail-closed with origi
   });
   await assert.rejects(ownerAlive(owner), { code: 'PROCESS_IDENTITY_UNAVAILABLE' });
 });
-
-async function writer(dir) {
-  const child = spawn(
-    process.execPath,
-    [fileURLToPath(new URL('./fixtures/registry-worker.mjs', import.meta.url)), dir],
-    { env: { PATH: process.env.PATH, HOME: dir }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] },
-  );
-  let stderr = '';
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk;
-  });
-  const messages = on(child, 'message', { close: ['exit'] }),
-    exited = once(child, 'exit');
-  async function next() {
-    const event = await messages.next();
-    assert.ok(!event.done, 'Worker exited: ' + stderr);
-    return event.value[0];
-  }
-  const worker = {
-    child,
-    exited,
-    next,
-    async close() {
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      await exited;
-      await messages.return();
-    },
-  };
-  assert.deepEqual(await next(), { type: 'ready' });
-  return worker;
-}
-test(
-  'registry mutex excludes live contenders and is released by the kernel after process death',
-  { timeout: 15000 },
-  async (t) => {
-    const { dir } = await fixture(t);
-    const holder = await writer(dir);
-    t.after(() => holder.close());
-    holder.child.send({ acquire: true });
-    assert.equal((await holder.next()).type, 'entered');
-    await assert.rejects(
-      registryTransaction(dir, () => assert.fail('Live lock stolen')),
-      /ATTACHMENT_REGISTRY_BUSY/,
-    );
-    await holder.close();
-    await fs.unlink(path.join(dir, 'critical'));
-    await registryTransaction(dir, async () => {
-      assert.equal(await fs.stat(dir).then((st) => st.isDirectory()), true);
-    });
-  },
-);

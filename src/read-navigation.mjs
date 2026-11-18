@@ -16,7 +16,7 @@ const slice = (text, start, end = text.length) => {
   if (/[\uD800-\uDBFF]/u.test(text[end - 1] ?? '')) end--;
   return text.slice(start, end);
 };
-export function excerpt(value, limit = 640, query = '') {
+function excerpt(value, limit = 640, query = '') {
   const text = compact(value);
   if (text.length <= limit) return text;
   if (limit < 8) return slice(text, 0, limit);
@@ -138,6 +138,27 @@ export const assistantBlockType = (block) =>
 export const assistantFailed = (message) =>
   ['error', 'aborted'].includes(message.stopReason) || Boolean(message.errorMessage);
 
+// A repeated call ID resolves to the latest preceding unresolved call.
+export function toolOperations(units) {
+  const open = new Map(),
+    operations = [];
+  for (const unit of units) {
+    if (unit.type === 'tool_call') {
+      const operation = [unit];
+      operations.push(operation);
+      const id = unit.block.id;
+      const stack = open.get(id) ?? [];
+      stack.push(operation);
+      open.set(id, stack);
+    } else if (unit.type === 'tool_result') {
+      const operation = open.get(unit.message.toolCallId)?.pop();
+      if (operation) operation.push(unit);
+      else operations.push([unit]);
+    }
+  }
+  return operations;
+}
+
 // Classify captured assistant blocks once, keeping original source order.
 export function runtimeUnits(atoms) {
   const units = [];
@@ -168,19 +189,15 @@ export function runtimeUnits(atoms) {
     )
       units.push({ ...original, message: metadata, prompt_id: turn });
   }
-  const open = new Map();
-  for (const unit of units) {
-    if (unit.block?.type === 'toolCall') {
-      const id = `runtime:${messageKey(unit.source)}:${unit.source.block_index}`;
-      unit.tool_id = id;
-      const stack = open.get(unit.block.id) ?? [];
-      stack.push(unit);
-      open.set(unit.block.id, stack);
-    } else if (unit.message?.role === 'toolResult') {
-      const source = messageKey(unit.source);
-      const call = open.get(unit.message.toolCallId)?.pop();
-      unit.tool_id = call?.tool_id ?? `tool:${source}`;
-      unit.prompt_id = call?.prompt_id ?? unit.prompt_id;
+  for (const [first, result] of toolOperations(units)) {
+    const source = messageKey(first.source);
+    first.tool_id =
+      first.type === 'tool_call'
+        ? `runtime:${source}:${first.source.block_index}`
+        : `tool:${source}`;
+    if (result) {
+      result.tool_id = first.tool_id;
+      result.prompt_id = first.prompt_id ?? result.prompt_id;
     }
   }
   return units;
@@ -273,8 +290,10 @@ export function navigationGroups(units, content) {
   return [...grouped.values()];
 }
 
-export function navigationDocuments(snapshot) {
-  const docs = navigationGroups(snapshot.units, snapshot.request?.content);
+export function navigationDocuments(
+  snapshot,
+  docs = navigationGroups(snapshot.units, snapshot.request?.content),
+) {
   const byId = new Map(docs.map((doc, index) => [doc.id, index]));
   const latest = new Map();
   for (const [parent, doc] of [...docs].entries()) {

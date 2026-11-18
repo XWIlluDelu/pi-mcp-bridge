@@ -1,7 +1,6 @@
 import { Bridge } from '../src/bridge.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { executeBatch } from '../src/batch.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 
 const mockBridge = (methods) => ({
@@ -10,118 +9,71 @@ const mockBridge = (methods) => ({
   registerInput: Bridge.prototype.registerInput,
   ...methods,
 });
-const send = (session_id, text) => ({
-  op: 'send',
-  args: { session_id, text },
-});
-test('batch is a transparent wrapper with per-item validation and original-order results', async () => {
-  const calls = [],
-    bridge = mockBridge({
-      send: async (args) => {
-        calls.push(args.text);
-        return { status: 'accepted' };
-      },
-      read: async () => {
-        throw new Error('NOT_FOUND_OR_DENIED');
-      },
-      health: async () => ({ ok: true }),
-    });
-  const result = await executeBatch(bridge, {
+const send = (session_id, text) => ({ op: 'send', args: { session_id, text } });
+
+test('batch preserves result order, forks use their source lane, and other sessions proceed', async () => {
+  const release = Promise.withResolvers(),
+    independent = Promise.withResolvers(),
+    calls = [];
+  const bridge = mockBridge({
+    async send({ text }) {
+      calls.push(text);
+      if (text === 'a1') await release.promise;
+      if (text === 'b1') independent.resolve();
+      return { text };
+    },
+    create: async () => (calls.push('fork'), { session_id: 'child' }),
+  });
+  const pending = callBridgeTool(bridge, 'batch', {
     operations: [
-      send('a', 'one'),
-      { op: 'read', args: { session_id: 'denied' } },
-      null,
-      { op: 'batch', args: {} },
-      ...['constructor', '__proto__', 'toString'].map((op) => ({ op, args: {} })),
-      { op: 'health', args: {} },
-      send('a', 'two'),
+      send('a', 'a1'),
+      { op: 'create', args: { project: '/project', fork_from: 'a' } },
+      send('a', 'a2'),
+      send('b', 'b1'),
     ],
   });
-  assert.deepEqual(calls, ['one', 'two']);
+  await independent.promise;
+  try {
+    assert.deepEqual(calls, ['a1', 'b1']);
+  } finally {
+    release.resolve();
+  }
+  const { results } = (await pending).structuredContent;
+  assert.deepEqual(calls, ['a1', 'b1', 'fork', 'a2']);
   assert.deepEqual(
-    result.results.map((x) => x.index),
-    [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    results.map(({ result }) => result.text ?? result.session_id),
+    ['a1', 'child', 'a2', 'b1'],
   );
-  assert.equal(result.results[1].error.code, 'NOT_FOUND_OR_DENIED');
-  for (const invalid of result.results.slice(2, 7))
-    assert.equal(invalid.error.code, 'INVALID_OPERATION');
-  assert.equal(result.results[7].result.ok, true);
 });
 
-test('different sessions progress independently while each session retains input order', async () => {
-  const entered = Promise.withResolvers(),
-    release = Promise.withResolvers(),
-    events = [];
-  const bridge = mockBridge({
-    send: async (args) => {
-      events.push(args.text);
-      if (args.text === 'a1') {
-        entered.resolve();
-        await release.promise;
-      }
-      return { status: 'accepted' };
-    },
-  });
-  const pending = executeBatch(bridge, {
-    operations: [send('a', 'a1'), send('a', 'a2'), send('b', 'b1')],
-  });
-  await entered.promise;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(events, ['a1', 'b1']);
-  release.resolve();
-  await pending;
-  assert.deepEqual(events, ['a1', 'b1', 'a2']);
-});
-test('outer size/shape bounds reject before any operation but bad item args do not', async () => {
+test('malformed batch items fail independently and outer shape errors admit no work', async () => {
   let calls = 0;
   const bridge = mockBridge({
-    send: async () => {
-      calls++;
-      return { status: 'accepted' };
+    send: async () => ({ calls: ++calls }),
+    read: async () => {
+      throw new Error('NOT_FOUND_OR_DENIED');
     },
   });
-  for (const input of [
-    { operations: [] },
-    { operations: Array.from({ length: 11 }, () => send('a', 'x')) },
-    { operations: [send('a', 'x')], extra: true },
-  ]) {
+  for (const input of [{ operations: [] }, { operations: [send('a', 'x')], extra: true }]) {
     const refused = await callBridgeTool(bridge, 'batch', input);
     assert.equal(refused.structuredContent.error.code, 'INVALID_ARGUMENTS');
     assert.equal(calls, 0);
   }
-  const result = await executeBatch(bridge, {
-    operations: [
-      { op: 'send', args: { session_id: 'a', text: '', mode: 'invented' } },
-      send('a', 'good'),
-    ],
-  });
-  assert.equal(result.results[0].error.code, 'INVALID_OPERATION');
-  assert.equal(calls, 1);
-});
-test('fork shares its source lane; list and health do not add mutation permissions', async () => {
-  const events = [],
-    bridge = mockBridge({
-      send: async () => {
-        events.push('send');
-      },
-      create: async () => {
-        events.push('fork');
-        return { session_id: 'child' };
-      },
-      list: async () => ({ sessions: [] }),
-      health: async () => ({ ok: true }),
-    });
-  const result = await executeBatch(bridge, {
-    operations: [
-      send('parent', 's'),
-      {
-        op: 'create',
-        args: { project: '/project', fork_from: 'parent', text: 'first' },
-      },
-      { op: 'list', args: {} },
-      { op: 'health', args: { domain: 'runtime' } },
-    ],
-  });
-  assert.deepEqual(events, ['send', 'fork']);
-  assert.equal(result.results.length, 4);
+  const { results } = (
+    await callBridgeTool(bridge, 'batch', {
+      operations: [
+        send('a', 'one'),
+        { op: 'read', args: { session_id: 'denied' } },
+        null,
+        { op: '__proto__', args: {} },
+        send('a', ''),
+        { op: 'batch', args: {} },
+        send('a', 'two'),
+      ],
+    })
+  ).structuredContent;
+  assert.deepEqual(
+    results.map(({ error, result }) => error?.code ?? result.calls),
+    [1, 'NOT_FOUND_OR_DENIED', ...Array(4).fill('INVALID_OPERATION'), 2],
+  );
 });

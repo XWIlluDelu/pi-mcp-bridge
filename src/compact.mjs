@@ -26,6 +26,19 @@ export function nativeCompactReason(message) {
     return message;
 }
 
+export function compactContext(ctx, customInstructions) {
+  return new Promise((onComplete, reject) =>
+    ctx.compact({
+      customInstructions,
+      onComplete,
+      onError: ({ message }) =>
+        reject(
+          Object.assign(new Error('PI_REJECTED'), { native_reason: nativeCompactReason(message) }),
+        ),
+    }),
+  );
+}
+
 // Native public APIs can interrupt but cannot attest unrelated input preflight.
 // A host with its own admission gate can implement idle compact separately.
 export function requireInterruptCompaction(input, state) {

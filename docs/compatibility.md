@@ -1,24 +1,9 @@
 # Optional plugin compatibility modules
 
-Trusted owner modules share configuration and lifecycle while registering
-independent input-mapping, session-reader and daemon-environment capabilities.
-They run with the owner's Unix access and do not change Bridge grants or install
-native Pi extensions. Core imports only configured module paths; it contains no
-plugin-specific detection or storage code. The modules under `integrations/` are
-independent examples/implementations, not automatically enabled dependencies.
-
-No module is needed for native Session Context or Runtime Context. Enable a
-module when you use the corresponding Pi extension and want its additional
-reading behavior:
-
-| Module        | Adds                                                                                 | Setup and supported scope                                                                      |
-| ------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
-| Intercom      | Input boundaries for `intercom_message`; Herdr daemon environment filtering          | [Intercom configuration](../integrations/intercom/README.md)                                   |
-| Magic Context | Stored session summaries and eligible own-project memories alongside native progress | [Magic Context configuration and schema requirements](../integrations/magic-context/README.md) |
-
-The integration README is authoritative for its external version, storage paths
-and content scope. This page defines shared Bridge configuration and the module
-API; [reading](reading.md) defines caller-facing selection and navigation.
+Configured modules run with the owner's Unix access. Enable
+[Intercom](../integrations/intercom/README.md) for its input mapping and Herdr
+environment filter, or [Magic Context](../integrations/magic-context/README.md)
+for stored summaries and project memory. Native reading works without modules.
 
 ## Owner configuration
 
@@ -39,11 +24,8 @@ are not imported. Changes require service restart and appear in
 [`health.restart_required`](configuration.md#request-permission-snapshots).
 Duplicate paths and active module IDs reject.
 
-After a planned restart, use `health` to check the active configuration and read
-an authorized session that actually uses the extension. A matching session reader
-returns `view:"adapted"` and `reader.id`; enabling the module alone does not make
-every session match. Input mappings change native turn grouping without selecting
-an adapted reader. Explicit `view:"session"` remains available for native context.
+After restarting, read a session that uses the extension. An applicable
+session reader reports `view:"adapted"` and `reader.id`.
 
 ## Module lifecycle
 
@@ -100,29 +82,16 @@ export default {
 };
 ```
 
-The illustrative helpers above belong to the integration, not Bridge core.
-`matches` and `read` may be asynchronous. Their context contains:
+`matches` and `read` may be asynchronous. Both receive the session's Bridge ID,
+canonical file, native ID and recorded cwd in `session`, live registration
+evidence in `owner`, and parsed args in `request`. The reader may also use
+stored evidence tied to the session. RPC hosts supply extension commands and
+leaf ID. SDK hosts and companions can include tool registrations.
 
-| Field                  | Meaning                                                                                                                 |
-| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `session`              | Bridge `id`, canonical `file`, native `native_id` and recorded `cwd`.                                                   |
-| `owner`                | Registration `available`, `tools`, `commands` and native `leaf_id`. Missing information is not proof of plugin absence. |
-| `request`              | Parsed initial read arguments, including `range` and `content`. Search acquires all matching content kinds.             |
-| `nativeRead(options?)` | In `read`, authorized native acquisition using the same request. Optional `entry_ids` requests branch facts.            |
-
-Owned RPCs, companions and SDK hosts expose native registrations. RPC hosts
-expose extension commands via `getCommands()` and leaf via `getEntries()`; tools
-are empty because RPC does not expose all registrations. Custom hosts can supply
-`readFeatures()` with the owner fields above. Commands can identify an extension
-whose tools are disabled. Without live information, matching may use session-local
-persisted evidence. Each module defines valid evidence and context acquisition;
-global installation alone does not establish session activation.
-
-A match overrides the default source for both read and search, including saved
-sessions. No match uses Session Context. Explicit `view:"session"` forces native
-acquisition and `view:"runtime"` uses the built-in capture. `range`, `content` and
-`leaf_id` stay with the selected reader: it must honor supported intent or reject
-it. Turn range must not silently change the reader's background-content selection. Reading never starts Pi or executes an extension tool to obtain data.
+A match selects the default source for read and search. Explicit
+`view:"session"` and `view:"runtime"` select native sources. Readers handle
+selection and source-specific request limits. Turn range controls the native
+portion independently of stored summaries and memory.
 
 ## Reader content contract
 
@@ -139,81 +108,29 @@ it. Turn range must not silently change the reader's background-content selectio
 | `related`         | Optional array of up to 32 `{id,relation}` links to items in the same result.           |
 | `branch_relation` | Optional `on_branch`, `off_branch`, or `unknown` for the item's native source boundary. |
 
-Other reader kinds use the `native` content control and public item type. Their
-original name is retained in `source.content_kind`. Bridge removes disabled
-kinds before serializing the capture and sets their coverage `selected` count
-to zero. The reader remains responsible for content counts, ordering and scope.
+Unknown kinds use the `native` content control and retain their name in
+`source.content_kind`. Bridge applies kind exclusions and keeps reader ordering.
+The reader owns content counts, visibility and provenance.
 
-Optional `coverage` contains up to 16 `{type,selected,total,excluded?}` rows. Each type is a
-nonempty content-kind string of up to 64 characters; counts are safe nonnegative
-integers with `selected <= total`. `total` counts items in the reader's declared
-source scope before branch or content selection; `selected` counts the captured
-items before response pagination or search-result filtering. Bridge
-returns these rows as `reader.coverage` alongside the reader ID. Optional
-`excluded` counts items from that total excluded by selection rules (for example,
-other-branch summaries), before applying the content count; it cannot exceed
-`total - selected`.
+`coverage` accepts up to 16 `{type,selected,total,excluded?}` rows. Counts are
+nonnegative safe integers. `total` describes the reader's source scope.
+`selected` counts captured items before search and paging. `excluded` counts
+source-rule exclusions and is at most `total - selected`.
 
-Use coverage when a default reader selects only a few summaries or memories.
-Increasing the page budget cannot recover items excluded from that capture;
-a larger content count, `-1`, or a fresh search can request broader content. Counts must
-not imply coverage of stores, visibility scopes or content kinds the reader does
-not support. Search acquires the full supported effective source; its `matches`
-count is separate from reader coverage.
+Use `native:true` to append the authorized Session Context capture in native
+order. If the reader needs ancestry facts, call
+`context.nativeRead({entry_ids: ids})` with up to 10,000 IDs of at most 128
+characters. It returns `entry_relations` as `on_branch`, `off_branch` or `unknown`
+relative to the captured leaf. Compacted ancestors are checked through raw
+parent links. Repeated calls share the one capture and must use the same
+requested facts. Omitting `native:true` leaves its units out of the result.
 
-Set `native:true` to include the target session's current task/progress alongside
-extension content. Bridge calls its authorized `nativeRead()` and combines the
-cleaned units. This avoids a memory-only directory as the default session answer.
-A reader providing its own complete task view may omit native content, but must
-state its source and coverage clearly. Do not copy the same native units into
-items and also request `native:true`.
+A verified historical endpoint can supply `source_entry_id` and
+`source_relation:"history_leaf"` in its provenance. Bridge issues a
+`source_context` ref at that native leaf. Other extension coordinates
+remain provenance as supplied.
 
-Readers that need native source facts can call
-`await context.nativeRead({entry_ids: ids})` before selecting their items. The
-list accepts at most 10,000 IDs of up to 128 characters each. The returned
-`entry_relations` maps each requested ID to `on_branch`, `off_branch`, or
-`unknown`, relative to the capture's `leaf_id`. The raw parent chain includes
-ancestors omitted from effective context by compaction. A missing target or
-incomplete chain cannot establish `off_branch`. These are structural facts,
-not judgments about whether a past decision still applies.
-
-One reader invocation shares one native capture. Repeated calls reuse it;
-requesting a different ID set after capture rejects. `native:true` appends that
-same capture. With `native:false`, its leaf still identifies the structural
-evidence but its units are not included. The module interprets its own source
-coordinates and uses `branch_relation` where that distinction helps reading;
-Bridge preserves the marker in brief rows even if other provenance is shortened.
-
-Bridge sanitizes and segments item text, creates previews, searches the full
-captured text and reader previews, and expands opaque references. Reader item order is preserved;
-appended native units retain their own effective source order. Public reader results use
-`view:"adapted"`, `reader.id` and `source.reader_item`; native units retain native
-locators. When `native:true`, `selection` and `omissions.selection` describe only
-the included Session Context portion. Extension content follows the reader's documented scope;
-those counts do not describe its store. Without native content the counts are null. Item
-IDs and refs are scoped to the capture, not permanent global identifiers.
-
-If an item identifies a verified native historical endpoint, it can supply
-`source_entry_id` with `source_relation:"history_leaf"` in `source`. Bridge exposes
-a `source_context` reference that reads Session Context at that leaf. This is a
-historical context boundary, not a claim that extension coordinates map to an
-exact native message or block range. Other origins remain provenance metadata.
-
-Readers own plugin storage layout, activation evidence, content structure,
-visibility rules and current schema validation. Core owns authorization, routing,
-cleaning, byte budgets, references and cache lifecycle. Keep independent module
-capabilities independent: a reader need not provide input mappings or daemon
-environment filters, and those capabilities do not require a reader.
-
-The [Magic Context reader](../integrations/magic-context/README.md) illustrates
-this contract with compartments, own-project memories and native session progress.
-Its supported version, storage scope and provenance limits are documented there.
-
-Continuations and ordinary reference expansion use the frozen capture without
-another owner probe or reader call, while rechecking authorization and identity.
-Any explicit continuation range or content fields must agree with the capture.
-Native turn equivalence alone does not establish equivalence of reader background
-selection; summary and memory counts are part of the frozen request. See the [read arguments](reading.md#browse-find-and-expand).
-Multiple matches report `SESSION_READER_CONFLICT`; reader exceptions report
-`SESSION_READER_FAILED`. Each fresh read selects a reader once for its capture.
-Bridge rechecks native identity before returning it.
+Each fresh read selects a reader once. Multiple matches report
+`SESSION_READER_CONFLICT` and reader failures use `SESSION_READER_FAILED`.
+Bridge rechecks native identity before returning the capture. Subsequent
+pages and ordinary refs use that frozen capture and recheck authorization.

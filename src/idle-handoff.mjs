@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import { atomicJson } from './storage.mjs';
 import {
   ownerAlive,
+  sameOwner,
   readClaim,
   registryTransaction,
   claimFile,
@@ -22,7 +23,6 @@ function validate(request) {
   )
     throw new Error('INVALID_OWNER_COMMAND');
 }
-const sameRequester = (a, b) => a?.pid === b.pid && a.start === b.start && a.boot === b.boot;
 export async function idleHandoff(bridge, request, { signal } = {}) {
   validate(request);
   bridge.assertOpen();
@@ -109,10 +109,7 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
 export async function cancelHandoff(bridge, request) {
   validate(request);
   const pending = bridge.handoffs.get(request.session_id);
-  if (
-    pending?.handoff_id === request.handoff_id &&
-    sameRequester(pending.requester, request.requester)
-  )
+  if (pending?.handoff_id === request.handoff_id && sameOwner(pending.requester, request.requester))
     pending.controller.abort();
   const session = await bridge.session(request.session_id).catch((error) => {
     if (error.message === 'NOT_FOUND_OR_DENIED') return null; // Already deleted.
@@ -126,7 +123,7 @@ export async function cancelHandoff(bridge, request) {
       if (
         current?.handoffId !== request.handoff_id ||
         current.kind !== 'handoff' ||
-        !sameRequester(current.owner, owner)
+        !sameOwner(current.owner, owner)
       )
         return;
       await fs.unlink(claimFile(dir, session));

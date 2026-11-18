@@ -6,6 +6,15 @@ import { pathToFileURL } from 'node:url';
 import { opaqueId } from './storage.mjs';
 import { privateDirectory } from './attachments.mjs';
 import { readOwnerConfig } from './owner-config.mjs';
+import { readRequest, listenPrivate } from './attachment-protocol.mjs';
+const methods = {
+  release: 'releaseForLocal',
+  settled: 'settledForLocal',
+  idle_candidate: 'idleCandidateForLocal',
+  reset: 'resetColdResume',
+  handoff: 'handoffForLocal',
+  handoff_cancel: 'cancelHandoff',
+};
 export function ownerSocket(config) {
   const dir = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
   return path.join(dir, `owner-${opaqueId(config.stateDir).slice(3, 11)}.sock`);
@@ -29,10 +38,7 @@ export async function serveOwnerControl(bridge) {
   let closing = false;
   const server = net.createServer({ allowHalfOpen: true }, (connection) => {
     connections.add(connection);
-    connection.setEncoding('utf8');
-    let buffer = '',
-      admitted = false,
-      controller,
+    let controller,
       completed = false;
     connection.setTimeout(30000, () => connection.destroy());
     connection.on('error', () => {});
@@ -43,26 +49,11 @@ export async function serveOwnerControl(bridge) {
     connection.on('end', () => {
       if (!completed) controller?.abort();
     });
-    connection.on('data', (chunk) => {
-      if (admitted || closing) return;
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > 8192) {
-        connection.destroy();
-        return;
-      }
-      if (!buffer.includes('\n')) return;
-      admitted = true;
+    readRequest(connection, 8192, (frame) => {
+      if (closing) return;
       const task = (async () => {
         try {
-          const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
-          const methods = {
-            release: 'releaseForLocal',
-            settled: 'settledForLocal',
-            idle_candidate: 'idleCandidateForLocal',
-            reset: 'resetColdResume',
-            handoff: 'handoffForLocal',
-            handoff_cancel: 'cancelHandoff',
-          };
+          const request = JSON.parse(frame);
           if (
             !request ||
             !Object.hasOwn(methods, request.op) ||
@@ -97,11 +88,7 @@ export async function serveOwnerControl(bridge) {
     });
   });
   try {
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socket, resolve);
-    });
-    await fs.chmod(socket, 0o600);
+    await listenPrivate(server, socket);
   } catch (error) {
     await new Promise((resolve) => server.close(resolve));
     throw error;

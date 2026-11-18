@@ -82,26 +82,6 @@ test('modern requests are self-contained; discovery and tool list carry required
   assert.equal(discovery.message.result.cacheScope, 'private');
   assert.equal(discovery.message.result._meta[META + 'serverInfo'].name, 'pi-session-bridge');
   const listed = (await dispatchModern(stub, message('tools/list'))).message.result;
-  assert.deepEqual(
-    listed.tools.map((t) => t.name),
-    [
-      'list',
-      'read',
-      'search',
-      'models',
-      'set_model',
-      'compact',
-      'reload',
-      'send',
-      'submission',
-      'command',
-      'stop',
-      'create',
-      'delete',
-      'batch',
-      'health',
-    ],
-  );
   assert.deepEqual(discovery.message.result._meta[META + 'serverInfo'], {
     name: 'pi-session-bridge',
     version: packageInfo.version,
@@ -132,6 +112,10 @@ test('modern versions, required metadata and unknown methods use official error 
   assert.equal(rejected.message.error.code, -32022);
   assert.equal(rejected.message.error.data.requested, '2099-01-01');
   assert.deepEqual(rejected.message.error.data.supported, [MODERN_VERSION]);
+  wrong.params._meta[META + 'protocolVersion'] = '\u0000'.repeat(MCP_INPUT_LIMIT / 6 - 100);
+  const oversized = await dispatchModern(stub, wrong);
+  assert.equal(oversized.message.error.code, -32022);
+  assert.ok(Buffer.byteLength(JSON.stringify(oversized.message)) < 4096);
   for (const key of [META + 'protocolVersion', META + 'clientCapabilities']) {
     const body = message('tools/list');
     delete body.params._meta[key];

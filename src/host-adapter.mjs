@@ -1,7 +1,6 @@
 import packageInfo from '../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
-import { publicError } from './errors.mjs';
 import { readSessionIdentity } from './data.mjs';
 
 import { parseCompactInput, compactMetadata } from './compact.mjs';
@@ -14,15 +13,13 @@ import { modelSettingsSchema, modelSettings } from './set-model.mjs';
 import { limitBashResult } from './bash-execution.mjs';
 import { stopReceipt, withdrawalCollector } from './stop-execution.mjs';
 import {
-  attachmentServer,
+  ownerServer,
   listenPrivate,
   ownerEnvelope,
   ownerIdentity,
   ownerReadFeatures,
   ownerRead,
-  ownerSnapshot,
   validNativeSnapshot,
-  parseOwnerRequest,
   nativeBusy,
   pendingMessages,
 } from './attachment-protocol.mjs';
@@ -152,25 +149,34 @@ export async function reserveHostSession({
       throw error;
     }
   }
-  function validateRequest(request) {
-    if (
-      (!ready && !(releasing && request?.op === 'release')) ||
-      closed ||
-      request?.generation !== record.generation ||
-      request.file !== target.file ||
-      request.sessionId !== target.header.id
-    )
-      fail('RUNTIME_SESSION_CHANGED');
-  }
   const supportsBash = () =>
     typeof callbacks.bash === 'function' &&
     (typeof callbacks.cancel === 'function' || typeof callbacks.stop === 'function');
   async function operate(request, partial) {
+    const args = request.body ?? {};
+    if (request.op === 'snapshot' || (request.op === 'read' && args.view !== 'runtime')) {
+      // A snapshot callback binds its capture to the actual native session.
+      // The RPC binding already samples native identity on each side of getEntries.
+      const snapshot = await callbacks.snapshot();
+      assertNativeIdentity(snapshot);
+      if (!validNativeSnapshot(snapshot)) fail('INVALID_HOST_SNAPSHOT');
+      const { entries, leafId } = snapshot;
+      const data =
+        request.op === 'snapshot'
+          ? { ...ownerIdentity(record), entries: structuredClone(entries), leafId }
+          : ownerRead(
+              record,
+              { ...snapshot, live: snapshot.live ?? { available: false, source: 'host_snapshot' } },
+              args,
+              { buildSessionProjection, readAdapters: request.readAdapters },
+            );
+      await assertIdentity();
+      return data;
+    }
     const entryStopSequence = stopSequence,
       stoppingAtEntry = stopping;
-    const observed = await state(),
-      args = request.body ?? {};
-    if (reloading && !['state', 'read', 'read_features', 'snapshot'].includes(request.op))
+    const observed = await state();
+    if (reloading && !['state', 'read', 'read_features'].includes(request.op))
       fail('RELOAD_IN_PROGRESS');
     if (
       ['bash', 'stop'].includes(request.op) &&
@@ -181,7 +187,6 @@ export async function reserveHostSession({
           (!Number.isInteger(args.max_chars) || args.max_chars < 256 || args.max_chars > 32768)))
     )
       fail('INVALID_ARGUMENTS');
-    const pendingMessageCount = pendingMessages(observed);
     let data;
     const beforeDispatch = () => {
       if (stoppingAtEntry || stopping || entryStopSequence !== stopSequence)
@@ -205,7 +210,7 @@ export async function reserveHostSession({
         isStreaming: typeof observed.isStreaming === 'boolean' ? observed.isStreaming : null,
         isCompacting: typeof observed.isCompacting === 'boolean' ? observed.isCompacting : null,
         isBashRunning: typeof observed.isBashRunning === 'boolean' ? observed.isBashRunning : null,
-        pendingMessageCount,
+        pendingMessageCount: pendingMessages(observed),
         ...modelState(observed),
         capabilities: {
           send: true,
@@ -218,29 +223,12 @@ export async function reserveHostSession({
         ? assertReadFeatures(await callbacks.readFeatures())
         : { available: false, tools: [], commands: [], leaf_id: null };
       data = ownerReadFeatures(record, features);
-    } else if (request.op === 'read' && args.view === 'runtime')
+    } else if (request.op === 'read')
       data = {
         ...ownerIdentity(record),
         ...unavailableObservation(args.session_id, 'host_observer_unavailable'),
       };
-    else if (['read', 'snapshot'].includes(request.op)) {
-      const observed = await callbacks.snapshot();
-      const snapshot = request.op === 'snapshot' ? structuredClone(observed) : observed;
-      assertNativeIdentity(snapshot);
-      if (!validNativeSnapshot(snapshot)) fail('INVALID_HOST_SNAPSHOT');
-      data =
-        request.op === 'snapshot'
-          ? ownerSnapshot(record, snapshot)
-          : ownerRead(
-              record,
-              {
-                ...snapshot,
-                live: snapshot.live ?? { available: false, source: 'host_snapshot' },
-              },
-              args,
-              { buildSessionProjection, readAdapters: request.readAdapters },
-            );
-    } else if (request.op === 'reload') {
+    else if (request.op === 'reload') {
       if (typeof callbacks.reload !== 'function') fail('RELOAD_UNSUPPORTED');
       if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
       if (bashing || stopping || settingModel || compacting || submitting || nativeBusy(observed))
@@ -407,30 +395,27 @@ export async function reserveHostSession({
     try {
       await state();
       if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
-      server = attachmentServer(sockets, async (line, socket) => {
-        try {
-          const request = parseOwnerRequest(line, validateRequest);
-          if (['stop', 'bash'].includes(request.op)) socket.setTimeout(5000);
+      server = ownerServer(
+        sockets,
+        () => record,
+        async (request, socket) => {
+          if (closed || (!ready && !(releasing && request.op === 'release')))
+            fail('RUNTIME_SESSION_CHANGED');
+          if (request.op === 'release') return release();
           if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
-          let data;
-          if (request.op === 'release') data = await release();
-          else {
-            const operation = operate(request, (data) => {
-              if (!socket.destroyed && !socket.writableEnded)
-                socket.write(ownerEnvelope(record, { partial: true, data }));
-            });
-            operations.add(operation);
-            try {
-              data = await operation;
-            } finally {
-              operations.delete(operation);
-            }
+          const operation = operate(request, (data) => {
+            if (!socket.destroyed && !socket.writableEnded)
+              socket.write(ownerEnvelope(record, { partial: true, data }));
+          });
+          operations.add(operation);
+          try {
+            return await operation;
+          } finally {
+            operations.delete(operation);
           }
-          socket.end(ownerEnvelope(record, { data }));
-        } catch (error) {
-          socket.end(ownerEnvelope(record, { error: publicError(error, 'HOST_OPERATION_FAILED') }));
-        }
-      });
+        },
+        'HOST_OPERATION_FAILED',
+      );
       await listenPrivate(server, record.socket);
       await state();
       if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');

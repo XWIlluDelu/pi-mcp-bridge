@@ -211,8 +211,10 @@ export class EventSubscriptions {
       this.assertAvailable();
       const next = new Map([...this.records].filter(([, r]) => r.expiresAt > this.now()));
       const result = await fn(next);
-      await atomicJson(this.file, [...next.values()]);
-      this.records = next;
+      if (result) {
+        await atomicJson(this.file, [...next.values()]);
+        this.records = next;
+      }
       return result;
     });
     this.changes = task.catch(() => {});
@@ -258,9 +260,7 @@ export class EventSubscriptions {
     if (method === 'events/unsubscribe') {
       // Same authenticated owner can always stop its subscription after revocation.
       const id = identity(request.arguments.session_id, request.delivery.url);
-      await this.change((next) => {
-        next.delete(id);
-      });
+      await this.change((next) => next.delete(id));
       for (const delivery of this.deliveries.values())
         if (delivery.id === id) delivery.controller.abort();
       return {};
@@ -359,23 +359,24 @@ export class EventSubscriptions {
     };
     // Serialize ONCE. Each retry signs and transmits these exact bytes.
     const body = JSON.stringify(event);
+    const session_ref = diagnosticRef(session.id);
     for (const record of records) {
       if (this.deliveries.size >= MAX_DELIVERIES) {
-        diagnostics.emit('events.delivery_dropped', { session_ref: diagnosticRef(session.id) });
+        diagnostics.emit('events.delivery_dropped', { session_ref });
         continue;
       }
       const controller = new AbortController();
       const signal = AbortSignal.any([controller.signal, this.shutdown.signal]);
       const task = this.deliver(record.id, session, event.eventId, body, signal)
         .catch(() => {
-          if (!signal.aborted)
-            diagnostics.emit('events.delivery_failed', { session_ref: diagnosticRef(session.id) });
+          if (!signal.aborted) diagnostics.emit('events.delivery_failed', { session_ref });
         })
         .finally(() => this.deliveries.delete(task));
       this.deliveries.set(task, { id: record.id, controller });
     }
   }
   async deliver(id, session, eventId, body, signal) {
+    const session_ref = diagnosticRef(session.id);
     for (let attempt = 0; attempt <= this.retryDelays.length; attempt++) {
       if (this.storeError || signal.aborted) return;
       let record = this.records.get(id);
@@ -386,38 +387,37 @@ export class EventSubscriptions {
         if (!sameSessionIdentity(await this.authorize(session.id), session)) return;
       } catch (error) {
         if (!this.bridge.closing && error.message === 'NOT_FOUND_OR_DENIED')
-          await this.change((next) => {
-            if (next.get(id) === record) next.delete(id);
-          });
+          await this.change((next) => next.get(id) === record && next.delete(id));
         return;
       }
       // Unsubscribe/rotation may have finished during authorization.
       record = this.records.get(id);
-      if (!record || record.expiresAt <= this.now() || signal.aborted) return;
+      const now = this.now();
+      if (!record || record.expiresAt <= now || signal.aborted) return;
       let response;
       try {
         response = await this.post(
           record.url,
           body,
-          signedHeaders(record, eventId, body, new Date(this.now())),
-          { signal: AbortSignal.any([signal, AbortSignal.timeout(record.expiresAt - this.now())]) },
+          signedHeaders(record, eventId, body, new Date(now)),
+          { signal: AbortSignal.any([signal, AbortSignal.timeout(record.expiresAt - now)]) },
         );
       } catch (error) {
         if (error instanceof CallbackError && error.reason === 'blocked_address') {
-          diagnostics.emit('events.delivery_failed', { session_ref: diagnosticRef(session.id) });
+          diagnostics.emit('events.delivery_failed', { session_ref });
           return;
         }
       }
       if (response?.status >= 200 && response.status < 300) {
         diagnostics.emit('events.delivered', {
-          session_ref: diagnosticRef(session.id),
+          session_ref,
           http_status: response.status,
         });
         return;
       }
       if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {
         diagnostics.emit('events.delivery_failed', {
-          session_ref: diagnosticRef(session.id),
+          session_ref,
           http_status: response.status,
         });
         return; // Includes 410, 413 and redirects; never follow or retry them.
@@ -425,7 +425,7 @@ export class EventSubscriptions {
       if (attempt < this.retryDelays.length)
         await delay(this.retryDelays[attempt], undefined, { signal });
     }
-    diagnostics.emit('events.delivery_failed', { session_ref: diagnosticRef(session.id) });
+    diagnostics.emit('events.delivery_failed', { session_ref });
   }
   async close() {
     this.shutdown.abort();

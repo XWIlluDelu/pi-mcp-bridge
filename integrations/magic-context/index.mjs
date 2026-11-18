@@ -9,42 +9,30 @@ import { z } from 'zod';
 import { contextSelection } from '../../src/read-schema.mjs';
 
 const execFileAsync = promisify(execFile);
-const COLUMNS = {
-  session_projects: ['session_id', 'harness', 'project_path'],
-  session_meta: ['session_id', 'harness', 'counter', 'cached_m0_bytes'],
-  compartments: [
-    'id',
-    'session_id',
-    'harness',
-    'sequence',
-    'title',
-    'content',
-    'p1',
-    'p2',
-    'p3',
-    'p4',
-    'start_message_id',
-    'end_message_id',
-    'start_block_index',
-    'end_block_index',
-    'rebase_status',
-    'created_at',
-  ],
-  memories: [
-    'id',
-    'project_path',
-    'category',
-    'content',
-    'importance',
-    'status',
-    'expires_at',
-    'source_session_id',
-    'source_type',
-    'verification_status',
-    'updated_at',
-    'superseded_by_memory_id',
-  ],
-};
+const PROJECT = `
+  SELECT project_path FROM session_projects AS project
+  WHERE project.session_id = ? AND project.harness = 'pi' AND (
+    ? OR EXISTS (
+      SELECT 1 FROM compartments AS c WHERE c.session_id = project.session_id AND c.harness = 'pi'
+    ) OR EXISTS (
+      SELECT 1 FROM session_meta AS m WHERE m.session_id = project.session_id AND m.harness = 'pi'
+        AND (m.counter > 0 OR length(m.cached_m0_bytes) > 0)
+    )
+  )`;
+const COMPARTMENTS = `
+  SELECT id, sequence, title, content, p1, p2, p3, start_message_id, end_message_id,
+    start_block_index, end_block_index, rebase_status, created_at
+  FROM compartments WHERE session_id = ? AND harness = 'pi'
+    AND (title <> '' OR content <> '' OR COALESCE(p1, '') <> ''
+      OR COALESCE(p2, '') <> '' OR COALESCE(p3, '') <> '' OR COALESCE(p4, '') <> '')
+  ORDER BY sequence ASC, id ASC`;
+const MEMORIES = `
+  SELECT id, category, content, status, verification_status, updated_at, source_type,
+    source_session_id, expires_at, importance
+  FROM memories WHERE project_path = ? AND status IN ('active', 'permanent')
+    AND superseded_by_memory_id IS NULL
+  ORDER BY COALESCE(importance, 50) ASC, updated_at ASC, id ASC`;
+
 // Validate the values we interpret, not MC's unrelated migration history.
 // Unknown rebase states stay readable but never establish a native history leaf.
 const integer = z.number().int().safe();
@@ -95,18 +83,6 @@ function validateOptions(options) {
   return options.database;
 }
 
-function validateSchema(db) {
-  for (const [table, required] of Object.entries(COLUMNS)) {
-    const columns = new Set(
-      db
-        .prepare(`PRAGMA table_info(${table})`)
-        .all()
-        .map((row) => row.name),
-    );
-    if (required.some((name) => !columns.has(name))) throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH');
-  }
-}
-
 function withDatabase(database, read) {
   let db;
   try {
@@ -118,10 +94,11 @@ function withDatabase(database, read) {
     // These pragmas affect this connection only. BEGIN takes a coherent read
     // snapshot; neither plugin initialization nor migration code is imported.
     db.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=1000; BEGIN');
-    validateSchema(db);
     return read(db);
   } catch (cause) {
     if (cause.message?.startsWith('MAGIC_CONTEXT_')) throw cause;
+    if (/^no such (table|column):/.test(cause.message))
+      throw fail('MAGIC_CONTEXT_SCHEMA_MISMATCH', cause);
     throw fail('MAGIC_CONTEXT_DATABASE_READ_FAILED', cause);
   } finally {
     db.close();
@@ -196,37 +173,12 @@ async function projectIdentity(cwd) {
   }
 }
 
-function liveEvidence(owner) {
-  return (
+function sessionProject(db, { session, owner }) {
+  const live =
     owner.available &&
     owner.commands.includes('ctx-status') &&
-    owner.commands.includes('ctx-recomp')
-  );
-}
-
-function activationEvidence(db, context) {
-  const nativeId = context.session.native_id;
-  if (liveEvidence(context.owner)) return true;
-  if (
-    db
-      .prepare("SELECT 1 FROM compartments WHERE session_id = ? AND harness = 'pi' LIMIT 1")
-      .get(nativeId)
-  )
-    return true;
-  return Boolean(
-    db
-      .prepare(
-        "SELECT 1 FROM session_meta WHERE session_id = ? AND harness = 'pi' AND (counter > 0 OR length(cached_m0_bytes) > 0)",
-      )
-      .get(nativeId),
-  );
-}
-
-function sessionEvidence(db, context, identity) {
-  const mapping = db
-    .prepare("SELECT project_path FROM session_projects WHERE session_id = ? AND harness = 'pi'")
-    .get(context.session.native_id);
-  return Boolean(mapping && mapping.project_path === identity && activationEvidence(db, context));
+    owner.commands.includes('ctx-recomp');
+  return db.prepare(PROJECT).get(session.native_id, Number(live))?.project_path;
 }
 
 function nativeEntryId(id) {
@@ -287,46 +239,26 @@ function memoryItem(row, capturedAt) {
 
 export function createMagicContextReader(options) {
   const database = validateOptions(options);
-  withDatabase(database, () => {});
+  // Prepare the actual queries to check the consumed schema at startup.
+  withDatabase(database, (db) => {
+    for (const sql of [PROJECT, COMPARTMENTS, MEMORIES]) db.prepare(sql);
+  });
   return {
     async matches(context) {
-      const candidate = withDatabase(database, (db) =>
-        Boolean(
-          db
-            .prepare("SELECT 1 FROM session_projects WHERE session_id = ? AND harness = 'pi'")
-            .get(context.session.native_id) && activationEvidence(db, context),
-        ),
+      const project = withDatabase(database, (db) => sessionProject(db, context));
+      return (
+        typeof project === 'string' && project === (await projectIdentity(context.session.cwd))
       );
-      if (!candidate) return false;
-      const identity = await projectIdentity(context.session.cwd);
-      return withDatabase(database, (db) => sessionEvidence(db, context, identity));
     },
     async read(context) {
       if (context.request.leaf_id !== undefined)
         throw fail('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
       const identity = await projectIdentity(context.session.cwd);
       const stored = withDatabase(database, (db) => {
-        if (!sessionEvidence(db, context, identity)) throw fail('MAGIC_CONTEXT_SESSION_MISMATCH');
+        if (sessionProject(db, context) !== identity) throw fail('MAGIC_CONTEXT_SESSION_MISMATCH');
         const capturedAt = Date.now();
-        const compartments = db
-          .prepare(
-            `SELECT id, sequence, title, content, p1, p2, p3, start_message_id, end_message_id,
-             start_block_index, end_block_index, rebase_status, created_at
-           FROM compartments WHERE session_id = ? AND harness = 'pi'
-             AND (title <> '' OR content <> '' OR COALESCE(p1, '') <> ''
-               OR COALESCE(p2, '') <> '' OR COALESCE(p3, '') <> '' OR COALESCE(p4, '') <> '')
-           ORDER BY sequence ASC, id ASC`,
-          )
-          .all(context.session.native_id);
-        const memories = db
-          .prepare(
-            `SELECT id, category, content, status, verification_status, updated_at, source_type, source_session_id,
-             expires_at, importance
-           FROM memories WHERE project_path = ? AND status IN ('active', 'permanent')
-             AND superseded_by_memory_id IS NULL
-           ORDER BY COALESCE(importance, 50) ASC, updated_at ASC, id ASC`,
-          )
-          .all(identity);
+        const compartments = db.prepare(COMPARTMENTS).all(context.session.native_id);
+        const memories = db.prepare(MEMORIES).all(identity);
         if (
           compartments.some((row) => !compartmentSchema.safeParse(row).success) ||
           memories.some((row) => !memorySchema.safeParse(row).success)

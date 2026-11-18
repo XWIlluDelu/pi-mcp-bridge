@@ -10,16 +10,13 @@ import { nativeReadFeatures } from './read-features.mjs';
 import { LiveMessageObserver } from './live-message.mjs';
 import { SettledObserver } from './settled-observer.mjs';
 import {
-  attachmentServer,
+  ownerServer,
   listenPrivate,
-  ownerEnvelope,
-  parseOwnerRequest,
   ownerIdentity,
   ownerReadFeatures,
   ownerRead,
 } from './attachment-protocol.mjs';
-import { parseCompactInput, compactMetadata, nativeCompactReason } from './compact.mjs';
-import { publicError } from './errors.mjs';
+import { parseCompactInput, compactContext, compactMetadata } from './compact.mjs';
 import { sameModel, thinkingLevelSchema } from './models.mjs';
 
 async function restoreEmptyContextSelection(pi, ctx, { file, sessionId, leafId }) {
@@ -129,101 +126,70 @@ export default async function rpcObserver(pi) {
     });
     observation.reset();
     if (server) return;
-    server = attachmentServer(connections, async (frame, connection) => {
-      let result, request;
-      const binding = {
+    server = ownerServer(
+      connections,
+      () => ({
+        kind: 'rpc',
         generation,
         file: context?.sessionManager.getSessionFile(),
         sessionId: context?.sessionManager.getSessionId(),
-      };
-      try {
-        request = parseOwnerRequest(frame, (request) => {
-          if (
-            !context ||
-            !['state', 'read', 'read_features', 'seal', 'compact'].includes(request.op) ||
-            request.generation !== binding.generation ||
-            request.file !== binding.file ||
-            request.sessionId !== binding.sessionId
-          )
-            throw new Error('RUNTIME_SESSION_CHANGED');
-        });
-        if (request.op === 'compact') {
-          const input = parseCompactInput(request.body);
-          if (input.interrupt) throw new Error('INVALID_ARGUMENTS');
-          const value = await admission.compact(context.sessionManager, context, () => {
-            connection.setTimeout(0);
-            return new Promise((resolve, reject) =>
-              context.compact({
-                customInstructions: input.instructions,
-                onComplete: resolve,
-                onError: (error) =>
-                  reject(
-                    Object.assign(new Error('PI_REJECTED'), {
-                      native_reason: nativeCompactReason(error.message),
-                    }),
-                  ),
+      }),
+      async ({ op, body, readAdapters }, connection, _reply, binding) => {
+        if (!context) throw new Error('RUNTIME_SESSION_CHANGED');
+        const ctx = context,
+          manager = ctx.sessionManager;
+        switch (op) {
+          case 'compact': {
+            const input = parseCompactInput(body);
+            if (input.interrupt) throw new Error('INVALID_ARGUMENTS');
+            return compactMetadata(
+              await admission.compact(manager, ctx, () => {
+                connection.setTimeout(0);
+                return compactContext(ctx, input.instructions);
               }),
             );
-          });
-          result = { data: compactMetadata(value) };
-        } else if (request.op === 'seal') {
-          if (
-            !request.body ||
-            typeof request.body !== 'object' ||
-            Array.isArray(request.body) ||
-            Object.keys(request.body).length
-          )
-            throw new Error('INVALID_ARGUMENTS');
-          const sealed = admission.seal(context.sessionManager, context);
-          result = { data: sealed ? { sealed: true } : { sealed: false, reason: 'busy' } };
-        } else if (request.op === 'state') {
-          result = {
-            data: {
-              isIdle: context.isIdle() && admission.idle(context.sessionManager),
-              hasPendingMessages: context.hasPendingMessages(),
-              sealed: admission.sealed(context.sessionManager),
-            },
-          };
-        } else if (request.op === 'read_features') {
-          result = {
-            data: ownerReadFeatures(
+          }
+          case 'seal': {
+            if (
+              !body ||
+              typeof body !== 'object' ||
+              Array.isArray(body) ||
+              Object.keys(body).length
+            )
+              throw new Error('INVALID_ARGUMENTS');
+            return admission.seal(manager, ctx)
+              ? { sealed: true }
+              : { sealed: false, reason: 'busy' };
+          }
+          case 'state':
+            return {
+              isIdle: ctx.isIdle() && admission.idle(manager),
+              hasPendingMessages: ctx.hasPendingMessages(),
+              sealed: admission.sealed(manager),
+            };
+          case 'read_features':
+            return ownerReadFeatures(
               binding,
-              nativeReadFeatures(
-                pi.getAllTools(),
-                pi.getCommands(),
-                context.sessionManager.getLeafId(),
-              ),
-            ),
-          };
-        } else if (request.body?.view === 'runtime') {
-          result = {
-            data: { ...ownerIdentity(binding), ...observation.read(request.body, context) },
-          };
-        } else {
-          result = {
-            data: ownerRead(
-              binding,
-              {
-                entries: context.sessionManager.getEntries(),
-                leafId: context.sessionManager.getLeafId(),
-                live: live.snapshot(),
-              },
-              request.body,
-              { ...sdk, readAdapters: request.readAdapters },
-            ),
-          };
+              nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
+            );
+          case 'read':
+            return body?.view === 'runtime'
+              ? { ...ownerIdentity(binding), ...observation.read(body, ctx) }
+              : ownerRead(
+                  binding,
+                  {
+                    entries: manager.getEntries(),
+                    leafId: manager.getLeafId(),
+                    live: live.snapshot(),
+                  },
+                  body,
+                  { ...sdk, readAdapters },
+                );
+          default:
+            throw new Error('INVALID_ATTACHED_OPERATION');
         }
-      } catch (error) {
-        result =
-          request?.op === 'compact'
-            ? {
-                error: publicError(error),
-                ...(error.native_reason ? { native_reason: error.native_reason } : {}),
-              }
-            : { error: error.message };
-      }
-      connection.end(ownerEnvelope(binding, result));
-    });
+      },
+    );
     await listenPrivate(server, socket);
   });
   pi.on('session_shutdown', async () => {

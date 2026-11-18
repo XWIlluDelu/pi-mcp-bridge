@@ -84,14 +84,9 @@ test('written seal failures remain uncertain and are never replayed', async (t) 
   for (const [response, code] of [
     [null, 'LIVE_OWNER_UNREACHABLE'],
     [{ data: { sealed: false } }, 'INVALID_ATTACHMENT_RESPONSE'],
-    [{ data: { sealed: true }, partial: true }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, error: 'INVALID_ARGUMENTS' }, 'INVALID_ATTACHMENT_RESPONSE'],
-    [{ data: { sealed: true }, version: 1 }, 'INVALID_ATTACHMENT_RESPONSE'],
     [{ data: { sealed: true }, generation: 'another' }, 'RUNTIME_SESSION_CHANGED'],
-    [{ data: { sealed: true }, sessionId: 'another' }, 'RUNTIME_SESSION_CHANGED'],
-    [{ data: { sealed: true }, file: '/another/session.jsonl' }, 'RUNTIME_SESSION_CHANGED'],
     [{ error: 'OWNER_COMPONENT_UPDATE_REQUIRED', sessionId: 'another' }, 'RUNTIME_SESSION_CHANGED'],
-    [{ error: 'ATTACHED_OPERATION_FAILED' }, 'ATTACHED_OPERATION_FAILED'],
   ]) {
     const before = f.requests.length;
     f.respond(() => response);

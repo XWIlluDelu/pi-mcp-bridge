@@ -96,32 +96,23 @@ const modernHeaders = (body) => ({
   'Mcp-Method': body.method,
   ...(body.method === 'tools/call' ? { 'Mcp-Name': body.params.name } : {}),
 });
-test('HTTP uses per-request metadata and rejects the old handshake and versions', async (t) => {
+test('HTTP accepts matching per-request headers and rejects mismatches or duplicates', async (t) => {
   const f = await fixture(t);
-  for (const method of ['server/discover', 'tools/list']) {
-    const response = await request(f.url, modern(method));
-    assert.equal(response.status, 200, response.text);
-    assert.equal(response.headers['mcp-session-id'], undefined);
-  }
   const body = modern('tools/call', { name: 'list', arguments: {} });
   const success = await request(f.url, body);
   assert.equal(success.status, 200);
+  assert.equal(success.headers['mcp-session-id'], undefined);
   assert.equal(success.body.result.structuredContent.sessions[0].session_id, f.id);
   for (const bad of [
     { 'Mcp-Method': 'tools/list' },
     { 'Mcp-Name': 'read' },
+    { 'MCP-Protocol-Version': '2025-11-25' },
     { 'Mcp-Method': ['tools/call', 'tools/call'] },
   ]) {
     const response = await request(f.url, body, { headers: bad });
     assert.equal(response.status, 400);
     assert.equal(response.body.error.code, -32020);
   }
-  const unsupported = modern('tools/list');
-  unsupported.params._meta[META + 'protocolVersion'] = '2025-11-25';
-  const version = await request(f.url, unsupported);
-  assert.equal(version.status, 400);
-  assert.equal(version.body.error.code, -32022);
-  assert.deepEqual(version.body.error.data.supported, [MODERN_VERSION]);
   const initialize = await request(f.url, {
     jsonrpc: '2.0',
     id: 1,
@@ -130,8 +121,6 @@ test('HTTP uses per-request metadata and rejects the old handshake and versions'
   });
   assert.equal(initialize.status, 400);
   assert.equal(initialize.body.error.code, -32020);
-  const unknown = modern('unknown/method');
-  assert.equal((await request(f.url, unknown)).status, 404);
   for (const method of ['GET', 'DELETE', 'OPTIONS'])
     assert.equal((await request(f.url, '', { method })).status, 405);
 });

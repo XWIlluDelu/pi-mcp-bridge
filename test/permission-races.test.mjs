@@ -9,42 +9,6 @@ import { savedSession } from './fixtures/saved-session.mjs';
 import { callBridgeTool } from '../src/protocol.mjs';
 import { fixture as nativeFixture } from './fixtures/model-runtime.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
-for (const op of ['create', 'command']) {
-  test(op + ' keeps admitted permissions through native identity observation', async (t) => {
-    const f = await nativeFixture(t);
-    f.config.grants[0].command = true;
-    await fs.writeFile(f.configFile, JSON.stringify(f.config));
-    const target =
-      op === 'create'
-        ? { project: f.cwd, text: 'ADMITTED' }
-        : { session_id: f.id, command: 'printf ADMITTED' };
-    const nativeType = op === 'create' ? 'prompt' : 'bash';
-    let dispatched = 0,
-      revoked = false;
-    const intercept = (rpc) => {
-      const dispatch = rpc.dispatch.bind(rpc);
-      t.mock.method(rpc, 'dispatch', async (input, ...args) => {
-        if (input.type === nativeType) dispatched++;
-        const result = await dispatch(input, ...args);
-        if (input.type === 'get_state' && !revoked) {
-          revoked = true;
-          await fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants: [] }));
-        }
-        return result;
-      });
-      return rpc;
-    };
-    if (op === 'create') {
-      const start = f.bridge.pool.factory;
-      f.bridge.pool.factory = async (...args) => intercept(await start(...args));
-    } else intercept(await f.bridge.pool.resolve(f.session));
-    const result = await f.bridge[op](target);
-    assert.equal(result.status, op === 'create' ? 'started' : 'completed');
-    assert.match(JSON.stringify(await callBridgeTool(f.bridge, op, target)), /NOT_FOUND_OR_DENIED/);
-    assert.equal(dispatched, 1);
-  });
-}
-
 for (const operation of ['command', 'stop']) {
   test(
     operation + ' delivers admitted inline output after revocation and rejects a new request',

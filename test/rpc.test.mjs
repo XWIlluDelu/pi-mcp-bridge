@@ -37,6 +37,9 @@ function fixture(state = () => identity) {
 }
 
 test('RPC identity checks fence dispatch and reject a reply under a changed identity', async () => {
+  const { rpc, child } = fixture();
+  child.stdin.write = () => {};
+  await assert.rejects(rpc.state(1), { code: 'ACK_TIMEOUT', uncertain: false });
   for (const type of ['get_entries', 'prompt']) {
     for (const when of ['before', 'after']) {
       let observed = 0;

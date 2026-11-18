@@ -8,6 +8,7 @@ import {
   isRpcRequest,
   dispatchModern,
   validateModernHeaders,
+  readJson,
   rpcError,
   MCP_INPUT_LIMIT,
 } from './protocol.mjs';
@@ -15,75 +16,37 @@ import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from '
 
 const digest = (value) => createHash('sha256').update(value).digest();
 
-function headers(req, name) {
-  const values = [];
-  for (let i = 0; i < req.rawHeaders.length; i += 2)
-    if (req.rawHeaders[i].toLowerCase() === name) values.push(req.rawHeaders[i + 1]);
-  return values;
-}
-const refuse = (res, code) => reject(res, NOT_ADMITTED[code], code);
-function reject(res, status, code) {
+const refuse = (res, code) => respond(res, NOT_ADMITTED[code], { error: code }, true);
+function respond(res, status, message, close = false) {
   if (res.destroyed || res.writableEnded) return;
-  diagnostics.emit('http.rejected', { http_status: status });
+  if (close) diagnostics.emit('http.rejected', { http_status: status });
+  else
+    diagnostics.emit('http.rpc_response', {
+      http_status: status,
+      rpc_status: message.error ? 'error' : 'result',
+      rpc_code: message.error?.code,
+      callback_reason: message.error?.data?.reason,
+    });
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
-    Connection: 'close',
+    ...(close ? { Connection: 'close' } : {}),
   });
-  res.end(JSON.stringify({ error: code }));
-}
-function logRpcResponse(message, httpStatus) {
-  diagnostics.emit('http.rpc_response', {
-    http_status: httpStatus,
-    rpc_status: message.error ? 'error' : message.result !== undefined ? 'result' : undefined,
-    rpc_code: message.error?.code,
-    callback_reason: message.error?.data?.reason,
-  });
-}
-function jsonResponse(res, status, message) {
-  if (res.destroyed || res.writableEnded) return;
-  logRpcResponse(message, status);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(message));
 }
 async function parseBody(req) {
-  const raw = await new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    const cleanup = () => {
-      req.off('data', data);
-      req.off('end', end);
-      req.off('error', error);
-      req.off('aborted', aborted);
-    };
-    const error = () => {
-      cleanup();
-      reject(new Error('INCOMPLETE_BODY'));
-    };
-    const aborted = () => error();
-    const end = () => {
-      cleanup();
-      resolve(Buffer.concat(chunks));
-    };
-    const data = (chunk) => {
-      size += chunk.length;
-      if (size > MCP_INPUT_LIMIT) {
-        cleanup();
-        req.pause();
-        reject(new Error('BODY_TOO_LARGE'));
-      } else chunks.push(chunk);
-    };
-    req.on('data', data);
-    req.once('end', end);
-    req.once('error', error);
-    req.once('aborted', aborted);
-  });
   try {
-    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+    // Preserve the socket long enough to send 413 after abandoning an upload.
+    const value = await readJson(
+      req.iterator({ destroyOnReturn: false }),
+      MCP_INPUT_LIMIT,
+      'BODY_TOO_LARGE',
+    );
     // The MCP batch tool is supported; JSON-RPC envelope arrays are not.
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
     return value;
-  } catch {
+  } catch (error) {
+    if (error.message === 'BODY_TOO_LARGE') throw error;
     throw new Error('INVALID_JSON_OBJECT');
   }
 }
@@ -93,8 +56,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     throw new Error('INVALID_WAIT_TIMEOUT');
   assertBackendToken(token);
   const tokenDigest = digest(token),
-    operations = new Set(),
-    requests = new Set();
+    requests = new Map();
   let stopping = false,
     closing,
     expectedHost;
@@ -114,44 +76,37 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
             response_finished: res.writableFinished,
           }),
         );
-        void handle(req, res).catch(() => reject(res, 500, 'REQUEST_FAILED'));
+        void handle(req, res).catch(() => respond(res, 500, { error: 'REQUEST_FAILED' }, true));
       });
     },
   );
   listener.maxConnections = 32;
   async function handle(req, res) {
-    const host = headers(req, 'host');
-    if (host.length !== 1 || host[0] !== expectedHost) return refuse(res, 'INVALID_HOST');
-    if (headers(req, 'origin').length) return refuse(res, 'ORIGIN_DENIED');
-    const credentials = headers(req, TOKEN_HEADER);
-    if (credentials.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
+    const headers = req.headersDistinct;
+    const host = headers.host;
+    if (host?.length !== 1 || host[0] !== expectedHost) return refuse(res, 'INVALID_HOST');
+    if (headers.origin) return refuse(res, 'ORIGIN_DENIED');
+    const credentials = headers[TOKEN_HEADER];
+    if (credentials?.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
       return refuse(res, 'UNAUTHORIZED');
     if (req.url !== '/mcp') return refuse(res, 'NOT_FOUND');
     if (req.method !== 'POST') return refuse(res, 'METHOD_NOT_ALLOWED');
     if (stopping) return refuse(res, 'SERVICE_STOPPING');
     if (requests.size >= 16) return refuse(res, 'SERVICE_BUSY');
-    const contentType = headers(req, 'content-type');
+    const contentType = headers['content-type'];
     if (
-      contentType.length !== 1 ||
+      contentType?.length !== 1 ||
       !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType[0]) ||
-      headers(req, 'content-encoding').length
+      headers['content-encoding']
     )
       return refuse(res, 'UNSUPPORTED_CONTENT_TYPE');
-    const length = req.headers['content-length'];
-    if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > MCP_INPUT_LIMIT))
+    if (Number(headers['content-length']?.[0]) > MCP_INPUT_LIMIT)
       return refuse(res, 'BODY_TOO_LARGE');
-    const record = {
-      res,
-      pending: 0,
-      disconnected: false,
-    };
-    requests.add(record);
-    const release = () => {
-      if (record.disconnected && record.pending === 0) requests.delete(record);
-    };
+    requests.set(res, null);
+    let deadline;
     res.once('close', () => {
-      record.disconnected = true;
-      release();
+      clearTimeout(deadline);
+      if (!requests.get(res)) requests.delete(res);
     });
     let body;
     try {
@@ -159,17 +114,18 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     } catch (error) {
       // Upload/parse failures happen before admission; others stay unknown.
       if (Object.hasOwn(NOT_ADMITTED, error.message)) return refuse(res, error.message);
-      return reject(res, 500, 'REQUEST_FAILED');
+      throw error;
     }
     try {
-      if (record.disconnected) return;
+      if (res.destroyed) return;
+      if (stopping) return refuse(res, 'SERVICE_STOPPING');
       diagnostics.emit('http.request', { method: body.method });
       if (!isRpcRequest(body) || body.id === undefined)
-        return jsonResponse(res, 400, rpcError(null, -32600, 'Invalid request'));
-      const mismatch = validateModernHeaders(body, (name) => headers(req, name));
-      if (mismatch) return jsonResponse(res, 400, mismatch);
-      const deadline = setTimeout(() => {
-        jsonResponse(
+        return respond(res, 400, rpcError(null, -32600, 'Invalid request'));
+      const mismatch = validateModernHeaders(body, (name) => headers[name] ?? []);
+      if (mismatch) return respond(res, 400, mismatch);
+      deadline = setTimeout(() => {
+        respond(
           res,
           504,
           rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
@@ -179,28 +135,19 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
         );
       }, waitTimeoutMs);
       deadline.unref();
-      res.once('close', () => clearTimeout(deadline));
-      res.once('finish', () => clearTimeout(deadline));
-      if (stopping) return refuse(res, 'SERVICE_STOPPING');
-      const execute = (run) => {
-        if (stopping || record.disconnected) throw new Error('REQUEST_NOT_ADMITTED');
-        // Keep admitted tools tracked until they finish, even after disconnect.
-        record.pending++;
-        const task = Promise.resolve().then(run);
-        operations.add(task);
-        void task
-          .finally(() => {
-            operations.delete(task);
-            record.pending--;
-            release();
-          })
-          .catch(() => {});
-        return task;
-      };
-      const response = await dispatchModern(bridge, body, { execute });
-      if (!record.disconnected) jsonResponse(res, response.status, response.message);
-    } catch {
-      reject(res, 500, 'REQUEST_FAILED');
+      const response = await dispatchModern(bridge, body, {
+        execute(run) {
+          // Keep admitted work in the request map after the response closes.
+          const task = Promise.resolve().then(run);
+          requests.set(res, task);
+          return task;
+        },
+      });
+      respond(res, response.status, response.message);
+    } finally {
+      clearTimeout(deadline);
+      if (res.destroyed) requests.delete(res);
+      else requests.set(res, null);
     }
   }
   return {
@@ -227,13 +174,17 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
           ),
         );
         // Stop incomplete uploads/validation; admitted tools remain alive.
-        for (const record of requests) if (record.pending === 0) record.res.destroy();
+        const admitted = [];
+        for (const [res, task] of requests) {
+          if (task) admitted.push(task);
+          else res.destroy();
+        }
         try {
           await bridge.prepareClose();
-          await Promise.allSettled([...operations]);
+          await Promise.allSettled(admitted);
           await bridge.close();
         } finally {
-          for (const record of requests) record.res.destroy();
+          for (const res of requests.keys()) res.destroy();
           listener.closeAllConnections();
           await stopped;
         }

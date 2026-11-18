@@ -248,57 +248,23 @@ test('search filters before bounded capture and retains the complete matching lo
   assert.equal(rows(found, { query })[0].type, 'tool');
 });
 
-test('adapter items expose related memory and source-boundary navigation without source body duplication', () => {
+test('reader previews are independently searchable alongside long source text', () => {
   const snap = snapshot(
     [
       {
         type: 'memory',
-        text: 'Full memory evidence',
-        preview: 'Condensed memory',
-        source: { reader_item: 'memory-1' },
-        provenance: { source_entry_id: 'end', source_relation: 'history_leaf' },
-        related: [{ id: 'summary-1', relation: 'summary' }],
+        text: 'Background context. '.repeat(100) + 'memory evidence',
+        preview: 'Preview-only marker',
+        source: { reader_item: 'memory' },
       },
-      { type: 'summary', text: 'Summary', source: { reader_item: 'summary-1' } },
     ],
     { view: 'adapted' },
   );
-  const documents = navigationDocuments(snap);
-  const overview = rows(snap, {}, documents);
-  assert.equal(overview.length, 2);
-  assert.equal(overview[0].text, 'Condensed memory');
-  const summary = overview[0].related.find((r) => r.relation === 'summary');
-  assert.equal(documents[summary.ref].kind, 'summary');
-  const source = overview[0].related.find((r) => r.relation === 'source_context');
-  assert.equal(documents[source.ref].request.view, 'session');
-  assert.equal(documents[source.ref].request.leaf_id, 'end');
-  assert.equal(documents[source.ref].request.session_id, identity.session_id);
-});
-
-test('reader previews are searchable without replacing source text excerpts', () => {
-  for (const text of [
-    'Full memory evidence',
-    'Background context. '.repeat(100) + 'memory evidence',
-  ]) {
-    const snap = snapshot(
-      [{ type: 'memory', text, preview: 'Preview-only marker', source: { reader_item: 'memory' } }],
-      { view: 'adapted' },
-    );
-    const overview = rows(snap)[0];
-    assert.equal(overview.text, 'Preview-only marker');
-    assert.equal(overview.truncated, undefined);
-    // A preview can be separately stored wording, such as a shorter summary tier.
-    assert.deepEqual(
-      rows(snap, { query: 'preview-only' }).map((row) => row.text),
-      ['Preview-only marker'],
-    );
-    const hits = rows(snap, { query: 'memory evidence' });
-    assert.equal(hits.length, 1);
-    assert.match(hits[0].text, /memory evidence/);
-    assert.doesNotMatch(hits[0].text, /Preview-only/);
-    assert.equal(hits[0].truncated, text.length > 640 ? true : undefined);
-    if (text.length <= 640) assert.equal(hits[0].text, text);
-  }
+  assert.equal(rows(snap)[0].text, 'Preview-only marker');
+  assert.equal(rows(snap, { query: 'preview-only' })[0].text, 'Preview-only marker');
+  const [match] = rows(snap, { query: 'memory evidence' });
+  assert.match(match.text, /memory evidence/);
+  assert.equal(match.truncated, true);
 });
 
 async function bridgeFixture(t) {

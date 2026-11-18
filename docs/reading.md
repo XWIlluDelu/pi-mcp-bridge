@@ -1,22 +1,13 @@
 # Reading a Pi session
 
-Start with `read({session_id})`. It selects the last three input turns and returns
-readable content in source order, with short tool navigation and refs for deeper
-reading. Use `range:{recent:1}` for only the current turn, or `search` to locate a
-particular decision or result without expanding the browsing range.
+`read({session_id})` selects the last three input turns. Set `range.recent` for
+more history, use `search` to locate evidence, or expand a result's refs.
 
-Both tools use a matching explicitly enabled session reader, otherwise Pi's native
-projection. `view:"session"` forces **Session Context**: the effective native
-context at a leaf. `view:"runtime"` selects **Runtime Context**: a captured request
-stage. Reader results identify `reader.id` and use `view:"adapted"`; callers do not
-need a plugin name to select the default path. [Module routing](compatibility.md#session-specific-read-routing)
-defines activation and content contracts.
-
-Native `buildSessionProjection` determines branch ancestry, compaction checkpoints
-and context edits. All effective turns means the retained context at that leaf,
-including active summaries, not the entire raw session log. Reading and searching
-require `read` permission and never start Pi, call a model, rerun context hooks or
-write history.
+The default source is an applicable [session reader](compatibility.md#session-specific-read-routing)
+or Pi's native projection. `view:"session"` selects **Session Context**, the
+effective context at a native leaf after compaction and context edits.
+`view:"runtime"` selects a captured provider-request stage. Both tools require
+`read` and work without starting Pi.
 
 ## Browse, find and expand
 
@@ -36,12 +27,9 @@ Find literal text across the reader's full supported source:
 { "session_id": "ps_...", "query": "retry policy", "content": ["assistant", "tool"] }
 ```
 
-Search is case-insensitive literal matching, independent of browse counts and
-preview lengths. It also matches previews a session reader stores separately,
-such as a shorter summary tier, and then shows that preview. Its optional `content` array uses the same kind names as
-`read.content`; it restricts kinds, not their counts. Search returns `query`,
-`matches`, snippets and refs. It searches one authorized session, not other
-sessions, hidden raw history or content the source never captured.
+Search matches literal text case-insensitively across one session's source,
+including stored reader previews. Optional `content` limits kinds. Results
+include `query`, `matches`, snippets and refs.
 
 Expand references from one capture:
 
@@ -77,15 +65,9 @@ Continue browse, search or expanded content by passing its `next_cursor` to
 Search accepts `session_id`, nonempty `query` up to 2048 UTF-16 units, and optional
 `view`, `content`, `leaf_id`, `max_bytes`. Runtime search rejects `leaf_id`.
 
-A continuation inherits its capture's source, leaf and content range. Any
-repeated selection arguments must agree with that capture. Use cursor-only or
-adjust `max_bytes`; a different selection requires a fresh read.
-
-`next_cursor:null` ends the selected result's page sequence. It does not mean
-all history was selected or every preview contains its full source; expand a
-shortened item's ref for that content. Increasing `max_bytes` gives the same
-selection more room. To select more turns or content, start a new read with a
-broader `range` or `content`.
+Cursors inherit the capture's selection. Adjust `max_bytes` to fit more of that
+selection. Change `range` or `content` in a fresh read. A null cursor ends the
+page sequence. Expand a shortened item's ref for its full captured source.
 
 ## Turn range and content
 
@@ -122,29 +104,13 @@ When system content is enabled, `tool:0` also omits native tool declarations.
 
 ## Previews and source coverage
 
-Browse items contain `type`, `text`, `ref`, source locators and optional `title`
-and `related` refs. Public kinds match the content controls; reference expansion
-exposes the underlying native unit types. Messages remain in source order.
-The reader does not generate a new summary or infer task success from a reply.
+Browse rows expose `text`, `ref`, source locators and optional titles or related
+refs. A shortened preview has `truncated:true`. Tool previews show operations,
+targets and recorded errors. Expand the ref for arguments or output.
 
-Previews keep meaningful newlines and give the latest reply in each turn more
-room. Search shows an excerpt around the match. `truncated:true` marks shortened
-prose. Expand its reference for the captured source.
-
-Tool navigation names the operation and target, recorded status and necessary
-diagnostics; it does not paste ordinary stdout into the overview. Native tool
-errors and nested-call failure clues are retained as evidence of that operation,
-not a claim that the current task remains blocked. Nested refs expose only what
-native history recorded; missing child output is not synthesized.
-
-Reader items retain provenance and may supply concise previews. A reader can
-include current native progress alongside its stored summaries and memories.
-`reader.coverage`, such as `{type:"memory",selected:3,total:12}`, describes its
-own source scope: total items before branch/content selection, items selected by
-the reader before search and pagination, and optional `excluded` items removed
-by source rules.
-To change that capture, adjust the relevant content count or use search. Cursor
-pages and refs do not recover unselected items.
+Reader `coverage` reports its own source scope, for example
+`{type:"memory",selected:3,total:12}`. Counts describe selection before search
+and pagination. Optional `excluded` records source-rule exclusions.
 
 ## Runtime request context
 
@@ -152,53 +118,27 @@ pages and refs do not recover unselected items.
 { "session_id": "ps_...", "view": "runtime", "max_bytes": 24000 }
 ```
 
-This reads the latest passively captured `context_with_system` event. All
-`context` handlers have run, including request-local memory transforms such as
-Magic Context's. Later full-context handlers, projections and provider conversion
-may still change the request; capture does not establish successful dispatch.
+Runtime Context captures the latest `context_with_system` observation, after
+`context` handlers and before later request transformations. Search and refs
+work on this capture. It has no native turn range or leaf selector. All kinds
+are included by default. Count fields accept only `0` and `-1` here.
 
-The captured message array supports previews, literal search and reference
-expansion. Runtime has no native input-turn grouping: `range` and `leaf_id`
-reject. `content` uses the same kind names, but only whole-kind switches are
-accepted: booleans for `input`, `system` and `native`, and `0`/`-1` for count
-fields. Omitted kinds include all captured content. `selection` and
-`omissions.selection` remain null because they describe no native turn selection.
-Items use `source.observation_index` and split content/part positions instead of
-native entry/prompt IDs. Cursor pages freeze the view and observation metadata.
+`observation` records the capture ID, time and generation, input leaf, current
+leaf, intervening commits and whether the observing owner is still active.
+Locations use `source.observation_index` instead of native entry IDs.
+Subsequent answers belong to Session Context.
 
-Available observations contain:
+The observer keeps one cleaned capture within 32 MiB. Bridge also retains its
+latest successful captures in memory for up to 16 sessions and about 32 MiB.
+It captures owned RPC observations before normal release and retains successful
+companion reads. A new owner with no capture can use the retained success if
+its input leaf still matches the active ancestry. Retained observations keep
+their original identity and report `source:"retained"`.
 
-| Field                                                      | Meaning                                                                                                                |
-| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `id`, `observed_at`, `owner_generation`                    | Identity, time and owner of the capture.                                                                               |
-| `phase`                                                    | `context_with_system_observer`.                                                                                        |
-| `input_leaf_id`                                            | Native leaf at capture; also the page's `leaf_id`.                                                                     |
-| `current_leaf_id`, `later_committed_entries`, `checked_at` | Active ancestry and intervening commits checked on the first read.                                                     |
-| `owner_active`                                             | Whether the capture came from the current live observer. Retained captures report false even if another owner is live. |
-
-Subsequent answers belong to the session view. Idle memory changes are not
-recomputed by reading, even when no new native entries exist.
-
-Owned RPCs and companions keep one bounded cleaned capture per runtime. Bridge
-retains available owned captures before normal RPC exit without a prior read;
-a successful companion runtime read is also retained. The observer has a 32 MiB
-accounted capture limit. The separate Bridge retention cache holds the latest
-successful capture for at most 16 sessions and approximately 32 MiB. Retention
-is memory-only and does not keep writers alive.
-
-Bridge queries a live owner first. If it has no capture yet, a retained success
-remains readable as `source:"retained"`, preserving its original ID, time,
-generation and input leaf. It is checked against the new owner's active branch,
-or the saved branch when no owner exists. No-prompt cold starts therefore leave
-previous captures available.
-
-Only successful captures replace retained content. Failed live captures report
-unavailable for that read; transport failures or unavailable replies do not erase
-an older success. Publication ordering fences delayed captures and retired owners.
-Missing, oversized or failed captures and changed branches report
-`observation.available:false`, a reason and empty items. Hosts without observers
-report `host_observer_unavailable`. Eviction or Bridge restart loses retained
-captures; a live observer can still supply its own.
+An unavailable capture reports `observation.available:false`, its reason and
+empty items. An earlier success can remain retained through a failed read.
+Hosts without observers report `host_observer_unavailable`. Bridge restart
+clears retention.
 
 ## Native source preservation
 
@@ -208,64 +148,30 @@ lines and an unterminated tail. Frozen references retain the captured entry IDs.
 
 ## Source content and references
 
-Pages contain `session_id`, `view`, acquisition `source`, captured `leaf_id`,
-resolved `selection:{range,content}`, source-ordered `items`, `omissions`, `live`
-and `next_cursor`. Runtime and reader-only captures have null native selection.
-`presentation:"preview"` identifies navigation rows; `presentation:"source"`
-identifies expanded source units. This is an output description, not an input
-format option. The MCP envelope represents the same result in JSON text `content`
-and `structuredContent`; consume either. `max_bytes` bounds the structured page;
-the wire budget accounts for both copies.
+`presentation:"preview"` gives navigation rows. `presentation:"source"`
+gives expanded native units with entry/message/block positions and `prompt_id`.
+The page also carries the captured `leaf_id`, selection, omissions and cursor.
+See [wire limits](transports.md#bounds-and-errors) for the MCP copies.
 
-Reference expansion returns native source units with entry/message/block positions and `prompt_id`. Message data
-uses `message`, assistant blocks use `block`, and large shared fields use linked
-`message_metadata` units. Types include prompt, text, thinking, tool call/result,
-command, system, custom, native and summary.
-
-- Images become `{type:"image",mime_type:"image/png",data_omitted:true}` without
-  base64 or invented links.
-- Assistant text/thinking retains `stopReason` on every part. Large error details
-  live in shared metadata. Native signatures, response IDs, replay metadata,
-  usage/cost and diagnostics are excluded; business arguments/details are not
-  recursively stripped by property name.
-- Tools retain name, namespace, arguments/errors, paired output and error state.
-  Indivisible metadata stays whole or is explicitly marked omitted.
-- Saved `nestedCalls` follow their parent tool selection. Small snapshots stay
-  whole; larger ones become source-linked `nested_call` units.
-  `nested_calls_complete` preserves recorder completeness independently of paging.
-  Native `argumentsBytes`, error and unfinished state remain available; missing
-  child result bodies are not synthesized.
-- Commands retain output and execution state. Every output part repeats
-  `exitCode`, `cancelled`, native `truncated` and command/path strings up to 256
-  encoded JSON bytes each. Larger fields occur once in linked metadata. Native
-  truncation differs from capacity omissions; `!!` records carry
-  `in_model_context:false`.
-- System sections are segmented before arbitrary-object limits. Summary provenance
-  and global/context-prefix content remain available. Later custom/unknown records
-  follow their prompt window; custom payloads retain `content`, `customType`,
-  `display` and business `details` under the same capacity limits.
-
-A context-hidden user creates an empty boundary; a retained assistant suffix
-without its input gets `context_prefix`. Tools are paired before sampling, even
-across steering inputs. `pairing` distinguishes paired, unresolved and orphan
-units; reused call IDs resolve to the latest preceding unresolved call. Text is
-not deduplicated across source positions or custom payload fields.
+- Native images retain MIME type with `data_omitted:true`.
+- Assistant blocks retain native termination status. Shared error details
+  can appear as `message_metadata`. Internal signatures, response IDs and
+  provider usage are removed while tool arguments and business details survive.
+- Tool outputs stay paired with preceding calls even across steering input.
+  `pairing` records unresolved or orphaned entries. Large recorded nested
+  calls split into linked `nested_call` units with recorder completeness.
+- Shell output retains execution flags and truncation state. Long command
+  metadata can appear separately. `!!` records carry `in_model_context:false`.
+- System sections and arbitrary native or custom payloads remain pageable.
+  Hidden input creates an empty boundary. Retained replies without an input
+  use `context_prefix`.
 
 ## Optional input mappings
 
-By default, custom messages follow their existing prompt window; native `custom`
-state entries are not conversation messages. Owners can enable exact custom-input
-mappings through [module configuration](compatibility.md#owner-configuration).
-
-After native projection, matching `role:"custom"` messages establish input
-boundaries before turn/message/tool selection. They become `type:"prompt"` with
-their native entry ID as `prompt_id` and `source.read_adapter` identifying the
-mapping. Their custom role, type, content and details remain intact. Hidden mapped
-inputs use an empty `hidden_input` boundary. Other custom messages/state do not
-become inputs. Runtime captures do not apply these mappings.
-
-The external [Intercom module](../integrations/intercom/README.md) maps `intercom_message`;
-disabling it and restarting restores ordinary custom-message reading.
+[Input mappings](compatibility.md#input-mapping) turn configured native custom
+messages into prompt boundaries before selection. They preserve the original
+content and details and identify the mapping in `source.read_adapter`.
+Runtime Context keeps the captured request messages as supplied.
 
 ## Capacity and continuation
 
@@ -305,22 +211,11 @@ search. Captures have no inactivity timeout.
 
 ## Live output and runtime extension events
 
-`live` is a separate bounded, transient and incomplete observation, outside cursor
-history. It uses the same image/signature sanitization and readable units. Native
-cumulative assistant message events feed it; tool-result streams
-and bash chunks are not assistant text. Owned projection and preview are captured
-together, keeping later-prompt output out of an earlier capture.
-
-The observer keeps the newest tail under 65,536 UTF-16 units, including per-block
-overhead. Oversized text/thinking trims at Unicode boundaries and reports truncation;
-a larger byte budget can expose more of that tail. Cursors and explicit-leaf reads
-have no moving preview. `available:false` carries a reason; an empty item list means
-no unfinished assistant text was observed, not that all work is idle. Final commits
-remain authoritative.
-
-`runtime_events` contains bounded, generation-scoped transient extension errors
-and notifications from owned RPCs. It is separate from history and completion
-notifications.
+`live` holds unfinished assistant output from cumulative native events.
+Its tail is limited to 65,536 UTF-16 units including block overhead. It is
+sampled with history on the first read. Cursor and explicit-leaf reads carry
+no moving preview. `runtime_events` carries bounded owned-RPC extension
+errors and notifications outside native history.
 
 ## Read costs and current components
 

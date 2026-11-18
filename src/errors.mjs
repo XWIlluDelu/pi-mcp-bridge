@@ -201,3 +201,16 @@ export function knownErrorCode(code, fallback = 'OPERATION_FAILED') {
 export function publicError(error, fallback = 'OPERATION_FAILED') {
   return knownErrorCode(error?.code ?? error?.message, fallback);
 }
+
+export function toolFailure(error) {
+  return {
+    code: publicError(error),
+    ...(error?.minimum_max_bytes ? { minimum_max_bytes: error.minimum_max_bytes } : {}),
+    ...(error?.uncertain
+      ? {
+          uncertain: true,
+          recovery: 'OUTCOME_UNKNOWN; inspect list/read. Do not automatically resubmit.',
+        }
+      : {}),
+  };
+}

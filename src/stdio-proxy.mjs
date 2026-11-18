@@ -1,7 +1,7 @@
 import { pathToFileURL } from 'node:url';
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
 import { StdioTransport } from './protocol-stdio.mjs';
-import { modernHeaderFields, rpcError } from './protocol.mjs';
+import { modernHeaderFields, readJson, rpcError } from './protocol.mjs';
 import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
@@ -51,15 +51,10 @@ export function createStdioProxy({
         });
         if (!/application\/json/i.test(response.headers.get('content-type') ?? ''))
           throw new Error('INVALID_BACKEND_RESPONSE');
-        let size = 0;
-        const chunks = [];
-        for await (const chunk of response.body) {
-          size += chunk.length;
-          if (size > MCP_RESPONSE_LIMIT) throw new Error('BACKEND_RESPONSE_TOO_LARGE');
-          chunks.push(chunk);
-        }
-        const result = JSON.parse(
-          new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
+        const result = await readJson(
+          response.body,
+          MCP_RESPONSE_LIMIT,
+          'BACKEND_RESPONSE_TOO_LARGE',
         );
         if (
           result !== null &&

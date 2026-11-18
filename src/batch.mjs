@@ -1,6 +1,10 @@
-import { batchOperationSchema, publicOperationSchemas } from './tool-schemas.mjs';
+import {
+  batchOperationSchema,
+  publicOperationSchemas,
+  publicAnnotations,
+} from './tool-schemas.mjs';
 import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
-import { publicError } from './errors.mjs';
+import { toolFailure } from './errors.mjs';
 
 const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
 const envelope = (results) => ({
@@ -15,9 +19,10 @@ function planBatch(operations) {
     share = Math.floor((BATCH_RESPONSE_LIMIT - jsonBytes(frame)) / count),
     wireShare = Math.floor((TOOL_RESULT_LIMIT - toolResultBytes(frame)) / count);
   return operations.map((item, index) => {
-    const op = item?.op,
-      schema = batchOperationSchema.safeParse(item).success ? publicOperationSchemas[op] : null,
-      parsed = schema?.safeParse(item?.args);
+    const op = item?.op;
+    const shape = batchOperationSchema.safeParse(item);
+    const parsed =
+      shape.success && publicOperationSchemas[shape.data.op].safeParse(shape.data.args);
     if (!parsed?.success)
       return {
         index,
@@ -53,14 +58,22 @@ function fitQuery(op, result, args, budget) {
   if (op === 'models' || op === 'list') {
     const key = op === 'models' ? 'models' : 'sessions',
       rows = result[key];
-    for (let count = rows.length - 1; count > 0; count--) {
+    let low = 1,
+      high = rows.length - 1,
+      best;
+    while (low <= high) {
+      const count = Math.floor((low + high) / 2);
       const page = {
         ...result,
         [key]: rows.slice(0, count),
         next_offset: (args.offset ?? 0) + count,
       };
-      if (fitsResult(page, budget)) return page;
+      if (fitsResult(page, budget)) {
+        best = page;
+        low = count + 1;
+      } else high = count - 1;
     }
+    if (best) return best;
   }
   throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
 }
@@ -73,14 +86,10 @@ export async function executeBatch(bridge, { operations }, { requestContext } = 
   void requestContext?.catch?.(() => {});
   const lanes = new Map(),
     readPins = [],
-    inputs = new Set(),
-    results = new Array(operations.length);
+    inputs = new Set();
   const jobs = plan.map((item) => {
     const { index, op, args, resultBudget, error } = item;
-    if (error) {
-      results[index] = { index, op, error };
-      return Promise.resolve();
-    }
+    if (error) return { index, op, error };
     let sessionId = args.session_id;
     if (op === 'read' && !sessionId && (args.cursor || args.refs)) {
       try {
@@ -90,56 +99,39 @@ export async function executeBatch(bridge, { operations }, { requestContext } = 
             : bridge.readCache.identity(args.cursor)
         ).session_id;
       } catch (error) {
-        results[index] = { index, op, error: { code: publicError(error) } };
-        return Promise.resolve();
+        return { index, op, error: toolFailure(error) };
       }
     }
     const pendingInput = ['send', 'command', 'compact', 'reload'].includes(op)
       ? bridge.registerInput(sessionId)
       : undefined;
     if (pendingInput) inputs.add(pendingInput);
-    const lane = sessionId ?? args.fork_from ?? `independent:${index}`;
+    const lane = sessionId ?? args.fork_from ?? index;
     const previous = lanes.get(lane) ?? Promise.resolve();
-    const job = previous
-      .catch(() => {})
-      .then(async () => {
-        try {
-          let result = structuredClone(
-            await bridge[op](args, {
-              requestContext,
-              resultBudget,
-              readPins,
-              pendingInput,
-              // An explicit ordered restart is not withdrawn by its own Stop.
-              // Exemption never clears cancellation by an external Stop.
-              retainedInputs: op === 'stop' ? inputs : undefined,
-            }),
-          );
-          if (['read', 'search', 'submission', 'models', 'list', 'health'].includes(op))
-            result = fitQuery(op, result, args, resultBudget);
-          results[index] = { index, op, result };
-        } catch (error) {
-          results[index] = {
-            index,
-            op,
-            error: {
-              code: publicError(error),
-              ...(error.minimum_max_bytes ? { minimum_max_bytes: error.minimum_max_bytes } : {}),
-              ...(error?.uncertain
-                ? {
-                    uncertain: true,
-                    recovery: 'OUTCOME_UNKNOWN; inspect list/read. Do not automatically resubmit.',
-                  }
-                : {}),
-            },
-          };
-        }
-      });
+    const job = previous.then(async () => {
+      try {
+        const result = await bridge[op](args, {
+          requestContext,
+          resultBudget,
+          readPins,
+          pendingInput,
+          // An explicit ordered restart is not withdrawn by its own Stop.
+          retainedInputs: op === 'stop' ? inputs : undefined,
+        });
+        return {
+          index,
+          op,
+          result: publicAnnotations[op] ? fitQuery(op, result, args, resultBudget) : result,
+        };
+      } catch (error) {
+        return { index, op, error: toolFailure(error) };
+      }
+    });
     lanes.set(lane, job);
     return job;
   });
   try {
-    await Promise.all(jobs);
+    const results = await Promise.all(jobs);
     await requestContext;
     return envelope(results);
   } finally {

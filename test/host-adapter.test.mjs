@@ -242,25 +242,18 @@ test('close during readiness verification cannot publish a new endpoint', async 
   assert.equal((await readClaim(f.attachmentDir, f.session)).phase, 'transitioning');
   await assert.rejects(fs.stat(f.controller.record.socket), { code: 'ENOENT' });
 });
-test('host read preserves the projection captured before the final identity check', async (t) => {
-  const f = await fixture(t),
-    snapshot = f.callbacks.snapshot(),
-    before = JSON.stringify(snapshot.entries);
-  let captured = false;
-  f.callbacks.snapshot = () => {
-    captured = true;
-    return snapshot;
-  };
-  const state = f.callbacks.state;
-  f.callbacks.state = () => {
-    if (captured) snapshot.entries[0].message.content = 'LATER_MUTATION';
-    return state();
-  };
+test('host history uses the snapshot identity without polling native state again', async (t) => {
+  const f = await fixture(t);
+  const snapshot = f.callbacks.snapshot();
+  f.callbacks.snapshot = () => snapshot;
   await f.controller.ready(f.callbacks);
-  const result = await request(f, 'read', { session_id: 'fixture' });
-  assert.notEqual(JSON.stringify(snapshot.entries), before);
-  assert.ok(JSON.stringify(result.data).includes('PUBLIC_FIXTURE'));
-  assert.ok(!JSON.stringify(result.data).includes('LATER_MUTATION'));
+  f.callbacks.state = () => assert.fail('captured history carries native identity');
+  assert.match(
+    JSON.stringify((await request(f, 'read', { session_id: 'fixture' })).data),
+    /PUBLIC_FIXTURE/,
+  );
+  snapshot.sessionId = 'another-session';
+  assert.equal((await request(f, 'snapshot')).error, 'RUNTIME_SESSION_CHANGED');
 });
 test('publication failure after listening closes endpoint while retaining ownership', async (t) => {
   const f = await fixture(t),

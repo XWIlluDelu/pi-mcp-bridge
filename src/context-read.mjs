@@ -10,6 +10,7 @@ import {
   documentMatches,
   assistantBlockType,
   assistantFailed,
+  toolOperations,
 } from './read-navigation.mjs';
 
 // Change only when the live read request/snapshot semantics become incompatible.
@@ -111,37 +112,27 @@ function timeline(projection, readAdapters) {
       }
     }
   }
-  // Pair before selection; a steering boundary must not steal a prior result.
-  // A repeated call ID resolves to the latest preceding call without a result.
-  const open = new Map(),
-    units = new Map();
-  for (const record of records) {
-    if (record.type === 'tool_call') {
-      record.tool_id = record.id;
-      record.call_id = record.block.id;
-      record.pairing = 'unresolved';
-      const stack = open.get(record.call_id) ?? [];
-      stack.push(record);
-      open.set(record.call_id, stack);
-      units.set(record.tool_id, { prompt_id: record.prompt_id, records: [record] });
-    } else if (record.type === 'tool_result') {
-      const call = open.get(record.message.toolCallId)?.pop();
-      record.call_id = record.message.toolCallId;
-      record.tool_id = call?.tool_id ?? record.id;
-      record.pairing = call ? 'paired' : 'orphan_result';
-      if (call) {
-        record.prompt_id = call.prompt_id;
-        record.call_source = call.source;
-        call.pairing = 'paired';
-        units.get(record.tool_id).records.push(record);
-      } else units.set(record.tool_id, { prompt_id: record.prompt_id, records: [record] });
-    }
+  // A result belongs to its original call even after a steering input.
+  const tools = toolOperations(records);
+  for (const [first, result] of tools) {
+    const call = first.type === 'tool_call';
+    first.tool_id = first.id;
+    first.call_id = call ? first.block.id : first.message.toolCallId;
+    first.pairing = result ? 'paired' : call ? 'unresolved' : 'orphan_result';
+    if (result)
+      Object.assign(result, {
+        tool_id: first.tool_id,
+        call_id: first.call_id,
+        pairing: 'paired',
+        prompt_id: first.prompt_id,
+        call_source: first.source,
+      });
   }
-  return { records, prompts, units };
+  return { records, prompts, tools };
 }
 
 function selectTimeline(projected, selection, readAdapters) {
-  const { records, prompts, units } = timeline(projected, readAdapters);
+  const { records, prompts, tools } = timeline(projected, readAdapters);
   const { range, content } = selection;
   const selectedPrompts = new Set([
     ...take(prompts, range.earliest),
@@ -153,7 +144,7 @@ function selectTimeline(projected, selection, readAdapters) {
     input: prompts.length,
     assistant: 0,
     thinking: 0,
-    tool: units.size,
+    tool: tools.length,
     system: records.filter((r) => r.type === 'system').length,
     summary: records.some((r) => r.type === 'summary') ? 1 : 0,
     command: records.filter((r) => r.type === 'command').length,
@@ -163,53 +154,40 @@ function selectTimeline(projected, selection, readAdapters) {
   included.turns = selectedPrompts.size;
   const assistantRecord = (record) =>
     record.type === 'text' || (record.type === 'native' && record.message?.role === 'assistant');
-  // Each content kind selects messages independently. Once a message qualifies,
-  // retain all its selected-kind blocks, never just a first/last block sample.
-  for (const kind of ['assistant', 'thinking']) {
-    const messages = new Map();
-    for (const record of records) {
-      if (kind === 'assistant' ? !assistantRecord(record) : record.type !== 'thinking') continue;
-      const key = `${record.source.entry_id}:${record.source.message_index}`;
-      const message = messages.get(key) ?? {
-        prompt_id: record.prompt_id,
-        records: [],
-        readable: false,
-      };
-      message.records.push(record);
-      const value = kind === 'assistant' ? record.block?.text : record.block?.thinking;
-      message.readable ||=
-        (typeof value === 'string' && value.trim().length > 0) ||
-        (kind === 'assistant' && assistantFailed(record.metadata ?? record.message ?? {}));
-      messages.set(key, message);
-    }
-    const groups = new Map();
-    for (const message of messages.values()) {
-      if (!message.readable) continue;
-      totals[kind]++;
-      const group = groups.get(message.prompt_id) ?? [];
-      group.push(message);
-      groups.set(message.prompt_id, group);
-    }
-    for (const [id, group] of groups) {
+  // Count messages and operations, then keep their complete selected blocks.
+  const selectRecent = (kind, groups) => {
+    totals[kind] = groups.length;
+    for (const [id, group] of Map.groupBy(groups, (records) => records[0].prompt_id)) {
       if (!selectedPrompts.has(id)) continue;
-      for (const message of take(group, content[kind], true)) {
+      for (const records of take(group, content[kind], true)) {
         included[kind]++;
-        for (const record of message.records) chosen.add(record);
+        for (const record of records) chosen.add(record);
       }
     }
+  };
+  const hasText = (value) => typeof value === 'string' && value.trim().length > 0;
+  for (const [kind, accepts, readable] of [
+    [
+      'assistant',
+      assistantRecord,
+      (record) => hasText(record.block?.text) || assistantFailed(record.metadata ?? record.message),
+    ],
+    [
+      'thinking',
+      (record) => record.type === 'thinking',
+      (record) => hasText(record.block.thinking),
+    ],
+  ]) {
+    const messages = Map.groupBy(
+      records.filter(accepts),
+      ({ source }) => `${source.entry_id}:${source.message_index}`,
+    );
+    selectRecent(
+      kind,
+      [...messages.values()].filter((group) => group.some(readable)),
+    );
   }
-  const toolGroups = new Map();
-  for (const unit of units.values()) {
-    const group = toolGroups.get(unit.prompt_id) ?? [];
-    group.push(unit);
-    toolGroups.set(unit.prompt_id, group);
-  }
-  for (const [id, group] of toolGroups)
-    if (selectedPrompts.has(id))
-      for (const unit of take(group, content.tool, true)) {
-        included.tool++;
-        for (const record of unit.records) chosen.add(record);
-      }
+  selectRecent('tool', tools);
   for (const record of take(
     records.filter((r) => r.type === 'command'),
     content.command,
@@ -602,13 +580,15 @@ function omittedUnit(unit) {
   };
 }
 export function appendUnits(target, record) {
-  appendCleanUnit(target, cleanRecord(record));
+  appendSnapshotUnit(target, cleanRecord(record));
 }
 
-function appendCleanUnit(target, unit) {
+export function appendSnapshotUnit(target, unit) {
   target.accountedBytes += jsonBytes(unit) * 4 + 256;
   if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
-  target.units.push(structuredClone(unit));
+  const captured = structuredClone(unit);
+  target.units.push(captured);
+  return captured;
 }
 export function validateReadEntryIds(value) {
   if (
@@ -661,9 +641,8 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
           ? (data.entries.at(-1)?.id ?? null)
           : data.leafId
         : args.leaf_id;
-  if (leaf !== null && !data.entries.some((entry) => entry.id === leaf))
-    throw new Error('ENTRY_NOT_FOUND');
   const byId = sessionEntryIndex(data.entries, leaf);
+  if (leaf !== null && !byId.has(leaf)) throw new Error('ENTRY_NOT_FOUND');
   const selected = selectTimeline(
       buildSessionProjection(data.entries, leaf, byId),
       selection,
@@ -673,21 +652,19 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
   if (search_query === undefined) {
     for (const record of selected.records) appendUnits(target, record);
   } else {
-    const matches = [];
+    const byPosition = [];
+    const source = { view: 'session', session_id: args.session_id };
     for (const group of navigationGroups(selected.records)) {
-      const units = group.atoms.map(({ unit }) => cleanRecord(unit));
-      const documents = navigationDocuments({ units });
-      if (documents.some((doc) => documentMatches(documents, doc, search_query))) {
-        for (const [i, { position }] of group.atoms.entries()) {
-          appendCleanUnit(target, units[i]);
-          matches.push(position);
-        }
-      }
+      const atoms = group.atoms.map(({ position, unit }) => ({
+        position,
+        unit: cleanRecord(unit),
+      }));
+      const documents = navigationDocuments(source, [{ ...group, atoms }]);
+      if (documents.some((doc) => documentMatches(documents, doc, search_query)))
+        for (const { position, unit } of atoms)
+          byPosition[position] = appendSnapshotUnit(target, unit);
     }
-    target.units = target.units
-      .map((unit, i) => ({ unit, position: matches[i] }))
-      .sort((a, b) => a.position - b.position)
-      .map(({ unit }) => unit);
+    target.units = byPosition.filter(Boolean);
   }
   return {
     contract: READ_CONTRACT,

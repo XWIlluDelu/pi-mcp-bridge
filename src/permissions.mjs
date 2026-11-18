@@ -14,37 +14,30 @@ export function inside(file, folder) {
 // Project rules cover their descendants; the longest matching path wins.
 export function resolvePermission(config, action, target = {}) {
   if (!ACTIONS.includes(action)) return { allowed: false, explicit: undefined, sourceScope: null };
-  const scopes = new Map();
+  const cwd = target.cwd ?? target.folder;
+  const directory = typeof cwd === 'string' ? path.resolve(cwd) : null;
+  const ancestors = new Map();
+  for (let folder = directory; folder;) {
+    ancestors.set(folder, undefined);
+    const parent = path.dirname(folder);
+    if (parent === folder) break;
+    folder = parent;
+  }
+  let explicit = target.session_id || directory ? undefined : config.defaults?.[action];
   for (const rule of config.grants ?? []) {
     if (!Object.hasOwn(rule, action)) continue;
-    const key = rule.session_id
-      ? `session:${rule.session_id}`
-      : `folder:${path.resolve(rule.folder)}`;
-    scopes.set(key, rule[action]);
+    if (rule.session_id) {
+      if (rule.session_id === target.session_id) explicit = rule[action];
+    } else if (directory) {
+      const folder = path.resolve(rule.folder);
+      if (ancestors.has(folder)) ancestors.set(folder, rule[action]);
+    }
   }
-  const directory = target.cwd ?? target.folder;
-  const ownKey = target.session_id
-    ? `session:${target.session_id}`
-    : typeof directory === 'string'
-      ? `folder:${path.resolve(directory)}`
-      : null;
-  const explicit = ownKey ? scopes.get(ownKey) : config.defaults?.[action];
-  if (action !== 'create' && target.session_id) {
-    const value = scopes.get(`session:${target.session_id}`);
-    if (typeof value === 'boolean')
-      return { allowed: value, explicit, sourceScope: { session_id: target.session_id } };
-  }
-  const ancestors = [...scopes]
-    .filter(
-      ([key]) =>
-        key.startsWith('folder:') &&
-        typeof directory === 'string' &&
-        inside(directory, key.slice(7)),
-    )
-    .sort((a, b) => b[0].length - a[0].length);
-  for (const [key, value] of ancestors) {
-    if (typeof value === 'boolean')
-      return { allowed: value, explicit, sourceScope: { folder: key.slice(7) } };
+  if (target.session_id && action !== 'create' && typeof explicit === 'boolean')
+    return { allowed: explicit, explicit, sourceScope: { session_id: target.session_id } };
+  if (!target.session_id && directory) explicit = ancestors.get(directory);
+  for (const [folder, value] of ancestors) {
+    if (typeof value === 'boolean') return { allowed: value, explicit, sourceScope: { folder } };
   }
   return { allowed: config.defaults?.[action] === true, explicit, sourceScope: { default: true } };
 }

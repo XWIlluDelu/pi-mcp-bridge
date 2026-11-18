@@ -58,15 +58,13 @@ export async function processIdentity(pid = process.pid) {
 export function isReleasedOwner(record) {
   return record?.owner === null && record.phase === 'released' && record.noColdReacquire === true;
 }
+export const sameOwner = (a, b) =>
+  Boolean(a && b && a.pid === b.pid && a.start === b.start && a.boot === b.boot);
+
 export async function ownerAlive(owner) {
   if (owner === null) return false;
   const current = await processIdentity(owner.pid);
-  return Boolean(
-    current &&
-    current.start === owner.start &&
-    current.boot === owner.boot &&
-    !['Z', 'X'].includes(current.state),
-  );
+  return sameOwner(current, owner) && !['Z', 'X'].includes(current.state);
 }
 export async function privateDirectory(dir) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir))
@@ -132,9 +130,7 @@ export async function readOwnerRecord(dir, file, session, scope = {}) {
     if (
       scope.owner &&
       (identified || isReleasedOwner(record)) &&
-      (record.owner?.pid !== scope.owner.pid ||
-        record.owner.start !== scope.owner.start ||
-        record.owner.boot !== scope.owner.boot)
+      !sameOwner(record.owner, scope.owner)
     )
       return null;
     if (
@@ -188,7 +184,6 @@ export async function assertNoOtherLiveOwner(
     if (completing) opening = true;
     if (
       other &&
-      other.file === session.file &&
       other.sessionId !== session.header?.id &&
       !completing &&
       (!allowSameProcess || other.owner?.pid !== process.pid) &&
@@ -328,9 +323,7 @@ async function terminateOwnerForDelete(config, session, record) {
       const identity = await readSessionIdentity(session.file);
       if (
         current?.generation !== record.generation ||
-        current.owner?.pid !== record.owner.pid ||
-        current.owner.start !== record.owner.start ||
-        current.owner.boot !== record.owner.boot ||
+        !sameOwner(current.owner, record.owner) ||
         identity.header.id !== session.header.id ||
         identity.header.cwd !== session.header.cwd
       )
@@ -740,9 +733,7 @@ export class AttachedRuntime {
           current.sessionId !== original.sessionId ||
           current.kind !== original.kind ||
           current.mode !== original.mode ||
-          current.owner?.pid !== original.owner.pid ||
-          current.owner?.start !== original.owner.start ||
-          current.owner?.boot !== original.owner.boot ||
+          !sameOwner(current.owner, original.owner) ||
           !(await ownerAlive(original.owner))
         )
           break;

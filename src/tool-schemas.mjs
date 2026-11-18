@@ -77,17 +77,14 @@ export const batchOperationSchema = z
     args: z.record(z.string(), z.unknown()),
   })
   .strict();
-const batchSchema = z
-  .object({
-    // Describe valid items, but retain malformed ones for per-item errors rather
-    // than rejecting valid siblings at the outer MCP validation boundary.
-    // Schema projection calls the catch handler without a parse context.
-    operations: z
-      .array(batchOperationSchema.catch((context) => context?.input))
-      .min(1)
-      .max(10),
-  })
-  .strict();
+// Advertise the operation shape while admitting malformed items for item-level errors.
+const { $schema, ...batchOperationShape } = z.toJSONSchema(batchOperationSchema, {
+  target: 'draft-7',
+  io: 'input',
+});
+const batchSchema = z.strictObject({
+  operations: z.array(z.unknown().meta(batchOperationShape)).min(1).max(10),
+});
 export const publicSchemas = { ...publicOperationSchemas, batch: batchSchema };
 
 const readableResult = z

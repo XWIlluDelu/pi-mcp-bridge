@@ -72,25 +72,14 @@ for (const policy of ['auto release', 'explicit release', 'reload', 'cancelled r
       const { owner, generation } = rpc.ownerRecord;
       const claim = () => readClaim(f.config.attachmentDir, session);
       const kill = t.mock.method(rpc.child, 'kill');
-      const idleSnapshot = rpc.idleSnapshot.bind(rpc);
-      let idleConfirmed = false;
-      t.mock.method(rpc, 'idleSnapshot', async () => {
-        const snapshot = await idleSnapshot();
-        idleConfirmed = snapshot.status === 'idle';
-        return snapshot;
-      });
       const seal = AttachedRuntime.prototype.seal;
-      const seals = [];
+      let sealed = false;
       t.mock.method(AttachedRuntime.prototype, 'seal', async function (...args) {
         const reply = await seal.apply(this, args);
-        if (this.record.generation === generation) {
-          seals.push({
-            idle: idleConfirmed,
-            sealed: reply.sealed,
-            eof: rpc.child.stdin.writableEnded,
-          });
-          if (policy === 'cancelled reload' && reply.sealed)
-            bridge.handoffs.get(id).controller.abort();
+        if (this.record.generation === generation && reply.sealed) {
+          assert.equal(rpc.child.stdin.writableEnded, false);
+          sealed = true;
+          if (policy === 'cancelled reload') bridge.handoffs.get(id).controller.abort();
         }
         return reply;
       });
@@ -118,7 +107,7 @@ for (const policy of ['auto release', 'explicit release', 'reload', 'cancelled r
           for (const result of blocked)
             assert.match(result.reason, /^(HANDOFF_PENDING|STOP_IN_PROGRESS)$/);
           await assert.rejects(f.release({ interrupt: true }), /HANDOFF_PENDING/);
-          assert.deepEqual(seals, []);
+          assert.equal(sealed, false);
           assert.equal(rpc.child.stdin.writableEnded, false);
         } finally {
           stop.resolve();
@@ -129,7 +118,7 @@ for (const policy of ['auto release', 'explicit release', 'reload', 'cancelled r
       }
 
       await f.waitFor('shutdown');
-      assert.deepEqual(seals, [{ idle: true, sealed: true, eof: false }]);
+      assert.equal(sealed, true);
       assert.equal(rpc.child.stdin.writableEnded, true);
       assert.equal(await ownerAlive(owner), true);
       assert.equal((await claim()).generation, generation);

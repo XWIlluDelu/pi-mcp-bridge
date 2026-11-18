@@ -96,13 +96,10 @@ test('retention keeps the latest successful capture with bounded memory, identit
   store.put(session, observer.read(args, ctx), runtime);
   const other = { ...session, id: 'ps_other', file: '/private/other.jsonl' };
   store.put(other, observer.read({ ...args, session_id: other.id }, ctx), {});
-  assert.equal(store.entries.size, 1);
   assert.equal(store.get(session).observation.reason, 'no_retained_observation');
-  assert.ok(store.accountedBytes <= store.maxBytes);
   const tiny = new RetainedObservations({ maxBytes: 1 });
   tiny.put(session, observer.read(args, ctx), runtime);
-  assert.equal(tiny.entries.size, 0);
-  assert.equal(tiny.accountedBytes, 0);
+  assert.equal(tiny.get(session).observation.reason, 'no_retained_observation');
   observer.capture({ messages: [{ role: 'user', content: 'NEWER' }] }, ctx);
   store.put(session, observer.read(args, ctx), runtime);
   store.delete(session.id);

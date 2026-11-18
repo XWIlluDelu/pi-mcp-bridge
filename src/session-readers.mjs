@@ -1,5 +1,6 @@
+import { z } from 'zod';
 import {
-  appendUnits,
+  appendSnapshotUnit,
   READ_CONTRACT,
   READ_SNAPSHOT_LIMIT,
   validateReadEntryIds,
@@ -7,6 +8,43 @@ import {
 import { jsonBytes } from './response-budget.mjs';
 import { CONTENT_KINDS, contentKind, contextSelection } from './read-schema.mjs';
 import { matchesReadText } from './read-navigation.mjs';
+
+const count = z.number().int().nonnegative();
+const kindName = z.string().min(1).max(64);
+const readerResponse = z.object({
+  native: z.boolean().optional(),
+  coverage: z
+    .array(
+      z
+        .looseObject({
+          type: kindName,
+          selected: count,
+          total: count,
+          excluded: count.optional(),
+        })
+        .refine(({ selected, total, excluded = 0 }) => excluded <= total - selected),
+    )
+    .max(16)
+    .optional(),
+  items: z.array(
+    z.object({
+      id: z.string().min(1).max(256),
+      kind: kindName,
+      text: z.string(),
+      title: z.string().optional(),
+      preview: z.string().optional(),
+      source: z
+        .record(z.string(), z.unknown())
+        .refine((value) => jsonBytes(value) <= 8192)
+        .optional(),
+      branch_relation: z.enum(['on_branch', 'off_branch', 'unknown']).optional(),
+      related: z
+        .array(z.looseObject({ id: z.string(), relation: z.string() }))
+        .max(32)
+        .optional(),
+    }),
+  ),
+});
 
 // A distinct capability under the shared module lifecycle, not a replacement
 // for input mappings. Each reader assesses the target session's own evidence.
@@ -65,78 +103,26 @@ export async function captureSessionRead(reader, context, args, query) {
     }
     return nativeCapture;
   };
-  let result;
+  let value;
   try {
-    result = await reader.read({ ...context, nativeRead });
+    value = await reader.read({ ...context, nativeRead });
   } catch (cause) {
     throw new Error('SESSION_READER_FAILED', { cause });
   }
-  if (
-    !result ||
-    !Array.isArray(result.items) ||
-    (result.native !== undefined && typeof result.native !== 'boolean')
-  )
-    throw new Error('INVALID_SESSION_READ');
-  if (
-    result.coverage !== undefined &&
-    (!Array.isArray(result.coverage) ||
-      result.coverage.length > 16 ||
-      result.coverage.some(
-        (row) =>
-          !row ||
-          typeof row.type !== 'string' ||
-          !row.type ||
-          row.type.length > 64 ||
-          !Number.isSafeInteger(row.selected) ||
-          row.selected < 0 ||
-          !Number.isSafeInteger(row.total) ||
-          row.total < row.selected ||
-          (row.excluded !== undefined &&
-            (!Number.isSafeInteger(row.excluded) ||
-              row.excluded < 0 ||
-              row.excluded > row.total - row.selected)),
-      ))
-  )
-    throw new Error('INVALID_SESSION_READ');
+  const parsed = readerResponse.safeParse(value);
+  if (!parsed.success) throw new Error('INVALID_SESSION_READ');
+  const result = parsed.data;
   const target = { units: [], accountedBytes: 0 };
   const { content } = contextSelection(args);
+  const enabledKind = (kind) => content[kind] !== false && content[kind] !== 0;
   const items = new Map();
   const keep = new Set();
   for (const item of result.items) {
-    if (
-      !item ||
-      typeof item.id !== 'string' ||
-      !item.id ||
-      item.id.length > 256 ||
-      items.has(item.id) ||
-      typeof item.kind !== 'string' ||
-      !item.kind ||
-      item.kind.length > 64 ||
-      typeof item.text !== 'string' ||
-      (item.title !== undefined && typeof item.title !== 'string') ||
-      (item.preview !== undefined && typeof item.preview !== 'string') ||
-      (item.branch_relation !== undefined &&
-        !['on_branch', 'off_branch', 'unknown'].includes(item.branch_relation)) ||
-      (item.related !== undefined &&
-        (!Array.isArray(item.related) ||
-          item.related.length > 32 ||
-          item.related.some(
-            (link) => typeof link?.id !== 'string' || typeof link.relation !== 'string',
-          )))
-    )
-      throw new Error('INVALID_SESSION_READ');
-    if (
-      item.source !== undefined &&
-      (!item.source ||
-        typeof item.source !== 'object' ||
-        Array.isArray(item.source) ||
-        jsonBytes(item.source) > 8192)
-    )
-      throw new Error('INVALID_SESSION_READ');
+    if (items.has(item.id)) throw new Error('INVALID_SESSION_READ');
     const kind = contentKind(item.kind);
     const title = item.title?.slice(0, 256);
     const preview = item.preview?.slice(0, 4096);
-    const enabled = content[kind] !== false && content[kind] !== 0;
+    const enabled = enabledKind(kind);
     items.set(item.id, { item, kind, title, preview, enabled });
     if (enabled && (!query || matchesReadText(title, preview, item.text, query))) keep.add(item.id);
   }
@@ -150,23 +136,25 @@ export async function captureSessionRead(reader, context, args, query) {
     if (!keep.has(item.id)) continue;
     const originalKind =
       !CONTENT_KINDS.includes(item.kind) && kind === 'native' ? { content_kind: item.kind } : {};
-    appendUnits(target, {
+    appendSnapshotUnit(target, {
       type: kind,
       source: { reader_item: item.id, ...originalKind },
       message: { role: 'custom', customType: item.kind, content: item.text },
-    });
-    Object.assign(target.units.at(-1), {
       kind,
       title: title || undefined,
       preview: preview || undefined,
-      provenance: item.source && { ...structuredClone(item.source), ...originalKind },
+      provenance: item.source && { ...item.source, ...originalKind },
       branch_relation: item.branch_relation,
-      related: item.related && structuredClone(item.related),
+      related: item.related,
     });
   }
   const native = result.native ? await nativeRead() : nativeCapture ? await nativeCapture : null;
-  if (result.native) target.units.push(...native.units);
-  if (jsonBytes(target.units) > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
+  if (
+    result.native &&
+    target.accountedBytes + jsonBytes(native.units) * 4 + native.units.length * 256 >
+      READ_SNAPSHOT_LIMIT
+  )
+    throw new Error('READ_SNAPSHOT_TOO_LARGE');
   return {
     contract: READ_CONTRACT,
     view: 'adapted',
@@ -176,9 +164,7 @@ export async function captureSessionRead(reader, context, args, query) {
         ? {
             coverage: result.coverage.map((row) => ({
               ...structuredClone(row),
-              ...(content[contentKind(row.type)] === false || content[contentKind(row.type)] === 0
-                ? { selected: 0 }
-                : {}),
+              ...(!enabledKind(contentKind(row.type)) ? { selected: 0 } : {}),
             })),
           }
         : {}),
@@ -187,7 +173,7 @@ export async function captureSessionRead(reader, context, args, query) {
     leaf_id: native ? native.leaf_id : context.owner.leaf_id,
     selection: result.native ? (native.selection ?? null) : null,
     omissions: result.native ? (native.omissions ?? null) : null,
-    units: target.units,
+    units: result.native ? target.units.concat(native.units) : target.units,
     live: result.native ? (native.live ?? null) : null,
   };
 }

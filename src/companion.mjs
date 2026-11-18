@@ -2,8 +2,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 // Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
-import { publicError } from './errors.mjs';
-import { parseCompactInput, compactMetadata } from './compact.mjs';
+import { parseCompactInput, compactContext, compactMetadata } from './compact.mjs';
 import { modelState } from './models.mjs';
 import { createModelSetter } from './set-model.mjs';
 import path from 'node:path';
@@ -15,14 +14,11 @@ import { atomicJson } from './storage.mjs';
 import { READ_CONTRACT } from './context-read.mjs';
 import { attachedPromptInput, remotePromptRejection } from './prompt-input.mjs';
 import {
-  attachmentServer,
+  ownerServer,
   listenPrivate,
-  ownerEnvelope,
   ownerIdentity,
   ownerReadFeatures,
   ownerRead,
-  ownerSnapshot,
-  parseOwnerRequest,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
 import {
@@ -38,6 +34,7 @@ import { ownerSocket } from './owner-runtime.mjs';
 import {
   privateDirectory,
   processIdentity,
+  sameOwner,
   ownerAlive,
   registryTransaction,
   readClaim,
@@ -153,9 +150,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
     if (
       other &&
       !['rpc', 'host', 'handoff'].includes(other.kind) &&
-      other.owner?.pid === owner.pid &&
-      other.owner.start === owner.start &&
-      other.owner.boot === owner.boot
+      sameOwner(other.owner, owner)
     ) {
       const file = claimFile(dir, replacement.session);
       if (other.noColdReacquire)
@@ -306,11 +301,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           completeHandoff: true,
         });
         const old = await readClaim(dir, session);
-        const sameProcess =
-          old?.owner &&
-          old.owner.pid === owner.pid &&
-          old.owner.start === owner.start &&
-          old.owner.boot === owner.boot;
+        const sameProcess = sameOwner(old?.owner, owner);
         // Rebinding UI/actions emits session_start again in the same native
         // extension runtime. Keep its existing endpoint instead of replacing it.
         if (
@@ -375,13 +366,10 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           runtime.mutations.delete(operation);
         }
       }
-      function check(request) {
+      function check() {
         if (
           active !== runtime ||
           !runtime.ready ||
-          request.generation !== record.generation ||
-          request.file !== file ||
-          request.sessionId !== header.id ||
           ctx.sessionManager.getSessionFile() !== file ||
           ctx.sessionManager.getSessionId() !== header.id
         )
@@ -389,7 +377,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       }
       const setModel = createModelSetter({
         state: () => {
-          check({ generation: record.generation, file, sessionId: header.id });
+          check();
           return {
             sessionFile: file,
             sessionId: header.id,
@@ -401,11 +389,13 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
         setModel: (model) => pi.setModel(model),
         setThinkingLevel: (level) => pi.setThinkingLevel(level),
       });
-      const server = attachmentServer(connections, async (line, socket) => {
-        try {
-          const request = parseOwnerRequest(line, check);
+      const server = ownerServer(
+        connections,
+        () => record,
+        async (request, socket, reply) => {
+          check();
           await validateStorage(runtime);
-          check(request);
+          check();
           let data;
           const args = request.body ?? {};
           if (
@@ -435,7 +425,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             const source = { entries: manager.getEntries(), leafId: manager.getLeafId() };
             data =
               request.op === 'snapshot'
-                ? ownerSnapshot(record, source)
+                ? { ...ownerIdentity(record), ...source }
                 : ownerRead(record, { ...source, live: runtime.liveMessage.snapshot() }, args, {
                     buildSessionProjection,
                     readAdapters: request.readAdapters,
@@ -446,9 +436,9 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             runtime.reload = operation;
             // Native reload closes this socket and drains ordinary mutations.
             // Flush admission first; never add reload itself to that drain set.
-            socket.end(ownerEnvelope(record, { data: { reloading: true } }), () => {
+            reply({ data: { reloading: true } }, () => {
               try {
-                check(request);
+                check();
                 pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
               } catch {
                 operation.cancel();
@@ -462,27 +452,19 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
                 thinking_level: args.thinking_level,
                 sessionFile: file,
                 sessionId: header.id,
-                beforeDispatch: () => check(request),
+                beforeDispatch: check,
               }),
             );
-            check(request);
+            check();
           } else if (request.op === 'compact') {
             const input = parseCompactInput(args);
             if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
             const compact = async () => {
-              check(request);
+              check();
               runtime.compacting = true;
               socket.setTimeout(0); // Disconnect only suppresses the receipt.
               try {
-                return await trackMutation(
-                  new Promise((resolve, reject) =>
-                    ctx.compact({
-                      customInstructions: input.instructions,
-                      onComplete: resolve,
-                      onError: () => reject(new AttachmentFailure('PI_REJECTED')),
-                    }),
-                  ),
-                );
+                return await trackMutation(compactContext(ctx, input.instructions));
               } finally {
                 runtime.compacting = false;
               }
@@ -490,7 +472,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             const value = input.interrupt
               ? await compact()
               : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
-            check(request);
+            check();
             data = compactMetadata(value);
           } else if (request.op === 'send') {
             if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
@@ -529,13 +511,9 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
             throw new AttachmentFailure('STOP_UNSUPPORTED');
           } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
-          socket.end(ownerEnvelope(record, { data }));
-        } catch (error) {
-          socket.end(
-            ownerEnvelope(record, { error: publicError(error, 'ATTACHED_OPERATION_FAILED') }),
-          );
-        }
-      });
+          return data;
+        },
+      );
       runtime.server = server;
       await listenPrivate(server, record.socket);
       runtime.ready = true;

@@ -20,12 +20,10 @@ test('single and batch mutation errors preserve uncertainty and independent outc
   const args = { session_id: 'known', text: 'fixture' };
   const result = await callBridgeTool(bridge, 'send', args);
   assert.equal(result.isError, true);
-  assert.deepEqual(JSON.parse(result.content[0].text).error, {
-    code: 'ACK_TIMEOUT',
-    uncertain: true,
-    recovery:
-      'OUTCOME_UNKNOWN; inspect list/read before deciding whether to submit again. No automatic replay.',
-  });
+  const { error } = result.structuredContent;
+  assert.deepEqual(JSON.parse(result.content[0].text).error, error);
+  assert.equal(error.code, 'ACK_TIMEOUT');
+  assert.equal(error.uncertain, true);
   const batch = await executeBatch(bridge, {
     operations: [
       { op: 'send', args },
@@ -33,8 +31,8 @@ test('single and batch mutation errors preserve uncertainty and independent outc
     ],
   });
   assert.equal(bridge.inputs.size, 0);
-  assert.equal(batch.results[0].error.uncertain, true);
-  assert.match(batch.results[0].error.recovery, /do not automatically resubmit/i);
+  assert.deepEqual(batch.results[0].error, error);
+  assert.match(error.recovery, /do not automatically resubmit/i);
   assert.deepEqual(batch.results[1].result, { sessions: [] });
 });
 

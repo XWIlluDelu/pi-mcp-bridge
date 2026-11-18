@@ -3,15 +3,27 @@ import packageInfo from '../package.json' with { type: 'json' };
 import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
-import { publicError } from './errors.mjs';
+import { toolFailure } from './errors.mjs';
+import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 import { EventError } from './events.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
 const SUPPORTED_VERSIONS = [MODERN_VERSION];
 const SERVER_INFO = { name: 'pi-session-bridge', version: packageInfo.version };
 export const META = 'io.modelcontextprotocol/';
-import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
+const decoder = new TextDecoder('utf-8', { fatal: true });
+export const parseJson = (bytes) => JSON.parse(decoder.decode(bytes));
+export async function readJson(stream, limit, tooLarge) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of stream) {
+    bytes += chunk.length;
+    if (bytes > limit) throw new Error(tooLarge);
+    chunks.push(chunk);
+  }
+  return parseJson(Buffer.concat(chunks, bytes));
+}
 // Descriptions state the permission, the outcome contract and retry safety.
 // Detailed semantics live in docs/api.md and in error recovery hints.
 const descriptions = {
@@ -43,8 +55,9 @@ const descriptions = {
     'Diagnose the permission configuration; a healthy setup returns a short ok. Optional session_id limits the diagnosis to that session. Unscoped calls also report settings awaiting restart and unavailable event storage. Changes nothing.',
 };
 const toolNames = Object.keys(descriptions);
+let tools;
 export function toolDefinitions() {
-  return toolNames.map((name) => ({
+  return (tools ??= toolNames.map((name) => ({
     name,
     description: descriptions[name],
     inputSchema: z.toJSONSchema(publicSchemas[name], { target: 'draft-7', io: 'input' }),
@@ -54,30 +67,27 @@ export function toolDefinitions() {
           outputSchema: z.toJSONSchema(publicOutputSchemas[name], { target: 'draft-7' }),
         }
       : {}),
-  }));
+  })));
 }
-function toolError(code, extra = {}) {
-  const result = {
-    error: {
-      code,
-      ...(code === 'OWNER_READ_REFRESH_REQUIRED'
-        ? {
-            recovery:
-              'Call reload for this session at an idle boundary, then retry read. If reload is unsupported, update the configured companion and use native /reload or a host-managed reopen once. Changing read arguments will not refresh the owner.',
-          }
-        : ['ATTACHMENT_PROTOCOL_MISMATCH', 'OWNER_COMPONENT_UPDATE_REQUIRED'].includes(code)
-          ? {
-              recovery:
-                'Use a session owner that supports the current control protocol and operation. A safe native reload can update the endpoint at an idle boundary.',
-            }
-          : {}),
-      ...extra,
-    },
-  };
+const ownerRecovery =
+  'Use a session owner that supports the current control protocol and operation. A safe native reload can update the endpoint at an idle boundary.';
+const recoveryByCode = {
+  OWNER_READ_REFRESH_REQUIRED:
+    'Call reload for this session at an idle boundary, then retry read. If reload is unsupported, update the configured companion and use native /reload or a host-managed reopen once. Changing read arguments will not refresh the owner.',
+  ATTACHMENT_PROTOCOL_MISMATCH: ownerRecovery,
+  OWNER_COMPONENT_UPDATE_REQUIRED: ownerRecovery,
+};
+function toolResult(result) {
   return {
-    isError: true,
     content: [{ type: 'text', text: JSON.stringify(result) }],
     structuredContent: result,
+  };
+}
+function toolError(code, extra = {}) {
+  const recovery = recoveryByCode[code];
+  return {
+    isError: true,
+    ...toolResult({ error: { code, ...(recovery ? { recovery } : {}), ...extra } }),
   };
 }
 export async function callBridgeTool(
@@ -97,13 +107,12 @@ export async function callBridgeTool(
     });
   const args = parsed.data;
   // Start at the authoritative receive boundary, not when a delayed executor runs.
-  const context = bridge.captureRequestContext?.();
+  const requestContext = bridge.captureRequestContext?.();
   // A delayed/rejected executor must not leave an early policy failure unhandled.
-  void context?.catch(() => {});
+  void requestContext?.catch(() => {});
   return execute(async () => {
     try {
       // Input methods register their existing Stop fence before awaiting policy I/O.
-      const requestContext = context;
       const result = await diagnostics.measure(
         'tool',
         {
@@ -116,23 +125,10 @@ export async function callBridgeTool(
             ? executeBatch(bridge, args, { requestContext })
             : bridge[name](args, { requestContext }),
       );
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result) }],
-        structuredContent: result,
-      };
+      return toolResult(result);
     } catch (error) {
-      return toolError(
-        publicError(error),
-        error?.minimum_max_bytes
-          ? { minimum_max_bytes: error.minimum_max_bytes }
-          : error?.uncertain
-            ? {
-                uncertain: true,
-                recovery:
-                  'OUTCOME_UNKNOWN; inspect list/read before deciding whether to submit again. No automatic replay.',
-              }
-            : {},
-      );
+      const { code, ...details } = toolFailure(error);
+      return toolError(code, details);
     }
   });
 }
@@ -165,7 +161,8 @@ function complete(result) {
 function unsupportedVersion(id, requested) {
   return rpcError(id, -32022, 'Unsupported protocol version', {
     supported: SUPPORTED_VERSIONS,
-    requested,
+    // A malformed version must still fit the MCP response budget.
+    requested: requested.slice(0, 64),
   });
 }
 // Applies to the entire serialized JSON-RPC envelope, including escaped text

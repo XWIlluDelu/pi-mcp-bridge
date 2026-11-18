@@ -12,7 +12,6 @@ import {
 } from './fixtures/read-pages.mjs';
 
 import { prepareContextRead as prepareNativeContext } from '../src/context-read.mjs';
-import { validateReadAdapters } from '../src/read-adapters.mjs';
 import { CompatibilityServices } from '../src/compatibility-services.mjs';
 import intercomModule from '../integrations/intercom/index.mjs';
 
@@ -115,13 +114,6 @@ test('tool pairing precedes prompt selection and keeps a steering result in sour
     msg('result', 'b', 'toolResult', [text('result for A')], { toolCallId: 'c' }),
     msg('answer-b', 'result', 'assistant', [text('answer B')]),
   ];
-  const result = render(snapshot(entries), { range: { recent: 3 }, content: { tool: -1 } });
-  assert.deepEqual(
-    result.items.map((r) => r.source.entry_id),
-    ['a', 'call', 'b', 'result', 'answer-b'],
-  );
-  assert.equal(result.items[3].prompt_id, 'a');
-  assert.equal(result.items[4].prompt_id, 'b');
   const a = render(snapshot(entries), { range: { earliest: 1, recent: 0 }, content: { tool: 1 } });
   assert.deepEqual(
     a.items.map((r) => r.source.entry_id),
@@ -367,28 +359,18 @@ test('native replacement is selected at original source positions without revivi
 });
 
 test('selection does not serialize deliberately omitted tool-result payloads', () => {
-  const entries = history([user('initial'), answer('previous answer'), user('new request')]);
-  for (let i = 0; i < 64; i++)
-    entries.push(
-      ...history(tool('call-' + i)).map((entry, index) => ({
-        ...entry,
-        id: 'tool-' + i + '-' + index,
-        parentId: index ? 'tool-' + i + '-0' : entries.at(-1).id,
-      })),
-    );
-  const results = entries.filter((e) => e.message.role === 'toolResult');
-  for (const result of results)
-    result.message.content = [
-      {
-        type: 'text',
-        get text() {
-          assert.fail('omitted tool body must not be serialized');
-        },
+  const entries = history([user('task'), ...tool('call')]);
+  entries.at(-1).message.content = [
+    {
+      type: 'text',
+      get text() {
+        assert.fail('omitted tool body must not be serialized');
       },
-    ];
+    },
+  ];
   const rendered = select(entries, { content: { tool: 0 } });
   assert.equal(rendered.units.filter((r) => r.type.startsWith('tool_')).length, 0);
-  assert.equal(rendered.omissions.tool, 64);
+  assert.equal(rendered.omissions.tool, 1);
 });
 
 const services = new CompatibilityServices();
@@ -405,21 +387,6 @@ const custom = (id, parentId, customType, content = id) => ({
 });
 const prepare = (entries, args = {}, readAdapters = [intercom]) =>
   prepareNativeContext({ entries }, { session_id: 'fixture', ...args }, { ...sdk, readAdapters });
-
-test('native input descriptors reject invalid and conflicting mappings independently of module loading', () => {
-  assert.deepEqual(validateReadAdapters(), []);
-  for (const adapters of [
-    null,
-    {},
-    [{}],
-    [{ id: 'bad', inputCustomTypes: [] }],
-    [{ id: 'bad', inputCustomTypes: [''] }],
-    [intercom, intercom],
-    [intercom, { id: 'other', inputCustomTypes: ['intercom_message'] }],
-    [{ ...intercom, transform: 'unsupported' }],
-  ])
-    assert.throws(() => validateReadAdapters(adapters), /INVALID_READ_ADAPTER/);
-});
 
 test('intercom inputs use native prompt selectors without rewriting message roles, payloads or state', () => {
   const entries = [

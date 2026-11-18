@@ -2,16 +2,8 @@
 
 Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, with owner-controlled permissions and one cooperating writer per session. Local clients use stdio; multiple or remote clients share a loopback HTTP service behind an authenticated tunnel.
 
-## What it does
-
-- List authorized sessions, read recent turns in source order, search effective context and expand referenced messages or evidence.
-- Read native Session Context, captured Runtime Context or explicitly enabled extension readers.
-- Send text and images, run native shell commands, select model/thinking settings, compact context, reload idle sessions and stop work.
-- Create or fork saved sessions, optionally sending a first task, and move deleted sessions to recoverable trash while retaining project files.
-- Notify ChatGPT Work chats and dots when an owned RPC or connected TUI/RPC companion settles, with a short result excerpt and pinned native reading arguments.
-- Batch independent operations and apply seven separate permissions at default, project and session tiers.
-
-See [working with a session](docs/collaboration.md) for the dispatch, observation and continuation workflow, and the [public API](docs/api.md) for tool arguments and outcomes.
+[Follow a session](docs/collaboration.md) from dispatch to result, or see the
+[tool reference](docs/api.md).
 
 ## Start locally
 
@@ -43,7 +35,8 @@ For one stdio MCP client:
 }
 ```
 
-For multiple clients, start one HTTP service and use `src/stdio-proxy.mjs` for stdio-only clients. [Transport setup](docs/transports.md) covers tokens, tunnels and the current protocol.
+For multiple clients, use the shared HTTP service. Stdio-only clients can connect
+through its proxy. [Transport setup](docs/transports.md) covers both.
 
 ### Verify the first connection
 
@@ -57,40 +50,20 @@ These calls verify access to the configured data. To send work, create a session
 
 ## Native Pi integration
 
-Cold resume uses the owner's native settings, authentication, tools, extensions and project configuration. Bridge-owned RPCs release when their work is safely idle and resume saved sessions for later work.
-
-[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to register ordinary TUI/RPC owners. Use [`reload({session_id})`](docs/api.md#reload) to apply resource changes to an idle owner. To open a Bridge session in a native TUI:
-
-```sh
-node src/open.mjs /absolute/private/path/owner.json ps_SESSION_ID
-```
-
-The launcher negotiates ownership before opening the session. See [runtime integration](docs/runtime.md) for handoff, host capabilities and lifecycle constraints, including the effect of closing an active TUI. The optional [Herdr switch](docs/configuration.md#herdr-process-placement) places new owned RPC writers in local Herdr.
+Bridge resumes saved sessions with the owner's native Pi environment. For live
+owners, see [companion registration, SDK hosts and terminal handoff](docs/runtime.md).
 
 ## Documentation
 
-| When you need to…                                               | Start here                                                                             |
-| --------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Choose accessible projects and operations                       | [Configuration and permissions](docs/configuration.md)                                 |
-| Connect one client, share a service or expose a remote endpoint | [MCP transports](docs/transports.md)                                                   |
-| Dispatch work and understand the result                         | [Working with a session](docs/collaboration.md), then the [API reference](docs/api.md) |
-| Find history, expand evidence or choose a context source        | [Reading and search](docs/reading.md)                                                  |
-| Change models, thinking effort or context size                  | [Model control](docs/model-control.md)                                                 |
-| Receive completion notifications                                | [Events](docs/events.md)                                                               |
-| Connect a live Pi owner or integrate an SDK/RPC host            | [Runtime integration](docs/runtime.md)                                                 |
-| Enable an optional plugin reader or input mapping               | [Compatibility modules](docs/compatibility.md)                                         |
-| Investigate a failed request or service operation               | [Diagnostics](docs/configuration.md#diagnostics)                                       |
-| Develop or verify Bridge                                        | [Architecture and verification](docs/architecture.md)                                  |
+- [Owner configuration and diagnostics](docs/configuration.md)
+- [MCP transports](docs/transports.md)
+- [Reading and search](docs/reading.md), [model controls](docs/model-control.md) and [completion events](docs/events.md)
+- [Optional integrations](docs/compatibility.md) and [architecture](docs/architecture.md)
 
 ## Development
 
-```sh
-npm test
-npm run format:check
-npm audit
-```
-
-Tests use synthetic providers, temporary session stores and isolated Pi profiles. See [verification](docs/architecture.md#verification) for required Linux utilities, external Pi selection and optional Herdr tests.
+Run `npm test` and `npm run format:check`. See [verification](docs/architecture.md#verification)
+for external Pi and optional Herdr coverage.
 
 ## License
 

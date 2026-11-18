@@ -3,6 +3,8 @@ import net from 'node:net';
 import fs from 'node:fs/promises';
 import { prepareContextRead, READ_CONTRACT } from './context-read.mjs';
 import { readLfLines } from './lf-lines.mjs';
+import { publicError } from './errors.mjs';
+import { nativeCompactReason } from './compact.mjs';
 
 // Includes JSON escaping and envelope fields, not just prompt characters.
 export const MAX_ATTACHMENT_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -23,11 +25,38 @@ export function ownerEnvelope({ generation, file, sessionId, bridgeVersion }, pa
   );
 }
 
-export function parseOwnerRequest(frame, checkIdentity) {
-  const request = JSON.parse(frame);
-  checkIdentity(request);
-  if (typeof request.version !== 'string') throw new Error('ATTACHMENT_PROTOCOL_MISMATCH');
-  return request;
+export function ownerServer(
+  connections,
+  binding,
+  handle,
+  failureCode = 'ATTACHED_OPERATION_FAILED',
+) {
+  return attachmentServer(connections, async (frame, socket) => {
+    const record = binding();
+    const reply = (payload, done) => socket.end(ownerEnvelope(record, payload), done);
+    try {
+      const request = JSON.parse(frame);
+      if (
+        request?.generation !== record.generation ||
+        request.file !== record.file ||
+        request.sessionId !== record.sessionId
+      )
+        throw new Error('RUNTIME_SESSION_CHANGED');
+      if (typeof request.version !== 'string') throw new Error('ATTACHMENT_PROTOCOL_MISMATCH');
+      const data = await handle(request, socket, reply, record);
+      if (socket.writableEnded) return;
+      const response = ownerEnvelope(record, { data });
+      if (request.op === 'snapshot' && Buffer.byteLength(response) > MAX_ATTACHMENT_SNAPSHOT_BYTES)
+        throw new Error('SESSION_TOO_LARGE');
+      socket.end(response);
+    } catch (error) {
+      const native_reason = record.kind === 'rpc' && nativeCompactReason(error?.native_reason);
+      reply({
+        error: publicError(error, failureCode),
+        ...(native_reason ? { native_reason } : {}),
+      });
+    }
+  });
 }
 
 export const ownerIdentity = ({ file, sessionId }) => ({ sessionFile: file, sessionId });
@@ -53,13 +82,6 @@ export function ownerRead(binding, source, args, projection) {
   return { ...ownerIdentity(binding), ...prepareContextRead(source, args, projection) };
 }
 
-export function ownerSnapshot(binding, { entries, leafId }) {
-  const data = { ...ownerIdentity(binding), entries, leafId };
-  if (Buffer.byteLength(JSON.stringify(data)) > MAX_ATTACHMENT_SNAPSHOT_BYTES)
-    throw new Error('SESSION_TOO_LARGE');
-  return data;
-}
-
 export const validNativeSnapshot = (snapshot) =>
   Array.isArray(snapshot?.entries) &&
   snapshot.entries.every((entry) => typeof entry?.id === 'string' && entry.id.length <= 128) &&
@@ -67,7 +89,24 @@ export const validNativeSnapshot = (snapshot) =>
     (typeof snapshot.leafId === 'string' && snapshot.leafId.length <= 128));
 
 // Owner endpoints accept one newline-terminated JSON request per connection.
-// Drop excess connections, oversized frames and idle peers without a reply.
+export function readRequest(socket, maxBytes, onRequest) {
+  let bytes = 0;
+  const bound = (chunk) => {
+    bytes += chunk.length;
+    if (bytes > maxBytes) {
+      lines.close();
+      socket.destroy();
+    }
+  };
+  socket.on('data', bound);
+  const lines = readLfLines(socket, (line) => {
+    socket.off('data', bound);
+    lines.close();
+    Promise.resolve(onRequest(line, socket)).catch(() => socket.destroy());
+  });
+  socket.once('close', lines.close);
+}
+
 export function attachmentServer(connections, onRequest) {
   return net.createServer((socket) => {
     if (connections.size >= 16) {
@@ -77,24 +116,8 @@ export function attachmentServer(connections, onRequest) {
     connections.add(socket);
     socket.setTimeout(5000, () => socket.destroy());
     socket.on('error', () => {});
-    let bytes = 0;
-    const bound = (chunk) => {
-      bytes += chunk.length;
-      if (bytes > MAX_ATTACHMENT_REQUEST_BYTES) {
-        lines.close();
-        socket.destroy();
-      }
-    };
-    socket.on('data', bound);
-    const lines = readLfLines(socket, (line) => {
-      socket.off('data', bound);
-      lines.close();
-      Promise.resolve(onRequest(line, socket)).catch(() => socket.destroy());
-    });
-    socket.on('close', () => {
-      lines.close();
-      connections.delete(socket);
-    });
+    readRequest(socket, MAX_ATTACHMENT_REQUEST_BYTES, onRequest);
+    socket.once('close', () => connections.delete(socket));
   });
 }
 export async function listenPrivate(server, socketPath) {

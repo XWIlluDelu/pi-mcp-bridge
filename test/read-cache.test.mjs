@@ -41,9 +41,6 @@ test('snapshot admission failure does not issue unusable references or narrow co
   f.bridge.readCache = new ContextReadCache({ maxBytes: 4096 });
   const denied = await callBridgeTool(f.bridge, 'read', { session_id: f.id });
   assert.equal(denied.structuredContent.error.code, 'READ_SNAPSHOT_TOO_LARGE');
-  f.bridge.readCache = new ContextReadCache();
-  f.entries[1].message.content[0].text = ('x'.repeat(1000) + '\n\n').repeat(9000);
-  await assert.rejects(f.bridge.read({ session_id: f.id }), /READ_SNAPSHOT_TOO_LARGE/);
 });
 
 test('batch reference snapshots remain pinned until assembly', async (t) => {

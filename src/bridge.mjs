@@ -193,9 +193,14 @@ export class Bridge {
         restartRequired = [
           ...new Set([...Object.keys(this.ownerSettings), ...Object.keys(settings)]),
         ].filter((key) => !isDeepStrictEqual(settings[key], this.ownerSettings[key]));
-        // Hot scope must remain valid against ACTIVE storage, not just a
-        // proposed stateDir that will only take effect after restart.
-        validateOwnerConfig({ ...this.config, grants, defaults, folders, sessionRoots });
+        // The file was already validated. Only a pending stateDir change
+        // requires checking the new roots against another directory.
+        const active = this.config.stateDir;
+        if (
+          config.stateDir !== active &&
+          sessionRoots.some((root) => inside(root, active) || inside(active, root))
+        )
+          throw new Error('OVERLAPPING_STORAGE');
         policy = config;
       }
       const defaults = Object.freeze({ ...policy.defaults });
@@ -268,7 +273,7 @@ export class Bridge {
     return this.#mutation(args, options, this.#setModel);
   }
   send(args, options) {
-    return this.#mutation(args, options, this.#send);
+    return this.#mutation(args, options, this.#send, true);
   }
   async submission(args, { requestContext } = {}) {
     requestContext = await (requestContext ?? this.captureRequestContext());
@@ -286,32 +291,41 @@ export class Bridge {
     return this.#mutation(args, options, this.#create);
   }
   command(args, options) {
-    return this.#mutation(args, options, this.#command);
+    return this.#mutation(args, options, this.#command, true);
   }
   stop(args, options) {
     return this.#mutation(args, options, this.#stop);
   }
   reload(args, options) {
-    return this.#mutation(args, options, this.#reload);
+    return this.#mutation(args, options, this.#reload, true);
   }
   compact(args, options) {
-    return this.#mutation(args, options, this.#compact);
+    return this.#mutation(args, options, this.#compact, true);
   }
   delete(args, options) {
     return this.#mutation(args, options, this.#delete);
   }
 
-  async #mutation(args, options, action) {
+  async #mutation(args, options, action, tracksInput = false) {
     this.assertOpen();
     let releaseCandidate;
+    const run = async (checkInput) => {
+      const requestContext = await (options?.requestContext ?? this.captureRequestContext());
+      this.assertOpen();
+      return action.call(this, args, {
+        ...options,
+        requestContext,
+        checkInput,
+        markForAutoRelease: (runtime) => {
+          if (runtime instanceof PiRpc) releaseCandidate = runtime;
+        },
+      });
+    };
     const work = (async () => {
       try {
-        return await action.call(this, args, {
-          ...options,
-          markForAutoRelease: (runtime) => {
-            if (runtime instanceof PiRpc) releaseCandidate = runtime;
-          },
-        });
+        return await (tracksInput
+          ? this.withInput(args.session_id, options?.pendingInput, run)
+          : run());
       } finally {
         if (releaseCandidate) {
           releaseCandidate.autoReleaseWanted = true;
@@ -324,94 +338,86 @@ export class Bridge {
     work.then(settled, settled);
     return work;
   }
-  async #reload(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
-    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
-      requestContext = await (requestContext ?? this.captureRequestContext());
-      this.assertOpen();
-      const session = await this.session(args.session_id, requestContext);
-      this.check('send', session, requestContext);
-      return this.mutationLock(session.id, 'send', requestContext, async () => {
-        let runtime,
-          marker,
-          replacementStarted = false;
-        try {
-          checkInput();
-          if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
-          runtime = await this.pool.forRead(session);
-          if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
-          if (runtime.attached) return await runtime.reload(checkInput);
-          if (!runtime.exitSeal)
-            await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
-          checkInput();
-          if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
-          marker = { kind: 'reload', controller: new AbortController() };
-          this.handoffs.set(session.id, marker);
-          runtime.handoffPending = true;
-          await runtime.gracefulExit(marker.controller.signal);
-          replacementStarted = true;
-          this.pool.instances.delete(session.id);
-          marker.controller.signal.throwIfAborted();
-          checkInput();
-          const replacement = await this.pool.resolve(session);
-          markForAutoRelease(replacement);
-          if (!(replacement instanceof PiRpc) || replacement === runtime)
-            throw new Error('RELOAD_UNCONFIRMED');
-          const version = replacement.ownerRecord?.bridgeVersion;
-          if (!version || replacement.ownerRecord?.readContract !== READ_CONTRACT)
-            throw new Error('RELOAD_UNCONFIRMED');
-          return { status: 'completed', owner_version: version, read_compatible: true };
-        } catch (error) {
-          const uncertain =
-            error.uncertain ||
-            replacementStarted ||
-            runtime?.gracefulExitPromise ||
-            runtime?.exitSeal;
-          return {
-            status: uncertain ? 'unknown' : 'rejected',
-            reason: [
-              'RUNTIME_BUSY',
-              'MODEL_SELECTION_PENDING',
-              'PROMPT_ADMISSION_PENDING',
-              'RELOAD_IN_PROGRESS',
-            ].includes(error.code ?? error.message)
-              ? 'RELOAD_BUSY'
-              : safeReason(error),
-          };
-        } finally {
-          if (marker && this.handoffs.get(session.id) === marker) this.handoffs.delete(session.id);
-          if (marker && runtime && !runtime.gracefulExitPromise && !runtime.exitSeal)
-            runtime.handoffPending = false;
-        }
-      });
+  async #reload(args, { requestContext, markForAutoRelease, checkInput }) {
+    const session = await this.session(args.session_id, requestContext);
+    this.check('send', session, requestContext);
+    return this.mutationLock(session.id, 'send', requestContext, async () => {
+      let runtime,
+        marker,
+        replacementStarted = false;
+      try {
+        checkInput();
+        if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
+        runtime = await this.pool.forRead(session);
+        if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
+        if (runtime.attached) return await runtime.reload(checkInput);
+        if (!runtime.exitSeal)
+          await runtime.assertIdle({ busy: 'RELOAD_BUSY', unconfirmed: 'RELOAD_UNCONFIRMED' });
+        checkInput();
+        if (this.locks.has(`bash:${session.id}`)) throw new Error('RELOAD_BUSY');
+        marker = { kind: 'reload', controller: new AbortController() };
+        this.handoffs.set(session.id, marker);
+        runtime.handoffPending = true;
+        await runtime.gracefulExit(marker.controller.signal);
+        replacementStarted = true;
+        this.pool.instances.delete(session.id);
+        marker.controller.signal.throwIfAborted();
+        checkInput();
+        const replacement = await this.pool.resolve(session);
+        markForAutoRelease(replacement);
+        if (!(replacement instanceof PiRpc) || replacement === runtime)
+          throw new Error('RELOAD_UNCONFIRMED');
+        const version = replacement.ownerRecord?.bridgeVersion;
+        if (!version || replacement.ownerRecord?.readContract !== READ_CONTRACT)
+          throw new Error('RELOAD_UNCONFIRMED');
+        return { status: 'completed', owner_version: version, read_compatible: true };
+      } catch (error) {
+        const uncertain =
+          error.uncertain ||
+          replacementStarted ||
+          runtime?.gracefulExitPromise ||
+          runtime?.exitSeal;
+        return {
+          status: uncertain ? 'unknown' : 'rejected',
+          reason: [
+            'RUNTIME_BUSY',
+            'MODEL_SELECTION_PENDING',
+            'PROMPT_ADMISSION_PENDING',
+            'RELOAD_IN_PROGRESS',
+          ].includes(error.code ?? error.message)
+            ? 'RELOAD_BUSY'
+            : safeReason(error),
+        };
+      } finally {
+        if (marker && this.handoffs.get(session.id) === marker) this.handoffs.delete(session.id);
+        if (marker && runtime && !runtime.gracefulExitPromise && !runtime.exitSeal)
+          runtime.handoffPending = false;
+      }
     });
   }
-  async #compact(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
-    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
-      requestContext = await (requestContext ?? this.captureRequestContext());
-      this.assertOpen();
-      const session = await this.session(args.session_id, requestContext);
-      this.check('send', session, requestContext);
-      if (args.interrupt) this.check('stop', session, requestContext);
-      const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
-      return this.mutationLock(session.id, 'send', requestContext, async () => {
-        try {
-          let runtime = await this.pool.forRead(session);
-          runtime ??= await this.#coldStart(session, checkInput);
-          markForAutoRelease(runtime);
-          const result = await runtime.compact(body, undefined, checkInput);
-          return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
-        } catch (error) {
-          const nativeReason =
-            error.code === 'PI_REJECTED' ? nativeCompactReason(error.native_reason) : undefined;
-          return {
-            status: error.uncertain ? 'unknown' : 'rejected',
-            reason: safeReason(error),
-            ...(nativeReason ? { native_reason: nativeReason } : {}),
-            native_effects:
-              error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
-          };
-        }
-      });
+  async #compact(args, { requestContext, markForAutoRelease, checkInput }) {
+    const session = await this.session(args.session_id, requestContext);
+    this.check('send', session, requestContext);
+    if (args.interrupt) this.check('stop', session, requestContext);
+    const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
+    return this.mutationLock(session.id, 'send', requestContext, async () => {
+      try {
+        let runtime = await this.pool.forRead(session);
+        runtime ??= await this.#coldStart(session, checkInput);
+        markForAutoRelease(runtime);
+        const result = await runtime.compact(body, undefined, checkInput);
+        return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
+      } catch (error) {
+        const nativeReason =
+          error.code === 'PI_REJECTED' ? nativeCompactReason(error.native_reason) : undefined;
+        return {
+          status: error.uncertain ? 'unknown' : 'rejected',
+          reason: safeReason(error),
+          ...(nativeReason ? { native_reason: nativeReason } : {}),
+          native_effects:
+            error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
+        };
+      }
     });
   }
   async list(args = {}, { requestContext } = {}) {
@@ -562,17 +568,12 @@ export class Bridge {
       native_cwd: s.header.cwd,
     };
     if (args.refs) {
-      const references = args.refs.map((ref) => this.readCache.reference(ref));
-      if (references.some((r) => JSON.stringify(r.entry.identity) !== JSON.stringify(identity)))
-        throw new Error('INVALID_READ_REFERENCE');
-      if (references.some((r) => r.document.request)) {
-        if (references.length !== 1) throw new Error('INVALID_READ_REFERENCE');
+      const snapshot = this.readCache.expand(args.refs, identity);
+      if (snapshot.sourceRequest)
         return this.read(
-          { ...references[0].document.request, max_bytes: args.max_bytes },
+          { ...snapshot.sourceRequest, max_bytes: args.max_bytes },
           { requestContext, resultBudget, readPins },
         );
-      }
-      const snapshot = this.readCache.expand(args.refs, identity);
       return this.readCache.render(
         snapshot,
         { max_bytes: args.max_bytes },
@@ -730,14 +731,14 @@ export class Bridge {
   }
   async acquireNativeRead(session, runtime, args) {
     if (runtime) return runtime.read(args);
-    session = await loadSavedSession(session, { omitImageData: true, config: this.config });
+    const sdk = await nativeSdk(this.config, launchProfile(this.config).env);
+    session = await loadSavedSession(session, { omitImageData: true, sdk });
     return prepareContextRead(session, args, {
-      ...(await nativeSdk(this.config, launchProfile(this.config).env)),
+      buildSessionProjection: sdk.buildSessionProjection,
       readAdapters: this.compatibilityServices.readInputs.snapshot(),
     });
   }
-  async #setModel(args, { requestContext, markForAutoRelease } = {}) {
-    requestContext = await (requestContext ?? this.captureRequestContext());
+  async #setModel(args, { requestContext, markForAutoRelease }) {
     const target = await this.session(args.session_id, requestContext);
     this.check('send', target, requestContext);
     return this.locked(target.id, async () => {
@@ -766,111 +767,91 @@ export class Bridge {
       return modelSettings(actual);
     });
   }
-  async #send(args, { requestContext, markForAutoRelease, pendingInput } = {}) {
-    return this.withInput(args.session_id, pendingInput, async (beforeDispatch) => {
-      requestContext = await (requestContext ?? this.captureRequestContext());
-      this.assertOpen();
-      const body = { ...promptInput(args), mode: args.mode ?? 'steer' };
-      let target;
+  async #send(args, { requestContext, markForAutoRelease, checkInput: beforeDispatch }) {
+    const body = { ...promptInput(args), mode: args.mode ?? 'steer' };
+    const target = await this.session(args.session_id, requestContext).catch(() => null);
+    if (!target || !permitted(requestContext.permissions, 'send', target))
+      return {
+        status: 'rejected',
+        reason: 'NOT_FOUND_OR_DENIED',
+      };
+    return this.mutationLock(args.session_id, 'send', requestContext, async () => {
+      const selection = {};
+      const submissionId = this.submissions.start(target.id, 'send');
+      const outcome = (receipt) => ({
+        ...selection,
+        ...(this.submissions.update(submissionId, receipt) ?? receipt),
+        submission_id: submissionId,
+      });
+      let runtime;
       try {
-        target = await this.session(args.session_id, requestContext);
-      } catch {
+        beforeDispatch();
+        const s = await this.session(args.session_id, requestContext);
+        this.check('send', s, requestContext);
+        runtime = await this.pool.forRead(s);
+        if (!runtime) {
+          runtime = await this.#coldStart(s);
+          markForAutoRelease(runtime);
+        }
+        await beforeDispatch();
+        return outcome(
+          await this.#submit(
+            runtime,
+            body,
+            submissionId,
+            selection,
+            beforeDispatch,
+            markForAutoRelease,
+          ),
+        );
+      } catch (e) {
+        return outcome(
+          promptResult({
+            ok: false,
+            code: safeReason(e),
+            uncertain: e.uncertain,
+          }),
+        );
+      }
+    });
+  }
+  async #command(args, { requestContext, resultBudget, markForAutoRelease, checkInput }) {
+    const session = await this.session(args.session_id, requestContext);
+    this.check('command', session, requestContext);
+    const lane = `bash:${session.id}`;
+    if (this.locks.has(lane))
+      return { status: 'rejected', reason: 'BASH_IN_PROGRESS', output_available: false };
+    let output;
+    const receipt = await this.locked(lane, async () => {
+      let generation;
+      try {
+        if (this.handoffs.get(session.id)?.kind === 'auto_release')
+          await this.pool.instances.get(session.id)?.autoReleaseTask;
+        const beforeDispatch = async () => {
+          checkInput();
+          if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
+        };
+        await beforeDispatch();
+        const runtime = (await this.pool.forRead(session)) ?? (await this.#coldStart(session));
+        markForAutoRelease(runtime);
+        await beforeDispatch();
+        generation = runtime.generation ?? runtime.record?.generation ?? null;
+        output = inlineBashResult(await runtime.executeBash({ ...args, beforeDispatch }));
+        return { status: 'completed', generation };
+      } catch (error) {
+        if (error.result) output = inlineBashResult(error.result);
         return {
-          status: 'rejected',
-          reason: 'NOT_FOUND_OR_DENIED',
+          status: error.uncertain ? 'unknown' : 'rejected',
+          reason: safeReason(error),
+          ...(generation ? { generation } : {}),
         };
       }
-      if (!permitted(requestContext.permissions, 'send', target))
-        return {
-          status: 'rejected',
-          reason: 'NOT_FOUND_OR_DENIED',
-        };
-      return this.mutationLock(args.session_id, 'send', requestContext, async () => {
-        const selection = {};
-        const submissionId = this.submissions.start(target.id, 'send');
-        const outcome = (receipt) => ({
-          ...selection,
-          ...(this.submissions.update(submissionId, receipt) ?? receipt),
-          submission_id: submissionId,
-        });
-        let runtime;
-        try {
-          beforeDispatch();
-          const s = await this.session(args.session_id, requestContext);
-          this.check('send', s, requestContext);
-          runtime = await this.pool.forRead(s);
-          if (!runtime) {
-            runtime = await this.#coldStart(s);
-            markForAutoRelease(runtime);
-          }
-          await beforeDispatch();
-          return outcome(
-            await this.#submit(
-              runtime,
-              body,
-              submissionId,
-              selection,
-              beforeDispatch,
-              markForAutoRelease,
-            ),
-          );
-        } catch (e) {
-          return outcome({
-            ...selection,
-            ...promptResult({
-              ok: false,
-              code: safeReason(e),
-              uncertain: e.uncertain,
-            }),
-          });
-        }
-      });
     });
+    return output
+      ? bashOutput(receipt, output, args, resultBudget)
+      : { ...receipt, output_available: false };
   }
-  async #command(args, { requestContext, resultBudget, markForAutoRelease, pendingInput } = {}) {
-    return this.withInput(args.session_id, pendingInput, async (checkInput) => {
-      requestContext = await (requestContext ?? this.captureRequestContext());
-      this.assertOpen();
-      const session = await this.session(args.session_id, requestContext);
-      this.check('command', session, requestContext);
-      let output;
-      const receipt = await (async () => {
-        if (this.locks.has(`bash:${session.id}`))
-          return { status: 'rejected', reason: 'BASH_IN_PROGRESS' };
-        return this.locked(`bash:${session.id}`, async () => {
-          let generation;
-          try {
-            if (this.handoffs.get(session.id)?.kind === 'auto_release')
-              await this.pool.instances.get(session.id)?.autoReleaseTask;
-            const beforeDispatch = async () => {
-              checkInput();
-              if (this.handoffs.has(session.id)) throw new Error('HANDOFF_PENDING');
-            };
-            await beforeDispatch();
-            const runtime = (await this.pool.forRead(session)) ?? (await this.#coldStart(session));
-            markForAutoRelease(runtime);
-            await beforeDispatch();
-            generation = runtime.generation ?? runtime.record?.generation ?? null;
-            output = inlineBashResult(await runtime.executeBash({ ...args, beforeDispatch }));
-            return { status: 'completed', generation };
-          } catch (error) {
-            if (error.result) output = inlineBashResult(error.result);
-            return {
-              status: error.uncertain ? 'unknown' : 'rejected',
-              reason: safeReason(error),
-              ...(generation ? { generation } : {}),
-            };
-          }
-        });
-      })();
-      return output
-        ? bashOutput(receipt, output, args, resultBudget)
-        : { ...receipt, output_available: false };
-    });
-  }
-  async #stop(args, { requestContext, resultBudget, retainedInputs } = {}) {
-    requestContext = await (requestContext ?? this.captureRequestContext());
-    this.assertOpen();
+  async #stop(args, { requestContext, resultBudget, retainedInputs }) {
     const session = await this.session(args.session_id, requestContext);
     this.check('stop', session, requestContext);
     let withdrawn;
@@ -911,9 +892,7 @@ export class Bridge {
       ? withdrawalOutput(receipt, withdrawn, args, resultBudget)
       : { ...receipt, withdrawn_available: false };
   }
-  async #create(args, { requestContext, markForAutoRelease } = {}) {
-    requestContext = await (requestContext ?? this.captureRequestContext());
-    this.assertOpen();
+  async #create(args, { requestContext, markForAutoRelease }) {
     const folder = requestContext.scope.folders.find((folder) => folder.path === args.project);
     if (!folder || !permitted(requestContext.permissions, 'create', { cwd: folder.path }))
       return {
@@ -999,20 +978,9 @@ export class Bridge {
       return child ? outcome(result) : result;
     }
   }
-  async #delete(args, { requestContext, resultBudget } = {}) {
-    requestContext = await (requestContext ?? this.captureRequestContext());
-    this.assertOpen();
+  async #delete(args, { requestContext, resultBudget }) {
     const target = await this.session(args.session_id, requestContext).catch(() => null);
-    if (
-      !permitted(
-        requestContext.permissions,
-        'delete',
-        target ?? {
-          id: args.session_id,
-          cwd: null,
-        },
-      )
-    )
+    if (!target || !permitted(requestContext.permissions, 'delete', target))
       return {
         status: 'rejected',
         reason: 'NOT_FOUND_OR_DENIED',
@@ -1025,7 +993,7 @@ export class Bridge {
       const marker = { kind: 'delete' };
       try {
         const s = await this.session(args.session_id, requestContext);
-        this.check('delete', s, requestContext);
+        if (!sameSessionIdentity(s, target)) throw new Error('RUNTIME_SESSION_CHANGED');
         trash = await prepareTrash(this.config, s);
         const prior = this.handoffs.get(s.id);
         this.handoffs.set(s.id, marker);

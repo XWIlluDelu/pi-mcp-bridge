@@ -59,12 +59,14 @@ export class ContextReadCache {
     const resolved = refs.map((ref) => this.reference(ref));
     const first = resolved[0];
     if (
-      resolved.some(
-        (r) =>
-          r.token !== first.token || JSON.stringify(r.entry.identity) !== JSON.stringify(identity),
-      )
+      JSON.stringify(first.entry.identity) !== JSON.stringify(identity) ||
+      resolved.some((r) => r.token !== first.token)
     )
       throw new Error('INVALID_READ_REFERENCE');
+    if (resolved.some(({ document }) => document.request)) {
+      if (refs.length !== 1) throw new Error('INVALID_READ_REFERENCE');
+      return { sourceRequest: first.document.request };
+    }
     this.entries.delete(first.token);
     this.entries.set(first.token, first.entry);
     const { documents, order, query, ...snapshot } = first.entry.snapshot;

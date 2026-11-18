@@ -1,4 +1,4 @@
-import { isRpcRequest, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
+import { isRpcRequest, parseJson, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
 // Bound each newline-delimited request before decoding UTF-8.
 export class StdioTransport {
@@ -41,10 +41,9 @@ export class StdioTransport {
     // Split before concatenation, so an oversized line never grows the buffer
     // without bound, even if the peer keeps writing without a newline.
     let start = 0;
-    for (let i = 0; i <= chunk.length; i++) {
-      if (i < chunk.length && chunk[i] !== 10) continue;
-      const part = chunk.subarray(start, i);
-      start = i + 1;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(10, start);
+      const part = chunk.subarray(start, newline < 0 ? chunk.length : newline);
       if (!this.discarding) {
         const size = this.bufferLength + part.length;
         if (size > MCP_INPUT_LIMIT) {
@@ -68,19 +67,19 @@ export class StdioTransport {
           this.bufferLength = size;
         }
       }
-      if (i < chunk.length) {
-        if (!this.discarding && this.bufferLength)
-          this.line(this.buffer.subarray(0, this.bufferLength));
-        this.buffer = Buffer.alloc(0);
-        this.bufferLength = 0;
-        this.discarding = false;
-      }
+      if (newline < 0) return;
+      if (!this.discarding && this.bufferLength)
+        this.line(this.buffer.subarray(0, this.bufferLength));
+      this.buffer = Buffer.alloc(0);
+      this.bufferLength = 0;
+      this.discarding = false;
+      start = newline + 1;
     }
   }
   line(bytes) {
     let body;
     try {
-      body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+      body = parseJson(bytes);
     } catch {
       this.track(this.write(rpcError(null, -32700, 'Parse error')));
       return;
