@@ -748,10 +748,9 @@ export class Bridge {
     return { session, runtime };
   }
   // Existing owners remain usable without their original cwd; only a new
-  // writer needs a validated directory and a valid saved transcript.
+  // writer needs a validated directory. PiRpc validates history under its claim.
   async #coldStart(session, beforeResolve = () => {}) {
     await validateExecutionCwd(session.cwd);
-    await loadSavedSession(session, { config: this.config });
     await beforeResolve();
     return this.pool.resolve(session);
   }

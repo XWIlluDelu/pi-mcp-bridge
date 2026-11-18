@@ -58,7 +58,9 @@ Thinking-only calls require a current model and act on it at execution. Selectio
 
 Busy selection is supported. Issued provider requests keep their captured settings; later provider calls, including continuations and queued input, use the current selection. Bridge serializes its own same-session mutations while independent native actions remain possible. Prompt preflight and concurrent Stop do not block selection. An unresolved setter blocks overlapping settings/input until it settles. Partial changes are not rolled back.
 
-Owned RPCs, ordinary TUI/RPC companions and supplied SDK/RPC bindings support native setters. Custom hosts use the optional [setModel callback](runtime.md#host-model-setter); a missing callback returns `MODEL_SELECTION_UNSUPPORTED`. Without a live owner, Bridge validates the saved session/cwd and cold-resumes an owned RPC, which becomes eligible for normal idle release, including after failure. Native launch overrides apply at each cold start.
+Owned RPCs, ordinary TUI/RPC companions and supplied SDK/RPC bindings support native setters. Custom hosts use the optional [setModel callback](runtime.md#host-model-setter); a missing callback returns `MODEL_SELECTION_UNSUPPORTED`. Without a live owner, Bridge validates the saved session/cwd and cold-resumes an owned RPC, which becomes eligible for normal idle release, including after failure.
+
+On a cold start with an empty context, Bridge restores recorded model and thinking settings from the saved native branch before accepting input. Explicit native launch overrides take precedence. If the saved model is unavailable, Pi's startup model remains in use. Independently launched Pi 1.5.2 owners use native defaults when resuming a branch with no context messages.
 
 The acknowledgement budget is five seconds per native/IPC request; there is no
 tool timeout parameter. A lost or late confirmation produces `uncertain:true`
@@ -66,10 +68,6 @@ and the setting may already have changed. Owned RPCs retain matching late-ACK
 tracking; attached setters stay fenced until their native call settles. Neither
 path retries the selection. Inspect `list.status` and authorized read before
 another call.
-
-### Empty-context resume limitation
-
-Pi 1.5.2 restores saved model and thinking settings at startup only when the current branch produces context messages. A session whose first input was handled without a run or refused before dispatch can remain empty. In that case, `set_model` writes selection entries and the next cold resume selects native defaults.
 
 ## Prompt model and thinking settings
 
@@ -87,7 +85,7 @@ Send and create accept either setting, including create's first prompt, together
 - Model only: preserve current effort, using Pi's native compatible fallback if unsupported by the new model.
 - Thinking only: validate and set the level on the current model.
 - Both: validate thinking against the target model before either change.
-- Neither: follow native selection, including cold-start restoration, launch overrides, availability and the [empty-context limitation](#empty-context-resume-limitation).
+- Neither: use the owner's selection, including cold-start restoration, launch overrides and model availability.
 
 Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, restricted
 to the target's supported set. Unsupported explicit levels return
@@ -131,7 +129,7 @@ gate; a missing callback returns `COMPACT_UNSUPPORTED`.
 
 Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
 
-`status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. The internal five-second acknowledgement budget does not abort compaction; an expired wait returns an unknown outcome, and native history can show a later completed summary. Attached operations retain their input fence until the native callback or controller Promise settles.
+`status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. If the five-second acknowledgement budget expires after dispatch, the result is `status:"unknown"` with `reason:"ACK_TIMEOUT"`. Native compaction can finish after the caller stops waiting. Attached operations retain their input fence until the native callback or controller Promise settles.
 
 The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect list/read; a new call performs another compaction.
 

@@ -10,7 +10,10 @@ export async function releasedEntries(bridge, id) {
   await until(() => !bridge.pool.get(id) && !bridge.autoReleases.size);
   return savedEntries(bridge, id);
 }
-export async function fixture(t) {
+export async function fixture(
+  t,
+  { modelArgs = ['--provider', 'model-fixture', '--model', 'alpha', '--thinking', 'off'] } = {},
+) {
   const f = await nativeOwner(t, {
     prefix: 'model',
     reloadConfig: true,
@@ -33,12 +36,7 @@ export async function fixture(t) {
         '--no-extensions',
         '-e',
         path.resolve('test/fixtures/model-provider.mjs'),
-        '--provider',
-        'model-fixture',
-        '--model',
-        'alpha',
-        '--thinking',
-        'off',
+        ...modelArgs,
       );
       const agent = config.piRuntime.agentDir;
       await fs.writeFile(
@@ -50,6 +48,9 @@ export async function fixture(t) {
       await fs.writeFile(
         path.join(agent, 'settings.json'),
         JSON.stringify({
+          defaultProvider: 'model-fixture',
+          defaultModel: 'alpha',
+          defaultThinkingLevel: 'off',
           cacheWarming: 'off',
           retry: { enabled: false },
           images: { autoResize: false },

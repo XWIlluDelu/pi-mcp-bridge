@@ -20,10 +20,46 @@ import {
 } from './attachment-protocol.mjs';
 import { parseCompactInput, compactMetadata, nativeCompactReason } from './compact.mjs';
 import { publicError } from './errors.mjs';
+import { sameModel, thinkingLevelSchema } from './models.mjs';
+
+async function restoreEmptyContextSelection(pi, ctx, { file, sessionId, leafId }) {
+  const manager = ctx.sessionManager;
+  if (manager.getSessionFile() !== file || manager.getSessionId() !== sessionId) return;
+  const branch = manager.getBranch(leafId);
+  // Pi 1.5.2 skips restoration when projection produces no context messages.
+  // Read the pre-start branch so startup's model/thinking entries cannot win.
+  if (!branch.length || sdk.buildSessionContext(branch, leafId).messages.length) return;
+  const savedModel = branch.findLast((entry) => entry.type === 'model_change');
+  const savedThinking = branch.findLast((entry) => entry.type === 'thinking_level_change');
+  if (!savedModel && !savedThinking) return;
+
+  const args = sdk.parseArgs(process.argv.slice(2));
+  const registry = ctx.modelRegistry;
+  const model = !args.model && savedModel && registry.find(savedModel.provider, savedModel.modelId);
+  let level = args.thinking;
+  if (model && !sameModel(model, ctx.model)) {
+    if ((await pi.setModel(model)) && !sameModel(model, ctx.model)) return;
+  }
+  if (level === undefined && args.model) {
+    level = sdk.resolveCliModel({
+      cliProvider: args.provider,
+      cliModel: args.model,
+      inlineApiKey: Boolean(args.apiKey),
+      modelRuntime: {
+        getModels: () => registry.getAll(),
+        hasConfiguredAuth: (provider) => registry.hasConfiguredAuth({ provider }),
+      },
+    }).thinkingLevel;
+  }
+  level ??= savedThinking?.thinkingLevel;
+  if (ctx.model && thinkingLevelSchema.safeParse(level).success && level !== pi.getThinkingLevel())
+    pi.setThinkingLevel(level);
+}
+
 export default async function rpcObserver(pi) {
   const value = process.env.PI_MCP_RPC_OBSERVER;
   if (!value) return;
-  const { socket, generation, ownerControl } = JSON.parse(value);
+  const { socket, generation, ownerControl, resume } = JSON.parse(value);
   const admission = reloadAdmission(sdk.AgentSession);
   let server, context;
   const connections = new Set();
@@ -71,6 +107,10 @@ export default async function rpcObserver(pi) {
       return { cancel: true };
   });
   pi.on('session_before_fork', () => ({ cancel: true }));
+  if (resume?.leafId)
+    pi.on('session_start', (event, ctx) => {
+      if (event.reason === 'startup') return restoreEmptyContextSelection(pi, ctx, resume);
+    });
   pi.on('session_start', async (_event, ctx) => {
     context = ctx;
     admission.setOnIdle(ctx.sessionManager, () => {

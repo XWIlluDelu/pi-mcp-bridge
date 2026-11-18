@@ -102,13 +102,17 @@ for (const route of ['companion', 'binding']) {
     { timeout: 15000 },
     async (t) => {
       const f = await attached(t, route);
-      ackTimeout(t, ['compact']);
+      if (route === 'binding') ackTimeout(t, ['compact']);
       const result = await f.bridge.compact({
         session_id: f.id,
         interrupt: true,
         instructions: 'HOLD_COMPACT',
       });
-      assert.equal(result.status, 'unknown', JSON.stringify(result));
+      assert.deepEqual(result, {
+        status: 'unknown',
+        reason: 'ACK_TIMEOUT',
+        native_effects: 'native_compact_attempted',
+      });
       await until(() => exists(f.gate + '.compact-start'));
       assert.equal(
         (await f.bridge.send({ session_id: f.id, text: 'NOT_SENT' })).reason,
@@ -126,6 +130,10 @@ for (const route of ['companion', 'binding']) {
       assert.equal(
         (await f.client.getEntries()).entries.filter((e) => e.type === 'compaction').length,
         1,
+      );
+      assert.match(
+        JSON.stringify(await f.bridge.read({ session_id: f.id, view: 'session' })),
+        /Native fixture summary HOLD_COMPACT/,
       );
     },
   );

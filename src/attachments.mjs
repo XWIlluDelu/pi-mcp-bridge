@@ -536,7 +536,13 @@ export class AttachedRuntime {
       // remains open after that caller times out, until a reply or exact exit.
       const abort = () =>
         finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating));
-      const timer = timeout === null ? undefined : setTimeout(abort, timeout);
+      const timer =
+        timeout === null
+          ? undefined
+          : setTimeout(
+              () => finish(new AttachmentFailure('ACK_TIMEOUT', written && mutating)),
+              timeout,
+            );
       signal?.addEventListener('abort', abort, { once: true });
       socket.on('error', abort);
       socket.on('end', abort);

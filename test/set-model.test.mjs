@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { fixture, until, choice, releasedEntries } from './fixtures/model-runtime.mjs';
+import { pngImage } from './fixtures/image-input.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -163,6 +164,61 @@ test('cold setters return native thinking adjustment, produce no prompt and rele
   entries = await releasedEntries(bridge, id);
   assert.equal(entries.filter((e) => e.message).length, 0);
   assert.equal(await fs.readFile(f.settings, 'utf8'), defaults);
+});
+
+test('cold send restores a standalone model selection from a branch with no messages', async (t) => {
+  const { bridge, id, settings } = await fixture(t, { modelArgs: [] });
+  const defaults = await fs.readFile(settings, 'utf8');
+  const selection = { model: choice('vision'), thinking_level: 'low' };
+  assert.deepEqual(await bridge.set_model({ session_id: id, ...selection }), selection);
+  const saved = await releasedEntries(bridge, id);
+  assert.equal(
+    saved.some((entry) => entry.type === 'message'),
+    false,
+  );
+  assert.equal(saved.findLast((entry) => entry.type === 'model_change').modelId, 'vision');
+  assert.equal(
+    saved.findLast((entry) => entry.type === 'thinking_level_change').thinkingLevel,
+    'low',
+  );
+
+  const sent = await bridge.send({
+    session_id: id,
+    text: 'Inspect the image',
+    images: [pngImage()],
+    mode: 'idle_only',
+  });
+  assert.equal(sent.status, 'started', JSON.stringify(sent));
+  const entries = await releasedEntries(bridge, id);
+  const reply = entries.find((entry) => entry.message?.role === 'assistant').message;
+  assert.equal(reply.model, 'vision');
+  const actual = JSON.parse(reply.content[0].text.slice('MODEL_INPUT:'.length));
+  assert.equal(actual.reasoning, 'low');
+  assert.equal(
+    actual.content.some((block) => block.type === 'image'),
+    true,
+  );
+  assert.equal(await fs.readFile(settings, 'utf8'), defaults);
+});
+
+test('explicit native model and thinking options override a saved empty-branch selection', async (t) => {
+  const { bridge, id } = await fixture(t, {
+    modelArgs: ['--model', 'model-fixture/reasoner:medium'],
+  });
+  const selection = { model: choice('vision'), thinking_level: 'low' };
+  assert.deepEqual(await bridge.set_model({ session_id: id, ...selection }), selection);
+  assert.equal(
+    (await releasedEntries(bridge, id)).some((entry) => entry.message),
+    false,
+  );
+
+  const sent = await bridge.send({ session_id: id, text: 'Use the launch options' });
+  assert.equal(sent.status, 'started', JSON.stringify(sent));
+  const entries = await releasedEntries(bridge, id);
+  const reply = entries.find((entry) => entry.message?.role === 'assistant').message;
+  assert.equal(reply.model, 'reasoner');
+  const actual = JSON.parse(reply.content[0].text.slice('MODEL_INPUT:'.length));
+  assert.equal(actual.reasoning, 'medium');
 });
 
 test(

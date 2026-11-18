@@ -20,7 +20,7 @@ import {
 import { modelSettings } from './set-model.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { assertSingleSessionFile, validateExecutionCwd } from './data.mjs';
+import { assertSingleSessionFile, loadSavedSession, validateExecutionCwd } from './data.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { nativeCompactReason } from './compact.mjs';
 import { uiFacts, uiSnapshot } from './rpc-ui.mjs';
@@ -122,6 +122,11 @@ export class PiRpc {
     signal?.throwIfAborted();
     try {
       this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
+      // Capture the committed leaf before native startup can append its defaults.
+      const { leafId } = await loadSavedSession(this.session, {
+        omitImageData: true,
+        config: { piExecutable: executable.cliPath },
+      });
       await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
         socket: path.join(
           this.config.attachmentDir,
@@ -135,6 +140,7 @@ export class PiRpc {
         socket: this.ownerRecord.socket,
         generation: this.ownerRecord.generation,
         ownerControl: this.completionControl,
+        resume: { file: this.session.file, sessionId: this.session.header.id, leafId },
       });
       // Recheck at the actual launch boundary: content preflight and owner
       // reservation may have taken time since discovery verified this path.
