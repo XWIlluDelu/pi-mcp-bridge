@@ -34,8 +34,7 @@ function packageEntry(root, field) {
 function importEntry(exports) {
   return typeof exports === 'string' ? exports : exports?.import;
 }
-async function inspectPackage(command) {
-  const physical = await fs.realpath(command);
+async function inspectPackage(command, physical) {
   let directory = path.dirname(physical),
     found;
   while (true) {
@@ -60,11 +59,11 @@ async function inspectPackage(command) {
   return { command, packageRoot: root, cliPath, sdkEntry, version: value.version };
 }
 async function inspect(command) {
-  const installation = await inspectPackage(command);
+  const launcher = await fs.realpath(command);
+  const installation = await inspectPackage(command, launcher);
   if (installation) return installation;
   // The official installer publishes a launcher at <agent>/bin/pi. Its marker
   // defines the current release layout; arbitrary shell wrappers are not parsed.
-  const launcher = await fs.realpath(command);
   if (path.basename(launcher) !== 'pi' || path.basename(path.dirname(launcher)) !== 'bin')
     throw new Error('PI_INSTALLATION_UNAVAILABLE');
   const managedRoot = path.join(path.dirname(path.dirname(launcher)), 'install');
@@ -86,7 +85,7 @@ async function inspect(command) {
       throw new Error();
     const release = path.join(managedRoot, 'releases', version, 'node_modules', '.bin', 'pi');
     await executable(release);
-    const selected = await inspectPackage(release);
+    const selected = await inspectPackage(release, await fs.realpath(release));
     if (!selected || selected.version !== version) throw new Error();
     // Do not invoke the switching launcher after binding this release's SDK.
     return { ...selected, command: selected.cliPath, managedRoot };
@@ -128,6 +127,29 @@ export async function piLaunchEnvironment(installation, env, cwd = process.cwd()
     // The installer uses the existing Node when it did not install its own.
   }
   return next;
+}
+export function launchProfile(config, hostEnv = process.env) {
+  const { inheritEnv, tools, agentDir } = config.piRuntime ?? {};
+  const env =
+    inheritEnv === undefined
+      ? { ...hostEnv }
+      : Object.fromEntries(
+          inheritEnv
+            .filter((name) => hostEnv[name] !== undefined)
+            .map((name) => [name, hostEnv[name]]),
+        );
+  if (inheritEnv !== undefined) env.PATH ??= hostEnv.PATH ?? '/usr/bin:/bin';
+  if (agentDir !== undefined) env.PI_CODING_AGENT_DIR = agentDir;
+  return {
+    env,
+    toolArgs:
+      tools === undefined ? [] : tools.length ? ['--tools', tools.join(',')] : ['--no-tools'],
+  };
+}
+export async function resolvePiLaunch(config, cwd, hostEnv) {
+  const { env, toolArgs } = launchProfile(config, hostEnv);
+  const installation = await resolvePiInstallation(config, env);
+  return { installation, toolArgs, env: await piLaunchEnvironment(installation, env, cwd) };
 }
 export function loadPiSdk(installation) {
   return import(pathToFileURL(installation.sdkEntry).href);

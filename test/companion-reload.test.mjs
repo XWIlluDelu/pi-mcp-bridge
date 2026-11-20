@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
-import { launchProfile } from '../src/runtime/rpc.mjs';
+import { launchProfile } from '../src/runtime/pi-installation.mjs';
 import { gatedExtension } from './fixtures/native-owner.mjs';
 import { readClaim } from '../src/runtime/attachments.mjs';
 

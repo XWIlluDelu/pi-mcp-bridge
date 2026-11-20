@@ -1,8 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { launchProfile } from '../runtime/rpc.mjs';
-import { resolvePiInstallation, piLaunchEnvironment } from '../runtime/pi-installation.mjs';
+import { resolvePiLaunch } from '../runtime/pi-installation.mjs';
 import { diagnostics } from '../core/diagnostics.mjs';
 
 const execute = promisify(execFile);
@@ -11,10 +10,8 @@ const helper = fileURLToPath(new URL('./native-model-catalog.mjs', import.meta.u
 // A separate process gives native configuration its owner-selected environment
 // without temporarily mutating Bridge process.env or sharing provider registries.
 export async function loadModelCatalog(config, { offset, limit }) {
-  const { env: baseEnv } = launchProfile(config);
-  const installation = await resolvePiInstallation(config, baseEnv);
-  const env = await piLaunchEnvironment(installation, baseEnv);
-  let stage = 'subprocess';
+  const { installation, env } = await resolvePiLaunch(config);
+  let failure;
   try {
     const { stdout } = await execute(
       process.execPath,
@@ -25,29 +22,23 @@ export async function loadModelCatalog(config, { offset, limit }) {
         maxBuffer: 512 * 1024,
       },
     );
-    stage = 'response';
-    return JSON.parse(stdout);
+    const result = JSON.parse(stdout);
+    if (!result.failure) return result;
+    failure = result.failure;
   } catch (error) {
-    let failure;
-    if (stage === 'subprocess') {
-      try {
-        failure = JSON.parse(error.stderr);
-      } catch {}
-    }
-    // The diagnostic sink accepts only known stage/reason values, never raw
-    // subprocess text. Remote callers keep a content-free public error.
-    diagnostics.emit('model_catalog.failure', {
-      catalog_stage: failure?.stage ?? stage,
-      catalog_reason:
-        failure?.reason ??
-        (stage === 'response'
-          ? 'invalid_response'
-          : error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
-            ? 'output_limit'
-            : error.killed
-              ? 'timeout'
-              : 'process_failed'),
-    });
-    throw new Error('MODEL_CATALOG_UNAVAILABLE');
+    const invalid = error instanceof SyntaxError;
+    failure = {
+      catalog_stage: invalid ? 'response' : 'subprocess',
+      catalog_reason: invalid
+        ? 'invalid_response'
+        : error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+          ? 'output_limit'
+          : error.killed
+            ? 'timeout'
+            : 'process_failed',
+    };
   }
+  const { catalog_stage, catalog_reason } = failure;
+  diagnostics.emit('model_catalog.failure', { catalog_stage, catalog_reason });
+  throw new Error('MODEL_CATALOG_UNAVAILABLE');
 }

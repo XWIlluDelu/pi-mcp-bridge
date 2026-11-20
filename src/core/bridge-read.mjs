@@ -6,8 +6,8 @@ import { prepareContextRead } from '../read/context-read.mjs';
 import { captureSessionRead } from '../compat/session-readers.mjs';
 import { checkObservation, unavailableObservation } from '../read/context-observation.mjs';
 import { readSessionIdentity, loadSavedSession } from './data.mjs';
-import { PiRpc, launchProfile } from '../runtime/rpc.mjs';
-import { nativeSdk } from '../runtime/pi-installation.mjs';
+import { PiRpc } from '../runtime/rpc.mjs';
+import { launchProfile, nativeSdk } from '../runtime/pi-installation.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { ownerReadFeatures } from '../read/read-features.mjs';
 

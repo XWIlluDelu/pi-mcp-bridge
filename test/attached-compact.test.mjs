@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
-import { launchProfile } from '../src/runtime/rpc.mjs';
+import { launchProfile } from '../src/runtime/pi-installation.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativeRpc, nativeRpcHost } from './fixtures/native-rpc.mjs';
 const exists = (file) =>

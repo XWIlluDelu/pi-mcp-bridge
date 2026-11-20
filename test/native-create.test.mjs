@@ -67,7 +67,7 @@ const script = `
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {Bridge} from ${JSON.stringify(moduleUrl('src/core/bridge.mjs'))};
-import {launchProfile} from ${JSON.stringify(moduleUrl('src/runtime/rpc.mjs'))};
+import {launchProfile} from ${JSON.stringify(moduleUrl('src/runtime/pi-installation.mjs'))};
 import {denyAllPermissions} from ${JSON.stringify(new URL('./fixtures/permissions.mjs', import.meta.url).href)};
 import {SessionManager, RpcClient} from ${JSON.stringify(sdkEntry)};
 const scenario=JSON.parse(process.argv[1]), home=process.env.HOME, project=path.join(home,'project');

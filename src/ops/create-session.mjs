@@ -4,13 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import {
-  resolvePiInstallation,
-  piLaunchEnvironment,
-  loadPiSdk,
-} from '../runtime/pi-installation.mjs';
+import { resolvePiLaunch, loadPiSdk } from '../runtime/pi-installation.mjs';
 import { sessionKey, syncDir, assertNativeDirectory, writeNewFile } from '../core/storage.mjs';
-import { launchProfile } from '../runtime/rpc.mjs';
 import { traceSessionBranch } from '../core/data.mjs';
 const exec = promisify(execFile);
 
@@ -18,9 +13,7 @@ const exec = promisify(execFile);
 // in-memory manager forks the native branch and its current labels without opening a writer
 // on the parent's file or switching the parent's live runtime.
 export async function prepareSession(config, project, { name, parentSession, captureFork } = {}) {
-  const { env: baseEnv } = launchProfile(config);
-  const installation = await resolvePiInstallation(config, baseEnv);
-  const env = await piLaunchEnvironment(installation, baseEnv, project);
+  const { installation, env } = await resolvePiLaunch(config, project);
   const sdk = captureFork ? await loadPiSdk(installation) : null;
   const snapshot = sdk ? await captureFork(sdk) : null;
   const { stdout } = await exec(

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import {
   resolvePiInstallation,
   piLaunchEnvironment,
+  launchProfile,
   loadPiSdk,
   loadPiAi,
 } from './pi-installation.mjs';
@@ -53,26 +54,6 @@ export class RpcFailure extends Error {
     this.code = code;
     this.uncertain = uncertain;
   }
-}
-export function launchProfile(config, hostEnv = process.env) {
-  // Validated with the owner configuration.
-  const { inheritEnv, tools, agentDir } = config.piRuntime ?? {};
-  const env =
-    inheritEnv === undefined
-      ? { ...hostEnv }
-      : Object.fromEntries(
-          inheritEnv
-            .filter((name) => hostEnv[name] !== undefined)
-            .map((name) => [name, hostEnv[name]]),
-        );
-  if (inheritEnv !== undefined) env.PATH ??= hostEnv.PATH ?? '/usr/bin:/bin';
-  if (agentDir !== undefined) env.PI_CODING_AGENT_DIR = agentDir;
-  // Pi resolves HOME, its native agent directory and resource/settings defaults.
-  return {
-    env,
-    toolArgs:
-      tools === undefined ? [] : tools.length ? ['--tools', tools.join(',')] : ['--no-tools'],
-  };
 }
 export class PiRpc {
   constructor(config, session, { completionControl, compatibility } = {}) {

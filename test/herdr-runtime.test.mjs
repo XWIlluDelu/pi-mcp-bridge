@@ -5,7 +5,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Bridge } from '../src/core/bridge.mjs';
-import { launchProfile } from '../src/runtime/rpc.mjs';
+import { launchProfile } from '../src/runtime/pi-installation.mjs';
 import { fileURLToPath } from 'node:url';
 import { findHerdr, HerdrControl } from '../src/runtime/herdr-control.mjs';
 import { HerdrRpcTransport, prepareHerdr } from '../src/runtime/herdr-rpc-transport.mjs';
