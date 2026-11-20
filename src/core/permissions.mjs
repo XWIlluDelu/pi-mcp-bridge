@@ -50,18 +50,32 @@ export function permitted(config, action, session) {
 }
 
 // Diagnostics do not add dependencies between permissions or change admission.
-function permissionWarnings(config, target = {}) {
+function permissionWarnings(config, target, issues) {
+  const sessionId = target.session_id;
   const effective = Object.fromEntries(
     ACTIONS.map((action) => [action, resolvePermission(config, action, target)]),
   );
   const allow = (action) => effective[action].allowed;
-  const warnings = [];
-  const add = (code, message, actions) =>
-    warnings.push({
-      code,
-      message,
-      evidence: Object.fromEntries(actions.map((action) => [action, effective[action]])),
-    });
+  const add = (code, message, actions) => {
+    const evidence = {};
+    let scope = sessionId ? { session_id: sessionId } : { default: true };
+    for (const action of actions) {
+      const { allowed, sourceScope } = effective[action];
+      const { session_id, folder } = sourceScope;
+      if (!sessionId && folder && folder.length > (scope.folder?.length ?? 0)) scope = { folder };
+      const source = sessionId
+        ? session_id
+          ? 'session'
+          : folder
+            ? 'project'
+            : 'default'
+        : sourceScope;
+      evidence[action] = { allowed, source };
+    }
+    const issue = { code, message, scope, evidence };
+    // Report inherited combinations once, at the rule that supplied them.
+    issues.set(JSON.stringify(issue), issue);
+  };
   const known = ['read', 'send', 'command', 'stop', 'delete'].filter(allow);
   const work = ['send', 'command'].filter(allow);
   if (!allow('list') && known.length)
@@ -75,13 +89,14 @@ function permissionWarnings(config, target = {}) {
       'read',
       ...work,
     ]);
-  const started = [...work, ...(!target.session_id && allow('create') ? ['create'] : [])];
+  const creates = !sessionId && allow('create');
+  const started = creates ? [...work, 'create'] : work;
   if (!allow('stop') && started.length)
     add('NO_REMOTE_STOP', 'Work can be started, but this client cannot stop it.', [
       'stop',
       ...started,
     ]);
-  if (!target.session_id && allow('create')) {
+  if (creates) {
     const missing = ['list', 'read', 'send'].filter((action) => !allow(action));
     if (missing.length)
       add(
@@ -96,49 +111,14 @@ function permissionWarnings(config, target = {}) {
       'Blocking the direct command endpoint does not disable shell tools available to Pi itself.',
       ['send', 'command'],
     );
-  return warnings;
 }
 
 export function permissionsHealth(config, target) {
-  const reports = target
-    ? [permissionWarnings(config, target)]
-    : [
-        permissionWarnings(config),
-        ...config.folders.map(({ path }) => permissionWarnings(config, { folder: path })),
-      ];
   const issues = new Map();
-  for (const warning of reports.flat()) {
-    const evidence = Object.fromEntries(
-      Object.entries(warning.evidence).map(([action, value]) => [
-        action,
-        {
-          allowed: value.allowed,
-          source: target?.session_id
-            ? value.sourceScope?.session_id
-              ? 'session'
-              : value.sourceScope?.folder
-                ? 'project'
-                : 'default'
-            : value.sourceScope,
-        },
-      ]),
-    );
-    const folder = Object.values(evidence)
-      .map((value) => value.source?.folder)
-      .filter(Boolean)
-      .sort((a, b) => b.length - a.length)[0];
-    const issue = {
-      code: warning.code,
-      message: warning.message,
-      scope: target?.session_id
-        ? { session_id: target.session_id }
-        : folder
-          ? { folder }
-          : { default: true },
-      evidence,
-    };
-    // Inherited combinations point to their source rules once, not every project.
-    issues.set(JSON.stringify(issue), issue);
+  if (target) permissionWarnings(config, target, issues);
+  else {
+    permissionWarnings(config, {}, issues);
+    for (const { path } of config.folders) permissionWarnings(config, { folder: path }, issues);
   }
   return {
     domain: 'permissions',

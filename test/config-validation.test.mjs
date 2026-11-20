@@ -36,6 +36,14 @@ test('current policy validates without mutation and snapshot rejects invalid cha
     snapshot = structuredClone(f.config);
   assert.strictEqual(validateOwnerConfig(f.config), f.config);
   assert.deepEqual(f.config, snapshot);
+  const [root] = f.config.sessionRoots;
+  assert.doesNotThrow(() =>
+    validateOwnerConfig({ ...f.config, sessionRoots: [root, root + '-2'] }),
+  );
+  assert.throws(
+    () => validateOwnerConfig({ ...f.config, sessionRoots: [root, root + '-2', root + '/child'] }),
+    /OVERLAPPING_STORAGE/,
+  );
   const bridge = await f.start();
   const first = await bridge.captureRequestContext();
   assert.strictEqual(await bridge.captureRequestContext(), first);

@@ -1,18 +1,22 @@
 // Owner-side configuration edits only. Not exposed as an MCP operation.
 import { validateCompatibilityModules } from '../compat/compatibility.mjs';
+import { parseAs } from '../mcp/schema.mjs';
 import path from 'node:path';
 import { z } from 'zod';
-import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
+import { ACTIONS, resolvePermission } from './permissions.mjs';
 import { hash, atomicJson, readPrivateFile } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
 import { loadPiSdk } from '../runtime/pi-installation.mjs';
 const MAX_OWNER_CONFIG_BYTES = 1024 * 1024;
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+const permissionValue = (value) => value === null || typeof value === 'boolean';
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
 const absolutePath = z.string().refine(absolute);
 const textArgument = z.string().refine((value) => !value.includes('\0'));
-const projectFolder = z.strictObject({ path: absolutePath });
+const projectFolders = z
+  .array(z.strictObject({ path: absolutePath }))
+  .refine((folders) => new Set(folders.map(({ path }) => path)).size === folders.length);
 const ownerShape = z.strictObject({
   stateDir: absolutePath,
   sessionRoots: z.array(absolutePath).min(1),
@@ -67,60 +71,43 @@ export async function validateLaunchArgs(installation, args = [], mode) {
 // Shape validation is shared by initialization, file reload and both transports.
 // Filesystem existence/privacy and execution-time cwd checks remain separate.
 export function validateOwnerConfig(config) {
-  if (!ownerShape.safeParse(config).success) throw new Error('INVALID_OWNER_CONFIG');
-  const paths = new Set();
-  for (const folder of config.folders) {
-    if (!projectFolder.safeParse(folder).success || paths.has(folder.path))
-      throw new Error('INVALID_PROJECT_FOLDER');
-    paths.add(folder.path);
-  }
+  parseAs(ownerShape, config, 'INVALID_OWNER_CONFIG');
+  parseAs(projectFolders, config.folders, 'INVALID_PROJECT_FOLDER');
   validatePermissionValues(config.defaults);
   validateGrants(config.grants);
   validateCompatibilityModules(config.compatibilityModules);
-  if (config.piRuntime !== undefined && !piRuntimeShape.safeParse(config.piRuntime).success)
-    throw new Error('INVALID_PI_RUNTIME');
-  const dirs = [config.stateDir, ...config.sessionRoots];
-  for (let i = 0; i < dirs.length; i++)
-    for (let j = i + 1; j < dirs.length; j++)
-      if (inside(dirs[i], dirs[j]) || inside(dirs[j], dirs[i]))
-        throw new Error('OVERLAPPING_STORAGE');
-  if (config.http !== undefined && !httpShape.safeParse(config.http).success)
-    throw new Error('INVALID_HTTP_CONFIG');
+  if (config.piRuntime !== undefined)
+    parseAs(piRuntimeShape, config.piRuntime, 'INVALID_PI_RUNTIME');
+  // Directory separators keep each ancestor adjacent to its descendants.
+  const dirs = [config.stateDir, ...config.sessionRoots]
+    .map((dir) => path.join(path.resolve(dir), path.sep))
+    .sort();
+  if (dirs.some((dir, i) => dirs[i + 1]?.startsWith(dir))) throw new Error('OVERLAPPING_STORAGE');
+  if (config.http !== undefined) parseAs(httpShape, config.http, 'INVALID_HTTP_CONFIG');
   return config;
 }
-function validatePermissionValues(values, scopeKeys = []) {
-  if (
-    !object(values) ||
-    Object.keys(values).some((key) => !ACTIONS.includes(key) && !scopeKeys.includes(key))
-  )
+function validatePermissionValues(values, scope) {
+  if (!object(values) || Object.keys(values).some((key) => key !== scope && !ACTIONS.includes(key)))
     throw new Error('INVALID_PERMISSION_FIELD');
   for (const action of ACTIONS)
-    if (
-      Object.hasOwn(values, action) &&
-      values[action] !== null &&
-      typeof values[action] !== 'boolean'
-    )
+    if (Object.hasOwn(values, action) && !permissionValue(values[action]))
       throw new Error('INVALID_OWNER_CONFIG');
+}
+function validateGrant(rule) {
+  if (!object(rule)) throw new Error('INVALID_OWNER_CONFIG');
+  const session = Object.hasOwn(rule, 'session_id');
+  if (session === Object.hasOwn(rule, 'folder')) throw new Error('INVALID_OWNER_CONFIG');
+  const { session_id, folder } = rule;
+  const validScope = session
+    ? typeof session_id === 'string' && session_id.length > 0 && session_id.length <= 128
+    : absolute(folder);
+  if (!validScope) throw new Error('INVALID_OWNER_CONFIG');
+  validatePermissionValues(rule, session ? 'session_id' : 'folder');
+  if (session && Object.hasOwn(rule, 'create')) throw new Error('CREATE_REQUIRES_PROJECT_SCOPE');
 }
 export function validateGrants(grants = []) {
   if (!Array.isArray(grants)) throw new Error('INVALID_OWNER_CONFIG');
-  for (const rule of grants) {
-    if (!rule || typeof rule !== 'object' || Array.isArray(rule))
-      throw new Error('INVALID_OWNER_CONFIG');
-    const session = Object.hasOwn(rule, 'session_id'),
-      folder = Object.hasOwn(rule, 'folder');
-    if (session === folder) throw new Error('INVALID_OWNER_CONFIG');
-    if (
-      session &&
-      (typeof rule.session_id !== 'string' ||
-        rule.session_id.length === 0 ||
-        rule.session_id.length > 128)
-    )
-      throw new Error('INVALID_OWNER_CONFIG');
-    if (folder && !absolute(rule.folder)) throw new Error('INVALID_OWNER_CONFIG');
-    validatePermissionValues(rule, ['session_id', 'folder']);
-    if (session && Object.hasOwn(rule, 'create')) throw new Error('CREATE_REQUIRES_PROJECT_SCOPE');
-  }
+  for (const rule of grants) validateGrant(rule);
   return grants;
 }
 export async function readOwnerConfig(file, { cached } = {}) {
@@ -161,19 +148,19 @@ export function permissionDetails(config, action, target) {
 export async function editPermission(file, revision, target, action, value) {
   if (
     !ACTIONS.includes(action) ||
-    ![true, false, null].includes(value) ||
+    !permissionValue(value) ||
     (target.session_id && action === 'create')
   )
     throw new Error('INVALID_PERMISSION_EDIT');
   const scope = target.default
-    ? {}
+    ? null
     : target.session_id
       ? { session_id: target.session_id }
       : { folder: target.folder };
-  if (!target.default) validateGrants([{ ...scope, [action]: value }]);
+  if (scope) validateGrant({ ...scope, [action]: value });
   // Project grants address the recorded identity, not the current filesystem.
   // Editing policy must remain possible after cleanup or symlink replacement.
-  if (scope.folder) scope.folder = path.resolve(scope.folder);
+  if (scope?.folder) scope.folder = path.resolve(scope.folder);
   const lock = await kernelLock('permissions:' + file, { busy: 'OWNER_CONFIG_BUSY' });
   try {
     const readCurrent = async () => {
@@ -182,20 +169,16 @@ export async function editPermission(file, revision, target, action, value) {
       return current;
     };
     const { config, mode, resolved } = await readCurrent();
-    let rule;
-    if (target.default) {
-      rule = config.defaults;
-    } else {
-      config.grants ??= [];
-      rule = config.grants.findLast((r) =>
-        scope.session_id
-          ? r.session_id === scope.session_id
-          : !r.session_id && path.resolve(r.folder) === scope.folder,
-      );
-      if (!rule) {
-        rule = { ...scope };
-        config.grants.push(rule);
-      }
+    let rule = config.defaults;
+    if (scope) {
+      const grants = (config.grants ??= []);
+      rule =
+        grants.findLast((r) =>
+          scope.session_id
+            ? r.session_id === scope.session_id
+            : !r.session_id && path.resolve(r.folder) === scope.folder,
+        ) ?? scope;
+      if (rule === scope) grants.push(rule);
     }
     rule[action] = value;
     await atomicJson(resolved, config, {

@@ -8,3 +8,9 @@ export function utf16String(max, { trim = false } = {}) {
     message: `Must contain at most ${max} UTF-16 code units`,
   });
 }
+
+export function parseAs(schema, value, errorCode) {
+  const result = schema.safeParse(value);
+  if (!result.success) throw new Error(errorCode);
+  return result.data;
+}
