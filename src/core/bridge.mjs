@@ -6,7 +6,7 @@ import { Submissions } from './submissions.mjs';
 import { publicError } from './errors.mjs';
 import { inside, permitted } from './permissions.mjs';
 import { ContextReadCache } from '../read/read-cache.mjs';
-import { CompatibilityModules } from '../compat/compatibility.mjs';
+import { startCompatibilityModules } from '../compat/compatibility.mjs';
 import { CompatibilityServices } from '../compat/compatibility-services.mjs';
 import { discover, readSessionIdentity, sameSessionIdentity } from './data.mjs';
 import { assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
@@ -18,65 +18,9 @@ import { serveOwnerControl } from '../owner-runtime.mjs';
 import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { inputOperations } from '../mcp/tool-schemas.mjs';
-import {
-  getHealth,
-  getSubmission,
-  listModels,
-  listSessions,
-  readSession,
-  searchSession,
-} from './bridge-read.mjs';
-import {
-  compactSession,
-  createSession,
-  deleteSession,
-  reloadSession,
-  runCommand,
-  sendPrompt,
-  setSessionModel,
-  stopSession,
-} from './bridge-mutations.mjs';
-import {
-  idleHandoff,
-  cancelHandoff,
-  idleCandidateForLocal,
-  releaseForLocal,
-  resetColdResume,
-  settledForLocal,
-} from './bridge-local.mjs';
-
-function scopeSnapshot(config) {
-  const folders = Object.freeze(config.folders.map((folder) => Object.freeze({ ...folder })));
-  const sessionRoots = Object.freeze([...config.sessionRoots]);
-  return Object.freeze({ folders, sessionRoots });
-}
-
-const queries = {
-  list: listSessions,
-  read: readSession,
-  search: searchSession,
-  models: listModels,
-  health: getHealth,
-  submission: getSubmission,
-};
-const mutations = {
-  send: [sendPrompt, 'send'],
-  command: [runCommand, 'command'],
-  compact: [compactSession, 'send'],
-  reload: [reloadSession, 'send'],
-  set_model: [setSessionModel, 'send'],
-  stop: [stopSession, 'stop'],
-  create: [createSession],
-  delete: [deleteSession, 'delete'],
-};
-const ownerOperations = {
-  settledForLocal,
-  handoffForLocal: idleHandoff,
-  cancelHandoff,
-  idleCandidateForLocal,
-  releaseForLocal,
-  resetColdResume,
-};
+import { queries } from './bridge-read.mjs';
+import { mutations } from './bridge-mutations.mjs';
+import * as ownerOperations from './bridge-local.mjs';
 
 export class Bridge {
   #jobs = new Map();
@@ -87,10 +31,6 @@ export class Bridge {
     this.ownerSettings = structuredClone(settings);
     this.cachedRequestPolicy = null;
     this.compatibilityServices = new CompatibilityServices();
-    this.compatibility = new CompatibilityModules(
-      config.compatibilityModules,
-      this.compatibilityServices,
-    );
     this.pool = new RuntimePool(config, factory, {
       compatibility: this.compatibilityServices,
       configFile,
@@ -127,11 +67,16 @@ export class Bridge {
       busy: 'BRIDGE_ALREADY_RUNNING',
     });
     try {
-      await this.compatibility.start();
+      this.assertOpen();
+      this.compatibility = startCompatibilityModules(
+        this.config.compatibilityModules,
+        this.compatibilityServices,
+      );
+      await this.compatibility.ready;
       await this.events.init();
       this.ownerControl = await serveOwnerControl(this);
     } catch (error) {
-      await Promise.allSettled([this.compatibility.stop(), this.events.close()]);
+      await Promise.allSettled([this.compatibility?.stop(), this.events.close()]);
       await this.lock.close();
       this.lock = null;
       throw error;
@@ -148,8 +93,11 @@ export class Bridge {
     try {
       return await fn();
     } finally {
-      if (job[name] === value) delete job[name];
-      if (!Object.keys(job).length && this.#jobs.get(id) === job) this.#jobs.delete(id);
+      if (job[name] === value) {
+        delete job[name];
+        if (!Object.keys(job).length) this.#jobs.delete(id);
+        if (name === 'stop' || name === 'bash') this.pool.instances.get(id)?.onIdleCandidate?.();
+      }
     }
   }
   locked(id, fn, lane = 'work') {
@@ -164,12 +112,14 @@ export class Bridge {
     this.mutations.add(mutation);
     return mutation;
   }
-  assertInput({ sessionId, stopped }) {
+  assertInput({ name, sessionId, stopped }) {
     // Keep cancellation across batch lanes, permission and state I/O.
     // A completed stop must not revive input that has not reached Pi yet.
     this.assertOpen();
     if (stopped || this.lane(sessionId, 'stop')) throw new Error('STOP_IN_PROGRESS');
-    if (this.handoff(sessionId)?.kind === 'delete') throw new Error('HANDOFF_PENDING');
+    const fence = this.handoff(sessionId);
+    if (fence && (fence.kind === 'delete' || name === 'command' || name === 'create'))
+      throw new Error('HANDOFF_PENDING');
   }
   handoff(id) {
     return this.lane(id, 'handoff');
@@ -230,57 +180,48 @@ export class Bridge {
       });
     return runtime.autoReleaseTask;
   }
-  async localHandoff(id, marker, fn) {
-    const release = this.autoReleaseInProgress(id);
-    if (release) await release;
-    if (this.handoff(id)) throw new Error('HANDOFF_PENDING');
-    const priorStop = this.lane(id, 'stop');
-    return this.withHandoff(id, marker, () =>
-      this.locked(id, async () => {
-        // Fence new stops before draining the one already admitted.
-        await priorStop?.catch(() => {});
-        this.assertOpen();
-        marker.controller.signal.throwIfAborted();
-        return fn();
-      }),
-    );
-  }
   async sessions(requestContext) {
     // Owner-local identity lookup is not business admission and remains available
     // during cleanup. Unknown identities use current scope, not startup roots.
-    const scope =
-      requestContext?.scope ??
-      scopeSnapshot(
-        this.configFile ? (await readOwnerConfig(this.configFile)).config : this.config,
-      );
-    const config = { ...this.config, ...scope };
-    const sessions = await diagnostics.measure('session.discover', {}, () => discover(config));
+    const sessionRoots = requestContext?.scope.sessionRoots ?? [
+      ...(this.configFile ? (await readOwnerConfig(this.configFile)).config : this.config)
+        .sessionRoots,
+    ];
+    const sessions = await diagnostics.measure('session.discover', {}, () =>
+      discover({ sessionRoots }),
+    );
     this.sessionFiles = new Map(sessions.map((s) => [s.id, s.file]));
     return sessions;
   }
-  async mutationLock(id, action, requestContext, fn, lane) {
-    const blockedReason = () =>
-      this.handoff(id) && this.handoff(id).kind !== 'auto_release'
-        ? 'HANDOFF_PENDING'
-        : action === 'send' && this.lane(id, 'stop')
-          ? 'STOP_IN_PROGRESS'
-          : null;
-    const blocked = async (reason) => {
-      try {
-        this.check(action, await this.session(id, requestContext), requestContext);
-        return { status: 'rejected', reason };
-      } catch (error) {
-        return { status: 'rejected', reason: this.safeReason(error) };
-      }
-    };
-    // The caller just authorized the target before entering this lane.
-    const reason = blockedReason();
-    if (reason) return { status: 'rejected', reason };
+  #mutationBlock(id, lane) {
+    const handoff = this.handoff(id);
+    if (handoff && handoff.kind !== 'auto_release') return 'HANDOFF_PENDING';
+    if (lane === 'work' && this.lane(id, 'stop')) return 'STOP_IN_PROGRESS';
+  }
+  #orderedMutation(name, id, right, requestContext, lane, run) {
+    if (lane === 'bash' && this.lane(id, lane))
+      return { status: 'rejected', reason: 'BASH_IN_PROGRESS', output_available: false };
+    // These calls own distinct admission checks once their lane begins.
+    if (lane === 'bash' || lane === 'delete' || name === 'set_model')
+      return this.locked(id, run, lane);
+    const reject = (reason) => ({
+      status: 'rejected',
+      reason,
+      ...(lane === 'stop' ? { withdrawn_available: false } : {}),
+    });
+    const blocked = this.#mutationBlock(id, lane);
+    if (blocked) return reject(blocked);
     return this.locked(
       id,
-      () => {
-        const reason = blockedReason();
-        return reason ? blocked(reason) : fn();
+      async () => {
+        const reason = this.#mutationBlock(id, lane);
+        if (!reason) return run();
+        try {
+          await this.authorizedSession(right, id, requestContext);
+          return reject(reason);
+        } catch (error) {
+          return reject(this.safeReason(error));
+        }
       },
       lane,
     );
@@ -288,39 +229,38 @@ export class Bridge {
   async captureRequestContext() {
     this.assertOpen();
     return diagnostics.measure('permission.snapshot', {}, async () => {
-      let policy = this.config;
-      let restartRequired = [];
-      let raw;
-      if (this.configFile) {
-        const loaded = await readOwnerConfig(this.configFile, {
-          cached: this.cachedRequestPolicy,
-        });
-        if (loaded.unchanged) return this.cachedRequestPolicy.context;
-        raw = loaded.raw;
-        const { config } = loaded;
-        const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
-        restartRequired = [
-          ...new Set([...Object.keys(this.ownerSettings), ...Object.keys(settings)]),
-        ].filter((key) => !isDeepStrictEqual(settings[key], this.ownerSettings[key]));
-        // The file was already validated. Only a pending stateDir change
-        // requires checking the new roots against another directory.
-        const active = this.config.stateDir;
-        if (
-          config.stateDir !== active &&
-          sessionRoots.some((root) => inside(root, active) || inside(active, root))
-        )
-          throw new Error('OVERLAPPING_STORAGE');
-        policy = config;
-      }
-      const defaults = Object.freeze({ ...policy.defaults });
-      const grants = Object.freeze((policy.grants ?? []).map((rule) => Object.freeze({ ...rule })));
-      const scope = scopeSnapshot(policy);
+      const loaded =
+        this.configFile &&
+        (await readOwnerConfig(this.configFile, { cached: this.cachedRequestPolicy }));
+      if (loaded?.unchanged) return this.cachedRequestPolicy.context;
+      const config = loaded?.config ?? this.config;
+      const { grants, defaults, folders, sessionRoots, herdr, ...settings } = config;
+      // The file was already validated. A pending stateDir change also needs
+      // to check the new roots against the active state directory.
+      const active = this.config.stateDir;
+      if (
+        config.stateDir !== active &&
+        sessionRoots.some((root) => inside(root, active) || inside(active, root))
+      )
+        throw new Error('OVERLAPPING_STORAGE');
       const context = Object.freeze({
-        permissions: Object.freeze({ defaults, grants }),
-        scope,
-        restartRequired: Object.freeze(restartRequired),
+        permissions: Object.freeze({
+          defaults: Object.freeze({ ...defaults }),
+          grants: Object.freeze((grants ?? []).map((rule) => Object.freeze({ ...rule }))),
+        }),
+        scope: Object.freeze({
+          folders: Object.freeze(folders.map((folder) => Object.freeze({ ...folder }))),
+          sessionRoots: Object.freeze([...sessionRoots]),
+        }),
+        restartRequired: Object.freeze(
+          loaded
+            ? [...new Set([...Object.keys(this.ownerSettings), ...Object.keys(settings)])].filter(
+                (key) => !isDeepStrictEqual(settings[key], this.ownerSettings[key]),
+              )
+            : [],
+        ),
       });
-      if (this.configFile) this.cachedRequestPolicy = { raw, config: policy, context };
+      if (loaded) this.cachedRequestPolicy = { raw: loaded.raw, config, context };
       return context;
     });
   }
@@ -349,8 +289,14 @@ export class Bridge {
     if (!sameSessionIdentity(current, session)) throw new Error('RUNTIME_SESSION_CHANGED');
     return current;
   }
-  // Request policy is immutable. Check at admission and after refreshing a
-  // target identity, not repeatedly across awaits with the same target/policy.
+  async authorizedSession(action, id, requestContext = this.captureRequestContext()) {
+    const context = await requestContext;
+    const session = await this.session(id, context);
+    this.check(action, session, context);
+    return session;
+  }
+  // An identity check preserves admission under the same immutable policy.
+  // A fresh target must be authorized before returning any of its details.
   check(action, s, requestContext) {
     const allowed = permitted(requestContext.permissions, action, s);
     diagnostics.emit('permission.check', { op: action, allowed });
@@ -369,31 +315,36 @@ export class Bridge {
   async #mutation(name, args, options) {
     this.assertOpen();
     const mutation = options?.pendingInput ?? {};
+    mutation.name = name;
     if (inputOperations.has(name) && !options?.pendingInput)
       this.registerInput(args.session_id, mutation);
     else this.mutations.add(mutation);
     let releaseCandidate;
     mutation.work = this.#requestOptions(options).then(async (request) => {
-      const [action, right] = mutations[name];
+      const [action, right, lane] = mutations[name];
       let target;
       if (right) {
         try {
-          target = await this.session(args.session_id, request.requestContext);
-          this.check(right, target, request.requestContext);
+          target = await this.authorizedSession(right, args.session_id, request.requestContext);
         } catch (error) {
           if (name !== 'send' && name !== 'delete') throw error;
           return { status: 'rejected', reason: 'NOT_FOUND_OR_DENIED' };
         }
       }
-      return action(this, args, {
-        ...request,
-        target,
-        mutation,
-        checkInput: () => this.assertInput(mutation),
-        markForAutoRelease: (runtime) => {
-          if (runtime instanceof PiRpc) releaseCandidate = runtime;
-        },
-      });
+      if (name === 'compact' && args.interrupt) this.check('stop', target, request.requestContext);
+      const run = () =>
+        action(this, args, {
+          ...request,
+          target,
+          mutation,
+          checkInput: () => this.assertInput(mutation),
+          markForAutoRelease: (runtime) => {
+            if (runtime instanceof PiRpc) releaseCandidate = runtime;
+          },
+        });
+      return lane
+        ? this.#orderedMutation(name, target.id, right, request.requestContext, lane, run)
+        : run();
     });
     try {
       return await mutation.work;
@@ -434,7 +385,7 @@ export class Bridge {
       );
       // Modules remain active until writers, ACKs and release captures drain.
       try {
-        await this.compatibility.stop();
+        await this.compatibility?.stop();
       } finally {
         if (this.lock) {
           await this.lock.close();

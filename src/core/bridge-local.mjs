@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { settledResultSchema } from '../events/settled-result.mjs';
+import { utf16String } from '../mcp/schema.mjs';
 import { assertSingleSessionFile } from './data.mjs';
 import { atomicJson, hash } from './storage.mjs';
 import { PiRpc } from '../runtime/rpc.mjs';
@@ -22,15 +23,21 @@ const settledOccurrence = z.object({
   sessionCwdHash: z.string().regex(/^[a-f0-9]{64}$/),
   generation: z.string().min(1),
   sequence: z.number().int().positive(),
-  leafId: z
-    .string()
-    .min(1)
-    .refine((id) => id.length <= 128)
-    .nullable(),
+  leafId: utf16String(128).min(1).nullable(),
   aborted: z.boolean(),
   result: settledResultSchema,
   timestamp: z.string().refine((value) => Number.isFinite(Date.parse(value))),
 });
+const handoffRequest = z.object({
+  requester: z.object({ pid: z.number().int().positive(), start: z.string(), boot: z.string() }),
+  handoff_id: z.string().regex(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/),
+});
+
+function hasOwnedGeneration(runtime, generation) {
+  return (
+    runtime instanceof PiRpc && runtime.alive && runtime.ownerRecord?.generation === generation
+  );
+}
 
 export async function settledForLocal(bridge, request) {
   bridge.assertOpen();
@@ -47,9 +54,7 @@ export async function settledForLocal(bridge, request) {
       claim?.generation !== request.generation ||
       !(await ownerAlive(claim.owner)) ||
       (claim.kind === 'rpc'
-        ? !(runtime instanceof PiRpc) ||
-          !runtime.alive ||
-          runtime.ownerRecord?.generation !== claim.generation
+        ? !hasOwnedGeneration(runtime, claim.generation)
         : claim.phase !== 'ready' || !bridge.events.supports({ attached: true, record: claim }))
     )
       throw new Error('INVALID_OWNER_COMMAND');
@@ -68,36 +73,48 @@ export async function settledForLocal(bridge, request) {
 export function idleCandidateForLocal(bridge, request) {
   bridge.assertOpen();
   const runtime = bridge.pool.instances.get(request.session_id);
-  if (
-    !(runtime instanceof PiRpc) ||
-    !runtime.alive ||
-    request.generation !== runtime.ownerRecord?.generation
-  )
-    throw new Error('INVALID_OWNER_COMMAND');
+  if (!hasOwnedGeneration(runtime, request.generation)) throw new Error('INVALID_OWNER_COMMAND');
   runtime.onIdleCandidate?.();
   return {};
 }
 
-async function localRuntime(bridge, session) {
-  if (bridge.pool.starting.has(session.id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
-  const runtime = await bridge.pool.forRead(session);
-  if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
-  return runtime;
+async function closeLocalWriter(bridge, id, marker, signal, close) {
+  const release = bridge.autoReleaseInProgress(id);
+  if (release) await release;
+  if (bridge.handoff(id)) throw new Error('HANDOFF_PENDING');
+  const stop = bridge.lane(id, 'stop');
+  return bridge.withHandoff(id, marker, () =>
+    bridge.locked(id, async () => {
+      // Fence new stops before draining the one already admitted.
+      await stop?.catch(() => {});
+      bridge.assertOpen();
+      signal.throwIfAborted();
+      const { requester, kind } = marker;
+      if (requester && !(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
+      const owned = bridge.pool.instances.get(id);
+      let session;
+      // Explicit release can reach an owned child even after its history disappears.
+      if (
+        kind === 'release' &&
+        owned instanceof PiRpc &&
+        owned.alive &&
+        (await assertSingleSessionFile(owned.session.file, { allowMissing: true })) === null
+      ) {
+        await owned.assertProcessIdentity();
+        session = owned.session;
+      } else session = await bridge.session(id);
+      if (bridge.pool.starting.has(id)) throw new Error('RUNTIME_IDLE_UNCONFIRMED');
+      const runtime = await bridge.pool.forRead(session);
+      if (runtime?.attached) throw new Error('EXTERNAL_OWNER_NOT_RELEASABLE');
+      return close(session, runtime, bridge.pool.attachmentDir);
+    }),
+  );
 }
 
 function validateHandoff(request) {
-  const { requester, handoff_id } = request;
-  if (
-    !Number.isSafeInteger(requester?.pid) ||
-    requester.pid < 1 ||
-    typeof requester.start !== 'string' ||
-    typeof requester.boot !== 'string' ||
-    typeof handoff_id !== 'string' ||
-    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(handoff_id)
-  )
-    throw new Error('INVALID_OWNER_COMMAND');
+  if (!handoffRequest.safeParse(request).success) throw new Error('INVALID_OWNER_COMMAND');
 }
-export async function idleHandoff(bridge, request, { signal } = {}) {
+export async function handoffForLocal(bridge, request, { signal } = {}) {
   validateHandoff(request);
   bridge.assertOpen();
   const { session_id, requester, handoff_id } = request;
@@ -105,42 +122,43 @@ export async function idleHandoff(bridge, request, { signal } = {}) {
   signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   const marker = { handoff_id, requester, controller };
   try {
-    return await bridge.localHandoff(session_id, marker, async () => {
-      signal?.throwIfAborted();
-      if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
-      const session = await bridge.session(session_id),
-        dir = bridge.pool.attachmentDir;
-      const runtime = await localRuntime(bridge, session);
-      // Cancellation after seal cannot undo shutdown. Finish observing the
-      // exact child's normal exit, but never open a cancelled destination.
-      const exitDetails = runtime
-        ? await bridge.pool.shutdown(runtime, signal, {
-            mode: 'wait_idle',
-            beforeExit: async () => {
-              signal.throwIfAborted();
-              if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
-            },
-          })
-        : {};
-      signal?.throwIfAborted();
-      const reservation = await reserveOwner(dir, session, 'handoff', requester, {
-        id: handoff_id,
-        signal,
-      });
-      if (signal?.aborted) {
-        await cancelHandoff(bridge, request);
-        signal.throwIfAborted();
-      }
-      return {
-        session_id,
-        status: 'reserved',
-        session_file: session.file,
-        native_id: session.header.id,
-        generation: reservation.generation,
-        no_cold_reacquire: reservation.noColdReacquire === true,
-        ...exitDetails,
-      };
-    });
+    return await closeLocalWriter(
+      bridge,
+      session_id,
+      marker,
+      signal,
+      async (session, runtime, dir) => {
+        // Cancellation after seal cannot undo shutdown. Finish observing the
+        // exact child's normal exit, but never open a cancelled destination.
+        const exitDetails = runtime
+          ? await bridge.pool.shutdown(runtime, signal, {
+              mode: 'wait_idle',
+              beforeExit: async () => {
+                signal.throwIfAborted();
+                if (!(await ownerAlive(requester))) throw new Error('HANDOFF_REQUESTER_GONE');
+              },
+            })
+          : {};
+        signal?.throwIfAborted();
+        const reservation = await reserveOwner(dir, session, 'handoff', requester, {
+          id: handoff_id,
+          signal,
+        });
+        if (signal?.aborted) {
+          await cancelHandoff(bridge, request);
+          signal.throwIfAborted();
+        }
+        return {
+          session_id,
+          status: 'reserved',
+          session_file: session.file,
+          native_id: session.header.id,
+          generation: reservation.generation,
+          no_cold_reacquire: reservation.noColdReacquire === true,
+          ...exitDetails,
+        };
+      },
+    );
   } catch (error) {
     if (signal.aborted) throw new Error('HANDOFF_CANCELLED');
     throw error;
@@ -191,30 +209,18 @@ export async function releaseForLocal(bridge, { session_id, interrupt = false })
     await closing.stop();
     return { session_id, status: 'released', no_cold_reacquire: true };
   }
-  const release = { kind: 'release', controller: new AbortController() };
-  return bridge.localHandoff(session_id, release, async () => {
-    const owned = bridge.pool.instances.get(session_id);
-    let session;
-    // Missing history must not strand a child we already own. Existing
-    // replacement or unsafe files still require normal identity discovery.
-    if (
-      owned instanceof PiRpc &&
-      owned.alive &&
-      (await assertSingleSessionFile(owned.session.file, { allowMissing: true })) === null
-    ) {
-      await owned.assertProcessIdentity();
-      session = owned.session;
-    } else session = await bridge.session(session_id);
-    const dir = bridge.pool.attachmentDir;
-    const runtime = await localRuntime(bridge, session);
+  const controller = new AbortController();
+  const release = { kind: 'release', controller };
+  const { signal } = controller;
+  return closeLocalWriter(bridge, session_id, release, signal, async (session, runtime, dir) => {
     let exitDetails = {};
     if (runtime) {
       const previousNoCold = runtime.ownerRecord?.noColdReacquire === true;
       try {
-        exitDetails = await bridge.pool.shutdown(runtime, release.controller.signal, {
+        exitDetails = await bridge.pool.shutdown(runtime, signal, {
           mode: interrupt ? 'interrupt' : 'idle',
           beforeExit: async () => {
-            release.controller.signal.throwIfAborted();
+            signal.throwIfAborted();
             await updateOwner(dir, session, runtime.ownerRecord, { noColdReacquire: true });
           },
         });
@@ -234,7 +240,7 @@ export async function releaseForLocal(bridge, { session_id, interrupt = false })
     } else
       await registryTransaction(dir, async () => {
         const current = await vacantClaim(dir, session);
-        release.controller.signal.throwIfAborted();
+        signal.throwIfAborted();
         await atomicJson(claimFile(dir, session), {
           kind: 'rpc',
           file: session.file,

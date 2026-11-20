@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
-import { CompatibilityModules } from '../src/compat/compatibility.mjs';
+import { startCompatibilityModules } from '../src/compat/compatibility.mjs';
 import { CompatibilityServices } from '../src/compat/compatibility-services.mjs';
 import { Bridge } from '../src/core/bridge.mjs';
 import { publicError } from '../src/core/errors.mjs';
@@ -70,11 +70,9 @@ test('one module lifecycle supports independent capabilities, options and revers
     { module: listener, options: { prefix: 'received:' } },
     { module: path.join(f.dir, 'not-installed.mjs'), enabled: false },
   ];
-  const manager = new CompatibilityModules(entries, services);
+  const manager = startCompatibilityModules(entries, services);
   t.after(() => manager.stop());
-  const starting = manager.start();
-  assert.strictEqual(manager.start(), starting);
-  await starting;
+  await manager.ready;
   assert.deepEqual(entries[0].options.types, ['fixture-input']);
   const mappings = ports.readInputs.snapshot();
   mappings[0].inputCustomTypes.push('snapshot-only');
@@ -94,7 +92,6 @@ test('one module lifecycle supports independent capabilities, options and revers
     'listener-stop',
     'input-stop',
   ]);
-  await assert.rejects(manager.start(), /COMPATIBILITY_MODULES_CLOSED/);
 });
 
 test('module import and registration failures are explicit, and partial activation unwinds', async (t) => {
@@ -119,9 +116,9 @@ test('module import and registration failures are explicit, and partial activati
       },
     }.start,
   );
-  const manager = new CompatibilityModules([{ module: first }, { module: fail }], services);
+  const manager = startCompatibilityModules([{ module: first }, { module: fail }], services);
   await assert.rejects(
-    manager.start(),
+    manager.ready,
     (error) => publicError(error) === 'COMPATIBILITY_MODULE_START_FAILED',
   );
   assert.deepEqual(services.events, ['fail-stop', 'first-stop']);
@@ -135,8 +132,8 @@ test('module import and registration failures are explicit, and partial activati
     [[{ module: invalid }], 'INVALID_COMPATIBILITY_MODULE'],
     [[{ module: first }, { module: duplicate }], 'INVALID_COMPATIBILITY_MODULE'],
   ]) {
-    const failed = new CompatibilityModules(entries, services);
-    await assert.rejects(failed.start(), { message: code });
+    const failed = startCompatibilityModules(entries, services);
+    await assert.rejects(failed.ready, { message: code });
     await failed.stop();
     assert.deepEqual(services.readInputs.snapshot(), []);
   }

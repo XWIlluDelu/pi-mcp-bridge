@@ -1,96 +1,49 @@
-// Owner-selected module lifecycle only. Capability-specific APIs belong to services,
-// not this loader; modules need not implement a common reading/transform interface.
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { z } from 'zod';
+import { parseAs } from '../mcp/schema.mjs';
 
-export function validateCompatibilityModules(entries = []) {
-  const files = new Set();
-  if (!Array.isArray(entries)) throw new Error('INVALID_COMPATIBILITY_CONFIG');
-  for (const entry of entries) {
+const entriesSchema = z
+  .array(
+    z.strictObject({
+      module: z.string().refine((file) => path.isAbsolute(file) && !file.includes('\0')),
+      enabled: z.boolean().optional(),
+      options: z.record(z.string(), z.unknown()).optional(),
+    }),
+  )
+  .refine((entries) => new Set(entries.map((entry) => entry.module)).size === entries.length);
+
+export const validateCompatibilityModules = (entries = []) =>
+  parseAs(entriesSchema, entries, 'INVALID_COMPATIBILITY_CONFIG');
+
+// Preflight the entire set before starting any owner-selected code.
+async function load(entries) {
+  const modules = new Map();
+  for (const { module: file, options, enabled } of entries) {
+    if (enabled === false) continue;
+    const { default: module } = await import(pathToFileURL(file).href).catch((cause) => {
+      throw new Error('COMPATIBILITY_MODULE_LOAD_FAILED', { cause });
+    });
     if (
-      !entry ||
-      typeof entry !== 'object' ||
-      Array.isArray(entry) ||
-      Object.keys(entry).some((key) => !['module', 'enabled', 'options'].includes(key)) ||
-      typeof entry.module !== 'string' ||
-      !path.isAbsolute(entry.module) ||
-      entry.module.includes('\0') ||
-      files.has(entry.module) ||
-      (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') ||
-      (entry.options !== undefined &&
-        (!entry.options || typeof entry.options !== 'object' || Array.isArray(entry.options)))
+      typeof module?.id !== 'string' ||
+      !module.id ||
+      modules.has(module.id) ||
+      typeof module !== 'object' ||
+      Array.isArray(module) ||
+      typeof module.start !== 'function'
     )
-      throw new Error('INVALID_COMPATIBILITY_CONFIG');
-    files.add(entry.module);
+      throw new Error('INVALID_COMPATIBILITY_MODULE');
+    modules.set(module.id, { module, options });
   }
-  return entries;
+  return modules.values();
 }
 
-export class CompatibilityModules {
-  constructor(entries = [], services = {}) {
-    this.entries = entries;
-    this.services = services;
-    this.active = [];
-  }
-  start() {
-    if (this.closing) return Promise.reject(new Error('COMPATIBILITY_MODULES_CLOSED'));
-    return (this.startPromise ??= this.activate());
-  }
-  async activate() {
-    // Entries were validated with the owner configuration (Bridge.init).
-    const loaded = [],
-      ids = new Set();
-    for (const entry of this.entries) {
-      if (entry.enabled === false) continue; // Disabled code is not imported.
-      let module;
-      try {
-        module = (await import(pathToFileURL(entry.module).href)).default;
-      } catch (cause) {
-        throw new Error('COMPATIBILITY_MODULE_LOAD_FAILED', { cause });
-      }
-      if (
-        !module ||
-        typeof module !== 'object' ||
-        Array.isArray(module) ||
-        typeof module.id !== 'string' ||
-        !module.id ||
-        ids.has(module.id) ||
-        typeof module.start !== 'function'
-      )
-        throw new Error('INVALID_COMPATIBILITY_MODULE');
-      ids.add(module.id);
-      loaded.push({ module, options: structuredClone(entry.options ?? {}) });
-    }
-    try {
-      for (const { module, options } of loaded) {
-        if (this.closing) throw new Error('COMPATIBILITY_MODULES_CLOSED');
-        const cleanups = [];
-        this.active.push(cleanups);
-        await module.start(
-          Object.freeze({
-            id: module.id,
-            services: this.services,
-            onStop(cleanup) {
-              if (typeof cleanup !== 'function') throw new Error('INVALID_COMPATIBILITY_MODULE');
-              cleanups.push(cleanup);
-            },
-          }),
-          options,
-        );
-      }
-    } catch (cause) {
-      try {
-        await this.dispose();
-      } catch (cleanupError) {
-        cause = new AggregateError([cause, cleanupError]);
-      }
-      throw new Error('COMPATIBILITY_MODULE_START_FAILED', { cause });
-    }
-    return this;
-  }
-  async dispose() {
+export function startCompatibilityModules(entries = [], services) {
+  const active = [];
+  let stopping;
+  async function dispose() {
     const errors = [];
-    for (const cleanups of this.active.splice(0).reverse())
+    for (const cleanups of active.reverse())
       for (const cleanup of cleanups.reverse())
         try {
           await cleanup();
@@ -100,11 +53,30 @@ export class CompatibilityModules {
     if (errors.length)
       throw new Error('COMPATIBILITY_MODULE_STOP_FAILED', { cause: new AggregateError(errors) });
   }
-  stop() {
-    this.closing = true;
-    return (this.stopPromise ??= (async () => {
-      await this.startPromise?.catch(() => {});
-      await this.dispose();
-    })());
-  }
+  const ready = (async () => {
+    const modules = await load(entries);
+    try {
+      for (const { module, options } of modules) {
+        if (stopping) throw new Error('COMPATIBILITY_MODULES_CLOSED');
+        const cleanups = [];
+        active.push(cleanups);
+        const onStop = (cleanup) => {
+          if (typeof cleanup !== 'function') throw new Error('INVALID_COMPATIBILITY_MODULE');
+          cleanups.push(cleanup);
+        };
+        await module.start(
+          Object.freeze({ id: module.id, services, onStop }),
+          structuredClone(options ?? {}),
+        );
+      }
+    } catch (cause) {
+      try {
+        await dispose();
+      } catch (error) {
+        cause = new AggregateError([cause, error]);
+      }
+      throw new Error('COMPATIBILITY_MODULE_START_FAILED', { cause });
+    }
+  })();
+  return { ready, stop: () => (stopping ??= ready.then(dispose, () => {})) };
 }

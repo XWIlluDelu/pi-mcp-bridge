@@ -8,24 +8,17 @@ export function nativeReadFeatures(allTools, commands, leafId) {
     leaf_id: leafId ?? null,
   });
 }
-export async function ownerReadFeatures(runtime) {
-  return runtime ? runtime.readFeatures() : nativeReadFeatures(undefined, undefined, null);
-}
+const validNames = (values) =>
+  Array.isArray(values) && values.every((name) => typeof name === 'string');
+
 export function assertReadFeatures(value) {
+  const { available, tools, commands, leaf_id } = value ?? {};
   if (
-    !value ||
-    typeof value.available !== 'boolean' ||
-    !Array.isArray(value.tools) ||
-    !value.tools.every((name) => typeof name === 'string') ||
-    !Array.isArray(value.commands) ||
-    !value.commands.every((name) => typeof name === 'string') ||
-    !(value.leaf_id === null || typeof value.leaf_id === 'string')
+    typeof available !== 'boolean' ||
+    !validNames(tools) ||
+    !validNames(commands) ||
+    !(leaf_id === null || typeof leaf_id === 'string')
   )
     throw new Error('INVALID_READ_FEATURES');
-  return {
-    available: value.available,
-    tools: [...value.tools],
-    commands: [...value.commands],
-    leaf_id: value.leaf_id,
-  };
+  return { available, tools: [...tools], commands: [...commands], leaf_id };
 }

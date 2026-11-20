@@ -20,18 +20,32 @@ function rejected(bridge, error) {
   return { status: error.uncertain ? 'unknown' : 'rejected', reason: bridge.safeReason(error) };
 }
 
-async function submit(bridge, target, operation, input, acquire, authorize, admitted) {
+async function submit(
+  bridge,
+  target,
+  operation,
+  input,
+  { requestContext, checkInput, markForAutoRelease },
+) {
   const submissionId = bridge.submissions.start(target.id, operation);
   const selection = {};
   const record = (receipt) => bridge.submissions.update(submissionId, receipt) ?? receipt;
   let receipt;
   try {
-    const runtime = await acquire();
+    checkInput();
+    if (operation === 'send') target = await bridge.revalidateSession(target, requestContext);
+    const runtime = await bridge.pool.resolve(target, {
+      beforeStart: checkInput,
+      onStart: markForAutoRelease,
+    });
+    if (operation === 'create') markForAutoRelease(runtime);
+    checkInput();
+    if (operation === 'create' && runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
     receipt = await runtime.submitPrompt(input, {
       submissionId,
       selection,
-      authorize,
-      onAdmitted: () => admitted(runtime),
+      authorize: checkInput,
+      onAdmitted: () => markForAutoRelease(runtime),
       onLate: record,
     });
   } catch (error) {
@@ -40,139 +54,97 @@ async function submit(bridge, target, operation, input, acquire, authorize, admi
   return { ...selection, ...record(receipt), submission_id: submissionId };
 }
 
-export async function reloadSession(
-  bridge,
-  _args,
-  { target: session, requestContext, markForAutoRelease, checkInput },
-) {
-  return bridge.mutationLock(session.id, 'send', requestContext, async () => {
-    let runtime,
-      replacementStarted = false;
-    const assertNoBash = () => {
-      checkInput();
-      if (bridge.lane(session.id, 'bash')) throw new Error('RELOAD_BUSY');
-    };
-    try {
-      assertNoBash();
-      runtime = await bridge.pool.forRead(session);
-      if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
-      if (runtime.attached) return await runtime.reload(checkInput);
-      const marker = { kind: 'reload', controller: new AbortController() };
-      return await bridge.withHandoff(session.id, marker, async () => {
-        await bridge.pool.shutdown(runtime, marker.controller.signal, { beforeExit: assertNoBash });
-        replacementStarted = true;
-        marker.controller.signal.throwIfAborted();
-        checkInput();
-        const replacement = await bridge.pool.resolve(session);
-        markForAutoRelease(replacement);
-        if (!(replacement instanceof PiRpc) || replacement === runtime)
-          throw new Error('RELOAD_UNCONFIRMED');
-        const version = replacement.ownerRecord?.bridgeVersion;
-        if (!version || replacement.ownerRecord?.readContract !== READ_CONTRACT)
-          throw new Error('RELOAD_UNCONFIRMED');
-        return { status: 'completed', owner_version: version, read_compatible: true };
-      });
-    } catch (error) {
-      const uncertain =
-        error.uncertain || replacementStarted || runtime?.gracefulExitPromise || runtime?.exitSeal;
-      return {
-        status: uncertain ? 'unknown' : 'rejected',
-        reason: [
-          'RUNTIME_BUSY',
-          'MODEL_SELECTION_PENDING',
-          'PROMPT_ADMISSION_PENDING',
-          'RELOAD_IN_PROGRESS',
-        ].includes(error.code ?? error.message)
-          ? 'RELOAD_BUSY'
-          : bridge.safeReason(error),
-      };
-    }
-  });
-}
-
-export async function compactSession(
-  bridge,
-  args,
-  { target: session, requestContext, markForAutoRelease, checkInput },
-) {
-  if (args.interrupt) bridge.check('stop', session, requestContext);
-  const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
-  return bridge.mutationLock(session.id, 'send', requestContext, async () => {
-    try {
-      const runtime = await bridge.pool.resolve(session, { beforeStart: checkInput });
-      markForAutoRelease(runtime);
-      const result = await runtime.compact(body, checkInput);
-      return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
-    } catch (error) {
-      const nativeReason =
-        error.code === 'PI_REJECTED' ? nativeCompactReason(error.native_reason) : undefined;
-      return {
-        status: error.uncertain ? 'unknown' : 'rejected',
-        reason: bridge.safeReason(error),
-        ...(nativeReason ? { native_reason: nativeReason } : {}),
-        native_effects:
-          error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
-      };
-    }
-  });
-}
-
-export async function setSessionModel(
-  bridge,
-  args,
-  { target, requestContext, markForAutoRelease },
-) {
-  return bridge.locked(target.id, async () => {
-    // The request policy is frozen and permission was checked for this exact
-    // identity. These rechecks bind each dispatch and its result to that target.
-    const authorized = async () => {
-      bridge.assertOpen();
-      if (bridge.handoff(target.id) && bridge.handoff(target.id).kind !== 'auto_release')
-        throw new Error('HANDOFF_PENDING');
-      await bridge.revalidateSession(target, requestContext);
-    };
-    await authorized();
-    const runtime = await bridge.pool.resolve(target, {
-      beforeStart: authorized,
-      onStart: markForAutoRelease,
-    });
-    await authorized();
-    const actual = await runtime.selectModel(args.model, {
-      thinkingLevel: args.thinking_level,
-      nativeThinking: true,
-      beforeDispatch: authorized,
-    });
-    await authorized();
-    return actual;
-  });
-}
-
-export function sendPrompt(
-  bridge,
-  args,
-  { target, requestContext, markForAutoRelease, checkInput },
-) {
-  const acquire = async () => {
+async function reloadSession(bridge, _args, { target: session, markForAutoRelease, checkInput }) {
+  let runtime;
+  const assertNoBash = () => {
     checkInput();
-    const session = await bridge.revalidateSession(target, requestContext);
-    bridge.check('send', session, requestContext);
-    const runtime = await bridge.pool.resolve(session, {
-      beforeStart: checkInput,
-      onStart: markForAutoRelease,
-    });
-    checkInput();
-    return runtime;
+    if (bridge.lane(session.id, 'bash')) throw new Error('RELOAD_BUSY');
   };
-  return bridge.mutationLock(target.id, 'send', requestContext, () =>
-    submit(
-      bridge,
-      target,
-      'send',
-      { ...promptInput(args), mode: args.mode ?? 'steer' },
-      acquire,
-      checkInput,
-      markForAutoRelease,
-    ),
+  try {
+    assertNoBash();
+    runtime = await bridge.pool.forRead(session);
+    if (!runtime) return { status: 'skipped', reason: 'no_active_owner' };
+    if (runtime.attached) return await runtime.reload(checkInput);
+    const marker = { kind: 'reload', controller: new AbortController() };
+    return await bridge.withHandoff(session.id, marker, async () => {
+      await bridge.pool.shutdown(runtime, marker.controller.signal, { beforeExit: assertNoBash });
+      marker.controller.signal.throwIfAborted();
+      checkInput();
+      const replacement = await bridge.pool.resolve(session);
+      markForAutoRelease(replacement);
+      if (!(replacement instanceof PiRpc) || replacement === runtime)
+        throw new Error('RELOAD_UNCONFIRMED');
+      const version = replacement.ownerRecord?.bridgeVersion;
+      if (!version || replacement.ownerRecord?.readContract !== READ_CONTRACT)
+        throw new Error('RELOAD_UNCONFIRMED');
+      return { status: 'completed', owner_version: version, read_compatible: true };
+    });
+  } catch (error) {
+    const uncertain = error.uncertain || runtime?.gracefulExitPromise || runtime?.exitSeal;
+    return {
+      status: uncertain ? 'unknown' : 'rejected',
+      reason: [
+        'RUNTIME_BUSY',
+        'MODEL_SELECTION_PENDING',
+        'PROMPT_ADMISSION_PENDING',
+        'RELOAD_IN_PROGRESS',
+      ].includes(error.code ?? error.message)
+        ? 'RELOAD_BUSY'
+        : bridge.safeReason(error),
+    };
+  }
+}
+
+async function compactSession(bridge, args, { target: session, markForAutoRelease, checkInput }) {
+  const body = { instructions: args.instructions ?? '', interrupt: args.interrupt ?? false };
+  try {
+    const runtime = await bridge.pool.resolve(session, { beforeStart: checkInput });
+    markForAutoRelease(runtime);
+    const result = await runtime.compact(body, checkInput);
+    return { interrupt_requested: body.interrupt, ...compactReceipt(result) };
+  } catch (error) {
+    const nativeReason =
+      error.code === 'PI_REJECTED' ? nativeCompactReason(error.native_reason) : undefined;
+    return {
+      ...rejected(bridge, error),
+      ...(nativeReason ? { native_reason: nativeReason } : {}),
+      native_effects:
+        error.code === 'PI_REJECTED' || error.uncertain ? 'native_compact_attempted' : 'none',
+    };
+  }
+}
+
+async function setSessionModel(bridge, args, { target, requestContext, markForAutoRelease }) {
+  // The request policy is frozen and permission was checked for this exact
+  // identity. These rechecks bind each dispatch and its result to that target.
+  const authorized = async () => {
+    bridge.assertOpen();
+    const handoff = bridge.handoff(target.id);
+    if (handoff && handoff.kind !== 'auto_release') throw new Error('HANDOFF_PENDING');
+    await bridge.revalidateSession(target, requestContext);
+  };
+  await authorized();
+  const runtime = await bridge.pool.resolve(target, {
+    beforeStart: authorized,
+    onStart: markForAutoRelease,
+  });
+  await authorized();
+  const actual = await runtime.selectModel(args.model, {
+    thinkingLevel: args.thinking_level,
+    nativeThinking: true,
+    beforeDispatch: authorized,
+  });
+  await authorized();
+  return actual;
+}
+
+function sendPrompt(bridge, args, admission) {
+  return submit(
+    bridge,
+    admission.target,
+    'send',
+    { ...promptInput(args), mode: args.mode ?? 'steer' },
+    admission,
   );
 }
 
@@ -191,82 +163,54 @@ async function inlineExecution(bridge, run) {
   }
 }
 
-export async function runCommand(
+async function runCommand(
   bridge,
   args,
   { target: session, resultBudget, markForAutoRelease, checkInput },
 ) {
-  if (bridge.lane(session.id, 'bash'))
-    return { status: 'rejected', reason: 'BASH_IN_PROGRESS', output_available: false };
-  const { receipt, output } = await bridge.locked(
-    session.id,
-    () =>
-      inlineExecution(bridge, async (bind) => {
-        const release = bridge.autoReleaseInProgress(session.id);
-        if (release) await release;
-        const beforeDispatch = () => {
-          checkInput();
-          if (bridge.handoff(session.id)) throw new Error('HANDOFF_PENDING');
-        };
-        beforeDispatch();
-        const runtime = await bridge.pool.resolve(session, { beforeStart: beforeDispatch });
-        markForAutoRelease(runtime);
-        beforeDispatch();
-        const generation = bind(runtime);
-        const output = await runtime.executeBash({ ...args, beforeDispatch });
-        return { receipt: { status: 'completed', generation }, output };
-      }),
-    'bash',
-  );
-  bridge.pool.instances.get(session.id)?.onIdleCandidate?.();
+  const { receipt, output } = await inlineExecution(bridge, async (bind) => {
+    const release = bridge.autoReleaseInProgress(session.id);
+    if (release) await release;
+    checkInput();
+    const runtime = await bridge.pool.resolve(session, { beforeStart: checkInput });
+    markForAutoRelease(runtime);
+    checkInput();
+    const generation = bind(runtime);
+    const output = await runtime.executeBash({ ...args, beforeDispatch: checkInput });
+    return { receipt: { status: 'completed', generation }, output };
+  });
   return output
     ? bashOutput(receipt, output, args, resultBudget)
     : { ...receipt, output_available: false };
 }
 
-export async function stopSession(
-  bridge,
-  args,
-  { target: session, requestContext, resultBudget, retainedInputs },
-) {
-  const result = await bridge.mutationLock(
-    session.id,
-    'stop',
-    requestContext,
-    () =>
-      inlineExecution(bridge, async (bind) => {
-        bridge.assertOpen();
-        for (const input of bridge.mutations)
-          if (input.sessionId === session.id && !retainedInputs?.has(input)) input.stopped = true;
-        const runtime =
-          bridge.handoff(session.id)?.kind === 'auto_release'
-            ? null
-            : await bridge.pool.forRead(session);
-        bridge.assertOpen();
-        if (!runtime) return { receipt: { status: 'skipped', reason: 'not_running' } };
-        const generation = bind(runtime);
-        if (bridge.handoff(session.id)) throw new Error('HANDOFF_PENDING');
-        const { withdrawal, ...receipt } = await runtime.stopExecution(args);
-        return { receipt: { ...receipt, generation }, output: { withdrawal } };
-      }),
-    'stop',
-  );
-  bridge.pool.instances.get(session.id)?.onIdleCandidate?.();
-  const receipt = result.receipt ?? result;
+async function stopSession(bridge, args, { target: session, resultBudget, retainedInputs }) {
+  const { receipt, output } = await inlineExecution(bridge, async (bind) => {
+    bridge.assertOpen();
+    for (const input of bridge.mutations)
+      if (input.sessionId === session.id && !retainedInputs?.has(input)) input.stopped = true;
+    const runtime =
+      bridge.handoff(session.id)?.kind === 'auto_release'
+        ? null
+        : await bridge.pool.forRead(session);
+    bridge.assertOpen();
+    if (!runtime) return { receipt: { status: 'skipped', reason: 'not_running' } };
+    const generation = bind(runtime);
+    if (bridge.handoff(session.id)) throw new Error('HANDOFF_PENDING');
+    const { withdrawal, ...receipt } = await runtime.stopExecution(args);
+    return { receipt: { ...receipt, generation }, output: { withdrawal } };
+  });
   const withdrawn =
     receipt.status === 'skipped'
       ? { text: '', includesEditorDraft: false, complete: true }
-      : result.output?.withdrawal;
+      : output?.withdrawal;
   return withdrawn
     ? withdrawalOutput(receipt, withdrawn, args, resultBudget)
     : { ...receipt, withdrawn_available: false };
 }
 
-export async function createSession(
-  bridge,
-  args,
-  { requestContext, markForAutoRelease, mutation, checkInput },
-) {
+async function createSession(bridge, args, admission) {
+  const { requestContext, mutation, checkInput } = admission;
   const folder = requestContext.scope.folders.find((folder) => folder.path === args.project);
   if (!folder || !permitted(requestContext.permissions, 'create', { cwd: folder.path }))
     return {
@@ -280,8 +224,7 @@ export async function createSession(
     await validateExecutionCwd(folder.path);
     let parent, captureFork;
     if (args.fork_from) {
-      parent = await bridge.session(args.fork_from, requestContext);
-      bridge.check('read', parent, requestContext);
+      parent = await bridge.authorizedSession('read', args.fork_from, requestContext);
       let runtime;
       ({ session: parent, runtime } = await readableOwner(bridge, parent, requestContext));
       captureFork = async (sdk) => {
@@ -314,30 +257,17 @@ export async function createSession(
     bridge.assertOpen();
     return await bridge.locked(child.id, async () => {
       bridge.registerInput(child.id, mutation);
-      const beforeDispatch = () => {
-        checkInput();
-        if (bridge.handoff(child.id)) throw new Error('HANDOFF_PENDING');
-      };
-      beforeDispatch();
+      checkInput();
       await persistSession(child, prepared.entries);
       created = true;
       bridge.sessionFiles.set(child.id, child.file);
       if (!input) return { status: 'created', created, session_id: child.id };
-      const acquire = async () => {
-        const runtime = await bridge.pool.resolve(child, { beforeStart: beforeDispatch });
-        markForAutoRelease(runtime);
-        beforeDispatch();
-        if (runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
-        return runtime;
-      };
       const { submission_id, ...send } = await submit(
         bridge,
         child,
         'create',
         { ...input, mode: 'steer' },
-        acquire,
-        beforeDispatch,
-        markForAutoRelease,
+        admission,
       );
       return { status: send.status, created, session_id: child.id, submission_id, send };
     });
@@ -353,52 +283,54 @@ export async function createSession(
   }
 }
 
-export async function deleteSession(bridge, args, { target, requestContext, resultBudget }) {
-  // Delete has its own serialization lane: a normal EOF/handoff may hold
-  // the session lane indefinitely. Fence new work before interrupting that
-  // lifecycle, then drain the session lane before moving the saved history.
-  return bridge.locked(
-    args.session_id,
-    async () => {
-      let trash, failure;
+async function deleteSession(bridge, _args, { target, requestContext, resultBudget }) {
+  let trash, failure;
+  try {
+    const session = await bridge.revalidateSession(target, requestContext);
+    trash = await prepareTrash(bridge.config, session);
+    const prior = bridge.handoff(session.id);
+    // The delete lane can interrupt native EOF before draining the work lane.
+    await bridge.withHandoff(session.id, { kind: 'delete' }, async () => {
+      let finishDeletion;
       try {
-        const s = await bridge.revalidateSession(target, requestContext);
-        trash = await prepareTrash(bridge.config, s);
-        const prior = bridge.handoff(s.id);
-        await bridge.withHandoff(s.id, { kind: 'delete' }, async () => {
-          let finishDeletion;
-          try {
-            prior?.controller?.abort();
-            // This gate covers termination, lane drain and the trash move.
-            finishDeletion = await bridge.pool.stopForDelete(s);
-            await bridge.locked(s.id, async () => {
-              await bridge.revalidateSession(s, requestContext);
-              await trash.move();
-            });
-          } catch (error) {
-            failure = error;
-          } finally {
-            await trash.cancel().catch(() => {});
-            if (trash.moved) {
-              bridge.completionSequences.delete(s.id);
-              bridge.sessionFiles.delete(s.id);
-            }
-            await finishDeletion?.(trash.moved);
-          }
+        prior?.controller?.abort();
+        finishDeletion = await bridge.pool.stopForDelete(session);
+        await bridge.locked(session.id, async () => {
+          await bridge.revalidateSession(session, requestContext);
+          await trash.move();
         });
       } catch (error) {
-        failure ??= error;
+        failure = error;
+      } finally {
+        await trash.cancel().catch(() => {});
+        if (trash.moved) {
+          bridge.completionSequences.delete(session.id);
+          bridge.sessionFiles.delete(session.id);
+        }
+        await finishDeletion?.(trash.moved);
       }
-      return optionalResultFields(
-        {
-          status: failure ? (trash?.moved ? 'unknown' : 'rejected') : 'deleted',
-          ...(failure ? { reason: bridge.safeReason(failure) } : {}),
-          ...(trash?.moved ? { recoverable: true, restore_token: trash.token } : {}),
-        },
-        { project: target?.cwd ?? null },
-        resultBudget,
-      );
+    });
+  } catch (error) {
+    failure ??= error;
+  }
+  return optionalResultFields(
+    {
+      status: failure ? (trash?.moved ? 'unknown' : 'rejected') : 'deleted',
+      ...(failure ? { reason: bridge.safeReason(failure) } : {}),
+      ...(trash?.moved ? { recoverable: true, restore_token: trash.token } : {}),
     },
-    'delete',
+    { project: target.cwd ?? null },
+    resultBudget,
   );
 }
+
+export const mutations = {
+  send: [sendPrompt, 'send', 'work'],
+  command: [runCommand, 'command', 'bash'],
+  compact: [compactSession, 'send', 'work'],
+  reload: [reloadSession, 'send', 'work'],
+  set_model: [setSessionModel, 'send', 'work'],
+  stop: [stopSession, 'stop', 'stop'],
+  create: [createSession],
+  delete: [deleteSession, 'delete', 'delete'],
+};

@@ -9,20 +9,19 @@ import { readSessionIdentity, loadSavedSession } from './data.mjs';
 import { PiRpc } from '../runtime/rpc.mjs';
 import { launchProfile, nativeSdk } from '../runtime/pi-installation.mjs';
 import { diagnostics } from './diagnostics.mjs';
-import { ownerReadFeatures } from '../read/read-features.mjs';
+import { nativeReadFeatures } from '../read/read-features.mjs';
+import { pick } from '../read/read-render.mjs';
 
 // A read-only operation waits for an admitted auto-release to finish, then
 // reselects the current owner under the same request policy.
 export async function readableOwner(bridge, session, requestContext) {
-  let runtime = await bridge.pool.forRead(session);
-  while (runtime && bridge.handoff(session.id)?.runtime === runtime) {
+  for (;;) {
+    const runtime = await bridge.pool.forRead(session);
+    if (!runtime || bridge.handoff(session.id)?.runtime !== runtime) return { session, runtime };
     await runtime.autoReleaseTask;
     bridge.assertOpen();
-    session = await bridge.session(session.id, requestContext);
-    bridge.check('read', session, requestContext);
-    runtime = await bridge.pool.forRead(session);
+    session = await bridge.authorizedSession('read', session.id, requestContext);
   }
-  return { session, runtime };
 }
 
 async function acquireNativeRead(bridge, session, runtime, args) {
@@ -35,7 +34,7 @@ async function acquireNativeRead(bridge, session, runtime, args) {
   });
 }
 
-export async function listModels(bridge, args = {}, { requestContext }) {
+async function listModels(bridge, args = {}, { requestContext }) {
   const policy = requestContext.permissions;
   let allowed = requestContext.scope.folders.some((folder) =>
     ['send', 'command', 'create'].some((action) => permitted(policy, action, { cwd: folder.path })),
@@ -56,7 +55,7 @@ export async function listModels(bridge, args = {}, { requestContext }) {
   return loadModelCatalog(bridge.config, args);
 }
 
-export async function getSubmission(bridge, args, { requestContext }) {
+async function getSubmission(bridge, args, { requestContext }) {
   const session = await bridge.session(args.session_id, requestContext);
   const policy = requestContext.permissions;
   const canInspect = permitted(policy, 'read', session) || permitted(policy, 'send', session);
@@ -66,7 +65,7 @@ export async function getSubmission(bridge, args, { requestContext }) {
   return record;
 }
 
-export async function listSessions(bridge, args = {}, { requestContext }) {
+async function listSessions(bridge, args = {}, { requestContext }) {
   const sessions = args.session_id
     ? await bridge.session(args.session_id, requestContext).then(
         (s) => [s],
@@ -92,31 +91,21 @@ export async function listSessions(bridge, args = {}, { requestContext }) {
     .sort((a, b) => b.mtimeMs - a.mtimeMs || a.id.localeCompare(b.id));
   const offset = args.offset ?? 0,
     limit = args.limit ?? 30,
+    page = title ? candidates : candidates.slice(offset, offset + limit),
     selected = [];
-  let matching = title ? 0 : offset,
-    hasMore = false;
-  const observations = new Map();
+  let matching = 0,
+    hasMore = !title && candidates.length > offset + limit;
   const byFile = new Map(sessions.map((session) => [session.file, session]));
   // Poll just the requested page, or use a small lookahead when filtering by title.
-  const observe = (start, count) => {
-    for (const session of candidates.slice(start, start + count))
-      if (!observations.has(session.id))
-        observations.set(session.id, runtimeMetadata(bridge.pool, session));
-  };
-  if (!title) observe(offset, limit);
-  for (let index = matching; index < candidates.length; index++) {
-    if (!title && selected.length === limit) {
-      hasMore = true;
-      break;
-    }
-    if (title) observe(index, 4);
-    const session = candidates[index];
-    const observed = await observations.get(session.id);
-    observations.delete(session.id);
+  const observe = (session) => runtimeMetadata(bridge.pool, session);
+  const pending = page.slice(0, title ? 4 : limit).map(observe);
+  for (const [index, session] of page.entries()) {
+    if (title && index && page[index + 3]) pending.push(observe(page[index + 3]));
+    const observed = await pending.shift();
     const name = Object.hasOwn(observed, 'name')
       ? observed.name
       : await savedSessionName(session, bridge.titleCache).catch(() => null);
-    if (!matches(name, title) || matching++ < offset) continue;
+    if (title && (!matches(name, title) || matching++ < offset)) continue;
     if (selected.length === limit) {
       hasMore = true;
       break;
@@ -154,23 +143,18 @@ export async function listSessions(bridge, args = {}, { requestContext }) {
   };
 }
 
-export async function getHealth(bridge, { session_id } = {}, { requestContext }) {
+async function getHealth(bridge, { session_id } = {}, { requestContext }) {
+  const policy = { ...requestContext.permissions, folders: requestContext.scope.folders };
   // Diagnose only the requested session, without its metadata or source paths.
   if (session_id) {
     const target = await bridge.session(session_id, requestContext).catch(() => ({
       id: session_id,
       cwd: null,
     }));
-    return permissionsHealth(
-      { ...requestContext.permissions, folders: requestContext.scope.folders },
-      { session_id, cwd: target.cwd },
-    );
+    return permissionsHealth(policy, { session_id, cwd: target.cwd });
   }
   return {
-    ...permissionsHealth({
-      ...requestContext.permissions,
-      folders: requestContext.scope.folders,
-    }),
+    ...permissionsHealth(policy),
     ...(requestContext.restartRequired?.length
       ? { restart_required: requestContext.restartRequired }
       : {}),
@@ -178,7 +162,7 @@ export async function getHealth(bridge, { session_id } = {}, { requestContext })
   };
 }
 
-export async function searchSession(bridge, { query, content, ...args }, options = {}) {
+async function searchSession(bridge, { query, content, ...args }, options = {}) {
   const selected =
     content === undefined
       ? ALL_CONTENT
@@ -194,23 +178,18 @@ export async function searchSession(bridge, { query, content, ...args }, options
   );
 }
 
-export async function readSession(
-  bridge,
-  args,
-  { requestContext, resultBudget, readPins, searchQuery },
-) {
+async function readSession(bridge, args, { requestContext, resultBudget, readPins, searchQuery }) {
   // Routing metadata only. Cached content is accessed after authorization and
   // today's canonical path/native identity check; a cursor is never a grant.
   const id = bridge.readCache.target(args);
-  let s = await bridge.session(id, requestContext);
-  bridge.check('read', s, requestContext);
-  const target = s;
+  const target = await bridge.authorizedSession('read', id, requestContext);
   const identity = {
     session_id: id,
-    file: s.file,
-    native_id: s.header.id,
-    native_cwd: s.header.cwd,
+    file: target.file,
+    native_id: target.header.id,
+    native_cwd: target.header.cwd,
   };
+  const renderOptions = { identity, resultBudget, readPins };
   if (args.refs) {
     const snapshot = bridge.readCache.expand(args.refs, identity);
     if (snapshot.sourceRequest)
@@ -218,37 +197,38 @@ export async function readSession(
         { ...snapshot.sourceRequest, max_bytes: args.max_bytes },
         { requestContext, resultBudget, readPins },
       );
-    return bridge.readCache.render(
-      snapshot,
-      { max_bytes: args.max_bytes },
-      { identity, resultBudget, readPins },
-    );
+    return bridge.readCache.render(snapshot, { max_bytes: args.max_bytes }, renderOptions);
   }
   if (args.cursor) {
     const captured = bridge.readCache.get(args, identity);
-    return bridge.readCache.render(captured.snapshot, args, {
-      ...captured,
-      identity,
-      resultBudget,
-      readPins,
-    });
+    return bridge.readCache.render(captured.snapshot, args, { ...captured, ...renderOptions });
   }
   args = { ...args, session_id: id };
-  let runtime;
-  ({ session: s, runtime } = await readableOwner(bridge, s, requestContext));
-  diagnostics.emit('read.source', {
-    kind: runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved',
-  });
+  const { session: s, runtime } = await readableOwner(bridge, target, requestContext);
+  const kind = runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved';
+  diagnostics.emit('read.source', { kind });
   let captured,
+    runtimeObservation,
     retained = false;
   if (args.view === 'runtime') {
-    captured =
-      runtime?.attached || (runtime instanceof PiRpc && runtime.ownerRecord)
-        ? await runtime.read(args)
-        : runtime
-          ? unavailableObservation(id, 'runtime_observer_unavailable')
-          : bridge.pool.observations.get(s);
-    retained = !runtime;
+    if (runtime)
+      runtimeObservation =
+        runtime.attached || (runtime instanceof PiRpc && runtime.ownerRecord)
+          ? await runtime.read(args)
+          : unavailableObservation(id, 'runtime_observer_unavailable');
+    captured = runtimeObservation;
+    if (!captured || captured.observation.reason === 'no_observation') {
+      const previous = bridge.pool.observations.get(s);
+      if (!captured || previous.observation.available) {
+        captured = previous;
+        retained = true;
+      }
+    }
+    if (retained && captured.observation.available) {
+      const saved = await loadSavedSession(s, { omitImageData: true, config: bridge.config });
+      if (runtimeObservation) saved.leafId = runtimeObservation.observation.current_leaf_id;
+      captured = checkObservation(captured, saved, { ownerActive: false });
+    }
   } else {
     const nativeRead = ({ entry_ids } = {}) =>
       acquireNativeRead(bridge, s, runtime, {
@@ -263,7 +243,7 @@ export async function readSession(
       const acquire = async () => {
         const context = {
           session: Object.freeze({ id, file: s.file, native_id: s.header.id, cwd: s.header.cwd }),
-          owner: await ownerReadFeatures(runtime),
+          owner: runtime ? await runtime.readFeatures() : nativeReadFeatures(),
           request: args,
           nativeRead,
         };
@@ -274,24 +254,7 @@ export async function readSession(
       captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
     }
   }
-  const runtimeObservation = runtime && captured.view === 'runtime' ? captured : null;
-  let currentLeaf;
-  if (runtimeObservation?.observation.reason === 'no_observation') {
-    const previous = bridge.pool.observations.get(s);
-    if (previous.observation.available) {
-      currentLeaf = runtimeObservation.observation.current_leaf_id;
-      captured = previous;
-      retained = true;
-    }
-  }
-  if (retained && captured.observation.available) {
-    s = await loadSavedSession(s, { omitImageData: true, config: bridge.config });
-    captured = checkObservation(captured, runtime ? { ...s, leafId: currentLeaf } : s, {
-      ownerActive: false,
-    });
-  }
   const current = await bridge.revalidateSession(target, requestContext);
-  bridge.check('read', current, requestContext);
   if (
     runtimeObservation &&
     (runtime.attached || runtime.alive) &&
@@ -302,29 +265,33 @@ export async function readSession(
   const live = searchQuery ? null : captured.live,
     snapshot = {
       session_id: id,
-      view: captured.view,
-      ...(captured.observation ? { observation: captured.observation } : {}),
-      ...(captured.reader ? { reader: captured.reader } : {}),
-      request: args,
-      leaf_id: captured.leaf_id,
-      selection: captured.selection,
-      omissions: captured.omissions,
-      ...(captured.history ? { history: captured.history } : {}),
-      units: captured.units,
-      source: retained
-        ? 'retained'
-        : runtime
-          ? runtime.attached
-            ? runtime.record.kind
-            : 'rpc'
-          : 'saved',
+      ...pick(captured, [
+        'view',
+        'observation',
+        'reader',
+        'leaf_id',
+        'selection',
+        'omissions',
+        'history',
+        'units',
+      ]),
+      source: retained ? 'retained' : runtime?.attached ? runtime.record.kind : kind,
     };
   const runtimeEvents =
     !searchQuery && (runtime?.runtimeEvents ?? bridge.pool.runtimeEvents.get(id))?.snapshot();
   return bridge.readCache.navigate(
     snapshot,
     args,
-    { identity, resultBudget, live, runtimeEvents, readPins },
+    { ...renderOptions, live, runtimeEvents },
     searchQuery,
   );
 }
+
+export const queries = {
+  list: listSessions,
+  read: readSession,
+  search: searchSession,
+  models: listModels,
+  health: getHealth,
+  submission: getSubmission,
+};
