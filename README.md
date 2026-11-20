@@ -50,6 +50,11 @@ After your MCP client connects, call these tools with the indicated arguments:
 2. `list({})` discovers authorized saved sessions. An empty result can mean no saved sessions or no effective `list` grant; check the configured roots and [permission rules](docs/configuration.md#seven-independent-rights).
 3. `read({session_id:"<ID from list>"})` opens recent history without starting a writer. Use the returned Bridge ID, not the native Pi ID or session filename.
 
+If you are starting with an empty session store and have `create` permission,
+call `create({project:"<path from list.creatable_projects>"})` to create a saved
+session. With a `send` grant, submit a prompt to that session and use `list` or
+`read` to follow its progress. See [the calling workflow](docs/api.md#calling-workflow).
+
 ## Documentation
 
 ### Core design & usage
