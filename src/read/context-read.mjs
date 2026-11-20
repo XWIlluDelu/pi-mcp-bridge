@@ -1,14 +1,14 @@
-import { readSchema, contextSelection, contentKind } from './read-schema.mjs';
-import { z } from 'zod';
+import { readSchema, contextSelection, contentKind, CONTENT_KINDS } from './read-schema.mjs';
+import { parseAs } from '../mcp/schema.mjs';
 import { jsonBytes } from '../mcp/response-budget.mjs';
 import { traceSessionBranch } from '../core/data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
 import {
   navigationGroups,
   searchGroupMatches,
+  assistantBlockType,
   assistantBlocks,
   assistantFailed,
-  toolOperations,
 } from './read-navigation.mjs';
 import { READ_PAGE_LIMIT, boundedFields, pick, smallLive } from './read-render.mjs';
 import { READ_SNAPSHOT_LIMIT, readSnapshotBytes } from './read-snapshots.mjs';
@@ -16,32 +16,28 @@ import { READ_SNAPSHOT_LIMIT, readSnapshotBytes } from './read-snapshots.mjs';
 // Change only when the live read request/snapshot semantics become incompatible.
 export const READ_CONTRACT = 'pi-bridge-read-v2';
 export const OBSERVATION_PHASE = 'context_with_system_observer';
-const count = z.number().int().nonnegative();
-const leafId = z.string().nullable();
-const observation = z.discriminatedUnion('available', [
-  z
-    .object({
-      available: z.literal(false),
-      reason: z.string(),
-      current_leaf_id: z.unknown().optional(),
-    })
-    .refine(
-      (capture) =>
-        capture.reason !== 'no_observation' || leafId.safeParse(capture.current_leaf_id).success,
-    ),
-  z.object({
-    available: z.literal(true),
-    phase: z.literal(OBSERVATION_PHASE),
-    id: z.string(),
-    owner_generation: z.string(),
-    observed_at: z.string(),
-    checked_at: z.string(),
-    owner_active: z.boolean(),
-    current_leaf_id: leafId,
-    input_leaf_id: leafId,
-    later_committed_entries: count,
-  }),
-]);
+const isCount = (value) => Number.isSafeInteger(value) && value >= 0;
+const isLeaf = (value) => value === null || typeof value === 'string';
+const omissionFields = ['turns', ...CONTENT_KINDS.filter((kind) => kind !== 'memory')];
+const observationText = ['id', 'owner_generation', 'observed_at', 'checked_at'];
+
+function validObservation(capture) {
+  if (!capture || typeof capture !== 'object' || Array.isArray(capture)) return false;
+  if (capture.available === false)
+    return (
+      typeof capture.reason === 'string' &&
+      (capture.reason !== 'no_observation' || isLeaf(capture.current_leaf_id))
+    );
+  return (
+    capture.available === true &&
+    capture.phase === OBSERVATION_PHASE &&
+    observationText.every((key) => typeof capture[key] === 'string') &&
+    typeof capture.owner_active === 'boolean' &&
+    isLeaf(capture.current_leaf_id) &&
+    isLeaf(capture.input_leaf_id) &&
+    isCount(capture.later_committed_entries)
+  );
+}
 
 const take = (values, n, reverse = false) =>
   n === -1 ? values : n === 0 ? [] : reverse ? values.slice(-n) : values.slice(0, n);
@@ -79,51 +75,61 @@ function addMessage(records, message, type, source, prompt_id, runtime = false) 
     if (!runtime) type = 'native';
   }
   const record = { type, source, prompt_id, message };
-  if (!runtime && type === 'summary') {
-    delete record.message;
-    record.parts = [{ source, message }];
-  }
   if (!runtime && type === 'command') record.in_model_context = !message.excludeFromContext;
   records.push(record);
 }
 
 function linkTools(records, runtime = false) {
-  const tools = toolOperations(records);
-  for (const [first, result] of tools) {
-    const call = first.type === 'tool_call';
-    const { entry_id, message_index, observation_index, block_index = 'message' } = first.source;
-    const id = runtime
-      ? call
-        ? `runtime:runtime:${observation_index}:${block_index}`
-        : `tool:runtime:${observation_index}`
-      : `${entry_id}:${message_index}:${block_index}:${first.type}`;
-    first.tool_id = id;
-    if (!runtime) {
-      first.call_id = call ? first.block.id : first.message.toolCallId;
-      first.pairing = result ? 'paired' : call ? 'unresolved' : 'orphan_result';
-      if (result)
-        Object.assign(result, {
+  const tools = [],
+    open = new Map();
+  for (const record of records) {
+    const call = record.type === 'tool_call';
+    if (!call && record.type !== 'tool_result') continue;
+    const callId = call ? record.block.id : record.message.toolCallId;
+    // Repeated call IDs match the latest preceding unresolved call.
+    const stack = open.get(callId) ?? [];
+    const paired = !call && stack.pop();
+    if (paired) {
+      const [first] = paired;
+      paired.push(record);
+      if (!runtime) {
+        first.pairing = 'paired';
+        Object.assign(record, {
           call_id: first.call_id,
           pairing: 'paired',
           call_source: first.source,
         });
+      }
+      record.tool_id = first.tool_id;
+      if (!runtime || first.prompt_id !== null) record.prompt_id = first.prompt_id;
+      continue;
     }
-    if (result) {
-      result.tool_id = id;
-      if (!runtime || first.prompt_id !== null) result.prompt_id = first.prompt_id;
+    const { entry_id, message_index, observation_index, block_index = 'message' } = record.source;
+    record.tool_id = runtime
+      ? call
+        ? `runtime:runtime:${observation_index}:${block_index}`
+        : `tool:runtime:${observation_index}`
+      : `${entry_id}:${message_index}:${block_index}:${record.type}`;
+    if (!runtime) {
+      record.call_id = callId;
+      record.pairing = call ? 'unresolved' : 'orphan_result';
+    }
+    const operation = [record];
+    tools.push(operation);
+    if (call) {
+      stack.push(operation);
+      open.set(callId, stack);
     }
   }
   return tools;
 }
 
 // A hidden input is a turn boundary even though it has no recoverable content.
-function timeline(entries, readAdapters) {
+function timeline(entries, adapters) {
   const records = [],
     prompts = [];
   let prompt = null;
-  const adapterFor = (message) =>
-    message?.role === 'custom' &&
-    readAdapters.find(({ inputCustomTypes }) => inputCustomTypes.includes(message.customType));
+  const adapterFor = (message) => message?.role === 'custom' && adapters.get(message.customType);
   function promptBoundary(source, reason, role = 'user', message = { role, content: '' }) {
     prompt = reason ? `empty:${source.entry_id}:${reason}` : source.entry_id;
     prompts.push(prompt);
@@ -146,14 +152,14 @@ function timeline(entries, readAdapters) {
       const adapter = adapterFor(original);
       if (original?.role === 'user') promptBoundary(base, 'hidden_user');
       else if (adapter)
-        promptBoundary({ ...base, read_adapter: adapter.id }, 'hidden_input', 'custom');
+        promptBoundary({ ...base, read_adapter: adapter }, 'hidden_input', 'custom');
     }
     for (const [message_index, message] of messages.entries()) {
       const type = messageKind(message);
       const adapter = adapterFor(message);
       const source = { ...base, message_index };
       if (type === 'prompt' || adapter) {
-        if (adapter) source.read_adapter = adapter.id;
+        if (adapter) source.read_adapter = adapter;
         promptBoundary(source, null, message.role, message);
         continue;
       }
@@ -181,12 +187,11 @@ function selectTimeline(projected, { range, content }, readAdapters) {
   const inTurn = (record) => turns.has(record.prompt_id);
   const chosen = new Set();
   const omissions = { turns: prompts.length - turns.size };
-  const keep = (kind, groups, selected) => {
-    omissions[kind] = groups.length - selected.length;
-    for (const group of selected) for (const record of group) chosen.add(record);
+  const keep = (kind, selected) => {
+    omissions[kind] = all(kind).length - selected.length;
+    for (const record of selected) chosen.add(record);
   };
-  const globalSummary = all('summary');
-  const individual = {
+  const enabled = {
     input: (record) => content.input && inTurn(record),
     system: (record) => {
       if (!content.system) return false;
@@ -197,18 +202,12 @@ function selectTimeline(projected, { range, content }, readAdapters) {
     },
     native: (record) => content.native && (record.prompt_id === null || inTurn(record)),
   };
-  for (const [kind, test] of Object.entries(individual)) {
-    const groups = all(kind).map((record) => [record]);
-    keep(
-      kind,
-      groups,
-      groups.filter(([record]) => test(record)),
-    );
-  }
-  const commands = all('command').map((record) => [record]);
-  keep('command', commands, take(commands, content.command, true));
-  const summaries = globalSummary.length ? [globalSummary] : [];
-  keep('summary', summaries, content.summary !== 0 ? summaries : []);
+  for (const [kind, test] of Object.entries(enabled)) keep(kind, all(kind).filter(test));
+  keep('command', take(all('command'), content.command, true));
+  const summaries = all('summary');
+  // Active native background summaries form one group.
+  omissions.summary = Number(summaries.length > 0 && content.summary === 0);
+  if (content.summary !== 0) for (const summary of summaries) chosen.add(summary);
   const meaningful = {
     assistant: (record) =>
       (typeof record.block?.text === 'string' && record.block.text.trim()) ||
@@ -225,13 +224,18 @@ function selectTimeline(projected, { range, content }, readAdapters) {
               ({ source }) => `${source.entry_id}:${source.message_index}`,
             ).values(),
           ].filter((group) => group.some(meaningful[kind]));
-    const selected = [];
-    for (const [turn, group] of Map.groupBy(groups, ([first]) => first.prompt_id))
-      if (turns.has(turn)) selected.push(...take(group, content[kind], true));
-    keep(kind, groups, selected);
+    let kept = 0;
+    for (const [turn, group] of Map.groupBy(groups, ([first]) => first.prompt_id)) {
+      if (!turns.has(turn)) continue;
+      for (const operation of take(group, content[kind], true)) {
+        kept++;
+        for (const record of operation) chosen.add(record);
+      }
+    }
+    omissions[kind] = groups.length - kept;
   }
   return {
-    records: records.filter((record) => chosen.has(record)),
+    records: records.values().filter((record) => chosen.has(record)),
     latestPrompt: prompts.at(-1) ?? null,
     latestPromptSelected: turns.has(prompts.at(-1)),
     omissions,
@@ -240,14 +244,17 @@ function selectTimeline(projected, { range, content }, readAdapters) {
 
 // Only native fields are reduced. Tool arguments, details and unknown business
 // objects are not recursively filtered by property name.
-const messageFields = [
-  'role',
+const assistantFields = [
   'timestamp',
   'model',
   'provider',
   'thinkingLevel',
   'stopReason',
   'errorMessage',
+];
+const messageFields = [
+  'role',
+  ...assistantFields,
   'toolCallId',
   'toolName',
   'isError',
@@ -297,34 +304,26 @@ function cleanMessage(message) {
     result.content = Array.isArray(message.content)
       ? message.content.map(cleanBlock)
       : message.content;
-  if (message?.nestedCalls !== undefined) result.nestedCalls = message.nestedCalls;
   // Known system sections/tool declarations are splittable reading content.
   // They must not be discarded as one oversized metadata object.
-  for (const key of ['summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'])
+  for (const key of ['nestedCalls', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'])
     if (message?.[key] !== undefined) result[key] = message[key];
   return result;
 }
 
 // Source locators and pairing fields are built by Bridge. Native payloads pass
 // through their own field selection before entering the detached snapshot.
-function cleanRecord({ block, metadata, message, parts, ...unit }) {
+function cleanRecord({ block, metadata, message, ...unit }) {
   if (block) {
     unit.block = cleanBlock(block);
-    const fields = boundedFields(
-      pick(metadata, [
-        'timestamp',
-        'model',
-        'provider',
-        'thinkingLevel',
-        'stopReason',
-        'errorMessage',
-      ]),
-    );
+    const fields = boundedFields(pick(metadata, assistantFields));
     if (Object.keys(fields).length) unit.metadata = fields;
   }
-  if (message) unit.message = cleanMessage(message);
-  if (parts)
-    unit.parts = parts.map(({ source, message }) => ({ source, message: cleanMessage(message) }));
+  if (message) {
+    const clean = cleanMessage(message);
+    if (unit.type === 'summary') unit.parts = [{ source: unit.source, message: clean }];
+    else unit.message = clean;
+  }
   return unit;
 }
 
@@ -344,12 +343,10 @@ export function captureRuntimeUnits(messages) {
   return structuredClone(units);
 }
 
-export function appendSnapshotUnit(target, unit) {
+export function appendSnapshotUnit(target, unit, position = target.units.length) {
   target.accountedBytes += readSnapshotBytes(unit, 1);
   if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
-  const captured = structuredClone(unit);
-  target.units.push(captured);
-  return captured;
+  target.units[position] = structuredClone(unit);
 }
 
 export function validateReadEntryIds(value) {
@@ -383,9 +380,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
     (typeof search_query !== 'string' || !search_query.trim() || search_query.length > 2048)
   )
     throw new Error('INVALID_READ_ARGUMENTS');
-  const parsed = readSchema.safeParse(readArgs);
-  if (!parsed.success) throw new Error('INVALID_READ_ARGUMENTS');
-  const args = parsed.data;
+  const args = parseAs(readSchema, readArgs, 'INVALID_READ_ARGUMENTS');
   if (args.cursor !== undefined || args.view === 'runtime')
     throw new Error('INVALID_READ_ARGUMENTS');
   const selection = contextSelection(args),
@@ -406,17 +401,14 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
   if (search_query === undefined) {
     for (const record of selected.records) appendSnapshotUnit(target, cleanRecord(record));
   } else {
-    const byPosition = [];
-    for (const group of navigationGroups(selected.records)) {
-      const atoms = group.atoms.map(({ position, unit }) => ({
-        position,
-        unit: cleanRecord(unit),
-      }));
-      if (searchGroupMatches({ ...group, atoms }, search_query))
-        for (const { position, unit } of atoms)
-          byPosition[position] = appendSnapshotUnit(target, unit);
+    const { documents, units } = navigationGroups(selected.records);
+    for (const group of documents) {
+      for (const position of group.positions) units[position] = cleanRecord(units[position]);
+      if (searchGroupMatches(units, group, search_query))
+        for (const position of group.positions)
+          appendSnapshotUnit(target, units[position], position);
     }
-    target.units = byPosition.filter(Boolean);
+    target.units = target.units.filter(Boolean);
   }
   return {
     contract: READ_CONTRACT,
@@ -460,8 +452,8 @@ function cleanLive(raw, selection, selected) {
   if (message === null) return { ...base, items: [] };
   if (message?.role !== 'assistant' || !Array.isArray(message.content))
     return { ...base, available: false, reason: 'invalid_live_message' };
-  const blocks = [...assistantBlocks(message.content, {}, null)],
-    groups = Map.groupBy(blocks, ({ type }) => contentKind(type)),
+  const blocks = message.content,
+    groups = Map.groupBy(blocks.keys(), (i) => contentKind(assistantBlockType(blocks[i]))),
     kept = new Set(selection.content.native ? groups.get('native') : []),
     omissions = { ...raw.selection_omissions };
   for (const kind of ['assistant', 'thinking', 'tool']) {
@@ -480,8 +472,8 @@ function cleanLive(raw, selection, selected) {
     for (const item of pick) kept.add(item);
   }
   const items = blocks
-    .filter((item) => kept.has(item))
-    .map(({ block: rawBlock }) => {
+    .filter((_item, i) => kept.has(i))
+    .map((rawBlock) => {
       const block = structuredClone(cleanBlock(rawBlock));
       return { type: block.type === 'toolCall' ? 'tool_call' : block.type, block };
     });
@@ -517,8 +509,8 @@ export function assertReadSnapshot(value, args) {
   const observed = args.view === 'runtime';
   if (
     observed &&
-    (!count.safeParse(value.capture_sequence).success ||
-      !observation.safeParse(value.observation).success ||
+    (!isCount(value.capture_sequence) ||
+      !validObservation(value.observation) ||
       (value.observation.available
         ? value.observation.input_leaf_id !== value.leaf_id
         : value.units?.length))
@@ -530,20 +522,8 @@ export function assertReadSnapshot(value, args) {
     !Array.isArray(value.units) ||
     (observed
       ? value.selection !== null || value.omissions !== null
-      : [
-          'turns',
-          'input',
-          'assistant',
-          'thinking',
-          'tool',
-          'command',
-          'system',
-          'summary',
-          'native',
-        ].some(
-          (key) => !Number.isSafeInteger(value.omissions?.[key]) || value.omissions[key] < 0,
-        )) ||
-    !(value.leaf_id === null || typeof value.leaf_id === 'string') ||
+      : omissionFields.some((key) => !isCount(value.omissions?.[key]))) ||
+    !isLeaf(value.leaf_id) ||
     (args.leaf_id !== undefined && value.leaf_id !== args.leaf_id) ||
     (!observed && JSON.stringify(value.selection) !== JSON.stringify(contextSelection(args))) ||
     jsonBytes(value) > READ_SNAPSHOT_LIMIT ||
@@ -551,9 +531,7 @@ export function assertReadSnapshot(value, args) {
       (unit) =>
         typeof unit?.type !== 'string' ||
         (observed
-          ? !Number.isSafeInteger(unit.source?.observation_index) ||
-            unit.source.observation_index < 0 ||
-            unit.source.entry_id !== undefined
+          ? !isCount(unit.source?.observation_index) || unit.source.entry_id !== undefined
           : typeof unit.source?.entry_id !== 'string'),
     )
   )

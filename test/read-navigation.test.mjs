@@ -8,11 +8,7 @@ import path from 'node:path';
 import { ContextReadCache } from '../src/read/read-cache.mjs';
 import { prepareContextRead } from '../src/read/context-read.mjs';
 import { READ_SNAPSHOT_LIMIT } from '../src/read/read-snapshots.mjs';
-import {
-  navigationDocuments,
-  navigationOrder,
-  navigationRow,
-} from '../src/read/read-navigation.mjs';
+import { navigationIndex, navigationRow } from '../src/read/read-navigation.mjs';
 import { contextSelection, ALL_CONTENT } from '../src/read/read-schema.mjs';
 
 import { jsonBytes } from '../src/mcp/response-budget.mjs';
@@ -47,10 +43,10 @@ const snapshot = (units, extra = {}) => ({
   units,
   ...extra,
 });
-const rows = (snap, { query } = {}, documents = navigationDocuments(snap)) =>
-  navigationOrder(documents, query).map((index) =>
-    navigationRow(documents, index, (i) => i, query),
-  );
+const rows = (snap, { query } = {}) => {
+  const index = navigationIndex(snap, query);
+  return index.order.map((offset) => navigationRow(index, offset, (i) => i, query));
+};
 
 test('codemode overview groups by canonical tool identity and surfaces nested failures despite long code', () => {
   const toolId = 'canonical-first';

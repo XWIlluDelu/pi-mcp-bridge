@@ -5,20 +5,23 @@ import { READ_SNAPSHOT_LIMIT, ReadSnapshots } from './read-snapshots.mjs';
 import { traceSessionBranch } from '../core/data.mjs';
 import { readSchema } from './read-schema.mjs';
 
-export function unavailableObservation(sessionId, reason, captureSequence = 0) {
+function observationSnapshot(sessionId, captureSequence, observation, units = [], leaf = null) {
   return {
     contract: READ_CONTRACT,
     view: 'runtime',
     capture_sequence: captureSequence, // Internal IPC ordering; never rendered in public pages.
     session_id: sessionId,
-    leaf_id: null,
+    leaf_id: leaf,
     selection: null,
     omissions: null,
-    units: [],
-    observation: { available: false, reason },
+    units,
+    observation,
     live: null,
   };
 }
+
+export const unavailableObservation = (sessionId, reason, sequence = 0) =>
+  observationSnapshot(sessionId, sequence, { available: false, reason });
 
 // The input leaf must still belong to the active native branch. Native history
 // is append-only; do not retain raw entries or compute full-history fingerprints.
@@ -55,27 +58,23 @@ export class ContextObservation {
   reset() {
     this.counter.captureSequence++;
     this.latest = null;
-    this.binding = null;
   }
   capture(event, ctx) {
     const manager = ctx.sessionManager;
-    this.binding = { file: manager.getSessionFile(), native_id: manager.getSessionId() };
+    const file = manager.getSessionFile();
+    const nativeId = manager.getSessionId();
     const leaf = manager.getLeafId();
     // Replace even a failed/oversized capture: an old observation must not
     // silently masquerade as the newest request.
     const sequence = ++this.counter.captureSequence;
-    this.latest = unavailableObservation(null, 'capture_failed', sequence);
+    this.latest = null;
+    let snapshot;
     try {
-      this.latest = {
-        contract: READ_CONTRACT,
-        view: 'runtime',
-        capture_sequence: sequence,
-        session_id: null,
-        leaf_id: leaf,
-        selection: null,
-        omissions: null,
-        units: captureRuntimeUnits(event.messages),
-        observation: {
+      const units = captureRuntimeUnits(event.messages);
+      snapshot = observationSnapshot(
+        null,
+        sequence,
+        {
           available: true,
           id: randomUUID(),
           phase: OBSERVATION_PHASE,
@@ -83,17 +82,19 @@ export class ContextObservation {
           owner_generation: this.generation,
           input_leaf_id: leaf,
         },
-        live: null,
-      };
+        units,
+        leaf,
+      );
     } catch (error) {
-      this.latest = unavailableObservation(
+      snapshot = unavailableObservation(
         null,
-        error.message === 'READ_SNAPSHOT_TOO_LARGE'
+        error?.message === 'READ_SNAPSHOT_TOO_LARGE'
           ? 'capture_capacity_exceeded'
           : 'capture_failed',
         sequence,
       );
     }
+    this.latest = { file, nativeId, snapshot };
   }
   read(args, ctx) {
     if (!readSchema.safeParse(args).success || args.view !== 'runtime' || args.cursor !== undefined)
@@ -110,17 +111,15 @@ export class ContextObservation {
       unavailable.observation.current_leaf_id = manager.getLeafId();
       return unavailable;
     }
-    if (
-      this.binding.file !== manager.getSessionFile() ||
-      this.binding.native_id !== manager.getSessionId()
-    )
+    const { file, nativeId, snapshot } = this.latest;
+    if (file !== manager.getSessionFile() || nativeId !== manager.getSessionId())
       return unavailableObservation(
         args.session_id,
         'session_changed',
         this.counter.captureSequence,
       );
     return checkObservation(
-      { ...this.latest, session_id: args.session_id },
+      { ...snapshot, session_id: args.session_id },
       { entries: manager.getEntries(), leafId: manager.getLeafId() },
     );
   }

@@ -2,12 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { contextSelection } from './read-schema.mjs';
 import { READ_SNAPSHOT_LIMIT, ReadSnapshots } from './read-snapshots.mjs';
 import { renderPreparedContextRead } from './read-render.mjs';
-import {
-  navigationDocuments,
-  navigationOrder,
-  navigationRow,
-  documentAtoms,
-} from './read-navigation.mjs';
+import { navigationIndex, navigationRow, nestedCall } from './read-navigation.mjs';
 
 const encodeHandle = (...parts) => Buffer.from(JSON.stringify(parts)).toString('base64url');
 const validToken = (token) => typeof token === 'string' && /^[0-9a-f-]{36}$/.test(token);
@@ -63,32 +58,28 @@ export class ContextReadCache extends ReadSnapshots {
       if (refs.length !== 1) throw new Error('INVALID_READ_REFERENCE');
       return { sourceRequest: resolved[0].document.request };
     }
-    const tokenOrder = new Map();
-    const selected = new Map();
-    for (const { token, entry, document } of resolved) {
-      this.touch(token, entry);
-      if (!tokenOrder.has(token)) tokenOrder.set(token, tokenOrder.size);
-      const captureIndex = tokenOrder.get(token);
-      for (const atom of documentAtoms(entry.snapshot.documents, document))
-        selected.set(
-          atom.child === undefined
-            ? `${token}:${atom.position}`
-            : `${token}:${atom.position}:${atom.child}`,
-          { ...atom, token, captureIndex },
-        );
-    }
-    const units = [...selected.values()]
-      .filter(
-        ({ token, position, child }) =>
-          child === undefined || !selected.has(`${token}:${position}`),
-      )
-      .sort(
-        (a, b) =>
-          a.captureIndex - b.captureIndex ||
-          a.position - b.position ||
-          (a.child ?? -1) - (b.child ?? -1),
-      )
-      .map(({ unit }) => unit);
+    for (const { token, entry } of resolved) this.touch(token, entry);
+    const units = [...Map.groupBy(resolved, ({ token }) => token).values()].flatMap((capture) => {
+      const selected = new Map();
+      const { units } = capture[0].entry.snapshot;
+      for (const { document } of capture) {
+        if (document.positions) {
+          for (const position of document.positions) selected.set(position, { position });
+        } else selected.set(`${document.position}:${document.ordinal}`, document);
+      }
+      return [...selected.values()]
+        .filter(({ position, ordinal }) => ordinal === undefined || !selected.has(position))
+        .sort((a, b) => a.position - b.position || (a.ordinal ?? -1) - (b.ordinal ?? -1))
+        .map((source) => {
+          const { position, ordinal } = source;
+          if (ordinal === undefined) return units[position];
+          return {
+            type: 'nested_call',
+            source: { ...units[position].source, nested_call_index: ordinal },
+            nested_call: nestedCall(units, source),
+          };
+        });
+    });
     const { documents, order, query, ...snapshot } = resolved[0].entry.snapshot;
     return { ...snapshot, units, presentation: 'source', expanded_refs: refs };
   }
@@ -121,10 +112,10 @@ export class ContextReadCache extends ReadSnapshots {
     let rows;
     if (snapshot.documents) {
       const ref = (index) => encodeHandle('ref', token, index);
-      const { documents, order, query } = snapshot;
+      const { order, query } = snapshot;
       rows = {
         length: order.length,
-        at: (offset) => navigationRow(documents, order[offset], ref, query),
+        at: (offset) => navigationRow(snapshot, order[offset], ref, query),
       };
     }
     const result = renderPreparedContextRead(snapshot, args, {
@@ -152,14 +143,11 @@ export class ContextReadCache extends ReadSnapshots {
     return result;
   }
   navigate(snapshot, args, options, query) {
-    const { units, ...capture } = snapshot;
-    const documents = navigationDocuments({ ...capture, units, request: args });
+    const capture = { ...snapshot, request: args };
     return this.render(
       {
         ...capture,
-        request: args,
-        documents,
-        order: navigationOrder(documents, query),
+        ...navigationIndex(capture, query),
         presentation: 'preview',
         query,
       },

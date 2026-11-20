@@ -4,16 +4,16 @@ import { utf16String } from '../mcp/schema.mjs';
 const count = z.number().int().min(-1).max(Number.MAX_SAFE_INTEGER);
 // Native source-unit names differ from public content controls. Extensions may
 // expose additional source kinds; they remain readable under the native switch.
+const contentKindAliases = {
+  prompt: 'input',
+  text: 'assistant',
+  tool_call: 'tool',
+  tool_result: 'tool',
+  nested_call: 'tool',
+  custom: 'native',
+};
 export function contentKind(kind) {
-  const mapped =
-    {
-      prompt: 'input',
-      text: 'assistant',
-      tool_call: 'tool',
-      tool_result: 'tool',
-      nested_call: 'tool',
-      custom: 'native',
-    }[kind] ?? kind;
+  const mapped = contentKindAliases[kind] ?? kind;
   return CONTENT_KINDS.includes(mapped) ? mapped : 'native';
 }
 // UTF-8 budget for one structured read page when max_bytes is omitted.
@@ -56,11 +56,11 @@ const contentSchema = z
   })
   .strict();
 
+const view = z.enum(['session', 'runtime']);
 export const readSchema = z
   .object({
     session_id: utf16String(256).min(1).optional(),
-    view: z
-      .enum(['session', 'runtime'])
+    view: view
       .describe(
         'Omit for default source; "session" = native context; "runtime" = last request capture.',
       )
@@ -110,17 +110,17 @@ export const readSchema = z
 
 export const searchSchema = z
   .object({
-    session_id: utf16String(256).min(1),
+    session_id: readSchema.shape.session_id.unwrap(),
     query: utf16String(2048, { trim: true }).min(1).describe('Case-insensitive literal text.'),
-    view: z.enum(['session', 'runtime']).optional(),
+    view: view.optional(),
     content: z
       .array(z.enum(CONTENT_KINDS))
       .min(1)
       .max(CONTENT_KINDS.length)
       .describe('Kinds to search (omit for all).')
       .optional(),
-    leaf_id: utf16String(128).min(1).nullable().optional(),
-    max_bytes: z.number().int().min(4096).max(65536).optional(),
+    leaf_id: readSchema.shape.leaf_id,
+    max_bytes: readSchema.shape.max_bytes,
   })
   .strict()
   .refine((args) => args.view !== 'runtime' || args.leaf_id === undefined, {

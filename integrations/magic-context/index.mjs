@@ -162,13 +162,12 @@ function sessionProject(db, { session, owner }) {
   return db.prepare(PROJECT).get(session.native_id, Number(live))?.project_path;
 }
 
-function nativeEntryId(id) {
-  return typeof id === 'string' && id.length > 0 && !/^(pi-msg-|synth-user-)/.test(id)
-    ? id
-    : undefined;
+function historyLeaf({ rebase_status, end_message_id }) {
+  if (rebase_status === 'ok' && end_message_id && !/^(pi-msg-|synth-user-)/.test(end_message_id))
+    return end_message_id;
 }
 
-function compartmentItem(row, capturedAt) {
+function compartmentItem(row, capturedAt, relations) {
   const concise = [row.p2, row.p3, row.p4].find((tier) => tier?.trim());
   const text = [row.p1, row.content, concise].find((tier) => tier?.trim()) ?? '';
   const preview = concise ?? text;
@@ -179,13 +178,13 @@ function compartmentItem(row, capturedAt) {
     compartment_id: row.id,
     sequence: row.sequence,
     created_at: row.created_at,
+    mc_start_message_id: row.start_message_id,
+    mc_end_message_id: row.end_message_id,
   };
-  source.mc_start_message_id = row.start_message_id;
-  source.mc_end_message_id = row.end_message_id;
   if (row.start_block_index !== null) source.mc_start_block_index = row.start_block_index;
   if (row.end_block_index !== null) source.mc_end_block_index = row.end_block_index;
-  const end = nativeEntryId(row.end_message_id);
-  if (row.rebase_status === 'ok' && end) {
+  const end = historyLeaf(row);
+  if (end) {
     // MC folds tool results into the next user message, so its part indexes
     // and starting message do not describe an exact native range. Only expose
     // the ending entry as a historical leaf whose ancestry Bridge can verify.
@@ -195,7 +194,15 @@ function compartmentItem(row, capturedAt) {
     source.source_unavailable =
       row.rebase_status === 'unresolved' ? 'unresolved_boundary' : 'no_native_history_leaf';
   }
-  return { id: `compartment:${row.id}`, kind: 'summary', title: row.title, text, preview, source };
+  return {
+    id: `compartment:${row.id}`,
+    kind: 'summary',
+    title: row.title,
+    text,
+    preview,
+    source,
+    branch_relation: end ? relations[end] : 'unknown',
+  };
 }
 
 function memoryItem(row, capturedAt) {
@@ -251,44 +258,35 @@ export function createMagicContextReader(options) {
           content.summary === 0
             ? db.prepare(`SELECT count(*) AS total ${sessionCompartments}`).get(id).total
             : compartments.length;
-        const memories = db.prepare(MEMORIES).all(identity);
-        if (
-          compartments.some((row) => !compartmentSchema.safeParse(row).success) ||
-          memories.some((row) => !memorySchema.safeParse(row).success)
-        )
+        if (compartments.some((row) => !compartmentSchema.safeParse(row).success))
           throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
-        return {
-          capturedAt,
-          compartments,
-          summaryTotal,
-          // Validate timestamp types before comparing; SQLite's coercion
-          // must not turn a changed storage representation into active memory.
-          memories: memories.filter(
-            (row) => row.expires_at === null || row.expires_at > capturedAt,
-          ),
-        };
+        // Validate timestamps before comparing so SQLite coercion cannot
+        // make an incompatible stored value active.
+        const memories = [];
+        for (const row of db.prepare(MEMORIES).iterate(identity)) {
+          if (!memorySchema.safeParse(row).success)
+            throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
+          if (row.expires_at === null || row.expires_at > capturedAt) memories.push(row);
+        }
+        return { capturedAt, compartments, summaryTotal, memories };
       });
-      const summaries = compartments.map((row) => compartmentItem(row, capturedAt));
-      const ids = [
-        ...new Set(summaries.map((item) => item.source.source_entry_id).filter(Boolean)),
-      ];
+      const ids = [...new Set(compartments.map(historyLeaf).filter(Boolean))];
       // Bridge appends the same native capture after read() returns.
       const relations = ids.length
         ? (await context.nativeRead({ entry_ids: ids })).entry_relations
         : {};
-      for (const item of summaries) {
-        const end = item.source.source_entry_id;
-        item.branch_relation = end ? relations[end] : 'unknown';
-      }
       const eligible =
         content.summary === -1
-          ? summaries
-          : summaries.filter((item) => item.branch_relation !== 'off_branch');
+          ? compartments
+          : compartments.filter((row) => {
+              const end = historyLeaf(row);
+              return !end || relations[end] !== 'off_branch';
+            });
       const last = (items, count) =>
         count === -1 ? items : count === 0 ? [] : items.slice(-count);
       const selectedSummaries = last(eligible, content.summary);
       const selectedMemories = last(memories, content.memory);
-      const excluded = summaries.length - eligible.length;
+      const excluded = compartments.length - eligible.length;
       return {
         native: true,
         coverage: [
@@ -301,7 +299,7 @@ export function createMagicContextReader(options) {
           { type: 'memory', selected: selectedMemories.length, total: memories.length },
         ],
         items: [
-          ...selectedSummaries,
+          ...selectedSummaries.map((row) => compartmentItem(row, capturedAt, relations)),
           ...selectedMemories.map((row) => memoryItem(row, capturedAt)),
         ],
       };

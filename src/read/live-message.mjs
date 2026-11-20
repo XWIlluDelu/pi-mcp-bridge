@@ -5,39 +5,31 @@ const BLOCK_OVERHEAD = 64;
 export class LiveMessageObserver {
   constructor(source) {
     this.source = source;
-    this.blocks = [];
-    this.active = false;
+    this.blocks = null;
     this.truncated = false;
     this.observedAt = null;
   }
   reset() {
-    this.blocks = [];
-    this.active = false;
+    this.blocks = null;
     this.truncated = false;
     this.observedAt = new Date().toISOString();
   }
-  update(event) {
+  update({ type, message }) {
+    const role = message?.role;
     if (
-      event.type === 'agent_start' ||
-      event.type === 'agent_settled' ||
-      (event.type === 'message_start' && event.message?.role === 'user')
-    ) {
+      type === 'agent_start' ||
+      type === 'agent_settled' ||
+      (type === 'message_start' && role === 'user') ||
+      (type === 'message_end' && role === 'assistant')
+    )
+      return this.reset();
+    if (role !== 'assistant') return;
+    if (type === 'message_start') {
       this.reset();
-      return;
-    }
-    if (event.type === 'message_end' && event.message?.role === 'assistant') {
-      this.reset();
-      return;
-    }
-    if (event.type === 'message_start') {
-      if (event.message?.role !== 'assistant') return;
-      this.reset();
-      this.active = true;
-    }
-    if (event.type !== 'message_start' && event.type !== 'message_update') return;
-    if (!this.active || event.message?.role !== 'assistant') return;
+      this.blocks = [];
+    } else if (type !== 'message_update' || !this.blocks) return;
     this.observedAt = new Date().toISOString();
-    const content = event.message.content;
+    const { content } = message;
     if (!Array.isArray(content)) return;
     const retained = [];
     let remaining = MAX_UNITS;
@@ -56,12 +48,7 @@ export class LiveMessageObserver {
       if (text.length > allowance) {
         this.truncated = true;
         let start = text.length - allowance;
-        if (
-          start > 0 &&
-          /[\uDC00-\uDFFF]/.test(text[start]) &&
-          /[\uD800-\uDBFF]/.test(text[start - 1])
-        )
-          start++;
+        if (text.codePointAt(start - 1) > 0xffff) start++;
         // Detach the tail from the growing cumulative message's backing string.
         text = structuredClone(text.slice(start));
       }
@@ -77,7 +64,7 @@ export class LiveMessageObserver {
       observed_at: this.observedAt,
       transient: true,
       truncated: this.truncated,
-      message: this.active
+      message: this.blocks
         ? { role: 'assistant', content: this.blocks.map((block) => ({ ...block })) }
         : null,
     };

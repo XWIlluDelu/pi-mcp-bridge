@@ -48,11 +48,10 @@ export class RuntimeEvents {
     this.sequence = 0;
   }
   invalidate() {
-    this.invalidated = true;
-    this.events = [];
+    this.events = null;
   }
   observe(event) {
-    if (this.invalidated) return false;
+    if (!this.events) return false;
     let payload;
     if (event.type === 'extension_error') {
       if (
@@ -83,7 +82,7 @@ export class RuntimeEvents {
     return true;
   }
   snapshot() {
-    if (!this.events.length) return null;
+    if (!this.events?.length) return null;
     return {
       source: 'rpc_extension_events',
       generation: this.generation,

@@ -3,7 +3,7 @@
 
 export function validateReadAdapters(adapters = []) {
   const ids = new Set(),
-    types = new Set();
+    byType = new Map();
   if (!Array.isArray(adapters)) throw new Error('INVALID_READ_ADAPTER');
   for (const adapter of adapters) {
     if (
@@ -20,10 +20,10 @@ export function validateReadAdapters(adapters = []) {
       throw new Error('INVALID_READ_ADAPTER');
     ids.add(adapter.id);
     for (const type of adapter.inputCustomTypes) {
-      if (typeof type !== 'string' || !type || types.has(type))
+      if (typeof type !== 'string' || !type || byType.has(type))
         throw new Error('INVALID_READ_ADAPTER');
-      types.add(type);
+      byType.set(type, adapter.id);
     }
   }
-  return adapters;
+  return byType;
 }

@@ -100,7 +100,11 @@ test('read contract is independent of product version and a mismatch cannot repl
   t.mock.method(runtime, 'request', () => assert.fail('Do not probe an incompatible owner'));
   runtime.record.readContract = 'unsupported';
   const result = await callBridgeTool(f.bridge, 'read', request);
+  assert.equal(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
   assert.equal(result.structuredContent.error.code, 'OWNER_READ_REFRESH_REQUIRED');
+  assert.match(result.structuredContent.error.recovery, /idle boundary/);
+  assert.match(result.structuredContent.error.recovery, /Call reload/);
   await assert.rejects(
     reserveOwner(f.config.attachmentDir, f.session, 'rpc'),
     /LIVE_OWNER_UNREACHABLE/,

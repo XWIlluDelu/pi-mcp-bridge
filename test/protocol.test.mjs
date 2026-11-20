@@ -164,28 +164,6 @@ test('public mutation payloads are validated before dispatch', async () => {
   );
   assert.deepEqual(calls, [{ project }, { project, text: 'initial' }, target]);
 });
-test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
-  const bridge = {
-    captureRequestContext,
-    read: async () => {
-      throw new Error('OWNER_READ_REFRESH_REQUIRED');
-    },
-  };
-  const response = await dispatchModern(
-    bridge,
-    message('tools/call', {
-      name: 'read',
-      arguments: { session_id: 'ps_' + 'a'.repeat(32) },
-    }),
-  );
-  const result = response.message.result;
-  assert.equal(result.isError, true);
-  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
-  assert.equal(result.structuredContent.error.code, 'OWNER_READ_REFRESH_REQUIRED');
-  assert.match(result.structuredContent.error.recovery, /idle boundary/);
-  assert.match(result.structuredContent.error.recovery, /Call reload/);
-});
-
 test('bounded stdio handles modern no-handshake calls, cancellation and oversized input', async () => {
   const input = new PassThrough(),
     output = new PassThrough(),
