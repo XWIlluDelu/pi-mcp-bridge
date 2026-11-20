@@ -1,6 +1,5 @@
 // Native cancellation and request-local withdrawal; never teardown or a result store.
-import { fitDecodedText } from '../core/data.mjs';
-import { fitsResult } from '../mcp/response-budget.mjs';
+import { fitDecodedText, fitsResult } from '../mcp/response-budget.mjs';
 
 export function withdrawalCollector(maxChars = 12000) {
   let current;

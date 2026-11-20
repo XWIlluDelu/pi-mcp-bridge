@@ -1,6 +1,6 @@
 // Native extension events have no prompt correlation. Keep them outside history
 // and receipts, scoped to the RPC generation that actually emitted them.
-import { jsonBytes } from '../mcp/response-budget.mjs';
+import { jsonBytes, largestFittingSize } from '../mcp/response-budget.mjs';
 
 const textFields = ['extension_path', 'event', 'error', 'message'];
 function clipped(event, limit) {
@@ -30,14 +30,8 @@ export function boundRuntimeEvents(snapshot, maxBytes) {
     if (jsonBytes(build([event, ...events])) <= maxBytes) events.unshift(event);
     else {
       if (!events.length) {
-        let low = 0,
-          high = 2048;
-        while (low < high) {
-          const mid = Math.ceil((low + high) / 2);
-          if (jsonBytes(build([clipped(event, mid)])) <= maxBytes) low = mid;
-          else high = mid - 1;
-        }
-        const candidate = clipped(event, low);
+        const fits = (length) => jsonBytes(build([clipped(event, length)])) <= maxBytes;
+        const candidate = clipped(event, largestFittingSize(2048, fits));
         if (jsonBytes(build([candidate])) <= maxBytes) events.push(candidate);
       }
       break;

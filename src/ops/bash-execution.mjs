@@ -1,6 +1,5 @@
 // Native Pi bash results, not a second shell executor or result store.
-import { fitDecodedText } from '../core/data.mjs';
-import { fitsResult, optionalResultFields } from '../mcp/response-budget.mjs';
+import { fitDecodedText, fitsResult, optionalResultFields } from '../mcp/response-budget.mjs';
 export function nativeBashResult(value) {
   if (
     !value ||

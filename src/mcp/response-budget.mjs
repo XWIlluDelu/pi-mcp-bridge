@@ -28,6 +28,26 @@ export function optionalResultFields(required, optional, budget) {
   const full = { ...required, ...optional };
   return fitsResult(full, budget) ? full : required;
 }
+export function largestFittingSize(high, fits) {
+  let low = 0;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    if (fits(mid)) low = mid;
+    else high = mid - 1;
+  }
+  return low;
+}
+
+export function fitDecodedText(text, maxChars, render, fits = () => true) {
+  const end = (offset) => (text.codePointAt(offset - 1) > 0xffff ? offset - 1 : offset);
+  return end(
+    largestFittingSize(Math.min(text.length, maxChars), (offset) => {
+      const value = render(text.slice(0, end(offset)));
+      return JSON.stringify(value).length <= maxChars && fits(value);
+    }),
+  );
+}
+
 export function toolResultBytes(result) {
   return resultSize(result, true).wireBytes;
 }

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { utf16String } from '../mcp/schema.mjs';
-import { jsonBytes } from '../mcp/response-budget.mjs';
+import { jsonBytes, largestFittingSize } from '../mcp/response-budget.mjs';
 
 // Leave room for identity/framing in the owner control channel's 8 KiB request.
 export const SETTLED_RESULT_LIMIT = 4096;
@@ -51,14 +51,11 @@ export function captureSettledResult(manager, startLeaf) {
         stop_reason: message.stopReason ?? null,
         truncated: text.length > limit,
       });
-      let low = 0,
-        high = Math.min(MAX_TEXT, text.length);
-      while (low < high) {
-        const mid = Math.ceil((low + high) / 2);
-        if (jsonBytes(make(mid)) <= SETTLED_RESULT_LIMIT) low = mid;
-        else high = mid - 1;
-      }
-      return settledResultSchema.parse(make(low));
+      const size = largestFittingSize(
+        Math.min(MAX_TEXT, text.length),
+        (limit) => jsonBytes(make(limit)) <= SETTLED_RESULT_LIMIT,
+      );
+      return settledResultSchema.parse(make(size));
     }
   }
   return null;
