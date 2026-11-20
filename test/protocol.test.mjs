@@ -83,6 +83,9 @@ test('modern requests are self-contained; discovery and tool list carry required
   });
   assert.equal(listed.ttlMs, 0);
   assert.equal(listed.cacheScope, 'private');
+  const serializedTools = JSON.stringify(listed.tools);
+  assert.ok(Buffer.byteLength(serializedTools) < 16384, 'tools/list should stay compact');
+  assert.ok(!/codemode|magic context/i.test(serializedTools), 'core tool schemas stay plugin-free');
   const read = listed.tools.find((tool) => tool.name === 'read').inputSchema;
   assert.equal(
     read.properties.range.default,

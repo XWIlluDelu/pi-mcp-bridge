@@ -38,60 +38,21 @@ export const ALL_CONTENT = Object.freeze(
 );
 const rangeSchema = z
   .object({
-    recent: count
-      .describe('Last N input turns; default 3; -1 includes all effective turns.')
-      .optional(),
-    earliest: count
-      .describe('Also include first N input turns; default 0; overlaps are deduplicated.')
-      .optional(),
+    recent: count.describe('Last N turns (default 3; -1 = all).').optional(),
+    earliest: count.describe('First N turns (default 0; overlaps deduplicated).').optional(),
   })
   .strict();
 const contentSchema = z
   .object({
-    input: z
-      .boolean()
-      .describe('Include the input message of each selected turn; default true.')
-      .optional(),
-    assistant: count
-      .describe(
-        'Last N assistant messages with body text or failure status per turn; -1 includes all (default). All text blocks of a selected message stay together.',
-      )
-      .optional(),
-    thinking: count
-      .describe(
-        'Last N messages with readable thinking per turn; default 1. 0 omits, -1 includes all. Selected thinking blocks stay in source order.',
-      )
-      .optional(),
-    tool: count
-      .describe(
-        'Last N logical tool operations per turn; default 1. A call and its paired result count once; a codemode batch counts once. 0 omits, -1 includes all.',
-      )
-      .optional(),
-    summary: count
-      .describe(
-        'Summary background, independent of turns: 0 omits, -1 includes all. Native active summaries form one group; readers select their own summary items. Default 2.',
-      )
-      .optional(),
-    memory: count
-      .describe(
-        'Last N eligible memory items supplied by the reader, independent of turns; default 3; 0 omits, -1 includes all.',
-      )
-      .optional(),
-    system: z
-      .boolean()
-      .describe('Include native system instructions and sections; default false.')
-      .optional(),
-    command: count
-      .describe(
-        'Last N native shell command records, independent of turns; default 0; -1 includes all.',
-      )
-      .optional(),
-    native: z
-      .boolean()
-      .describe(
-        'Include other custom/native context in selected turns and global prefixes; default true.',
-      )
-      .optional(),
+    input: z.boolean().describe('Turn input message (default true).').optional(),
+    assistant: count.describe('Last N assistant messages per turn (-1 = all, default).').optional(),
+    thinking: count.describe('Last N thinking messages per turn (default 1; 0 = omit).').optional(),
+    tool: count.describe('Last N tool operations per turn (default 1; 0 = omit).').optional(),
+    summary: count.describe('Background summaries (default 2; 0 = omit, -1 = all).').optional(),
+    memory: count.describe('Reader memory items (default 3; 0 = omit, -1 = all).').optional(),
+    system: z.boolean().describe('System instructions (default false).').optional(),
+    command: count.describe('Last N shell commands (default 0; -1 = all).').optional(),
+    native: z.boolean().describe('Other custom/native context (default true).').optional(),
   })
   .strict();
 
@@ -101,7 +62,7 @@ export const readSchema = z
     view: z
       .enum(['session', 'runtime'])
       .describe(
-        'Omit for automatic reader routing; session forces native context; runtime reads the request-stage capture.',
+        'Omit for default source; "session" = native context; "runtime" = last request capture.',
       )
       .optional(),
     range: rangeSchema.optional(),
@@ -112,9 +73,7 @@ export const readSchema = z
       .array(utf16String(4096).min(1))
       .min(1)
       .max(8)
-      .describe(
-        'Expand up to eight references from one frozen capture into original selected source content.',
-      )
+      .describe('Expand up to 8 refs from one session.')
       .optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),
   })
@@ -152,19 +111,13 @@ export const readSchema = z
 export const searchSchema = z
   .object({
     session_id: utf16String(256).min(1),
-    query: utf16String(2048, { trim: true })
-      .min(1)
-      .describe(
-        'Case-insensitive literal text across the reader’s full effective content, independent of read sampling.',
-      ),
+    query: utf16String(2048, { trim: true }).min(1).describe('Case-insensitive literal text.'),
     view: z.enum(['session', 'runtime']).optional(),
     content: z
       .array(z.enum(CONTENT_KINDS))
       .min(1)
       .max(CONTENT_KINDS.length)
-      .describe(
-        'Content kinds to search; omit for all supported kinds. Uses the same names as read.content.',
-      )
+      .describe('Kinds to search (omit for all).')
       .optional(),
     leaf_id: utf16String(128).min(1).nullable().optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),

@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import packageInfo from '../package.json' with { type: 'json' };
-import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
+import { publicSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from './diagnostics.mjs';
 import { toolFailure } from './errors.mjs';
@@ -24,35 +24,35 @@ export async function readJson(stream, limit, tooLarge) {
   }
   return parseJson(Buffer.concat(chunks, bytes));
 }
-// Descriptions state the permission, the outcome contract and retry safety.
-// Detailed semantics live in docs/api.md and in error recovery hints.
+// Keep descriptions concise to minimize per-conversation token overhead.
+// Detailed semantics live in docs/api.md and error recovery hints.
 const descriptions = {
-  list: 'List authorized sessions, newest activity first, with project, name and sampled runtime status (state, model, thinking level, capabilities). Filters combine. Also returns creatable_projects for create. Requires list permission; never starts Pi.',
-  read: 'Read a Pi session in source order; requires read and never starts Pi. Default: the last three input turns with input, all assistant text, the latest thinking and one tool operation per turn. range:{recent,earliest} selects turns (-1 = all); content sets per-kind counts. Items carry refs: read({refs:[...]}) expands up to eight from one result. Continue with read({cursor}), optionally changing max_bytes. Omit view for the session’s default source; where a configured reader applies, results add stored summaries/memories as view:"adapted" with reader.coverage counts. view:"session" forces native context; view:"runtime" reads the captured request context. Stale cursors or refs need a fresh read.',
+  list: 'List authorized Pi sessions (newest first) with status, model, thinking level, capabilities and creatable_projects. Requires list; never starts Pi.',
+  read: 'Read a Pi session in source order (default: last 3 turns); requires read, never starts Pi. Expand item refs with read({refs:[...]}); continue pages with read({cursor}). Omit view for default source (including configured readers).',
   search:
-    'Find case-insensitive literal text in one session’s full effective context, beyond the default read selection; requires read and never starts Pi. Optional content restricts kinds (input, assistant, thinking, tool, summary, memory, system, command, native); view routes as in read. Returns snippets with refs for read({refs}); continue with read({cursor}).',
+    'Search literal case-insensitive text across a session’s full effective context; requires read, never starts Pi. Returns snippets with refs for read({refs}) and cursor for read({cursor}).',
   models:
-    'List the owner’s configured native model catalog without network refresh. Requires send, command or create on a configured project, or send/command on an in-scope session. Each model has provider, id, name, input, context_window and thinking_levels. Use list.status for a session’s current settings.',
+    'List configured native Pi models (provider, id, context_window, thinking_levels) without network refresh. Requires send, command or create.',
   set_model:
-    'Change a session’s model and/or thinking_level without sending a prompt; requires send. Works while busy: in-flight provider requests keep their selection. Returns the actual model and thinking_level after native adjustment. May cold-resume a saved session. An uncertain error may follow a partial change; check list.status before retrying.',
+    'Change a session’s model and/or thinking_level without sending a prompt (works while busy); requires send. Returns actual selection after native adjustment.',
   compact:
-    'Run native context compaction; requires send and a proven-idle session. interrupt:true also requires stop and may abort current work even if compaction fails. Returns status:completed with compaction metadata; read the summary with read. On timeout the outcome is unknown: check list/read before compacting again.',
+    'Run native context compaction on an idle session (requires send; interrupt:true also requires stop). Returns metadata; on unknown check list/read before retrying.',
   reload:
-    'Reload Pi resources (extensions, settings) for an idle active owner; requires send. Preserves history and resets extension-local state. Returns completed with owner_version and read_compatible, rejected/RELOAD_BUSY while work is active, skipped/no_active_owner when nothing runs, or unknown/RELOAD_UNCONFIRMED (check list/read before retrying). Never interrupts or queues work.',
-  send: 'Submit text and/or base64 images (PNG, JPEG, GIF, WebP; at most 32 images and 5 MiB decoded) to a session; requires send. mode: steer (default; starts when idle, steers when busy), follow_up (queues after current work) or idle_only (skips when busy). model/thinking_level require a proven-idle Bridge-owned RPC. Returns submission_id and the admission status, not model completion: started/queued/handled are native acknowledgements; dispatched means an external owner received it without admission evidence; unknown is uncertain, so query submission for a late acknowledgement. Every call is new input; never resubmit automatically.',
+    'Reload Pi extensions and settings for an idle active owner; requires send. Never interrupts or queues work; check list/read before retrying after unknown.',
+  send: 'Submit text and/or images to a session; requires send. mode: steer (default), follow_up or idle_only. Returns submission_id and admission status (not completion); check submission/list/read after unknown—never resubmit automatically.',
   submission:
-    'Look up one send/create admission receipt by session_id and submission_id without contacting Pi; late native acknowledgements update it. Requires read or send, or create for a create receipt. Receipts hold status only, last at most one hour (newest 256) and are lost on restart; SUBMISSION_UNAVAILABLE does not mean the input failed.',
+    'Look up a send/create admission receipt (including late native ACKs) without contacting Pi. Requires read, send, or create for a create receipt.',
   command:
-    'Run a shell command through Pi’s native bash path (omit the leading !); requires command. Returns status:completed with output, exitCode and cancelled once it ends. native_truncated reports Pi’s own truncation; response_complete:false means Bridge shortened the output to max_chars, with no continuation. Every call executes again; never retry an unknown outcome automatically.',
-  stop: 'Cancel current execution and withdraw queued input; requires stop and never starts Pi. Returns withdrawn_text, with withdrawn_complete:false if shortened. Each call acts on whatever runs now, so repeating it can interrupt later work.',
+    'Run a native Pi shell command (omit leading !); requires command. Returns output, exitCode and cancelled. Never retry automatically after unknown.',
+  stop: 'Cancel active work and withdraw queued input; requires stop, never starts Pi. Acts on current work each time.',
   create:
-    'Create a saved session in a configured project path (see list.creatable_projects); requires create. Optional text/images submit the first prompt with the same rules as send; without them no agent runs. fork_from copies a parent’s committed branch and also requires read on it. Returns the new session_id even after a partial failure, plus the nested send status and submission_id when prompted. Each call creates another session; never recreate automatically after unknown.',
+    'Create a saved session in a configured project (see list.creatable_projects); requires create. Optional text/images send the first prompt; fork_from copies a parent branch (also requires read). Never recreate automatically after unknown.',
   delete:
-    'Interrupt the writer and move the session to recoverable trash; requires delete. Project files are untouched. Returns a restore_token for owner-side recovery. Each call is a new deletion attempt.',
+    'Stop the session’s writer and move the session file to recoverable trash (project files untouched); requires delete. Returns restore_token.',
   batch:
-    'Run 1–10 operations of other tools as {op,args}, e.g. {"operations":[{"op":"list","args":{}}]}. Same-session items run in order and other sessions concurrently; each item needs its own permissions and fails independently. Results keep input order. A shared response budget may shorten query pages (with cursors) or command output (with completeness flags). Repeating a batch repeats its mutations.',
+    'Run 1–10 operations as {op,args}. Same-session items run in order, different sessions concurrently; items fail independently. Repeating a batch repeats its mutations.',
   health:
-    'Diagnose the permission configuration; a healthy setup returns a short ok. Optional session_id limits the diagnosis to that session. Unscoped calls also report settings awaiting restart and unavailable event storage. Changes nothing.',
+    'Check permission policy warnings, settings awaiting restart, and event-store status. Optional session_id scopes to one session.',
 };
 const toolNames = Object.keys(descriptions);
 let tools;
@@ -62,11 +62,6 @@ export function toolDefinitions() {
     description: descriptions[name],
     inputSchema: z.toJSONSchema(publicSchemas[name], { target: 'draft-7', io: 'input' }),
     ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
-    ...(publicOutputSchemas[name]
-      ? {
-          outputSchema: z.toJSONSchema(publicOutputSchemas[name], { target: 'draft-7' }),
-        }
-      : {}),
   })));
 }
 const ownerRecovery =
