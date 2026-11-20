@@ -6,8 +6,7 @@ import {
 } from './tool-schemas.mjs';
 import {
   TOOL_RESULT_LIMIT,
-  toolResultBytes,
-  jsonBytes,
+  resultSize,
   fitsResult,
   largestFittingSize,
 } from './response-budget.mjs';
@@ -20,44 +19,19 @@ const envelope = (results) => ({
   results,
 });
 
-function planBatch(operations) {
-  const frame = envelope(operations.map(() => null)),
-    count = operations.length,
-    share = Math.floor((BATCH_RESPONSE_LIMIT - jsonBytes(frame)) / count),
-    wireShare = Math.floor((TOOL_RESULT_LIMIT - toolResultBytes(frame)) / count);
-  return operations.map((item, index) => {
-    const op = item?.op;
-    const shape = batchOperationSchema.safeParse(item);
-    const parsed =
-      shape.success && publicOperationSchemas[shape.data.op].safeParse(shape.data.args);
-    if (!parsed?.success)
-      return {
-        index,
-        op: typeof op === 'string' ? op.slice(0, 64) : null,
-        error: {
-          code: 'INVALID_OPERATION',
-          ...(typeof op === 'string' && op.length > 64 ? { op_truncated: true } : {}),
-        },
-      };
-    // Costs are additive at each null placeholder, including MCP's escaped text
-    // copy. Subtract the item wrapper before giving its renderer a budget.
-    // At most 10 items leave >19 KiB JSON and >24 KiB duplicated wire per result.
-    // Required metadata fits: two <=256-unit model strings cost <=6656 wire bytes;
-    // reason <=128, entry ID <=128, UUIDs and safe counters leave ample room.
-    // See models.mjs, prompt-input.mjs, compact.mjs, storage.mjs and trash.mjs.
-    // Unbounded auxiliary filesystem paths are optional in budgeted renderers.
-    const empty = { index, op, result: null };
+function itemBudget(operations) {
+  const frame = resultSize(envelope(operations.map(() => null)));
+  const empty = resultSize(null);
+  const bytes = Math.floor((BATCH_RESPONSE_LIMIT - frame.bytes) / operations.length);
+  const wire = Math.floor((TOOL_RESULT_LIMIT - frame.wireBytes) / operations.length);
+  // Replace the null placeholders in both the batch envelope and the item wrapper.
+  return (index, op) => {
+    const wrapper = resultSize({ index, op, result: null });
     return {
-      index,
-      op,
-      args: parsed.data,
-      resultBudget: {
-        maxBytes: share + 4 - (jsonBytes(empty) - 4),
-        maxWireBytes:
-          wireShare + toolResultBytes(null) - (toolResultBytes(empty) - toolResultBytes(null)),
-      },
+      maxBytes: bytes + 2 * empty.bytes - wrapper.bytes,
+      maxWireBytes: wire + 2 * empty.wireBytes - wrapper.wireBytes,
     };
-  });
+  };
 }
 
 function fitQuery(op, result, args, budget) {
@@ -79,23 +53,34 @@ function fitQuery(op, result, args, budget) {
 // Callers validate the outer batch shape; malformed items are retained for
 // per-item errors and validated here against their own operation schema.
 export async function executeBatch(bridge, { operations }, { requestContext } = {}) {
-  const plan = planBatch(operations);
+  const budgetFor = itemBudget(operations);
   requestContext ??= bridge.captureRequestContext();
   void requestContext.catch(() => {});
   const lanes = new Map(),
     readPins = [],
     inputs = new Set();
-  const jobs = plan.map((item) => {
-    const { index, op, args, resultBudget, error } = item;
-    if (error) return { index, op, error };
+  const jobs = operations.map((item, index) => {
+    const op = item?.op;
+    const shape = batchOperationSchema.safeParse(item);
+    const parsed = shape.success && publicOperationSchemas[op].safeParse(shape.data.args);
+    if (!parsed?.success)
+      return {
+        index,
+        op: typeof op === 'string' ? op.slice(0, 64) : null,
+        error: {
+          code: 'INVALID_OPERATION',
+          ...(typeof op === 'string' && op.length > 64 ? { op_truncated: true } : {}),
+        },
+      };
+    const args = parsed.data;
     let sessionId = args.session_id;
-    if (op === 'read' && !sessionId && (args.cursor || args.refs)) {
-      try {
+    try {
+      if (op === 'read' && !sessionId && (args.cursor || args.refs))
         sessionId = bridge.readCache.target(args);
-      } catch (error) {
-        return { index, op, error: toolFailure(error) };
-      }
+    } catch (error) {
+      return { index, op, error: toolFailure(error) };
     }
+    const resultBudget = budgetFor(index, op);
     const pendingInput = inputOperations.has(op) ? bridge.registerInput(sessionId) : undefined;
     if (pendingInput) inputs.add(pendingInput);
     const lane = sessionId ?? args.fork_from ?? index;

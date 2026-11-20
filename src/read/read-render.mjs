@@ -1,5 +1,10 @@
 import { DEFAULT_READ_BYTES } from './read-schema.mjs';
-import { jsonBytes, largestFittingSize, resultSize } from '../mcp/response-budget.mjs';
+import {
+  jsonBytes,
+  largestFittingSize,
+  payloadSize,
+  TOOL_FRAME_BYTES,
+} from '../mcp/response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { fitNavigationRow } from './read-navigation.mjs';
 
@@ -58,7 +63,20 @@ function* fragments(text, emit) {
 const bodyFields = ['content', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'];
 const messageIdentity = ['role', 'toolCallId', 'toolName', 'isError', 'customType', 'stopReason'];
 const commandStatus = ['exitCode', 'cancelled', 'truncated'];
+const essentialMetadata = new Set([
+  ...messageIdentity.filter((key) => key !== 'customType'),
+  ...commandStatus,
+  'id',
+  'name',
+  'status',
+]);
 const isText = (block) => block.type === 'text' || block.type === 'thinking';
+
+function* blockParts(block, emit) {
+  const field = block.type;
+  if (isText(block)) yield* fragments(block[field], (text) => emit({ ...block, [field]: text }));
+  else yield emit(block);
+}
 
 function* messageParts(message, emit) {
   const { sections, toolsAdded, toolsRemoved, content } = message;
@@ -118,13 +136,10 @@ function* messageParts(message, emit) {
   if (field) yield* fragments(record[field], (text) => emit({ ...record, [field]: text }));
   else if (Array.isArray(content) && content.length)
     for (const [content_index, block] of content.entries()) {
-      const emitBlock = (value) => {
+      yield* blockParts(block, (value) => {
         const unit = emit({ ...record, content: [value] });
         return { ...unit, source: { ...unit.source, content_index } };
-      };
-      if (isText(block))
-        yield* fragments(block[block.type], (text) => emitBlock({ ...block, [block.type]: text }));
-      else yield emitBlock(block);
+      });
     }
   else yield emit(record);
 }
@@ -137,10 +152,7 @@ function* pageParts(record) {
       yield { ...base, metadata, type: 'message_metadata' };
       if (metadata.stopReason !== undefined) base.metadata = { stopReason: metadata.stopReason };
     }
-    yield* fragments(block[block.type], (text) => ({
-      ...base,
-      block: { ...block, [block.type]: text },
-    }));
+    yield* blockParts(block, (part) => ({ ...base, block: part }));
   } else if (record.message)
     yield* messageParts(record.message, (message) => ({ ...record, message }));
   else if (record.parts)
@@ -158,21 +170,8 @@ function fitMetadata(unit, fits) {
       ? result.nested_call
       : (result.message ?? result.parts?.[0]?.message ?? result.metadata);
   if (!fields) return result;
-  const essential = [
-    'role',
-    'toolCallId',
-    'toolName',
-    'isError',
-    'id',
-    'name',
-    'status',
-    'stopReason',
-    'exitCode',
-    'cancelled',
-    'truncated',
-  ];
   const removable = Object.keys(fields)
-    .filter((key) => !essential.includes(key))
+    .filter((key) => !essentialMetadata.has(key))
     .map((key) => [key, jsonBytes(fields[key])])
     .sort((a, b) => b[1] - a[1]);
   for (const [key] of removable) {
@@ -232,13 +231,10 @@ export function smallLive(live, budget) {
 // unread part for forward paging; replay from source for a different cursor.
 const continuations = new WeakMap();
 
-function* pageItems(units, rows, offset, part) {
+function* pageItems(units, preview, offset, part) {
   for (; offset < units.length; offset++) {
-    if (rows) {
-      yield { unit: rows.at(offset), nextOffset: offset + 1, nextPart: 0 };
-      continue;
-    }
-    const parts = pageParts(units[offset]);
+    const unit = units.at(offset);
+    const parts = preview ? [unit].values() : pageParts(unit);
     let current = parts.next();
     for (let i = 0; i < part && !current.done; i++) current = parts.next();
     if (current.done) throw new Error('INVALID_CURSOR');
@@ -298,10 +294,10 @@ export function renderPreparedContextRead(
     },
   });
   const maxBytes = Math.min(max, resultBudget?.maxBytes ?? max);
-  const maxWireBytes = resultBudget?.maxWireBytes ?? Infinity;
-  const size = (value) => resultSize(value, Boolean(resultBudget));
+  // Work in payload bytes throughout. Charge the MCP text/structured wrapper once.
+  const maxWireBytes = (resultBudget?.maxWireBytes ?? Infinity) - TOOL_FRAME_BYTES;
+  const size = (value) => payloadSize(value, Boolean(resultBudget));
   const fits = ({ bytes, wireBytes }) => bytes <= maxBytes && wireBytes <= maxWireBytes;
-  const emptyObjectWire = size({}).wireBytes;
   const requiredSize = size(required);
   let baseSize = size(base);
   const items = [];
@@ -311,52 +307,38 @@ export function renderPreparedContextRead(
     part = firstPart;
   const previous = continuations.get(snapshot);
   const resume = previous?.offset === start && previous.part === firstPart;
-  const iterator = resume ? previous.iterator : pageItems(units, rows, start, firstPart);
+  const iterator = resume ? previous.iterator : pageItems(units, Boolean(rows), start, firstPart);
   let current = resume ? previous.current : iterator.next();
   continuations.delete(snapshot);
   while (!current.done) {
     let { unit, nextOffset, nextPart } = current.value;
     const tail = size({ items: [], ...paging(nextOffset, nextPart) });
     const comma = items.length ? 1 : 0;
-    const unitSize = (candidate) => {
-      const cost = size(candidate);
-      return {
-        bytes: cost.bytes,
-        wireBytes: resultBudget ? cost.wireBytes - emptyObjectWire + 4 : 0,
-      };
-    };
-    // Joining JSON objects replaces two braces with one comma. Each insert
-    // also adds one array comma after the first item, in both copies.
+    // Join two JSON objects (-1 byte) and separate consecutive items (+1).
+    const punctuation = comma - 1;
     const pageWith = (cost) => ({
-      bytes: baseSize.bytes + tail.bytes - 1 + bytes + cost.bytes + comma,
-      wireBytes:
-        baseSize.wireBytes +
-        tail.wireBytes -
-        emptyObjectWire +
-        2 +
-        wireBytes +
-        cost.wireBytes +
-        2 * comma,
+      bytes: baseSize.bytes + tail.bytes + bytes + cost.bytes + punctuation,
+      wireBytes: baseSize.wireBytes + tail.wireBytes + wireBytes + cost.wireBytes + 2 * punctuation,
     });
-    let cost = unitSize(unit);
+    let cost = size(unit);
     if (!items.length && !fits(pageWith(cost))) {
       base = { ...required, live: smallLive(base.live, 256) };
       baseSize = size(base);
       if (!fits(pageWith(cost))) {
         base = required;
         baseSize = requiredSize;
+        if (!fits(pageWith(cost))) {
+          const fitsUnit = (value) => fits(pageWith(size(value)));
+          if (metadataUnit(unit)) unit = fitMetadata(unit, fitsUnit);
+          else if (rows) unit = fitNavigationRow(unit, fitsUnit);
+          cost = size(unit);
+        }
       }
-    }
-    if (!items.length && !fits(pageWith(cost))) {
-      const fitsUnit = (value) => fits(pageWith(unitSize(value)));
-      if (metadataUnit(unit)) unit = fitMetadata(unit, fitsUnit);
-      else if (rows) unit = fitNavigationRow(unit, fitsUnit);
-      cost = unitSize(unit);
     }
     if (requiredSize.bytes + tail.bytes - 1 + cost.bytes > READ_PAGE_LIMIT) {
       if (items.length && metadataUnit(unit)) break;
       unit = omittedUnit(unit);
-      cost = unitSize(unit);
+      cost = size(unit);
     }
     const measured = pageWith(cost);
     if (!fits(measured)) {

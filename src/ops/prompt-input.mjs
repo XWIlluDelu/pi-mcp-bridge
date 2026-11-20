@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { utf16String } from '../mcp/schema.mjs';
-import { modelSelectionSchema, thinkingLevelSchema, sameModel } from './models.mjs';
+import { parseAs, utf16String } from '../mcp/schema.mjs';
+import { modelPreferenceFields, sameModel } from './models.mjs';
 export const hasPromptSettings = (input) =>
   input.model !== undefined || input.thinking_level !== undefined;
 
@@ -24,15 +24,15 @@ export const promptOptions = (mode) =>
       : {};
 const MAX_BASE64 = 4 * Math.ceil(MAX_IMAGE_BYTES / 3);
 const mimeTypes = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+const pngSignature = Buffer.from('89504e470d0a1a0a', 'hex');
 function matchesMime(bytes, mime) {
-  if (mime === 'image/png')
-    return bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'));
+  if (mime === 'image/png') return bytes.subarray(0, 8).equals(pngSignature);
   if (mime === 'image/jpeg') return bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
   if (mime === 'image/gif') return ['GIF87a', 'GIF89a'].includes(bytes.toString('ascii', 0, 6));
   return bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
 }
 const imageSchema = z
-  .object({
+  .strictObject({
     type: z.literal('image'),
     data: z
       .string()
@@ -41,7 +41,6 @@ const imageSchema = z
       .describe('Canonical base64 image bytes (no data URL or path).'),
     mimeType: z.enum(mimeTypes),
   })
-  .strict()
   .superRefine((image, ctx) => {
     const issue = (message) =>
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['data'], message });
@@ -69,8 +68,7 @@ export const imagesSchema = z
 export const promptSchema = z.object({
   text: utf16String(100000).min(1).optional(),
   images: imagesSchema.optional(),
-  model: modelSelectionSchema.optional(),
-  thinking_level: thinkingLevelSchema.optional(),
+  ...modelPreferenceFields,
 });
 export function promptInput({ text, images, model, thinking_level }) {
   if (text === undefined && images === undefined) return undefined;
@@ -85,20 +83,18 @@ export function promptInput({ text, images, model, thinking_level }) {
   };
 }
 export function attachedPromptInput(args) {
-  const parsed = promptSchema.safeParse(args);
-  if (!parsed.success) throw new Error('INVALID_PROMPT_INPUT');
-  const input = promptInput(parsed.data);
+  const input = promptInput(parseAs(promptSchema, args, 'INVALID_PROMPT_INPUT'));
   if (!input) throw new Error('INVALID_ATTACHED_SEND');
   if (hasPromptSettings(input)) throw new Error('MODEL_SELECTION_UNSUPPORTED');
   if (!SEND_MODES.includes(args.mode)) throw new Error('INVALID_ATTACHED_SEND');
   return { ...input, mode: args.mode };
 }
 export function assertPromptSelection(input, state) {
-  if (input.model && !sameModel(input.model, state.model))
+  if (
+    (input.model && !sameModel(input.model, state.model)) ||
+    (input.thinking_level !== undefined && state.thinkingLevel !== input.thinking_level)
+  )
     throw new Error('MODEL_SELECTION_CHANGED');
-  if (input.thinking_level !== undefined) {
-    if (state.thinkingLevel !== input.thinking_level) throw new Error('MODEL_SELECTION_CHANGED');
-  }
 }
 
 // Public admission results are not completion tracking. Only a validated native

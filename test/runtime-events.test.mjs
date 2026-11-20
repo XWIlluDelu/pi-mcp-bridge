@@ -6,7 +6,7 @@ import { RuntimeEvents, boundRuntimeEvents } from '../src/read/runtime-events.mj
 import { assertContextReadResponse, prepareContextRead } from './fixtures/read-pages.mjs';
 import { message } from './fixtures/native-history.mjs';
 import { ContextReadCache } from '../src/read/read-cache.mjs';
-import { toolResultBytes } from '../src/mcp/response-budget.mjs';
+import { resultSize } from '../src/mcp/response-budget.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const notify = (message) => ({ type: 'extension_ui_request', method: 'notify', message });
@@ -120,7 +120,7 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
   });
   assertContextReadResponse(reduced, args);
   assert.ok(bytes(reduced) <= 19000);
-  assert.ok(toolResultBytes(reduced) <= 25000);
+  assert.ok(resultSize(reduced).wireBytes <= 25000);
   assert.ok(reduced.items.length > 0, 'Committed history wins over optional previews');
   if (reduced.runtime_events) assert.equal(reduced.runtime_events.events.at(-1).sequence, 40);
 });

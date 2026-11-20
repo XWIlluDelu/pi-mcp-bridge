@@ -6,17 +6,11 @@ import { SEND_MODES, promptSchema } from '../ops/prompt-input.mjs';
 import { modelsSchema } from '../ops/models.mjs';
 import { modelSettingsSchema } from '../ops/set-model.mjs';
 const id = utf16String(128).min(1);
-const executionShape = {
-  session_id: id,
+const sessionTarget = z.strictObject({ session_id: id });
+const stopSchema = sessionTarget.extend({
   max_chars: z.number().int().min(256).max(32768).optional(),
-};
-const stopSchema = z.object(executionShape).strict();
-const bashSchema = z
-  .object({
-    ...executionShape,
-    command: utf16String(100000).min(1),
-  })
-  .strict();
+});
+const bashSchema = stopSchema.extend({ command: utf16String(100000).min(1) });
 // Owners receive the same command/stop arguments, already bound to their session.
 export const ownerControlSchemas = {
   bash: bashSchema.omit({ session_id: true }),
@@ -31,16 +25,14 @@ export const inputOperations = new Set(['send', 'command', 'compact', 'reload'])
 
 export const publicOperationSchemas = {
   list: z
-    .object({
+    .strictObject({
       project: utf16String(200).optional(),
       name: utf16String(200).optional(),
       active_after: date.optional(),
       active_before: date.optional(),
       session_id: id.optional(),
-      offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-      limit: z.number().int().min(1).max(100).optional(),
+      ...modelsSchema.shape,
     })
-    .strict()
     .refine(
       (args) =>
         !args.active_after ||
@@ -49,10 +41,10 @@ export const publicOperationSchemas = {
       { message: 'active_after must not exceed active_before' },
     ),
   models: modelsSchema,
-  submission: z.object({ session_id: id, submission_id: z.string().uuid() }).strict(),
+  submission: sessionTarget.extend({ submission_id: z.string().uuid() }),
   set_model: modelSettingsSchema.safeExtend({ session_id: id }),
   compact: compactSchema,
-  reload: z.object({ session_id: id }).strict(),
+  reload: sessionTarget,
   read: publicReadSchema,
   search: searchSchema,
   send: promptSchema
@@ -75,15 +67,13 @@ export const publicOperationSchemas = {
       (args) => hasPrompt(args) || (args.model === undefined && args.thinking_level === undefined),
       { message: 'Model and thinking settings require text or images' },
     ),
-  delete: z.object({ session_id: id }).strict(),
-  health: z.object({ session_id: id.optional() }).strict(),
+  delete: sessionTarget,
+  health: sessionTarget.partial(),
 };
-export const batchOperationSchema = z
-  .object({
-    op: z.enum(Object.keys(publicOperationSchemas)),
-    args: z.record(z.string(), z.unknown()),
-  })
-  .strict();
+export const batchOperationSchema = z.strictObject({
+  op: z.enum(Object.keys(publicOperationSchemas)),
+  args: z.record(z.string(), z.unknown()),
+});
 // Advertise the operation shape while admitting malformed items for item-level errors.
 const { $schema, ...batchOperationShape } = z.toJSONSchema(batchOperationSchema, {
   target: 'draft-7',

@@ -1,3 +1,4 @@
+import { mcpRequest } from './fixtures/tool-call.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { append, message, text } from './fixtures/native-history.mjs';
 import { ALL_CONTENT } from '../src/read/read-schema.mjs';
@@ -7,7 +8,7 @@ import { MCP_RESPONSE_LIMIT } from '../src/mcp/response-budget.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { callBridgeTool, dispatchModern, META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
+import { callBridgeTool, dispatchModern } from '../src/mcp/protocol.mjs';
 async function nativeLongPath(dir) {
   let value = dir;
   const segment = '\x01'.repeat(200) + '漢😀\n"\\';
@@ -32,19 +33,10 @@ test('ten real deletes keep restore tokens when escaped native project paths can
   const operations = [{ op: 'delete', args: { session_id: f.id } }];
   while (operations.length < 10)
     operations.push({ op: 'delete', args: { session_id: (await f.create()).id } });
-  const response = await dispatchModern(bridge, {
-    jsonrpc: '2.0',
-    id: '\0'.repeat(1024),
-    method: 'tools/call',
-    params: {
-      name: 'batch',
-      arguments: { operations },
-      _meta: {
-        [META + 'protocolVersion']: MODERN_VERSION,
-        [META + 'clientCapabilities']: {},
-      },
-    },
-  });
+  const response = await dispatchModern(
+    bridge,
+    mcpRequest('tools/call', { name: 'batch', arguments: { operations } }, '\0'.repeat(1024)),
+  );
   assert.ok(Buffer.byteLength(JSON.stringify(response.message)) <= MCP_RESPONSE_LIMIT);
   const results = response.message.result.structuredContent.results;
   assert.equal(results.length, 10);

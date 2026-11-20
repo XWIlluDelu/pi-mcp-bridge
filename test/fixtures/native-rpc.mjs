@@ -2,8 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { processIdentity } from '../../src/runtime/attachments.mjs';
-import { reserveHostSession } from '../../src/runtime/host-adapter.mjs';
-import { RpcClient, buildSessionProjection } from './pi.mjs';
+import { RpcClient } from './pi.mjs';
 import { nativePiCli } from './isolated-runtime.mjs';
 
 export async function nativeRpc(fixture, options) {
@@ -34,13 +33,7 @@ export async function nativeRpcHost(fixture, { args, ...options }) {
   await client.getState();
   const owner = await processIdentity(Number(await fs.readFile(pidFile, 'utf8')));
   assert.ok(owner && owner.pid !== process.pid);
-  const controller = await reserveHostSession({
-    attachmentDir: fixture.bridge.pool.attachmentDir,
-    session: fixture.session,
-    buildSessionProjection,
-    owner,
-  });
-  fixture.cleanup.push(() => controller.close());
+  const controller = await fixture.reserveHost(fixture.session, owner);
   const { cancelled } = await client.switchSession(fixture.session.file);
   assert.equal(cancelled, false);
   return { client, controller, owner };

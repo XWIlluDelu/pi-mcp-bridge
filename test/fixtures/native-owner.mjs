@@ -9,6 +9,8 @@ import {
   readClaim,
   waitOwnerExit,
 } from '../../src/runtime/attachments.mjs';
+import { reserveHostSession } from '../../src/runtime/host-adapter.mjs';
+import { buildSessionProjection } from './pi.mjs';
 import { isolatedRuntime, nativePiCli } from './isolated-runtime.mjs';
 import { denyAllPermissions } from './permissions.mjs';
 import { savedSession } from './saved-session.mjs';
@@ -102,6 +104,16 @@ export async function nativeOwner(
     session,
     id: session?.id,
     bridge,
+    async reserveHost(target = session, owner) {
+      const controller = await reserveHostSession({
+        attachmentDir: bridge.pool.attachmentDir,
+        session: target,
+        buildSessionProjection,
+        owner,
+      });
+      cleanup.push(() => controller.close());
+      return controller;
+    },
     env,
     mark: (name) => fs.writeFile(path.join(dir, name), 'yes'),
   };

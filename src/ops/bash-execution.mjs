@@ -1,35 +1,23 @@
 // Native Pi bash results, not a second shell executor or result store.
-import { fitDecodedText, fitsResult, optionalResultFields } from '../mcp/response-budget.mjs';
-export function nativeBashResult(value) {
-  if (
-    !value ||
-    typeof value.output !== 'string' ||
-    typeof value.cancelled !== 'boolean' ||
-    typeof value.truncated !== 'boolean' ||
-    !(value.exitCode == null || Number.isSafeInteger(value.exitCode)) ||
-    !(value.fullOutputPath == null || typeof value.fullOutputPath === 'string')
-  )
-    throw new Error('INVALID_BASH_RESULT');
-  return {
-    output: value.output,
-    exitCode: value.exitCode ?? null,
-    cancelled: value.cancelled,
-    truncated: value.truncated,
-    fullOutputPath: value.fullOutputPath ?? null,
-  };
-}
+import { z } from 'zod';
+import { parseAs } from '../mcp/schema.mjs';
+import { fitTextField, renderTextField, optionalResultFields } from '../mcp/response-budget.mjs';
+
+const nativeResult = z.object({
+  output: z.string(),
+  exitCode: z.int().nullable().default(null),
+  cancelled: z.boolean(),
+  truncated: z.boolean(),
+  fullOutputPath: z.string().nullable().default(null),
+});
+const inlineResult = nativeResult.extend({ output_complete: z.boolean() });
+export const nativeBashResult = (value) => parseAs(nativeResult, value, 'INVALID_BASH_RESULT');
+export const inlineBashResult = (value) => parseAs(inlineResult, value, 'INVALID_BASH_RESULT');
+
 export function limitBashResult(value, maxChars = 12000) {
   const result = nativeBashResult(value);
-  const units = fitDecodedText(result.output, maxChars, (output) => ({ output }));
-  return {
-    ...result,
-    output: result.output.slice(0, units),
-    output_complete: units === result.output.length,
-  };
-}
-export function inlineBashResult(value) {
-  if (typeof value?.output_complete !== 'boolean') throw new Error('INVALID_BASH_RESULT');
-  return { ...nativeBashResult(value), output_complete: value.output_complete };
+  const output = fitTextField(result.output, 'output', maxChars);
+  return { ...result, output, output_complete: output.length === result.output.length };
 }
 export function bashOutput(receipt, record, args, resultBudget) {
   const render = (output) =>
@@ -48,12 +36,12 @@ export function bashOutput(receipt, record, args, resultBudget) {
       { fullOutputPath: record.fullOutputPath },
       resultBudget,
     );
-  const units = fitDecodedText(
+  return renderTextField(
     record.output,
-    args.max_chars ?? 12000,
-    (output) => ({ output }),
-    ({ output }) => fitsResult(render(output), resultBudget),
+    'output',
+    args,
+    resultBudget,
+    render,
+    'BASH_BUDGET_TOO_SMALL',
   );
-  if (record.output && !units) throw new Error('BASH_BUDGET_TOO_SMALL');
-  return render(record.output.slice(0, units));
 }

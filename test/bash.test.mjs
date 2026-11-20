@@ -1,11 +1,8 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { callBridgeTool } from '../src/mcp/protocol.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 import { validateGrants } from '../src/core/owner-config.mjs';
 import net from 'node:net';
@@ -39,11 +36,7 @@ async function fixture(t) {
   });
   const { bridge, config, session: saved } = f,
     [rule] = config.grants;
-  const controller = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: bridge.pool.attachmentDir,
-    session: saved,
-  });
+  const controller = await f.reserveHost();
   let calls = 0;
   const output = 'complete 😀 "\\ result\n'.repeat(1500);
   const callbacks = {
@@ -62,7 +55,6 @@ async function fixture(t) {
     },
   };
   await controller.ready(callbacks);
-  f.cleanup.push(() => controller.close());
   const call = (args) => callBridgeTool(bridge, 'command', { session_id: saved.id, ...args });
   return { ...f, rule, saved, call, calls: () => calls, callbacks, output };
 }

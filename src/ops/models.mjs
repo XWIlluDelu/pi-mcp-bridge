@@ -2,7 +2,9 @@ import { z } from 'zod';
 import { utf16String } from '../mcp/schema.mjs';
 
 const identifier = utf16String(256).min(1);
-export const modelSelectionSchema = z.object({ provider: identifier, id: identifier }).strict();
+// Owner state carries complete native models. Project only the public identity.
+export const modelIdentity = z.object({ provider: identifier, id: identifier });
+export const modelSelectionSchema = modelIdentity.strict();
 export const thinkingLevelSchema = z.enum([
   'off',
   'minimal',
@@ -12,24 +14,23 @@ export const thinkingLevelSchema = z.enum([
   'xhigh',
   'max',
 ]);
+export const modelPreferenceFields = {
+  model: modelSelectionSchema.optional(),
+  thinking_level: thinkingLevelSchema.optional(),
+};
 export function assertThinkingLevel(model, level, ai) {
   if (!ai) return;
   if (typeof model?.reasoning !== 'boolean') throw new Error('THINKING_SUPPORT_UNKNOWN');
   if (!ai.getSupportedThinkingLevels(model).includes(level))
     throw new Error('THINKING_LEVEL_UNSUPPORTED');
 }
-export const modelsSchema = z
-  .object({
-    offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-    limit: z.number().int().min(1).max(100).optional(),
-  })
-  .strict();
+export const modelsSchema = z.strictObject({
+  offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+});
 // Native state is reduced before owner IPC as well as before public list output.
 export function modelState(state) {
-  const model = modelSelectionSchema.safeParse({
-    provider: state?.model?.provider,
-    id: state?.model?.id,
-  });
+  const model = modelIdentity.safeParse(state?.model);
   const level = thinkingLevelSchema.safeParse(state?.thinkingLevel);
   return {
     model: model.success ? model.data : null,
@@ -44,8 +45,7 @@ const textOrNull = (value) => (typeof value === 'string' && value.length <= 256 
 // Allowlist only. Full native Model objects can carry endpoint headers and
 // arbitrary provider configuration; never pass them to MCP or owner IPC.
 export function modelInfo(model, getSupportedThinkingLevels) {
-  if (!modelSelectionSchema.safeParse({ provider: model?.provider, id: model?.id }).success)
-    throw new Error('INVALID_MODEL_METADATA');
+  if (!modelIdentity.safeParse(model).success) throw new Error('INVALID_MODEL_METADATA');
   const input =
     Array.isArray(model.input) && model.input.every((x) => ['text', 'image'].includes(x))
       ? [...new Set(model.input)]

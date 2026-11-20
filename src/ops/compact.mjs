@@ -1,18 +1,12 @@
 import { z } from 'zod';
-import { utf16String } from '../mcp/schema.mjs';
-export const compactSchema = z
-  .object({
-    session_id: utf16String(128).min(1),
-    instructions: utf16String(100000).optional(),
-    interrupt: z.boolean().optional(),
-  })
-  .strict();
+import { parseAs, utf16String } from '../mcp/schema.mjs';
+export const compactSchema = z.strictObject({
+  session_id: utf16String(128).min(1),
+  instructions: utf16String(100000).optional(),
+  interrupt: z.boolean().optional(),
+});
 const compactInputSchema = compactSchema.omit({ session_id: true });
-export function parseCompactInput(body) {
-  const input = compactInputSchema.safeParse(body);
-  if (!input.success) throw new Error('INVALID_ARGUMENTS');
-  return input.data;
-}
+export const parseCompactInput = (body) => parseAs(compactInputSchema, body, 'INVALID_ARGUMENTS');
 
 // Exact native messages only: never forward provider, extension or history text.
 export function nativeCompactReason(message) {
@@ -54,7 +48,13 @@ export function requireInterruptCompaction(input, state) {
   throw new Error('COMPACT_IDLE_UNCONFIRMED');
 }
 export function compactMetadata(value) {
-  compactReceipt(value);
+  if (
+    typeof value?.firstKeptEntryId !== 'string' ||
+    value.firstKeptEntryId.length > 128 ||
+    !Number.isSafeInteger(value.tokensBefore) ||
+    value.tokensBefore < 0
+  )
+    throw Object.assign(new Error('INVALID_COMPACT_RESULT'), { uncertain: true });
   const { firstKeptEntryId, tokensBefore, estimatedTokensAfter } = value;
   return {
     firstKeptEntryId,
@@ -65,20 +65,14 @@ export function compactMetadata(value) {
 // Compaction summaries contain read-protected history. Return only a bounded
 // completion receipt; clients with read permission can inspect the native entry.
 export function compactReceipt(value) {
-  if (
-    typeof value?.firstKeptEntryId !== 'string' ||
-    value.firstKeptEntryId.length > 128 ||
-    !Number.isSafeInteger(value.tokensBefore) ||
-    value.tokensBefore < 0
-  )
-    throw Object.assign(new Error('INVALID_COMPACT_RESULT'), { uncertain: true });
+  const { firstKeptEntryId, tokensBefore, estimatedTokensAfter } = compactMetadata(value);
   return {
     status: 'completed',
-    first_kept_entry_id: value.firstKeptEntryId,
-    tokens_before: value.tokensBefore,
+    first_kept_entry_id: firstKeptEntryId,
+    tokens_before: tokensBefore,
     estimated_tokens_after:
-      Number.isSafeInteger(value.estimatedTokensAfter) && value.estimatedTokensAfter >= 0
-        ? value.estimatedTokensAfter
+      Number.isSafeInteger(estimatedTokensAfter) && estimatedTokensAfter >= 0
+        ? estimatedTokensAfter
         : null,
   };
 }

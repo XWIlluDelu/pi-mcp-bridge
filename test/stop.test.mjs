@@ -1,6 +1,5 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +9,6 @@ import { PiRpc } from '../src/runtime/rpc.mjs';
 import { withdrawalCollector, requestStop } from '../src/ops/stop-execution.mjs';
 import { sdkSession } from './fixtures/sdk-session.mjs';
 import { createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 const gate = () => Promise.withResolvers();
 async function fixture(t) {
@@ -20,9 +18,6 @@ async function fixture(t) {
     generation: 'offline-generation',
     state: async () => ({ isStreaming: false }),
     command: async () => ({ disposition: 'started' }),
-    stop: async () => {
-      runtime.alive = false;
-    },
     stopExecution: async ({ max_chars }) => {
       stops++;
       return {
@@ -188,7 +183,7 @@ for (const failure of ['clear', 'capture', 'abort'])
       clears = 0;
     const stopping = requestStop(
       {
-        clearQueue: async () => {
+        clearQueue: () => {
           clears++;
           if (failure === 'clear') {
             failed.resolve();
@@ -231,15 +226,8 @@ test('SDK host keeps Stop fenced through partial withdrawal and cancellation fai
   const f = await fixture(t),
     cancellation = gate(),
     captured = gate();
-  const controller = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: f.session,
-  });
-  f.cleanup.push(
-    () => cancellation.resolve(),
-    () => controller.close(),
-  );
+  f.cleanup.push(() => cancellation.resolve());
+  const controller = await f.reserveHost();
   const binding = createSdkHostBinding(
     sdkSession({
       sessionFile: f.session.file,
