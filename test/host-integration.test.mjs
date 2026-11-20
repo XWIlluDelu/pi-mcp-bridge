@@ -1,67 +1,29 @@
-import { nativeOwner } from './fixtures/native-owner.mjs';
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativeRpcHost } from './fixtures/native-rpc.mjs';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
-import { fauxAssistantMessage, fauxProvider, RpcClient } from './fixtures/pi.mjs';
-import { processIdentity, readClaim } from '../src/runtime/attachments.mjs';
+import { fauxAssistantMessage, fauxProvider } from './fixtures/pi.mjs';
+import { readClaim } from '../src/runtime/attachments.mjs';
 import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 
-const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => Promise.withResolvers();
 const fixture = (t) => nativeOwner(t, { factory: () => assert.fail('Unexpected second writer') });
 test('official host-owned Pi RPC serves bridge reads and sends without spawning; timed-out replies do not redispatch', async (t) => {
   const f = await fixture(t),
-    saved = f.session,
-    pidFile = path.join(f.dir, 'writer-pid.json');
-  const extension = path.join(f.dir, 'pid-extension.mjs');
-  await fs.writeFile(
-    extension,
-    `import fs from 'node:fs';export default function(){fs.writeFileSync(${JSON.stringify(pidFile)},JSON.stringify(process.pid));}`,
-  );
-  const client = new RpcClient({
-    cliPath: nativePiCli,
-    cwd: f.cwd,
-    env: { HOME: f.dir, PI_CODING_AGENT_DIR: path.join(f.dir, 'agent'), PI_OFFLINE: '1' },
-    provider: 'bridge-fixture',
-    model: 'deterministic',
-    args: [
-      '--no-session',
-      '--no-extensions',
-      '--no-skills',
-      '--no-prompt-templates',
-      '--no-themes',
-      '--no-tools',
-      '-e',
-      path.join(base, 'test/fixtures/faux-extension.mjs'),
-      '-e',
-      extension,
-    ],
+    saved = f.session;
+  const { client, controller, owner } = await nativeRpcHost(f, {
+    args: [...f.config.piArgs, '--no-extensions', '--no-tools', ...fauxArgs],
   });
-  f.cleanup.push(() => client.stop());
-  await client.start();
-  await client.getState();
-  const pid = JSON.parse(await fs.readFile(pidFile, 'utf8')),
-    owner = await processIdentity(pid);
-  assert.notEqual(pid, process.pid);
-  const controller = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: saved,
-    owner,
-  });
-  f.cleanup.push(() => controller.close());
-  await client.switchSession(saved.file);
   const binding = createRpcHostBinding(client),
     gate = deferred();
   let submissions = 0;
@@ -106,7 +68,7 @@ test('official host-owned Pi RPC serves bridge reads and sends without spawning;
     ).length,
     1,
   );
-  assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, pid);
+  assert.equal((await readClaim(f.config.attachmentDir, saved)).owner.pid, owner.pid);
 });
 
 test('two official SDK sessions in one host PID release independently without shutting down their neighbor', async (t) => {

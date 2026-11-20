@@ -1,16 +1,12 @@
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { RpcClient } from './fixtures/pi.mjs';
-
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
 import { launchProfile } from '../src/runtime/rpc.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativeRpc, nativeRpcHost } from './fixtures/native-rpc.mjs';
 const exists = (file) =>
   fs.stat(file).then(
     () => true,
@@ -18,44 +14,24 @@ const exists = (file) =>
   );
 
 async function attached(t, route) {
-  const cleanup = [],
-    f = await fixture({ after: (fn) => cleanup.push(fn) }),
-    session = await f.bridge.session(f.id);
-  let controller;
-  if (route === 'binding')
-    controller = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: f.bridge.pool.attachmentDir,
-      session,
+  const f = await fixture(t);
+  const env = { ...launchProfile(f.config).env, ...f.env };
+  let client, controller;
+  if (route === 'binding') {
+    ({ client, controller } = await nativeRpcHost(f, { env, args: f.config.piArgs }));
+    await controller.ready(createRpcHostBinding(client));
+  } else {
+    client = await nativeRpc(f, {
+      env,
+      args: [
+        '--session',
+        f.session.file,
+        ...f.config.piArgs,
+        '-e',
+        path.resolve('src/attach-extension.mjs'),
+      ],
     });
-  const client = new RpcClient({
-    cliPath: nativePiCli,
-    cwd: f.cwd,
-    env: {
-      ...launchProfile(f.config).env,
-      HOME: f.dir,
-      PI_OFFLINE: '1',
-      ...(route === 'companion' ? { PI_MCP_ATTACH_DIR: f.bridge.pool.attachmentDir } : {}),
-    },
-    args: [
-      '--session',
-      session.file,
-      ...f.config.piArgs,
-      ...(route === 'companion' ? ['-e', path.resolve('src/attach-extension.mjs')] : []),
-    ],
-  });
-  // Before fixture cleanup: native compaction hooks must settle before closing.
-  t.after(async () => {
-    try {
-      await fs.writeFile(f.gate, 'go');
-      await controller?.close();
-    } finally {
-      await client.stop();
-      for (const close of cleanup) await close();
-    }
-  });
-  await client.start();
-  if (controller) await controller.ready(createRpcHostBinding(client));
+  }
   await client.prompt('KEEP_HISTORY '.repeat(200));
   await until(async () => !(await client.getState()).isStreaming);
   return { ...f, client, controller };

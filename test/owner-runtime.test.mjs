@@ -10,12 +10,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { RpcClient } from './fixtures/pi.mjs';
+import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { Bridge } from '../src/core/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
 import { RpcFailure } from '../src/runtime/rpc.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function fixture(t, extraArgs = []) {
@@ -68,10 +67,7 @@ test(
     assert.equal((await send('NEVER_ADMITTED')).reason, 'COLD_REACQUIRE_BLOCKED');
     assert.match(JSON.stringify(await f.bridge.read(args)), /PRESERVE_ON_RELEASE/);
 
-    const local = new RpcClient({
-      cliPath: nativePiCli,
-      cwd: f.cwd,
-      env: f.env,
+    const local = await nativeRpc(f, {
       args: [
         ...f.config.piArgs,
         '--session',
@@ -80,8 +76,6 @@ test(
         path.resolve('src/attach-extension.mjs'),
       ],
     });
-    f.cleanup.unshift(() => local.stop());
-    await local.start();
     await local.getState();
     const external = await claim();
     assert.equal(external.kind, 'extension');

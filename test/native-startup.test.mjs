@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { nativeOwner } from './fixtures/native-owner.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
-import { RpcClient } from './fixtures/pi.mjs';
-import { readClaim } from '../src/runtime/attachments.mjs';
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
+import { until } from './fixtures/until.mjs';
+import { nativeRpc } from './fixtures/native-rpc.mjs';
+import { ownerAlive, readClaim } from '../src/runtime/attachments.mjs';
 
 test('native profile discovery leaves an owned RPC claim intact and registers an ordinary RPC', async (t) => {
   const companion = new URL('../src/attach-extension.mjs', import.meta.url).pathname;
@@ -44,17 +44,23 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
   assert.equal(probe.data.label, '--resume');
   await rpc.gracefulExit();
 
-  const local = new RpcClient({
-    cliPath: nativePiCli,
-    cwd: f.cwd,
-    env: f.env,
-    args: ['--offline', '--session', f.session.file, '-e', companion],
+  const local = await nativeRpc(f, {
+    args: ['--offline', '--session', f.session.file, '-e', companion, ...fauxArgs],
   });
-  f.cleanup.push(() => local.stop());
-  await local.start();
   assert.equal((await local.getState()).sessionId, f.session.header.id);
   const external = await claim();
   assert.equal(external.kind, 'extension');
   assert.equal(external.phase, 'ready');
-  assert.equal((await f.bridge.read({ session_id: f.id })).source, 'extension');
+  const args = { session_id: f.id };
+  assert.equal((await f.bridge.stop(args)).reason, 'STOP_UNSUPPORTED');
+  const sent = await f.bridge.send({ ...args, text: 'companion dispatch proof' });
+  assert.equal(sent.status, 'dispatched');
+  assert.equal(sent.admission, 'unobservable');
+  await until(async () => !(await local.getState()).isStreaming);
+  const read = await f.bridge.read(args);
+  assert.equal(read.source, 'extension');
+  assert.match(JSON.stringify(read), /companion dispatch proof/);
+  assert.equal((await claim()).generation, external.generation);
+  await f.bridge.close();
+  assert.equal(await ownerAlive(external.owner), true);
 });

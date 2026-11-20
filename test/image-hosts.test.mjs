@@ -1,7 +1,7 @@
 import { nativeOwner, launchNativeTui } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativeRpc, nativeRpcHost } from './fixtures/native-rpc.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -9,8 +9,8 @@ import path from 'node:path';
 
 import { loadSavedSession } from '../src/core/data.mjs';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
-import { RpcClient, fauxProvider } from './fixtures/pi.mjs';
-import { processIdentity, readClaim } from '../src/runtime/attachments.mjs';
+import { fauxProvider } from './fixtures/pi.mjs';
+import { readClaim } from '../src/runtime/attachments.mjs';
 import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
@@ -36,26 +36,15 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
             JSON.stringify(settingsValue),
           ),
       });
-      const { dir, cwd, config, bridge, session: saved } = f;
-      const agentDir = config.piRuntime.agentDir;
-      let native, controller, sdk;
-      f.cleanup.push(async () => {
-        try {
-          await controller?.close();
-        } finally {
-          if (sdk) {
-            await sdk.abort();
-            sdk.dispose();
-          }
-          await native?.stop();
-        }
-      });
+      const { config, bridge, session: saved } = f;
+      let native, sdk;
       if (route === 'sdk-host') {
-        controller = await reserveHostSession({
+        const controller = await reserveHostSession({
           buildSessionProjection: hostProjection,
           attachmentDir: config.attachmentDir,
           session: saved,
         });
+        f.cleanup.push(() => controller.close());
         const faux = fauxProvider({
           provider: 'image-sdk',
           models: [{ id: 'vision', input: ['text', 'image'] }],
@@ -66,26 +55,14 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
           settings: settingsValue,
           extensions: [imageInputExtension],
         });
+        f.cleanup.push(async () => {
+          await sdk.abort();
+          sdk.dispose();
+        });
         await sdk.bindExtensions({ mode: 'rpc' });
         await controller.ready(createSdkHostBinding(sdk));
       } else {
-        const pidFile = path.join(dir, 'pid'),
-          extension = path.join(dir, 'identity.mjs');
-        await fs.writeFile(
-          extension,
-          'import fs from "node:fs";export default function(){fs.writeFileSync(' +
-            JSON.stringify(pidFile) +
-            ',String(process.pid));}',
-        );
         const nativeOptions = {
-          cliPath: nativePiCli,
-          cwd,
-          env: {
-            HOME: dir,
-            PI_CODING_AGENT_DIR: agentDir,
-            PI_OFFLINE: '1',
-            PI_MCP_ATTACH_DIR: config.attachmentDir,
-          },
           provider: 'image-fixture',
           model: 'vision',
           args: [
@@ -96,42 +73,33 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
             '--no-tools',
             '-e',
             path.resolve('test/fixtures/image-provider.mjs'),
-            '-e',
-            extension,
-            ...(route.endsWith('companion')
-              ? ['--session', saved.file, '-e', path.resolve('src/attach-extension.mjs')]
-              : ['--no-session']),
           ],
         };
-        if (route === 'tui-companion') {
-          const tui = launchNativeTui(
-            f,
-            [
-              ...nativeOptions.args,
-              '--provider',
-              'image-fixture',
-              '--model',
-              'vision',
-              '--thinking',
-              'off',
-            ],
-            { ...f.env, ...nativeOptions.env },
+        if (route.endsWith('companion'))
+          nativeOptions.args.push(
+            '--session',
+            saved.file,
+            '-e',
+            path.resolve('src/attach-extension.mjs'),
           );
+        if (route === 'tui-companion') {
+          const tui = launchNativeTui(f, [
+            ...nativeOptions.args,
+            '--provider',
+            'image-fixture',
+            '--model',
+            'vision',
+            '--thinking',
+            'off',
+          ]);
           await tui.ready(saved);
-        } else {
-          native = new RpcClient(nativeOptions);
-          await native.start();
-          await native.getState();
-        }
-        if (route === 'rpc-host') {
-          controller = await reserveHostSession({
-            buildSessionProjection: hostProjection,
-            attachmentDir: config.attachmentDir,
-            session: saved,
-            owner: await processIdentity(Number(await fs.readFile(pidFile, 'utf8'))),
-          });
-          await native.switchSession(saved.file);
+        } else if (route === 'rpc-host') {
+          const { client, controller } = await nativeRpcHost(f, nativeOptions);
+          native = client;
           await controller.ready(createRpcHostBinding(native));
+        } else {
+          native = await nativeRpc(f, nativeOptions);
+          await native.getState();
         }
       }
       const record = await readClaim(config.attachmentDir, saved);

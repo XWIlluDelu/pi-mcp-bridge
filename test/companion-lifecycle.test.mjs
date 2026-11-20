@@ -16,13 +16,12 @@ import {
   createAgentSessionFromServices,
   SessionManager,
   SettingsManager,
-  RpcClient,
 } from './fixtures/pi.mjs';
 
 import attachExtension from './fixtures/companion.mjs';
 import { claimFile, readClaim } from '../src/runtime/attachments.mjs';
 
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativeRpc } from './fixtures/native-rpc.mjs';
 
 async function fixture(t, extension) {
   const f = await nativeOwner(t, {
@@ -225,15 +224,10 @@ test('ordinary RPC refuses a native switch to another live writer', async (t) =>
   const extension = new URL('../src/attach-extension.mjs', import.meta.url).pathname;
   const clients = [];
   for (const session of [f.session, second]) {
-    const client = new RpcClient({
-      cliPath: nativePiCli,
-      cwd: f.cwd,
-      env: f.env,
+    const client = await nativeRpc(f, {
       args: [...f.config.piArgs, '--session', session.file, '-e', extension, ...fauxArgs],
     });
     clients.push(client);
-    f.cleanup.push(() => client.stop());
-    await client.start();
     await client.getState();
   }
   const [first, other] = clients;

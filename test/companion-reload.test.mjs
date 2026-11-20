@@ -2,9 +2,8 @@ import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { RpcClient } from './fixtures/pi.mjs';
+import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { launchProfile } from '../src/runtime/rpc.mjs';
 import { gatedExtension } from './fixtures/native-owner.mjs';
 import { readClaim } from '../src/runtime/attachments.mjs';
@@ -30,9 +29,11 @@ test(
       });
     `,
     );
-    const client = new RpcClient({
-      cliPath: nativePiCli,
-      cwd: f.cwd,
+    f.cleanup.unshift(async () => {
+      await fs.writeFile(f.gate + '.preflight-release', 'go');
+      await f.mark('reload-release');
+    });
+    const client = await nativeRpc(f, {
       env: {
         ...launchProfile(f.config).env,
         HOME: f.dir,
@@ -47,12 +48,6 @@ test(
         new URL('../src/attach-extension.mjs', import.meta.url).pathname,
       ],
     });
-    f.cleanup.unshift(async () => {
-      await fs.writeFile(f.gate + '.preflight-release', 'go');
-      await f.mark('reload-release');
-      await client.stop();
-    });
-    await client.start();
     await client.getState();
     const claim = () => readClaim(f.config.attachmentDir, session);
     const initial = await claim();
