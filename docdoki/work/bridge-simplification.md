@@ -16,7 +16,9 @@ original review inspected `b3c6ed9` and is available in Git at `578f7de`.
 The first implementation started from `5dc7c53`. The initial deletion pass
 started at `0eb95b7`. The follow-up started at `e779cb2`, with a clean
 `auto-dev` working tree. These are measurement points from before the local
-history was regrouped.
+history was regrouped. The local dev.28 and dev.29 commit IDs below likewise
+identify pre-publication measurement points. The published review range starts
+at `a4aaaa8`.
 
 ## Results
 
@@ -53,6 +55,114 @@ different admission hooks. A shared Unix socket client added options for
 half-close, pre-write authorization, partial replies, and transport errors.
 Both attempts were discarded. The largest unresolved reduction is a concrete
 replacement of an entire ownership or Read pipeline.
+
+### Review follow-up
+
+The review of `a4aaaa8` estimated 620–905 lines for its three named areas and
+another 150–220 for unspecified cleanup. The concrete changes in
+`0.8.0-dev.28` reduced `src/` from 13,005 to 12,968 lines. Test and integration
+counts stayed at 15,056 and 746 lines.
+
+| Area | Verified change | Source lines |
+| --- | --- | ---: |
+| Write lifecycle | Bridge routes Send, Compact, Reload, and Stop into their lanes after authorization. The route checks the fence on admission and at dequeue. Finishing a Bash or Stop lane can wake idle release. | −14 |
+| Owned RPC | Prompt settings reuse checked state before dispatch. The thinking setter uses the checked state after its ACK. | −2 |
+| Native Read | Tool pairs are matched and annotated in one pass. Search retains matched units at their original positions, and reference expansion orders source atoms within each frozen capture. | −21 |
+
+An identity check around an entire compound native operation would miss
+boundaries between writes and during late ACK handling. Search filtering
+keeps oversized nonmatching histories out of owner IPC. Consumer navigation
+still builds links for the final snapshot, which may include reader content.
+Default tests already cover idle release, missing ACK fences, busy retries,
+uncertain seals, and fragmented and oversized input.
+
+`npm test` passed 388 tests with one opt-in skip on both Node 22 and 26 using
+Pi 1.5.2. The explicit real Herdr run passed four tests. All 15 MCP tool
+definitions, 147 rendered pages, and 36 search comparisons matched
+`a4aaaa8`. The focused Read comparison also matched tool pairing, mixed-capture
+reference expansion, and snapshot eviction order.
+
+### Continued implementation
+
+The next implementation began at `4a86988` with 12,968 production lines.
+`0.8.0-dev.29` has 12,732 production lines. Test source dropped from 15,056
+to 15,052 lines. The production module, test suite, and fixture counts are
+73, 79, and 31.
+
+| Area | Changes | Source lines |
+| --- | --- | ---: |
+| Write lifecycle and local control | Send and Create share writer acquisition and dispatch. Input checks own the handoff fence. Release and Join share local writer selection and drain. Each owner-control connection carries its request and cancellation, including after disconnect. | −39 |
+| Owned and external runtimes | Owned RPC and Companion share native observation hooks. All three controllers use the same listener lifecycle. Companion uses a single binding and tracks compaction in its operation ledger. Host uses one endpoint phase. | −66 |
+| Native Read | Selection no longer wraps individual units in groups. Navigation builds child reference order together with its index. A single cursor iterator serves preview and source pages and sizes the batch envelope once. | −29 |
+| Permissions | Health assembles scoped evidence directly from the effective rules. The TUI menu uses its abort signal for both session start and shutdown. | −30 |
+| Transport, configuration, and events | HTTP dispatch and the proxy share header rules. Private files, HTTP JSON, and callback verification share bounded reads. Subscription and permission validation reuse their input schemas. | −72 |
+
+The slot-table prototype added code because an external live owner can appear
+while a cold startup is preparing. The visible owner and the pending launch
+still have separate lifetimes. The simpler JSON-based fragment fitting
+prototype produced the same offsets but increased execution time for
+representative multi-megabyte transcripts. The linear Unicode scanner remains.
+
+With Pi 1.5.2, the default suite passed 388 tests on both Node 22 and 26.
+The opt-in Herdr suite passed all four cases. The 15 MCP tool definitions,
+147 rendered pages, and 36 search comparisons matched `4a86988`. A dedicated
+Read comparison matched 40 captures and 744 page or error outcomes across
+different budgets and native content shapes.
+
+### Verified implementation of the cloud review
+
+The review baseline `a4aaaa8` contains 13,005 production lines. The next two
+development snapshots removed 273. Starting from `3e12c77`, the
+`0.8.0-dev.30` pass removed another 503, leaving 12,229. The three passes
+removed 776 production lines against the review's 770–1,125 estimate.
+The 7,000–9,000 line exploration target remains outside that estimate.
+
+| Directory or files | Removed since `3e12c77` | Removed since `a4aaaa8` |
+| --- | ---: | ---: |
+| `src/runtime/` | 155 | 238 |
+| `src/core/` | 85 | 150 |
+| `src/ops/` | 73 | 73 |
+| `src/read/` | 66 | 110 |
+| `src/compat/` | 33 | 33 |
+| `src/mcp/` | 31 | 40 |
+| `src/events/` | 21 | 50 |
+| Entry points and extensions directly under `src/` | 39 | 82 |
+| **Net production lines** | **503** | **776** |
+
+The final tree has 73 production modules, 79 test suites and 31 fixture
+modules. Test source fell from 15,052 to 15,013 lines in this pass. The two
+optional integrations and their tests now total 744 lines, down from 746.
+
+- The mutation routes own permission and lane selection. Session lookup,
+  cache reads, forks and subscriptions share the same authorization check.
+  Stop still withdraws admitted batch inputs before native dispatch. Reload,
+  compaction and exit sealing share one exclusive native slot.
+- Direct RPC, local open, native create and the model catalog resolve the same
+  Pi installation and launch environment. A failed spawn releases its reservation
+  without attributing the missing child PID to Bridge. Host cancellation drains
+  the native aborts even when queue withdrawal throws synchronously.
+- A frozen navigation index stores each selected source unit once. Parent,
+  child and source references use its positions. In an isolated 20,000-row
+  comparison against `3e12c77`, retained V8 heap for the index fell from
+  9.54 to 6.46 MB. Smaller indexes can fit more content under the same 32 MiB
+  cache ceiling. Owner IPC still applies its own transfer limit.
+- MCP batch accounting and source rendering share the JSON and escaped wire
+  byte costs. Magic Context applies branch and count selection before building
+  the returned items. Native projection, fork input, read references and
+  webhook delivery keep their own identity and lifetime checks.
+- Broken stdio replies enter transport error handling. HTTP shutdown waits
+  for a pending listen and for admitted work. Webhook verification checks
+  every DNS answer and pins the selected address in the actual TLS request.
+
+With real Pi 1.5.2, Node 22.23.5 and 26.13.1 each passed 391 default tests and
+skipped the opt-in Herdr case. A separate Node 26 run with a named temporary
+Herdr daemon passed all four checks. Against `a4aaaa8`, all 15 tool
+definitions and 35 MCP envelopes matched after normalizing the product version.
+The Read comparison matched 215 captures, 2,015 source pages, 686 navigation
+and search pages, 2,562 reference expansion pages, 240 budget failures, and
+288 owner snapshot validation cases. It checked the serialized wire size 10,526
+times. A 25-case SQLite comparison matched both the response bytes and the native
+leaf requests for stored reader branches, ranks and limits.
 
 ## Deletion map
 
