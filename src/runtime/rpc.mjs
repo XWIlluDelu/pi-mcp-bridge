@@ -27,7 +27,7 @@ import {
   loadSavedSession,
   sameSessionIdentity,
   servesSession,
-  sessionEntryIndex,
+  traceSessionBranch,
   validateExecutionCwd,
 } from '../core/data.mjs';
 import { diagnostics } from '../core/diagnostics.mjs';
@@ -122,7 +122,7 @@ export class PiRpc {
         omitImageData: true,
         sdk: await loadPiSdk(executable),
       });
-      sessionEntryIndex(entries, leafId, byId);
+      traceSessionBranch(entries, leafId, byId);
       // An installed daily companion must use this writer's actual registry,
       // not an unrelated default owner profile, then defer to the RPC claim.
       env.PI_MCP_ATTACH_DIR = this.config.attachmentDir;

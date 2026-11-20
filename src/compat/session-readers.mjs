@@ -1,10 +1,6 @@
 import { z } from 'zod';
-import {
-  appendSnapshotUnit,
-  READ_CONTRACT,
-  READ_SNAPSHOT_LIMIT,
-  validateReadEntryIds,
-} from '../read/context-read.mjs';
+import { appendSnapshotUnit, READ_CONTRACT, validateReadEntryIds } from '../read/context-read.mjs';
+import { READ_SNAPSHOT_LIMIT, readSnapshotBytes } from '../read/read-snapshots.mjs';
 import { jsonBytes } from '../mcp/response-budget.mjs';
 import { CONTENT_KINDS, contentKind, contextSelection } from '../read/read-schema.mjs';
 import { matchesReadText } from '../read/read-navigation.mjs';
@@ -156,7 +152,7 @@ export async function captureSessionRead(reader, context, args, query) {
   const native = result.native ? await nativeRead() : nativeCapture ? await nativeCapture : null;
   if (
     result.native &&
-    target.accountedBytes + jsonBytes(native.units) * 4 + native.units.length * 256 >
+    target.accountedBytes + readSnapshotBytes(native.units, native.units.length) >
       READ_SNAPSHOT_LIMIT
   )
     throw new Error('READ_SNAPSHOT_TOO_LARGE');

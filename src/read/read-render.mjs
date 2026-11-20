@@ -1,5 +1,5 @@
 import { DEFAULT_READ_BYTES } from './read-schema.mjs';
-import { jsonBytes, resultSize } from '../mcp/response-budget.mjs';
+import { jsonBytes, largestFittingSize, resultSize } from '../mcp/response-budget.mjs';
 import { boundRuntimeEvents } from './runtime-events.mjs';
 import { fitNavigationRow } from './read-navigation.mjs';
 
@@ -25,9 +25,9 @@ export function boundedFields(value) {
 
 // Split only for the response. Keep source text intact and use stable part
 // boundaries so a continuation can change its page budget.
-function jsonTextEnd(text, start, end) {
+function jsonTextEnd(text, start) {
   let bytes = 2; // Quotes.
-  for (let index = start; index < end;) {
+  for (let index = start; index < text.length;) {
     const code = text.codePointAt(index);
     if (code < 32) bytes += code >= 8 && code <= 13 && code !== 11 ? 2 : 6;
     else if (code < 128) bytes += code === 34 || code === 92 ? 2 : 1;
@@ -37,154 +37,116 @@ function jsonTextEnd(text, start, end) {
     if (bytes > UNIT_TARGET) return index;
     index += code > 0xffff ? 2 : 1;
   }
-  return end;
+  return text.length;
 }
 
-function* splitText(record, text, replace) {
-  if (typeof text !== 'string' || !text.length) {
-    yield record;
+// Every splittable field uses the same stable offsets. The emitter supplies
+// only the surrounding native wire shape (block, message or summary part).
+function* fragments(text, emit) {
+  if (typeof text !== 'string' || !text) {
+    yield emit(text);
     return;
   }
-  let part = 0;
-  for (let start = 0; start < text.length;) {
-    let end = Math.min(text.length, start + UNIT_TARGET - 2);
-    if (text.codePointAt(end - 1) > 0xffff) end--;
-    if (jsonBytes(text.slice(start, end)) > UNIT_TARGET) end = jsonTextEnd(text, start, end);
-    yield start === 0 && end === text.length
-      ? record
-      : { ...replace(text.slice(start, end)), part: ++part };
-    start = end;
+  for (let index = 0, part = 0; index < text.length;) {
+    const end = jsonTextEnd(text, index);
+    const unit = emit(text.slice(index, end));
+    yield index || end < text.length ? { ...unit, part: ++part } : unit;
+    index = end;
   }
 }
 
-// Shared message metadata is one complete unit, not copied into every text part.
-// Nested calls are saved native records, not fabricated tool results.
-function* splitMessage(record, message, replace) {
-  const bodyKeys = ['content', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'];
-  const essentials = pick(message, [
-    'role',
-    'toolCallId',
-    'toolName',
-    'isError',
-    'customType',
-    'stopReason',
-  ]);
-  if (message.role === 'bashExecution') {
-    // Repeat small execution facts, not arbitrary command/path metadata.
-    Object.assign(essentials, pick(message, ['exitCode', 'cancelled', 'truncated']));
-    for (const key of ['command', 'fullOutputPath'])
-      if (typeof message[key] === 'string' && jsonBytes(message[key]) <= 256)
-        essentials[key] = message[key];
-  }
-  const metadata = Object.fromEntries(
-    Object.entries(message).filter(([key]) => !bodyKeys.includes(key)),
+const bodyFields = ['content', 'summary', 'output', 'sections', 'toolsAdded', 'toolsRemoved'];
+const messageIdentity = ['role', 'toolCallId', 'toolName', 'isError', 'customType', 'stopReason'];
+const commandStatus = ['exitCode', 'cancelled', 'truncated'];
+const isText = (block) => block.type === 'text' || block.type === 'thinking';
+
+function* messageParts(message, emit) {
+  const { sections, toolsAdded, toolsRemoved, content } = message;
+  const body = pick(message, bodyFields);
+  const meta = Object.fromEntries(
+    Object.entries(message).filter(([key]) => !bodyFields.includes(key)),
   );
-  const nested = metadata.nestedCalls;
-  const separateCalls =
+  const identity = pick(message, messageIdentity);
+  if (message.role === 'bashExecution') {
+    Object.assign(identity, pick(message, commandStatus));
+    for (const key of ['command', 'fullOutputPath'])
+      if (typeof meta[key] === 'string' && jsonBytes(meta[key]) <= 256) identity[key] = meta[key];
+  }
+  const nested = meta.nestedCalls;
+  const separate =
     Array.isArray(nested?.calls) && nested.calls.length && jsonBytes(nested) > UNIT_TARGET;
-  if (separateCalls) delete metadata.nestedCalls;
-  if (
-    !bodyKeys.some((key) => Object.hasOwn(message, key)) ||
-    Object.keys(metadata).some((key) => !Object.hasOwn(essentials, key))
-  )
-    yield { ...replace(metadata), type: 'message_metadata' };
-  if (separateCalls) {
-    for (const [index, call] of nested.calls.entries())
+  if (separate) delete meta.nestedCalls;
+  if (!Object.keys(body).length || Object.keys(meta).some((key) => !Object.hasOwn(identity, key)))
+    yield { ...emit(meta), type: 'message_metadata' };
+  if (separate)
+    for (const [index, call] of nested.calls.entries()) {
+      const unit = emit(identity);
       yield {
-        ...replace(essentials),
+        ...unit,
         type: 'nested_call',
-        source: { ...record.source, nested_call_index: index },
+        source: { ...unit.source, nested_call_index: index },
         nested_call: boundedFields(call),
         nested_calls_complete: nested.complete,
       };
-  }
-  const body = { ...essentials, ...pick(message, bodyKeys) };
-  if (bodyKeys.some((key) => Object.hasOwn(body, key)))
-    yield* splitMessageBody(replace(body), body, replace);
-}
-
-function* splitMessageBody(record, message, replace) {
-  if (message.sections || message.toolsAdded || message.toolsRemoved) {
-    const { sections, toolsAdded, toolsRemoved, content, ...rest } = message;
-    for (const [name, value] of Object.entries(sections ?? {})) {
-      const make = (text) => replace({ ...rest, sections: { [name]: text } }),
-        base = make(value);
-      if (typeof value === 'string') yield* splitText(base, value, make);
-      else yield base;
     }
+  if (!Object.keys(body).length) return;
+  if (sections || toolsAdded || toolsRemoved) {
+    const rest = { ...identity, ...pick(body, ['summary', 'output']) };
+    for (const [name, value] of Object.entries(sections ?? {}))
+      yield* fragments(value, (text) => emit({ ...rest, sections: { [name]: text } }));
     for (const key of ['toolsAdded', 'toolsRemoved'])
-      for (const tool of message[key] ?? []) {
-        if (tool && typeof tool === 'object') {
-          const { description, ...fields } = tool,
-            reduced = boundedFields(fields),
-            make = (text) =>
-              replace({
-                ...rest,
-                [key]: [
-                  { ...reduced, ...(description === undefined ? {} : { description: text }) },
-                ],
-              }),
-            base = make(description);
-          if (typeof description === 'string') yield* splitText(base, description, make);
-          else yield base;
-        } else yield replace({ ...rest, [key]: [tool] });
+      for (const tool of body[key] ?? []) {
+        if (!tool || typeof tool !== 'object') yield emit({ ...rest, [key]: [tool] });
+        else {
+          const { description, ...fields } = tool;
+          const safe = boundedFields(fields);
+          yield* fragments(description, (text) =>
+            emit({
+              ...rest,
+              [key]: [{ ...safe, ...(text === undefined ? {} : { description: text }) }],
+            }),
+          );
+        }
       }
-    if (content) yield* splitMessage(replace({ ...rest, content }), { ...rest, content }, replace);
-    return;
+    if (!content) return;
+    delete body.sections;
+    delete body.toolsAdded;
+    delete body.toolsRemoved;
   }
-  for (const key of ['summary', 'output'])
-    if (typeof message[key] === 'string') {
-      yield* splitText(record, message[key], (text) => replace({ ...message, [key]: text }));
-      return;
-    }
-  if (typeof message.content === 'string') {
-    yield* splitText(record, message.content, (text) => replace({ ...message, content: text }));
-    return;
-  }
-  if (Array.isArray(message.content) && message.content.length) {
-    for (const [index, block] of message.content.entries()) {
-      const make = (block) => {
-        const unit = replace({ ...message, content: [block] });
-        return { ...unit, source: { ...unit.source, content_index: index } };
+  const record = { ...identity, ...body };
+  const field = ['summary', 'output', 'content'].find((key) => typeof record[key] === 'string');
+  if (field) yield* fragments(record[field], (text) => emit({ ...record, [field]: text }));
+  else if (Array.isArray(content) && content.length)
+    for (const [content_index, block] of content.entries()) {
+      const emitBlock = (value) => {
+        const unit = emit({ ...record, content: [value] });
+        return { ...unit, source: { ...unit.source, content_index } };
       };
-      const base = make(block);
-      const key = block.type === 'text' ? 'text' : block.type === 'thinking' ? 'thinking' : null;
-      if (key) yield* splitText(base, block[key], (text) => make({ ...block, [key]: text }));
-      else yield base;
+      if (isText(block))
+        yield* fragments(block[block.type], (text) => emitBlock({ ...block, [block.type]: text }));
+      else yield emitBlock(block);
     }
-    return;
-  }
-  yield record;
+  else yield emit(record);
 }
 
 function* pageParts(record) {
-  if (jsonBytes(record) <= UNIT_TARGET) {
-    yield record;
-    return;
-  }
-  if (record.block && ['text', 'thinking'].includes(record.block.type)) {
-    const { metadata, ...body } = record;
+  if (jsonBytes(record) <= UNIT_TARGET) yield record;
+  else if (record.block && isText(record.block)) {
+    const { block, metadata, ...base } = record;
     if (metadata) {
-      const { block, ...shared } = record;
-      yield { ...shared, type: 'message_metadata' };
-      if (metadata.stopReason !== undefined) body.metadata = { stopReason: metadata.stopReason };
+      yield { ...base, metadata, type: 'message_metadata' };
+      if (metadata.stopReason !== undefined) base.metadata = { stopReason: metadata.stopReason };
     }
-    const key = record.block.type;
-    yield* splitText(body, body.block[key], (text) => ({
-      ...body,
-      block: { ...body.block, [key]: text },
+    yield* fragments(block[block.type], (text) => ({
+      ...base,
+      block: { ...block, [block.type]: text },
     }));
-  } else if (record.message) {
-    yield* splitMessage(record, record.message, (message) => ({ ...record, message }));
-  } else if (record.parts) {
-    for (const part of record.parts) {
-      const base = { ...record, parts: [part] };
-      yield* splitMessage(base, part.message, (message) => ({
-        ...base,
-        parts: [{ source: part.source, message }],
-      }));
-    }
-  } else yield record;
+  } else if (record.message)
+    yield* messageParts(record.message, (message) => ({ ...record, message }));
+  else if (record.parts)
+    for (const { source, message } of record.parts)
+      yield* messageParts(message, (part) => ({ ...record, parts: [{ source, message: part }] }));
+  else yield record;
 }
 
 const metadataUnit = (unit) => ['message_metadata', 'nested_call'].includes(unit.type);
@@ -209,9 +171,11 @@ function fitMetadata(unit, fits) {
     'cancelled',
     'truncated',
   ];
-  for (const key of Object.keys(fields)
+  const removable = Object.keys(fields)
     .filter((key) => !essential.includes(key))
-    .sort((a, b) => jsonBytes(fields[b]) - jsonBytes(fields[a]))) {
+    .map((key) => [key, jsonBytes(fields[key])])
+    .sort((a, b) => b[1] - a[1]);
+  for (const [key] of removable) {
     delete fields[key];
     (result.omitted_fields ??= []).push(key);
     result.complete = false;
@@ -256,14 +220,8 @@ export function smallLive(live, budget) {
           if (text.codePointAt(start - 1) > 0xffff) start++;
           return { ...item, truncated: true, block: { ...item.block, [key]: text.slice(start) } };
         };
-      let low = 0,
-        high = text.length;
-      while (low < high) {
-        const mid = Math.ceil((low + high) / 2);
-        if (fits(make(mid))) low = mid;
-        else high = mid - 1;
-      }
-      if (low && fits(make(low))) result.items.unshift(make(low));
+      const length = largestFittingSize(text.length, (size) => fits(make(size)));
+      if (length) result.items.unshift(make(length));
     }
     break;
   }
@@ -307,7 +265,7 @@ export function renderPreparedContextRead(
     max = args.max_bytes ?? DEFAULT_READ_BYTES;
   const units = rows ?? snapshot.units;
   if (start < 0 || start > units.length) throw new Error('INVALID_CURSOR');
-  const base = {
+  const required = {
     session_id: snapshot.session_id,
     view: snapshot.view ?? 'session',
     ...(snapshot.observation ? { observation: snapshot.observation } : {}),
@@ -319,6 +277,10 @@ export function renderPreparedContextRead(
     ...(snapshot.query ? { query: snapshot.query, matches: units.length } : {}),
     ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
     ...(snapshot.history ? { history: snapshot.history } : {}),
+    live: null,
+  };
+  let base = {
+    ...required,
     live: cursor || args.leaf_id !== undefined ? null : smallLive(live, Math.floor(max / 4)),
     ...(snapshot.view !== 'runtime' &&
     snapshot.view !== 'adapted' &&
@@ -328,9 +290,7 @@ export function renderPreparedContextRead(
       ? { runtime_events: boundRuntimeEvents(runtimeEvents, Math.min(4096, Math.floor(max / 4))) }
       : {}),
   };
-  const page = (items, offset, part = 0) => ({
-    ...base,
-    items,
+  const paging = (offset, part) => ({
     next_cursor: offset < units.length ? encode(offset, part) : null,
     omissions: {
       selection: snapshot.omissions,
@@ -341,12 +301,14 @@ export function renderPreparedContextRead(
   const maxWireBytes = resultBudget?.maxWireBytes ?? Infinity;
   const size = (value) => resultSize(value, Boolean(resultBudget));
   const fits = ({ bytes, wireBytes }) => bytes <= maxBytes && wireBytes <= maxWireBytes;
-  const emptyArray = size([]);
+  const emptyObjectWire = size({}).wireBytes;
+  const requiredSize = size(required);
+  let baseSize = size(base);
   const items = [];
-  let itemBytes = 0;
-  let itemWireBytes = 0;
-  let offset = start;
-  let part = firstPart;
+  let bytes = 0,
+    wireBytes = 0;
+  let offset = start,
+    part = firstPart;
   const previous = continuations.get(snapshot);
   const resume = previous?.offset === start && previous.part === firstPart;
   const iterator = resume ? previous.iterator : pageItems(units, rows, start, firstPart);
@@ -354,29 +316,35 @@ export function renderPreparedContextRead(
   continuations.delete(snapshot);
   while (!current.done) {
     let { unit, nextOffset, nextPart } = current.value;
-    let frame = size(page([], nextOffset, nextPart));
+    const tail = size({ items: [], ...paging(nextOffset, nextPart) });
     const comma = items.length ? 1 : 0;
-    // JSON array items add only their serialized bytes and a comma. The
-    // escaped text copy adds the same comma and the escaped item bytes.
     const unitSize = (candidate) => {
-      const { bytes, wireBytes } = size([candidate]);
+      const cost = size(candidate);
       return {
-        bytes: bytes - emptyArray.bytes + comma,
-        wireBytes: wireBytes - emptyArray.wireBytes + comma * 2,
+        bytes: cost.bytes,
+        wireBytes: resultBudget ? cost.wireBytes - emptyObjectWire + 4 : 0,
       };
     };
+    // Joining JSON objects replaces two braces with one comma. Each insert
+    // also adds one array comma after the first item, in both copies.
     const pageWith = (cost) => ({
-      bytes: frame.bytes + itemBytes + cost.bytes,
-      wireBytes: frame.wireBytes + itemWireBytes + cost.wireBytes,
+      bytes: baseSize.bytes + tail.bytes - 1 + bytes + cost.bytes + comma,
+      wireBytes:
+        baseSize.wireBytes +
+        tail.wireBytes -
+        emptyObjectWire +
+        2 +
+        wireBytes +
+        cost.wireBytes +
+        2 * comma,
     });
     let cost = unitSize(unit);
     if (!items.length && !fits(pageWith(cost))) {
-      base.live = smallLive(base.live, 256);
-      delete base.runtime_events;
-      frame = size(page([], nextOffset, nextPart));
+      base = { ...required, live: smallLive(base.live, 256) };
+      baseSize = size(base);
       if (!fits(pageWith(cost))) {
-        base.live = null;
-        frame = size(page([], nextOffset, nextPart));
+        base = required;
+        baseSize = requiredSize;
       }
     }
     if (!items.length && !fits(pageWith(cost))) {
@@ -385,14 +353,10 @@ export function renderPreparedContextRead(
       else if (rows) unit = fitNavigationRow(unit, fitsUnit);
       cost = unitSize(unit);
     }
-    if (frame.bytes + cost.bytes > READ_PAGE_LIMIT) {
-      const maximum = { ...page([unit], nextOffset, nextPart), live: null };
-      delete maximum.runtime_events;
-      if (jsonBytes(maximum) > READ_PAGE_LIMIT) {
-        if (items.length && metadataUnit(unit)) break;
-        unit = omittedUnit(unit);
-        cost = unitSize(unit);
-      }
+    if (requiredSize.bytes + tail.bytes - 1 + cost.bytes > READ_PAGE_LIMIT) {
+      if (items.length && metadataUnit(unit)) break;
+      unit = omittedUnit(unit);
+      cost = unitSize(unit);
     }
     const measured = pageWith(cost);
     if (!fits(measured)) {
@@ -403,13 +367,13 @@ export function renderPreparedContextRead(
       throw error;
     }
     items.push(unit);
-    itemBytes += cost.bytes;
-    itemWireBytes += cost.wireBytes;
+    bytes += cost.bytes + comma;
+    wireBytes += cost.wireBytes + 2 * comma;
     offset = nextOffset;
     part = nextPart;
     current = iterator.next();
   }
-  const result = page(items, offset, part);
+  const result = { ...base, items, ...paging(offset, part) };
   if (!fits(size(result))) throw new Error('READ_BUDGET_TOO_SMALL');
   if (!rows && !current.done) continuations.set(snapshot, { offset, part, iterator, current });
   return structuredClone(result);

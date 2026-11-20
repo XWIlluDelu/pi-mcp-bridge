@@ -211,11 +211,7 @@ export async function readSession(
   bridge.assertOpen();
   // Routing metadata only. Cached content is accessed after authorization and
   // today's canonical path/native identity check; a cursor is never a grant.
-  const id =
-    args.session_id ??
-    (args.refs
-      ? bridge.readCache.referenceIdentity(args.refs[0]).session_id
-      : bridge.readCache.identity(args.cursor).session_id);
+  const id = bridge.readCache.target(args);
   let s = await bridge.session(id, requestContext);
   bridge.check('read', s, requestContext);
   const target = s;

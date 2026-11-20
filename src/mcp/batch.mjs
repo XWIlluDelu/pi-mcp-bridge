@@ -93,11 +93,7 @@ export async function executeBatch(bridge, { operations }, { requestContext } = 
     let sessionId = args.session_id;
     if (op === 'read' && !sessionId && (args.cursor || args.refs)) {
       try {
-        sessionId = (
-          args.refs
-            ? bridge.readCache.referenceIdentity(args.refs[0])
-            : bridge.readCache.identity(args.cursor)
-        ).session_id;
+        sessionId = bridge.readCache.target(args);
       } catch (error) {
         return { index, op, error: toolFailure(error) };
       }

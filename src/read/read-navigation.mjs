@@ -1,4 +1,5 @@
 import { contentKind } from './read-schema.mjs';
+import { largestFittingSize } from '../mcp/response-budget.mjs';
 
 // Reading documents own sanitized source atoms and their original positions.
 const compact = (value) =>
@@ -37,14 +38,7 @@ export function fitNavigationRow(row, fits) {
   };
   if (!fits(shorten(0))) delete base.source;
   if (!fits(shorten(0))) delete base.related;
-  let low = 0,
-    high = row.text.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (fits(shorten(mid))) low = mid;
-    else high = mid - 1;
-  }
-  return shorten(low);
+  return shorten(largestFittingSize(row.text.length, (limit) => fits(shorten(limit))));
 }
 
 function messageText(message, { metadata = false } = {}) {
@@ -132,8 +126,18 @@ const messageKey = (source = {}) =>
   source.observation_index !== undefined
     ? `runtime:${source.observation_index}`
     : `session:${source.entry_id}:${source.message_index ?? ''}`;
-export const assistantBlockType = (block) =>
-  ({ text: 'text', thinking: 'thinking', toolCall: 'tool_call' })[block.type] ?? 'native';
+export function* assistantBlocks(content, source, prompt_id) {
+  for (const [block_index, block] of content.entries()) {
+    const kind = block.type;
+    yield {
+      type:
+        kind === 'toolCall' ? 'tool_call' : ['text', 'thinking'].includes(kind) ? kind : 'native',
+      source: { ...source, block_index },
+      prompt_id,
+      block,
+    };
+  }
+}
 export const assistantFailed = (message) =>
   ['error', 'aborted'].includes(message.stopReason) || Boolean(message.errorMessage);
 
@@ -158,56 +162,20 @@ export function toolOperations(units) {
   return operations;
 }
 
-// Classify captured assistant blocks once, keeping original source order.
-export function runtimeUnits(atoms) {
-  const units = [];
-  let turn = null;
-  for (const original of atoms) {
-    const message = original.message;
-    if (message?.role === 'user') turn = `runtime:${original.source.observation_index}`;
-    if (
-      message?.role !== 'assistant' ||
-      !Array.isArray(message.content) ||
-      !message.content.length
-    ) {
-      units.push({ ...original, prompt_id: turn });
-      continue;
-    }
-    const { content, ...metadata } = message;
-    for (const [index, block] of content.entries())
-      units.push({
-        type: assistantBlockType(block),
-        metadata: block.type === 'text' ? metadata : undefined,
-        block,
-        source: { ...original.source, block_index: index },
-        prompt_id: turn,
-      });
-    if (
-      assistantFailed(message) &&
-      !content.some((block) => block.type === 'text' && block.text?.trim())
-    )
-      units.push({ ...original, message: metadata, prompt_id: turn });
-  }
-  for (const [first, result] of toolOperations(units)) {
-    const source = messageKey(first.source);
-    first.tool_id =
-      first.type === 'tool_call'
-        ? `runtime:${source}:${first.source.block_index}`
-        : `tool:${source}`;
-    if (result) {
-      result.tool_id = first.tool_id;
-      result.prompt_id = first.prompt_id ?? result.prompt_id;
-    }
-  }
-  return units;
-}
-
 function toolName(units) {
   return (
     units.find((unit) => unit.block?.type === 'toolCall')?.block.name ??
     units.find((unit) => unit.message?.role === 'toolResult')?.message.toolName ??
     'tool'
   );
+}
+
+function nestedToolCalls(units) {
+  const calls = new Map();
+  for (const [atom, unit] of units.entries())
+    for (const [ordinal, call] of (unit.message?.nestedCalls?.calls ?? []).entries())
+      calls.set(call.id, { atom, ordinal, call });
+  return calls.values();
 }
 
 function toolPreview(documents, doc) {
@@ -277,10 +245,8 @@ export function navigationGroups(units, content) {
   return [...grouped.values()];
 }
 
-export function navigationDocuments(
-  snapshot,
-  docs = navigationGroups(snapshot.units, snapshot.request?.content),
-) {
+export function navigationDocuments(snapshot) {
+  const docs = navigationGroups(snapshot.units, snapshot.request?.content);
   const byId = new Map(docs.map((doc, index) => [doc.id, index]));
   const latest = new Map();
   for (const [parent, doc] of [...docs].entries()) {
@@ -316,13 +282,9 @@ export function navigationDocuments(
       });
     }
     if (!units[0].tool_id) continue;
-    const calls = new Map();
-    for (const [atom, unit] of units.entries())
-      for (const [ordinal, call] of (unit.message?.nestedCalls?.calls ?? []).entries())
-        calls.set(call.id, { atom, ordinal, call });
-    const children = [...calls.values()];
     doc.title = toolName(units);
-    doc.children = children.map(
+    doc.children = Array.from(
+      nestedToolCalls(units),
       ({ atom, ordinal, call }) =>
         docs.push({
           parent,
@@ -354,10 +316,26 @@ export function matchesReadText(title, preview, text, query) {
   return [title, preview, text].some((value) => value && includesQuery(value, query));
 }
 
-export function documentMatches(documents, doc, query) {
+function documentMatches(documents, doc, query) {
   return (
     doc.kind !== 'source' &&
-    matchesReadText(doc.title, doc.atoms?.[0].unit.preview, documentText(documents, doc), query)
+    (matchesReadText(doc.title, doc.atoms?.[0].unit.preview, undefined, query) ||
+      includesQuery(documentText(documents, doc), query))
+  );
+}
+
+// Owner acquisition retains matching sources before transfer. Links and
+// previews belong to the public snapshot and are built once, after capture.
+export function searchGroupMatches(group, query) {
+  const units = group.atoms.map(({ unit }) => unit);
+  const tool = units[0].tool_id;
+  if (documentMatches([], { ...group, title: tool ? toolName(units) : units[0].title }, query))
+    return true;
+  return Boolean(
+    tool &&
+    nestedToolCalls(units).some(({ call }) =>
+      matchesReadText(call.name, undefined, JSON.stringify(call), query),
+    ),
   );
 }
 
@@ -369,15 +347,18 @@ function searchedText(documents, doc, query) {
 }
 
 export function navigationOrder(documents, query) {
-  const order = [...documents.keys()];
-  if (!query) return order.filter((index) => documents[index].parent === undefined);
-  const matching = order.filter((index) => documentMatches(documents, documents[index], query));
-  const parents = new Set(matching.map((index) => documents[index].parent));
-  // Child operations occupy their parent's source position, even though their
-  // reference documents are appended after the top-level document index.
-  return matching
-    .filter((index) => !parents.has(index))
-    .sort((a, b) => (documents[a].parent ?? a) - (documents[b].parent ?? b) || a - b);
+  const order = [];
+  for (const [index, document] of documents.entries()) {
+    if (document.parent !== undefined) continue;
+    const nested =
+      query &&
+      document.children?.filter((child) => documentMatches(documents, documents[child], query));
+    // Show matching children at their parent's position and skip its preview.
+    if (nested?.length) {
+      for (const child of nested) order.push(child);
+    } else if (!query || documentMatches(documents, document, query)) order.push(index);
+  }
+  return order;
 }
 
 export function navigationRow(documents, index, ref, query) {

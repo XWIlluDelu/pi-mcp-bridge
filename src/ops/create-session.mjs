@@ -13,7 +13,7 @@ import {
 } from '../runtime/pi-installation.mjs';
 import { sessionKey, syncDir, assertNativeDirectory } from '../core/storage.mjs';
 import { launchProfile } from '../runtime/rpc.mjs';
-import { sessionEntryIndex } from '../core/data.mjs';
+import { traceSessionBranch } from '../core/data.mjs';
 const exec = promisify(execFile);
 
 // Fork committed native entries, never the Bridge read representation. An
@@ -44,7 +44,7 @@ export async function prepareSession(config, project, { name, parentSession, cap
   let entries = [];
   if (snapshot && snapshot.leafId !== null) {
     const { header, entries: raw, leafId } = snapshot;
-    if (!sessionEntryIndex(raw, leafId, snapshot.byId).has(leafId))
+    if (!traceSessionBranch(raw, leafId, snapshot.byId).ancestry.has(leafId))
       throw new Error('INVALID_RUNTIME_ENTRIES');
     const manager = sdk.SessionManager.inMemory(header.cwd || project, undefined, [header, ...raw]);
     manager.createBranchedSession(leafId);

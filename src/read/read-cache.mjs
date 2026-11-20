@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { contextSelection } from './read-schema.mjs';
-import { jsonBytes } from '../mcp/response-budget.mjs';
-import { READ_SNAPSHOT_LIMIT, renderPreparedContextRead } from './context-read.mjs';
+import { READ_SNAPSHOT_LIMIT, ReadSnapshots } from './read-snapshots.mjs';
+import { renderPreparedContextRead } from './read-render.mjs';
 import {
   navigationDocuments,
   navigationOrder,
@@ -25,9 +25,9 @@ function decodeHandle(value, error) {
 
 // Immutable sanitized history, not a version-dependent acceleration cache.
 // Missing snapshots are never reacquired to reconstruct an old cursor.
-export class ContextReadCache {
+export class ContextReadCache extends ReadSnapshots {
   constructor({ maxBytes = READ_SNAPSHOT_LIMIT, maxEntries = 64 } = {}) {
-    Object.assign(this, { maxBytes, maxEntries, accountedBytes: 0, entries: new Map() });
+    super(maxBytes, maxEntries);
   }
   lookup(cursor) {
     const [token, offset, part] = decodeHandle(cursor, 'INVALID_CURSOR');
@@ -39,9 +39,6 @@ export class ContextReadCache {
       throw new Error('INVALID_CURSOR');
     return { position: { token, offset, part }, entry };
   }
-  identity(cursor) {
-    return this.lookup(cursor).entry.identity;
-  }
   reference(ref) {
     const [tag, token, index] = decodeHandle(ref, 'INVALID_READ_REFERENCE');
     if (tag !== 'ref' || !validToken(token) || !validIndex(index))
@@ -52,8 +49,10 @@ export class ContextReadCache {
     if (!document) throw new Error('INVALID_READ_REFERENCE');
     return { token, entry, document };
   }
-  referenceIdentity(ref) {
-    return this.reference(ref).entry.identity;
+  target(args) {
+    if (args.session_id !== undefined) return args.session_id;
+    const { entry } = args.refs ? this.reference(args.refs[0]) : this.lookup(args.cursor);
+    return entry.identity.session_id;
   }
   expand(refs, identity) {
     const resolved = refs.map((ref) => this.reference(ref));
@@ -67,8 +66,7 @@ export class ContextReadCache {
     const tokenOrder = new Map();
     const selected = new Map();
     for (const { token, entry, document } of resolved) {
-      this.entries.delete(token);
-      this.entries.set(token, entry);
+      this.touch(token, entry);
       if (!tokenOrder.has(token)) tokenOrder.set(token, tokenOrder.size);
       const captureIndex = tokenOrder.get(token);
       for (const atom of documentAtoms(entry.snapshot.documents, document))
@@ -112,35 +110,8 @@ export class ContextReadCache {
       )
     )
       throw new Error('STALE_CURSOR');
-    this.entries.delete(position.token);
-    this.entries.set(position.token, entry);
+    this.touch(position.token, entry);
     return { token: position.token, snapshot, cursor: position };
-  }
-  delete(token) {
-    const entry = this.entries.get(token);
-    if (entry) this.accountedBytes -= entry.accountedBytes;
-    this.entries.delete(token);
-  }
-  insert(token, snapshot, identity, length) {
-    const accountedBytes = jsonBytes(snapshot) * 4 + length * 256;
-    if (accountedBytes > this.maxBytes || this.maxEntries < 1)
-      throw new Error('READ_SNAPSHOT_TOO_LARGE');
-    while (
-      this.entries.size >= this.maxEntries ||
-      this.accountedBytes + accountedBytes > this.maxBytes
-    ) {
-      const evictable = [...this.entries].find(([, entry]) => !entry.pins);
-      if (!evictable) throw new Error('READ_CACHE_BUSY');
-      this.delete(evictable[0]);
-    }
-    this.entries.set(token, {
-      snapshot,
-      identity,
-      accountedBytes,
-      length,
-      pins: 0,
-    });
-    this.accountedBytes += accountedBytes;
   }
   render(
     snapshot,
@@ -165,8 +136,11 @@ export class ContextReadCache {
       runtimeEvents,
     });
     if (result.next_cursor || rows?.length) {
-      if (!this.entries.has(token))
-        this.insert(token, snapshot, identity, rows?.length ?? snapshot.units.length);
+      if (
+        !this.entries.has(token) &&
+        !this.insert(token, { snapshot, identity }, rows?.length ?? snapshot.units.length)
+      )
+        throw new Error('READ_SNAPSHOT_TOO_LARGE');
       if (readPins) {
         const entry = this.entries.get(token);
         entry.pins++;
@@ -179,7 +153,7 @@ export class ContextReadCache {
   }
   navigate(snapshot, args, options, query) {
     const { units, ...capture } = snapshot;
-    const documents = navigationDocuments({ units, ...capture, request: args });
+    const documents = navigationDocuments({ ...capture, units, request: args });
     return this.render(
       {
         ...capture,
@@ -192,9 +166,5 @@ export class ContextReadCache {
       args,
       options,
     );
-  }
-  clear() {
-    this.entries.clear();
-    this.accountedBytes = 0;
   }
 }

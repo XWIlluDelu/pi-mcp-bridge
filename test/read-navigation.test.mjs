@@ -6,7 +6,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { ContextReadCache } from '../src/read/read-cache.mjs';
-import { prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/read/context-read.mjs';
+import { prepareContextRead } from '../src/read/context-read.mjs';
+import { READ_SNAPSHOT_LIMIT } from '../src/read/read-snapshots.mjs';
 import {
   navigationDocuments,
   navigationOrder,
@@ -245,18 +246,24 @@ test('search filters before bounded capture and retains the complete matching lo
   for (let i = 0; i < Math.ceil(READ_SNAPSHOT_LIMIT / (noise.length * 4)) + 3; i++)
     add('noise-' + i, 'assistant', [tool('noise-' + i, { code: noise })]);
   add('call', 'assistant', [tool('target', { path: '/target/evidence.txt' })]);
-  add('result', 'toolResult', [text('needle-verification')], { toolCallId: 'target' });
+  add('result', 'toolResult', [text('needle-verification')], {
+    toolCallId: 'target',
+    nestedCalls: { calls: [{ id: 'child', name: 'verify_file', result: 'child-only-match' }] },
+  });
   const prepare = (extra) =>
     prepareContextRead({ entries }, { ...args, ...extra }, { buildSessionProjection });
   assert.throws(() => prepare(), /READ_SNAPSHOT_TOO_LARGE/);
-  const query = 'needle-verification',
-    found = prepare({ search_query: query });
-  assert.deepEqual(
-    found.units.map((unit) => unit.source.entry_id),
-    ['call', 'result'],
-  );
-  assert.ok(jsonBytes(found) < 4096);
-  assert.equal(rows(found, { query })[0].type, 'tool');
+  for (const query of ['needle-verification', 'child-only-match']) {
+    const found = prepare({ search_query: query });
+    assert.deepEqual(
+      found.units.map((unit) => unit.source.entry_id),
+      ['call', 'result'],
+    );
+    assert.ok(jsonBytes(found) < 4096);
+    const [hit] = rows(found, { query });
+    assert.equal(hit.type, 'tool');
+    assert.ok(hit.text.includes(query));
+  }
 });
 
 test('reader tool items preserve their title, preview and searchable source text', () => {

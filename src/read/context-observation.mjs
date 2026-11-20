@@ -1,9 +1,8 @@
 // Passive request-stage observations. No Pi/extension imports or memory-store access.
 import { randomUUID } from 'node:crypto';
-import { appendUnits, READ_CONTRACT, READ_SNAPSHOT_LIMIT } from './context-read.mjs';
-import { jsonBytes } from '../mcp/response-budget.mjs';
-import { sessionEntryIndex } from '../core/data.mjs';
-import { runtimeUnits } from './read-navigation.mjs';
+import { captureRuntimeUnits, OBSERVATION_PHASE, READ_CONTRACT } from './context-read.mjs';
+import { READ_SNAPSHOT_LIMIT, ReadSnapshots } from './read-snapshots.mjs';
+import { traceSessionBranch } from '../core/data.mjs';
 import { readSchema } from './read-schema.mjs';
 
 export function unavailableObservation(sessionId, reason, captureSequence = 0) {
@@ -27,16 +26,10 @@ export function checkObservation(snapshot, data, { ownerActive = true } = {}) {
   if (!snapshot?.observation?.available) return snapshot;
   const input = snapshot.observation.input_leaf_id,
     current = data.leafId,
-    byId = sessionEntryIndex(data.entries, current, data.byId);
-  let leaf = current,
-    later = 0;
-  while (leaf !== input && leaf !== null) {
-    const entry = byId.get(leaf);
-    if (!entry) break;
-    leaf = entry.parentId ?? null;
-    later++;
-  }
-  if (leaf !== input)
+    { ancestry, end } = traceSessionBranch(data.entries, current, data.byId),
+    last = ancestry.size ? (end ?? null) : end,
+    later = ancestry.get(input) ?? (last === input ? ancestry.size : undefined);
+  if (later === undefined)
     return unavailableObservation(
       snapshot.session_id,
       'input_branch_changed',
@@ -73,24 +66,6 @@ export class ContextObservation {
     const sequence = ++this.counter.captureSequence;
     this.latest = unavailableObservation(null, 'capture_failed', sequence);
     try {
-      const target = { units: [], accountedBytes: 0 };
-      for (const [index, message] of event.messages.entries()) {
-        const type =
-          {
-            user: 'prompt',
-            system: 'system',
-            assistant: 'assistant',
-            toolResult: 'tool_result',
-            compactionSummary: 'summary',
-            branchSummary: 'summary',
-            bashExecution: 'command',
-            custom: 'custom',
-          }[message.role] ?? 'native';
-        appendUnits(target, { type, source: { observation_index: index }, message });
-      }
-      const units = runtimeUnits(target.units);
-      if (jsonBytes(units) * 4 + units.length * 256 > READ_SNAPSHOT_LIMIT)
-        throw new Error('READ_SNAPSHOT_TOO_LARGE');
       this.latest = {
         contract: READ_CONTRACT,
         view: 'runtime',
@@ -99,11 +74,11 @@ export class ContextObservation {
         leaf_id: leaf,
         selection: null,
         omissions: null,
-        units,
+        units: captureRuntimeUnits(event.messages),
         observation: {
           available: true,
           id: randomUUID(),
-          phase: 'context_with_system_observer',
+          phase: OBSERVATION_PHASE,
           observed_at: new Date().toISOString(),
           owner_generation: this.generation,
           input_leaf_id: leaf,
@@ -153,14 +128,9 @@ export class ContextObservation {
 
 // Latest successful capture per session, bounded across owned tasks. Kept by Bridge, not the
 // short-lived Pi child. Frozen read cursors may share these sanitized units.
-export class RetainedObservations {
+export class RetainedObservations extends ReadSnapshots {
   constructor({ maxBytes = READ_SNAPSHOT_LIMIT, maxEntries = 16 } = {}) {
-    Object.assign(this, { maxBytes, maxEntries, accountedBytes: 0, entries: new Map() });
-  }
-  delete(id) {
-    const entry = this.entries.get(id);
-    if (entry) this.accountedBytes -= entry.bytes;
-    this.entries.delete(id);
+    super(maxBytes, maxEntries);
   }
   put(session, snapshot, runtime) {
     if (!Number.isSafeInteger(snapshot.capture_sequence) || snapshot.capture_sequence < 0)
@@ -172,19 +142,11 @@ export class RetainedObservations {
     // Lifecycle/status replies are not captures. Keep the last actual request
     // with its original identity; a failed live capture is reported by that read.
     if (!snapshot.observation.available) return;
-    this.delete(session.id);
-    const bytes = jsonBytes(snapshot) * 4 + snapshot.units.length * 256;
-    if (bytes > this.maxBytes || this.maxEntries < 1) return;
-    while (this.entries.size >= this.maxEntries || this.accountedBytes + bytes > this.maxBytes)
-      this.delete(this.entries.keys().next().value);
-    this.entries.set(session.id, {
-      file: session.file,
-      nativeId: session.header.id,
-      cwd: session.header.cwd,
-      snapshot,
-      bytes,
-    });
-    this.accountedBytes += bytes;
+    this.insert(
+      session.id,
+      { file: session.file, nativeId: session.header.id, cwd: session.header.cwd, snapshot },
+      snapshot.units.length,
+    );
   }
   get(session) {
     const entry = this.entries.get(session.id);
@@ -197,12 +159,7 @@ export class RetainedObservations {
       this.delete(session.id);
       return unavailableObservation(session.id, 'session_changed');
     }
-    this.entries.delete(session.id);
-    this.entries.set(session.id, entry);
+    this.touch(session.id, entry);
     return entry.snapshot;
-  }
-  clear() {
-    this.entries.clear();
-    this.accountedBytes = 0;
   }
 }

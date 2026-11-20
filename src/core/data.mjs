@@ -150,10 +150,7 @@ export async function loadSession(file, { omitImageData = false, config, sdk } =
   const unterminated = await withSessionFile(file, async (fd, opened) => {
     // Native pure parsing skips malformed records; never call a loader which
     // repairs a missing LF or opens/migrates the user's file for writing.
-    const tail = await scanSavedLines(
-      fd.createReadStream({ encoding: 'utf8', autoClose: false }),
-      parse,
-    );
+    const tail = await scanSavedLines(fd.createReadStream({ autoClose: false }), parse);
     const current = await assertSingleSessionFile(file);
     if (current.ino !== opened.ino || current.dev !== opened.dev)
       throw new Error('RUNTIME_SESSION_CHANGED');
@@ -191,19 +188,22 @@ export async function loadSession(file, { omitImageData = false, config, sdk } =
       : {}),
   };
 }
-// Native projection and getBranch follow parent links without a cycle guard.
-// Check only the requested path, not abandoned branches or missing parents.
-export function sessionEntryIndex(entries, leafId, byId) {
+// Native projection follows parent links. Validate the selected chain and keep
+// the distance to each ancestor for branch relations and retained observations.
+export function traceSessionBranch(entries, leafId, byId) {
   if (!byId) {
     byId = new Map();
     for (const entry of entries) byId.set(entry.id, entry);
   }
-  const visited = new Set();
-  for (let entry = byId.get(leafId); entry; entry = byId.get(entry.parentId)) {
-    if (visited.has(entry.id)) throw new Error('INVALID_SESSION_TREE');
-    visited.add(entry.id);
+  const ancestry = new Map();
+  let end = leafId,
+    entry;
+  while ((entry = byId.get(end))) {
+    if (ancestry.has(entry.id)) throw new Error('INVALID_SESSION_TREE');
+    ancestry.set(entry.id, ancestry.size);
+    end = entry.parentId;
   }
-  return byId;
+  return { byId, ancestry, end };
 }
 export async function loadSavedSession(session, options) {
   const data = await loadSession(session.file, options);
@@ -238,25 +238,4 @@ export async function discover(config) {
   }
   for (const root of config.sessionRoots) await walk(root);
   return found.sort((a, b) => a.id.localeCompare(b.id));
-}
-const textBoundary = (text, offset) =>
-  !(
-    offset > 0 &&
-    offset < text.length &&
-    text.charCodeAt(offset - 1) >= 0xd800 &&
-    text.charCodeAt(offset - 1) <= 0xdbff &&
-    text.charCodeAt(offset) >= 0xdc00 &&
-    text.charCodeAt(offset) <= 0xdfff
-  );
-export function fitDecodedText(text, maxChars, render, fits = () => true) {
-  let low = 0,
-    high = Math.min(text.length, maxChars);
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2),
-      end = textBoundary(text, mid) ? mid : mid - 1;
-    const value = render(text.slice(0, end));
-    if (JSON.stringify(value).length <= maxChars && fits(value)) low = mid;
-    else high = mid - 1;
-  }
-  return textBoundary(text, low) ? low : low - 1;
 }

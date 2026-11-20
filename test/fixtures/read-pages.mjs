@@ -8,7 +8,7 @@ import { ContextReadCache } from '../../src/read/read-cache.mjs';
 const cache = new ContextReadCache();
 export function renderContextRead(data, args) {
   const identity = {
-    session_id: args.session_id ?? cache.identity(args.cursor).session_id,
+    session_id: cache.target(args),
     file: 'fixture',
     native_id: data.header.id,
   };

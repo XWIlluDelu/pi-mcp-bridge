@@ -1,236 +1,240 @@
-import { readSchema, contextSelection } from './read-schema.mjs';
+import { readSchema, contextSelection, contentKind } from './read-schema.mjs';
+import { z } from 'zod';
 import { jsonBytes } from '../mcp/response-budget.mjs';
-import { sessionEntryIndex } from '../core/data.mjs';
+import { traceSessionBranch } from '../core/data.mjs';
 import { validateReadAdapters } from './read-adapters.mjs';
 import {
   navigationGroups,
-  navigationDocuments,
-  documentMatches,
-  assistantBlockType,
+  searchGroupMatches,
+  assistantBlocks,
   assistantFailed,
   toolOperations,
 } from './read-navigation.mjs';
-import {
-  READ_PAGE_LIMIT,
-  boundedFields,
-  pick,
-  renderPreparedContextRead,
-  smallLive,
-} from './read-render.mjs';
-
-export { renderPreparedContextRead };
+import { READ_PAGE_LIMIT, boundedFields, pick, smallLive } from './read-render.mjs';
+import { READ_SNAPSHOT_LIMIT, readSnapshotBytes } from './read-snapshots.mjs';
 
 // Change only when the live read request/snapshot semantics become incompatible.
 export const READ_CONTRACT = 'pi-bridge-read-v2';
-export const READ_SNAPSHOT_LIMIT = 32 * 1024 * 1024;
+export const OBSERVATION_PHASE = 'context_with_system_observer';
+const count = z.number().int().nonnegative();
+const leafId = z.string().nullable();
+const observation = z.discriminatedUnion('available', [
+  z
+    .object({
+      available: z.literal(false),
+      reason: z.string(),
+      current_leaf_id: z.unknown().optional(),
+    })
+    .refine(
+      (capture) =>
+        capture.reason !== 'no_observation' || leafId.safeParse(capture.current_leaf_id).success,
+    ),
+  z.object({
+    available: z.literal(true),
+    phase: z.literal(OBSERVATION_PHASE),
+    id: z.string(),
+    owner_generation: z.string(),
+    observed_at: z.string(),
+    checked_at: z.string(),
+    owner_active: z.boolean(),
+    current_leaf_id: leafId,
+    input_leaf_id: leafId,
+    later_committed_entries: count,
+  }),
+]);
 
 const take = (values, n, reverse = false) =>
   n === -1 ? values : n === 0 ? [] : reverse ? values.slice(-n) : values.slice(0, n);
 
-/**
- * The projection, not timestamps or raw-file order, is the ordering authority.
- * Retain hidden inputs as empty boundaries before flattening messages.
- */
-function timeline(projection, readAdapters) {
+const messageKinds = {
+  user: 'prompt',
+  system: 'system',
+  assistant: 'assistant',
+  toolResult: 'tool_result',
+  compactionSummary: 'summary',
+  branchSummary: 'summary',
+  bashExecution: 'command',
+  custom: 'custom',
+};
+
+function messageKind(message) {
+  return Object.hasOwn(messageKinds, message.role) ? messageKinds[message.role] : 'native';
+}
+
+function addMessage(records, message, type, source, prompt_id, runtime = false) {
+  if (type === 'assistant') {
+    const { content, ...metadata } = message;
+    if (Array.isArray(content) && content.length) {
+      for (const unit of assistantBlocks(content, source, prompt_id)) {
+        if (!runtime || unit.type === 'text') unit.metadata = metadata;
+        records.push(unit);
+      }
+      if (
+        !assistantFailed(message) ||
+        content.some((block) => block.type === 'text' && (!runtime || block.text?.trim()))
+      )
+        return;
+      message = runtime ? metadata : { ...metadata, content: [] };
+    }
+    if (!runtime) type = 'native';
+  }
+  const record = { type, source, prompt_id, message };
+  if (!runtime && type === 'summary') {
+    delete record.message;
+    record.parts = [{ source, message }];
+  }
+  if (!runtime && type === 'command') record.in_model_context = !message.excludeFromContext;
+  records.push(record);
+}
+
+function linkTools(records, runtime = false) {
+  const tools = toolOperations(records);
+  for (const [first, result] of tools) {
+    const call = first.type === 'tool_call';
+    const { entry_id, message_index, observation_index, block_index = 'message' } = first.source;
+    const id = runtime
+      ? call
+        ? `runtime:runtime:${observation_index}:${block_index}`
+        : `tool:runtime:${observation_index}`
+      : `${entry_id}:${message_index}:${block_index}:${first.type}`;
+    first.tool_id = id;
+    if (!runtime) {
+      first.call_id = call ? first.block.id : first.message.toolCallId;
+      first.pairing = result ? 'paired' : call ? 'unresolved' : 'orphan_result';
+      if (result)
+        Object.assign(result, {
+          call_id: first.call_id,
+          pairing: 'paired',
+          call_source: first.source,
+        });
+    }
+    if (result) {
+      result.tool_id = id;
+      if (!runtime || first.prompt_id !== null) result.prompt_id = first.prompt_id;
+    }
+  }
+  return tools;
+}
+
+// A hidden input is a turn boundary even though it has no recoverable content.
+function timeline(entries, readAdapters) {
   const records = [],
     prompts = [];
   let prompt = null;
-  function add(type, source, extra = {}, owner = prompt) {
-    records.push({ type, prompt_id: owner, source, ...extra });
-  }
-  function emptyPrompt(source, reason, role = 'user') {
-    prompt = `empty:${source.entry_id}:${reason}`;
+  const adapterFor = (message) =>
+    message?.role === 'custom' &&
+    readAdapters.find(({ inputCustomTypes }) => inputCustomTypes.includes(message.customType));
+  function promptBoundary(source, reason, role = 'user', message = { role, content: '' }) {
+    prompt = reason ? `empty:${source.entry_id}:${reason}` : source.entry_id;
     prompts.push(prompt);
-    add('prompt', source, { synthetic: true, reason, message: { role, content: '' } });
+    records.push({
+      type: 'prompt',
+      prompt_id: prompt,
+      source,
+      synthetic: Boolean(reason),
+      ...(reason ? { reason } : {}),
+      message,
+    });
   }
-  const inputAdapter = (message) =>
-    message?.role === 'custom'
-      ? readAdapters.find((value) => value.inputCustomTypes.includes(message.customType))
-      : undefined;
-  function requirePrompt(source) {
-    if (prompt === null) {
-      const { message_index, block_index, ...entrySource } = source;
-      emptyPrompt(entrySource, 'context_prefix');
-    }
-  }
-  for (const [entryIndex, projected] of projection.entries.entries()) {
-    const { sourceEntry: entry, messages } = projected;
-    const base = { entry_id: entry.id, entry_index: entryIndex };
+  for (const [entry_index, { sourceEntry: entry, messages }] of entries.entries()) {
+    const base = { entry_id: entry.id, entry_index };
     if (!messages.length) {
       const original =
         entry.type === 'custom_message'
           ? { role: 'custom', customType: entry.customType }
-          : entry.type === 'message'
-            ? entry.message
-            : null;
-      const adapter = inputAdapter(original);
-      if (original?.role === 'user') emptyPrompt(base, 'hidden_user');
+          : entry.message;
+      const adapter = adapterFor(original);
+      if (original?.role === 'user') promptBoundary(base, 'hidden_user');
       else if (adapter)
-        emptyPrompt({ ...base, read_adapter: adapter.id }, 'hidden_input', 'custom');
+        promptBoundary({ ...base, read_adapter: adapter.id }, 'hidden_input', 'custom');
     }
-    for (const [messageIndex, message] of messages.entries()) {
-      const source = { ...base, message_index: messageIndex };
-      const adapter = inputAdapter(message);
-      if (message.role === 'user' || adapter) {
-        // Classify the input before selection, without rewriting its native role
-        // or payload. Source links identify both the entry and opt-in mapping.
+    for (const [message_index, message] of messages.entries()) {
+      const type = messageKind(message);
+      const adapter = adapterFor(message);
+      const source = { ...base, message_index };
+      if (type === 'prompt' || adapter) {
         if (adapter) source.read_adapter = adapter.id;
-        prompt = entry.id;
-        prompts.push(prompt);
-        add('prompt', source, { synthetic: false, message });
-      } else if (message.role === 'compactionSummary' || message.role === 'branchSummary') {
-        add('summary', source, { parts: [{ source, message }] }, null);
-      } else if (message.role === 'system') {
-        add('system', source, { message }, null);
-      } else if (message.role === 'assistant') {
-        requirePrompt(source);
-        const { content, ...metadata } = message;
-        if (Array.isArray(content) && content.length) {
-          for (const [blockIndex, block] of content.entries()) {
-            add(
-              assistantBlockType(block),
-              { ...source, block_index: blockIndex },
-              { block, metadata },
-            );
-          }
-          // A failed message can contain only thinking or an unfinished call.
-          // Its status belongs to assistant selection, not to those other kinds.
-          if (!content.some((block) => block.type === 'text') && assistantFailed(metadata))
-            add('native', source, { message: { ...metadata, content: [] } });
-        } else add('native', source, { message });
-      } else if (message.role === 'toolResult') {
-        requirePrompt(source);
-        add('tool_result', source, { message });
-      } else if (message.role === 'bashExecution') {
-        add('command', source, { message, in_model_context: !message.excludeFromContext });
-      } else {
-        // Custom, image-bearing and future augmented roles remain native data.
-        add(message.role === 'custom' ? 'custom' : 'native', source, { message });
+        promptBoundary(source, null, message.role, message);
+        continue;
       }
+      if (prompt === null && (type === 'assistant' || type === 'tool_result'))
+        promptBoundary(base, 'context_prefix');
+      addMessage(
+        records,
+        message,
+        type,
+        source,
+        ['summary', 'system'].includes(type) ? null : prompt,
+      );
     }
   }
-  // A result belongs to its original call even after a steering input.
-  const tools = toolOperations(records);
-  for (const [first, result] of tools) {
-    const call = first.type === 'tool_call';
-    const { entry_id, message_index, block_index = 'message' } = first.source;
-    first.tool_id = `${entry_id}:${message_index}:${block_index}:${first.type}`;
-    first.call_id = call ? first.block.id : first.message.toolCallId;
-    first.pairing = result ? 'paired' : call ? 'unresolved' : 'orphan_result';
-    if (result)
-      Object.assign(result, {
-        tool_id: first.tool_id,
-        call_id: first.call_id,
-        pairing: 'paired',
-        prompt_id: first.prompt_id,
-        call_source: first.source,
-      });
-  }
-  return { records, prompts, tools };
+  return { records, prompts, tools: linkTools(records) };
 }
 
-function selectTimeline(projected, selection, readAdapters) {
-  const { records, prompts, tools } = timeline(projected, readAdapters);
-  const { range, content } = selection;
-  const selectedPrompts = new Set([
-    ...take(prompts, range.earliest),
-    ...take(prompts, range.recent, true),
-  ]);
+function selectTimeline(projected, { range, content }, readAdapters) {
+  const { records, prompts, tools } = timeline(projected.entries, readAdapters);
+  const turns = new Set([...take(prompts, range.earliest), ...take(prompts, range.recent, true)]);
+  const recordsByKind = Map.groupBy(records, (record) =>
+    record.message?.role === 'assistant' ? 'assistant' : contentKind(record.type),
+  );
+  const all = (kind) => recordsByKind.get(kind) ?? [];
+  const inTurn = (record) => turns.has(record.prompt_id);
   const chosen = new Set();
-  const totals = {
-    turns: prompts.length,
-    input: prompts.length,
-    assistant: 0,
-    thinking: 0,
-    tool: tools.length,
-    system: records.filter((r) => r.type === 'system').length,
-    summary: records.some((r) => r.type === 'summary') ? 1 : 0,
-    command: records.filter((r) => r.type === 'command').length,
-    native: 0,
+  const omissions = { turns: prompts.length - turns.size };
+  const keep = (kind, groups, selected) => {
+    omissions[kind] = groups.length - selected.length;
+    for (const group of selected) for (const record of group) chosen.add(record);
   };
-  const included = Object.fromEntries(Object.keys(totals).map((key) => [key, 0]));
-  included.turns = selectedPrompts.size;
-  const assistantRecord = (record) =>
-    record.type === 'text' || (record.type === 'native' && record.message?.role === 'assistant');
-  // Count messages and operations, then keep their complete selected blocks.
-  const selectRecent = (kind, groups) => {
-    totals[kind] = groups.length;
-    for (const [id, group] of Map.groupBy(groups, (records) => records[0].prompt_id)) {
-      if (!selectedPrompts.has(id)) continue;
-      for (const records of take(group, content[kind], true)) {
-        included[kind]++;
-        for (const record of records) chosen.add(record);
-      }
-    }
+  const globalSummary = all('summary');
+  const individual = {
+    input: (record) => content.input && inTurn(record),
+    system: (record) => {
+      if (!content.system) return false;
+      if (content.tool !== 0) return true;
+      const { toolsAdded, toolsRemoved, ...message } = record.message;
+      record.message = message;
+      return Boolean(message.content?.length || Object.keys(message.sections ?? {}).length);
+    },
+    native: (record) => content.native && (record.prompt_id === null || inTurn(record)),
   };
-  const hasText = (value) => typeof value === 'string' && value.trim().length > 0;
-  for (const [kind, accepts, readable] of [
-    [
-      'assistant',
-      assistantRecord,
-      (record) => hasText(record.block?.text) || assistantFailed(record.metadata ?? record.message),
-    ],
-    [
-      'thinking',
-      (record) => record.type === 'thinking',
-      (record) => hasText(record.block.thinking),
-    ],
-  ]) {
-    const messages = Map.groupBy(
-      records.filter(accepts),
-      ({ source }) => `${source.entry_id}:${source.message_index}`,
-    );
-    selectRecent(
+  for (const [kind, test] of Object.entries(individual)) {
+    const groups = all(kind).map((record) => [record]);
+    keep(
       kind,
-      [...messages.values()].filter((group) => group.some(readable)),
+      groups,
+      groups.filter(([record]) => test(record)),
     );
   }
-  selectRecent('tool', tools);
-  for (const record of take(
-    records.filter((r) => r.type === 'command'),
-    content.command,
-    true,
-  )) {
-    chosen.add(record);
-    included.command++;
-  }
-  for (const record of records) {
-    if (record.type === 'system') {
-      if (!content.system) continue;
-      if (content.tool === 0) {
-        const { toolsAdded, toolsRemoved, ...message } = record.message;
-        if (!message.content?.length && !Object.keys(message.sections ?? {}).length) continue;
-        record.message = message;
-      }
-      chosen.add(record);
-      included.system++;
-    } else if (record.type === 'prompt') {
-      if (content.input && selectedPrompts.has(record.prompt_id)) {
-        chosen.add(record);
-        included.input++;
-      }
-    } else if (record.type === 'summary') {
-      if (content.summary !== 0) {
-        chosen.add(record);
-        included.summary = 1;
-      }
-    } else if (['custom', 'native'].includes(record.type) && !assistantRecord(record)) {
-      // Other extension/native content stays in its own input window; global
-      // context prefixes remain independent of turn selection.
-      totals.native++;
-      if (content.native && (record.prompt_id === null || selectedPrompts.has(record.prompt_id))) {
-        chosen.add(record);
-        included.native++;
-      }
-    }
+  const commands = all('command').map((record) => [record]);
+  keep('command', commands, take(commands, content.command, true));
+  const summaries = globalSummary.length ? [globalSummary] : [];
+  keep('summary', summaries, content.summary !== 0 ? summaries : []);
+  const meaningful = {
+    assistant: (record) =>
+      (typeof record.block?.text === 'string' && record.block.text.trim()) ||
+      assistantFailed(record.metadata ?? record.message),
+    thinking: (record) => typeof record.block.thinking === 'string' && record.block.thinking.trim(),
+  };
+  for (const kind of ['assistant', 'thinking', 'tool']) {
+    const groups =
+      kind === 'tool'
+        ? tools
+        : [
+            ...Map.groupBy(
+              all(kind),
+              ({ source }) => `${source.entry_id}:${source.message_index}`,
+            ).values(),
+          ].filter((group) => group.some(meaningful[kind]));
+    const selected = [];
+    for (const [turn, group] of Map.groupBy(groups, ([first]) => first.prompt_id))
+      if (turns.has(turn)) selected.push(...take(group, content[kind], true));
+    keep(kind, groups, selected);
   }
   return {
     records: records.filter((record) => chosen.has(record)),
     latestPrompt: prompts.at(-1) ?? null,
-    latestPromptSelected: selectedPrompts.has(prompts.at(-1)),
-    omissions: Object.fromEntries(
-      Object.keys(totals).map((key) => [key, totals[key] - included[key]]),
-    ),
+    latestPromptSelected: turns.has(prompts.at(-1)),
+    omissions,
   };
 }
 
@@ -324,12 +328,24 @@ function cleanRecord({ block, metadata, message, parts, ...unit }) {
   return unit;
 }
 
-export function appendUnits(target, record) {
-  appendSnapshotUnit(target, cleanRecord(record));
+// Capture runtime request messages directly in the detached source shape.
+export function captureRuntimeUnits(messages) {
+  const units = [];
+  let prompt = null;
+  for (const [observation_index, original] of messages.entries()) {
+    const message = cleanMessage(original),
+      type = messageKind(message);
+    if (type === 'prompt') prompt = `runtime:${observation_index}`;
+    addMessage(units, message, type, { observation_index }, prompt, true);
+  }
+  linkTools(units, true);
+  if (readSnapshotBytes(units, units.length) > READ_SNAPSHOT_LIMIT)
+    throw new Error('READ_SNAPSHOT_TOO_LARGE');
+  return structuredClone(units);
 }
 
 export function appendSnapshotUnit(target, unit) {
-  target.accountedBytes += jsonBytes(unit) * 4 + 256;
+  target.accountedBytes += readSnapshotBytes(unit, 1);
   if (target.accountedBytes > READ_SNAPSHOT_LIMIT) throw new Error('READ_SNAPSHOT_TOO_LARGE');
   const captured = structuredClone(unit);
   target.units.push(captured);
@@ -346,21 +362,13 @@ export function validateReadEntryIds(value) {
   return [...new Set(value)].sort();
 }
 
-function entryRelations(byId, leaf, ids) {
-  const ancestry = new Set();
-  let current = leaf;
-  while (current !== null) {
-    const entry = byId.get(current);
-    if (!entry) break;
-    ancestry.add(current);
-    current = entry.parentId;
-  }
+function entryRelations({ byId, ancestry, end }, ids) {
   // The raw parent chain includes ancestors omitted by compaction. A missing
   // parent prevents negative claims; entries reached on the chain are known.
   return Object.fromEntries(
     ids.map((id) => [
       id,
-      ancestry.has(id) ? 'on_branch' : current === null && byId.has(id) ? 'off_branch' : 'unknown',
+      ancestry.has(id) ? 'on_branch' : end === null && byId.has(id) ? 'off_branch' : 'unknown',
     ]),
   );
 }
@@ -387,26 +395,24 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
           ? (data.entries.at(-1)?.id ?? null)
           : data.leafId
         : args.leaf_id;
-  const byId = sessionEntryIndex(data.entries, leaf, data.byId);
-  if (leaf !== null && !byId.has(leaf)) throw new Error('ENTRY_NOT_FOUND');
+  const branch = traceSessionBranch(data.entries, leaf, data.byId);
+  if (leaf !== null && !branch.ancestry.has(leaf)) throw new Error('ENTRY_NOT_FOUND');
   const selected = selectTimeline(
-      buildSessionProjection(data.entries, leaf, byId),
+      buildSessionProjection(data.entries, leaf, branch.byId),
       selection,
       validateReadAdapters(readAdapters),
     ),
     target = { units: [], accountedBytes: 0 };
   if (search_query === undefined) {
-    for (const record of selected.records) appendUnits(target, record);
+    for (const record of selected.records) appendSnapshotUnit(target, cleanRecord(record));
   } else {
     const byPosition = [];
-    const source = { view: 'session', session_id: args.session_id };
     for (const group of navigationGroups(selected.records)) {
       const atoms = group.atoms.map(({ position, unit }) => ({
         position,
         unit: cleanRecord(unit),
       }));
-      const documents = navigationDocuments(source, [{ ...group, atoms }]);
-      if (documents.some((doc) => documentMatches(documents, doc, search_query)))
+      if (searchGroupMatches({ ...group, atoms }, search_query))
         for (const { position, unit } of atoms)
           byPosition[position] = appendSnapshotUnit(target, unit);
     }
@@ -419,7 +425,7 @@ export function prepareContextRead(data, rawArgs, { buildSessionProjection, read
     leaf_id: leaf,
     selection,
     omissions: selected.omissions,
-    ...(requestedEntries ? { entry_relations: entryRelations(byId, leaf, requestedEntries) } : {}),
+    ...(requestedEntries ? { entry_relations: entryRelations(branch, requestedEntries) } : {}),
     ...(search_query !== undefined ? { search_query } : {}),
     units: target.units,
     ...(data.history ? { history: data.history } : {}),
@@ -454,45 +460,40 @@ function cleanLive(raw, selection, selected) {
   if (message === null) return { ...base, items: [] };
   if (message?.role !== 'assistant' || !Array.isArray(message.content))
     return { ...base, available: false, reason: 'invalid_live_message' };
-  const indices = new Set(),
+  const blocks = [...assistantBlocks(message.content, {}, null)],
+    groups = Map.groupBy(blocks, ({ type }) => contentKind(type)),
+    kept = new Set(selection.content.native ? groups.get('native') : []),
     omissions = { ...raw.selection_omissions };
-  for (const [kind, key] of [
-    ['text', 'assistant'],
-    ['thinking', 'thinking'],
-    ['toolCall', 'tool'],
-  ]) {
-    const group = message.content
-      .map((block, index) => ({ block, index }))
-      .filter((item) => item.block.type === kind);
+  for (const kind of ['assistant', 'thinking', 'tool']) {
+    const group = groups.get(kind) ?? [];
     // Live text/thinking belong to one transient message. Tool calls still
     // count independently because each is a distinct logical operation.
-    const keep =
-      key === 'tool'
+    const pick =
+      kind === 'tool'
         ? take(group, selection.content.tool, true)
-        : selection.content[key] === 0
-          ? []
-          : group;
-    omissions[key] =
-      (omissions[key] ?? 0) +
-      (key === 'tool' ? group.length - keep.length : group.length && !keep.length ? 1 : 0);
-    for (const { index } of keep) indices.add(index);
+        : selection.content[kind]
+          ? group
+          : [];
+    omissions[kind] =
+      (omissions[kind] ?? 0) +
+      (kind === 'tool' ? group.length - pick.length : Number(group.length > 0 && !pick.length));
+    for (const item of pick) kept.add(item);
   }
-  if (selection.content.native)
-    message.content.forEach((block, index) => {
-      if (!['text', 'thinking', 'toolCall'].includes(block.type)) indices.add(index);
+  const items = blocks
+    .filter((item) => kept.has(item))
+    .map(({ block: rawBlock }) => {
+      const block = structuredClone(cleanBlock(rawBlock));
+      return { type: block.type === 'toolCall' ? 'tool_call' : block.type, block };
     });
-  const result = {
-    ...base,
-    items: [],
-    selection_omissions: omissions,
-    ...(raw.truncated || raw.upstream_truncated ? { upstream_truncated: true } : {}),
-  };
-  for (const index of [...indices].sort((a, b) => a - b)) {
-    const block = cleanBlock(message.content[index]),
-      type = block.type === 'toolCall' ? 'tool_call' : block.type;
-    result.items.push({ type, block: structuredClone(block) });
-  }
-  return smallLive(result, READ_PAGE_LIMIT);
+  return smallLive(
+    {
+      ...base,
+      items,
+      selection_omissions: omissions,
+      ...(raw.truncated || raw.upstream_truncated ? { upstream_truncated: true } : {}),
+    },
+    READ_PAGE_LIMIT,
+  );
 }
 
 export function assertReadSnapshot(value, args) {
@@ -516,31 +517,11 @@ export function assertReadSnapshot(value, args) {
   const observed = args.view === 'runtime';
   if (
     observed &&
-    (!Number.isSafeInteger(value.capture_sequence) ||
-      value.capture_sequence < 0 ||
-      typeof value.observation?.available !== 'boolean' ||
-      (value.observation.available &&
-        (value.observation.phase !== 'context_with_system_observer' ||
-          typeof value.observation.id !== 'string' ||
-          typeof value.observation.owner_generation !== 'string' ||
-          typeof value.observation.observed_at !== 'string' ||
-          typeof value.observation.checked_at !== 'string' ||
-          typeof value.observation.owner_active !== 'boolean' ||
-          !(
-            value.observation.current_leaf_id === null ||
-            typeof value.observation.current_leaf_id === 'string'
-          ) ||
-          !Number.isSafeInteger(value.observation.later_committed_entries) ||
-          value.observation.later_committed_entries < 0 ||
-          value.observation.input_leaf_id !== value.leaf_id)) ||
-      (!value.observation.available &&
-        (typeof value.observation.reason !== 'string' ||
-          value.units?.length ||
-          (value.observation.reason === 'no_observation' &&
-            !(
-              value.observation.current_leaf_id === null ||
-              typeof value.observation.current_leaf_id === 'string'
-            )))))
+    (!count.safeParse(value.capture_sequence).success ||
+      !observation.safeParse(value.observation).success ||
+      (value.observation.available
+        ? value.observation.input_leaf_id !== value.leaf_id
+        : value.units?.length))
   )
     throw new Error('INVALID_OWNER_READ');
   if (
