@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { atomicJson } from '../src/storage.mjs';
+import { atomicJson } from '../src/core/storage.mjs';
 
 test('atomic JSON failures preserve the published record and remove uncommitted temporary files', async (t) => {
   for (const stage of ['write', 'file sync', 'rename', 'directory sync'])

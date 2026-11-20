@@ -1,11 +1,11 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { StdioTransport } from './protocol-stdio.mjs';
-import { dispatchModern } from './protocol.mjs';
-import { Bridge } from './bridge.mjs';
-import { publicError } from './errors.mjs';
-import { diagnostics } from './diagnostics.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
+import { StdioTransport } from './mcp/protocol-stdio.mjs';
+import { dispatchModern } from './mcp/protocol.mjs';
+import { Bridge } from './core/bridge.mjs';
+import { publicError } from './core/errors.mjs';
+import { diagnostics } from './core/diagnostics.mjs';
+import { readOwnerConfig } from './core/owner-config.mjs';
 async function main() {
   const configFile = process.argv[2];
   if (!configFile)

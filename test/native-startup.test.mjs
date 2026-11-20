@@ -5,7 +5,7 @@ import path from 'node:path';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { RpcClient } from './fixtures/pi.mjs';
-import { readClaim } from '../src/attachments.mjs';
+import { readClaim } from '../src/runtime/attachments.mjs';
 
 test('native profile discovery leaves an owned RPC claim intact and registers an ordinary RPC', async (t) => {
   const companion = new URL('../src/attach-extension.mjs', import.meta.url).pathname;

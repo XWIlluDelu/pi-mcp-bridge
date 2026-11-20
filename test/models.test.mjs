@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { modelInfo as nativeModelInfo } from '../src/models.mjs';
+import { modelInfo as nativeModelInfo } from '../src/ops/models.mjs';
 import { getSupportedThinkingLevels } from './fixtures/pi.mjs';
 const modelInfo = (model) => nativeModelInfo(model, getSupportedThinkingLevels);
-import { publicSchemas } from '../src/tool-schemas.mjs';
+import { publicSchemas } from '../src/mcp/tool-schemas.mjs';
 
 import { fixture, choice } from './fixtures/model-runtime.mjs';
 import { assertInvalidArguments } from './fixtures/tool-call.mjs';

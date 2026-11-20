@@ -72,20 +72,23 @@ the branch lookup.
   It does not invent an exact source message from a session-level relationship.
 - Returned data is the current **stored** extension snapshot, marked in `source`.
   It does not claim to be present in the most recently captured `runtime` context.
-- Explicit historical `leaf_id` requests reject. Use Bridge's Session Context view
-  for a particular historical branch; this module never reads or forks raw history.
+- Explicit historical `leaf_id` requests automatically fall back to Bridge's
+  native Session Context view (`view:"session"`), so callers do not need to pass
+  `view:"session"` manually when inspecting a historical leaf; this module never
+  reads or forks raw history.
 
 Each operation uses a read-only SQLite transaction. It closes the connection
 before acquiring native history, and reads committed updates on the next call.
 
-Missing/unreadable databases report `MAGIC_CONTEXT_DATABASE_UNAVAILABLE`.
-Missing consumed columns or incompatible row representations report
-`MAGIC_CONTEXT_SCHEMA_MISMATCH`. The reader expects text summaries/memories,
-numeric ordering, integer millisecond timestamps and native boundary identifiers;
-it validates eligible own-project memory expiry before filtering. Unknown rebase
-states remain readable without claiming a native history leaf. Changed identity during
-acquisition reports `MAGIC_CONTEXT_SESSION_MISMATCH`. Bridge wraps module failures
-in its reader error without silently substituting another source.
+The reader expects text summaries/memories, numeric ordering, integer millisecond
+timestamps and native boundary identifiers; it validates eligible own-project
+memory expiry before filtering. Unknown rebase states remain readable without
+claiming a native history leaf. A missing/unreadable database
+(`MAGIC_CONTEXT_DATABASE_UNAVAILABLE`), missing columns or incompatible rows
+(`MAGIC_CONTEXT_SCHEMA_MISMATCH`) and identity changes during acquisition
+(`MAGIC_CONTEXT_SESSION_MISMATCH`) fail the read. Bridge reports reader failures
+to clients as `SESSION_READER_FAILED` with the module code in `detail`, and never
+substitutes another source on failure.
 
 ## Validation
 

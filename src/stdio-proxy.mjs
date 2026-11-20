@@ -1,8 +1,8 @@
 import { pathToFileURL } from 'node:url';
-import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
-import { StdioTransport } from './protocol-stdio.mjs';
-import { modernHeaderFields, readJson, rpcError } from './protocol.mjs';
-import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
+import { StdioTransport } from './mcp/protocol-stdio.mjs';
+import { modernHeaderFields, readJson, rpcError } from './mcp/protocol.mjs';
+import { MCP_RESPONSE_LIMIT } from './mcp/response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
 // queue or automatic retries live here. HTTP authentication stays owner-local.
@@ -13,9 +13,8 @@ export function createStdioProxy({
   output = process.stdout,
   fetchImpl = fetch,
 }) {
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('INVALID_HTTP_CONFIG');
+  // The token and port come from loadHttpConfig, which validates them.
   const target = new URL(`http://127.0.0.1:${port}/mcp`);
-  assertBackendToken(token);
   const encode = (value) =>
     /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && !value.startsWith('=?base64?')
       ? value

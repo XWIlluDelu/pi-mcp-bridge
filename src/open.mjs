@@ -2,10 +2,10 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readOwnerConfig, validateLaunchArgs } from './owner-config.mjs';
-import { discover, validateExecutionCwd } from './data.mjs';
-import { launchProfile } from './rpc.mjs';
-import { resolvePiInstallation, piLaunchEnvironment } from './pi-installation.mjs';
+import { readOwnerConfig, registryDirectory, validateLaunchArgs } from './core/owner-config.mjs';
+import { discover, validateExecutionCwd } from './core/data.mjs';
+import { launchProfile } from './runtime/rpc.mjs';
+import { resolvePiInstallation, piLaunchEnvironment } from './runtime/pi-installation.mjs';
 
 export async function openProfile(configFile, sessionId, hostEnv = process.env) {
   if (!/^ps_[a-f0-9]{32}$/.test(sessionId ?? '')) throw new Error('INVALID_SESSION_ID');
@@ -18,7 +18,7 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   const executable = await resolvePiInstallation(config, baseEnv);
   const env = await piLaunchEnvironment(executable, baseEnv, session.cwd);
   env.PI_MCP_OWNER_CONFIG = configFile;
-  env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
+  env.PI_MCP_ATTACH_DIR = registryDirectory(config);
   const extra = config.piArgs ?? [];
   await validateLaunchArgs(executable, extra, 'text');
   // The companion and join must reach Pi before owner flags can consume

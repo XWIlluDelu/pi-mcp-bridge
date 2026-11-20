@@ -3,10 +3,10 @@ import net from 'node:net';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { opaqueId } from './storage.mjs';
-import { privateDirectory } from './attachments.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
-import { readRequest, listenPrivate } from './attachment-protocol.mjs';
+import { opaqueId } from './core/storage.mjs';
+import { privateDirectory } from './runtime/attachments.mjs';
+import { readOwnerConfig, registryDirectory } from './core/owner-config.mjs';
+import { readRequest, listenPrivate } from './runtime/attachment-protocol.mjs';
 const methods = {
   release: 'releaseForLocal',
   settled: 'settledForLocal',
@@ -16,8 +16,10 @@ const methods = {
   handoff_cancel: 'cancelHandoff',
 };
 export function ownerSocket(config) {
-  const dir = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  return path.join(dir, `owner-${opaqueId(config.stateDir).slice(3, 11)}.sock`);
+  return path.join(
+    registryDirectory(config),
+    `owner-${opaqueId(config.stateDir).slice(3, 11)}.sock`,
+  );
 }
 export async function serveOwnerControl(bridge) {
   const socket = ownerSocket(bridge.config);

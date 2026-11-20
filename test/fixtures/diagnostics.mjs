@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHttpService } from '../../src/http-server.mjs';
-import { TOKEN_HEADER } from '../../src/http-config.mjs';
-import { diagnostics, diagnosticRef } from '../../src/diagnostics.mjs';
-import { PiRpc } from '../../src/rpc.mjs';
+import { TOKEN_HEADER } from '../../src/mcp/http-config.mjs';
+import { diagnostics, diagnosticRef } from '../../src/core/diagnostics.mjs';
+import { PiRpc } from '../../src/runtime/rpc.mjs';
 import { nativeOwner } from './native-owner.mjs';
-import { META, MODERN_VERSION } from '../../src/protocol.mjs';
+import { META, MODERN_VERSION } from '../../src/mcp/protocol.mjs';
 
 const cleanup = [];
 try {
@@ -60,8 +60,9 @@ try {
       'tool',
       { op: 'send', mcp_id_ref: diagnosticRef('PRIVATE_RPC_TIMEOUT') },
       () =>
-        rpc.dispatch({ type: 'prompt', message: 'PRIVATE_BODY' }, 5, () =>
-          diagnostics.emit('fixture.late_callback'),
+        rpc.dispatch(
+          { type: 'prompt', message: 'PRIVATE_BODY' },
+          { timeout: 5, onLate: () => diagnostics.emit('fixture.late_callback') },
         ),
     ),
     { code: 'ACK_TIMEOUT' },

@@ -77,7 +77,7 @@ to the target's supported set. Unsupported explicit levels return
 This prompt-specific validation differs from standalone `set_model`, which
 returns Pi's actual selection after native clamping.
 
-Explicit prompt settings require a proven-idle Bridge-owned RPC with no pending input. Busy work returns `MODEL_SELECTION_BUSY` (`idle_only` skips without changes), unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`, and companions/shared hosts return `MODEL_SELECTION_UNSUPPORTED`. Plain queued sends use native settings when consumed.
+On a Bridge-owned RPC, explicit prompt settings require a proven-idle session with no pending input (busy work returns `MODEL_SELECTION_BUSY`, `idle_only` skips without changes, unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`). On companions and hosts with `set_model` support, Bridge applies standalone model selection first and then submits the prompt (hosts without `set_model` return `MODEL_SELECTION_UNSUPPORTED`). Plain queued sends use native settings when consumed.
 
 Settings and input are separate native commands. Bridge rechecks identity, admission and selected values before dispatch; it refuses a conflicting local change instead of restoring earlier settings. Settings-bearing input omits native queue behavior, so a hook starting concurrent work causes refusal. Pi offers no atomic settings-plus-input transaction or per-message settings binding: an earlier setting can remain after a later failure. Native image processing follows the [send/create image contract](api.md#image-input-send-and-create).
 

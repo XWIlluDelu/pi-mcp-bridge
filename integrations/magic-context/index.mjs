@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
 import { z } from 'zod';
 
-import { contextSelection } from '../../src/read-schema.mjs';
+import { contextSelection } from '../../src/read/read-schema.mjs';
 
 const execFileAsync = promisify(execFile);
 const PROJECT = `
@@ -229,6 +229,8 @@ export function createMagicContextReader(options) {
   });
   return {
     async matches(context) {
+      // Explicit historical leaf requests route directly to native Session Context.
+      if (context.request?.leaf_id !== undefined) return false;
       const project = withDatabase(database, (db) => sessionProject(db, context));
       return (
         typeof project === 'string' && project === (await projectIdentity(context.session.cwd))

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { readLfLines } from '../src/lf-lines.mjs';
+import { readLfLines } from '../src/core/lf-lines.mjs';
 
 test('LF framing preserves Unicode separators across every UTF-8 byte boundary', () => {
   const payload = JSON.stringify({ text: 'Before\u2028between\u2029after 😀 汉字' });

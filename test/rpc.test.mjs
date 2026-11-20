@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PiRpc, RpcFailure, RuntimePool } from '../src/rpc.mjs';
+import { PiRpc, RpcFailure, RuntimePool } from '../src/runtime/rpc.mjs';
 
 const session = { file: '/isolated/session.jsonl', header: { id: 'native' } };
 const identity = { sessionFile: session.file, sessionId: session.header.id };
@@ -92,9 +92,15 @@ test('settlement, idle and bad ACKs leave timed-out admission fenced until the e
   const { rpc, writes, emit, ack } = fixture();
   let late;
   await assert.rejects(
-    rpc.dispatch({ type: 'prompt' }, 1, (value) => {
-      late = value;
-    }),
+    rpc.dispatch(
+      { type: 'prompt' },
+      {
+        timeout: 1,
+        onLate: (value) => {
+          late = value;
+        },
+      },
+    ),
     {
       code: 'ACK_TIMEOUT',
       uncertain: true,
@@ -137,7 +143,7 @@ test('write uncertainty retains admission; authoritative rejection or confirmed 
       if (failure === 'throw') throw new Error('synthetic');
       cb(new Error('synthetic'));
     };
-    await assert.rejects(rpc.dispatch({ type: 'prompt', message: 'first' }, 1000), {
+    await assert.rejects(rpc.dispatch({ type: 'prompt', message: 'first' }, { timeout: 1000 }), {
       code: 'WRITE_UNKNOWN',
       uncertain: true,
     });
@@ -212,11 +218,17 @@ test('pool and writer drain received ACK tasks without waiting for missing repli
     queueMicrotask(() => child.emit('exit', 0));
   };
   await assert.rejects(
-    rpc.command({ type: 'prompt' }, 1, async () => {
-      entered.resolve();
-      await validate.promise;
-      receipt = true;
-    }),
+    rpc.command(
+      { type: 'prompt' },
+      {
+        timeout: 1,
+        onLate: async () => {
+          entered.resolve();
+          await validate.promise;
+          receipt = true;
+        },
+      },
+    ),
     { code: 'ACK_TIMEOUT' },
   );
   await pool.drainAcks();
@@ -252,7 +264,7 @@ test('late mutation replies recheck native identity even without an observer', a
             published = true;
           }
         : undefined;
-    await assert.rejects(rpc.command({ type }, 1, onLate), { code: 'ACK_TIMEOUT' });
+    await assert.rejects(rpc.command({ type }, { timeout: 1, onLate }), { code: 'ACK_TIMEOUT' });
     state = other;
     ack(
       writes.find((command) => command.type === type),
@@ -290,7 +302,7 @@ test('late clear_queue ACK validates identity without cancellation replay, stora
     cancellations = 0,
     checks = 0,
     changed = false;
-  rpc.dispatch = async (command, _timeout, onLate) => {
+  rpc.dispatch = async (command, { onLate } = {}) => {
     if (command.type === 'get_state') {
       checks++;
       return { sessionFile: session.file, sessionId: changed ? 'different' : session.header.id };

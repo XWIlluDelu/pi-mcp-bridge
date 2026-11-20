@@ -29,7 +29,7 @@ rows with `text`, `ref`, source locators and optional titles or related refs.
 A shortened preview carries `truncated:true`. Reader `coverage` counts selection
 before search and pagination, for example `{type:"memory",selected:3,total:12}`.
 
-Expand up to eight refs from one capture for frozen source content in original
+Expand up to eight refs from one session (including across captures) for frozen source content in original
 order and formatting. Duplicate refs expand once. An `operation` link opens
 a recorded nested tool call. Open a `source_context` link by itself for a fresh
 Session Context read at the verified historical leaf.
@@ -68,9 +68,10 @@ boundary rather than a recoverable user message.
 Count fields accept nonnegative safe integers or `-1`; `0` omits the kind and `-1`
 includes all in its scope. Assistant and thinking are selected independently by
 original message, not by text-block count. All blocks of a selected kind within
-that message remain available and preserve source positions. A codemode batch
-counts as one logical tool operation; its recorded children have related refs.
-When system content is enabled, `tool:0` also omits native tool declarations.
+that message remain available and preserve source positions. A tool call with
+recorded nested operations counts as one logical tool operation; its recorded
+children have related refs. When system content is enabled, `tool:0` also omits
+native tool declarations.
 
 ## Runtime request context
 
@@ -152,7 +153,7 @@ exceeding the shared budget returns an item budget error; read it separately.
 
 ## Frozen bounded snapshots
 
-The cache retains detached, sanitized documents, with at most 16 snapshots and
+The cache retains detached, sanitized documents, with at most 64 snapshots and
 about 32 MiB of accounted memory. Session and adapted search keep matches and
 related sources. Runtime search budgets the entire provider-request capture.
 If selected data exceeds the limit, Bridge returns

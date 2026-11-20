@@ -1,6 +1,6 @@
 // Tests use an explicitly selected external Pi, never a Bridge dependency.
 import { pathToFileURL } from 'node:url';
-import { loadPiSdk, piDependencyEntry, loadPiAi } from '../../src/pi-installation.mjs';
+import { loadPiSdk, piDependencyEntry, loadPiAi } from '../../src/runtime/pi-installation.mjs';
 import { installation } from './pi-installation.mjs';
 export { installation } from './pi-installation.mjs';
 export const sdkEntry = pathToFileURL(installation.sdkEntry).href;

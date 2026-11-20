@@ -1,7 +1,7 @@
 import { AdmissionSession } from './fixtures/admission-session.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { reloadAdmission } from '../src/reload-admission.mjs';
+import { reloadAdmission } from '../src/runtime/reload-admission.mjs';
 const deferred = () => Promise.withResolvers();
 const idle = { isIdle: () => true, hasPendingMessages: () => false };
 function fixture() {

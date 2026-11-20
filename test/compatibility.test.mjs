@@ -5,10 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
-import { CompatibilityModules } from '../src/compatibility.mjs';
-import { CompatibilityServices } from '../src/compatibility-services.mjs';
-import { Bridge } from '../src/bridge.mjs';
-import { publicError } from '../src/errors.mjs';
+import { CompatibilityModules } from '../src/compat/compatibility.mjs';
+import { CompatibilityServices } from '../src/compat/compatibility-services.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+import { publicError } from '../src/core/errors.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 const intercom = fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url));

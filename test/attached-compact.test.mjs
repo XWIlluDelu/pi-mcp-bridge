@@ -6,9 +6,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { RpcClient } from './fixtures/pi.mjs';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding } from '../src/host-bindings.mjs';
-import { launchProfile } from '../src/rpc.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
+import { launchProfile } from '../src/runtime/rpc.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exists = (file) =>

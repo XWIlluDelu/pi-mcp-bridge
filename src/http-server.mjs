@@ -1,9 +1,9 @@
 import http from 'node:http';
-import { publicError } from './errors.mjs';
+import { publicError } from './core/errors.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { Bridge } from './bridge.mjs';
-import { diagnostics } from './diagnostics.mjs';
+import { Bridge } from './core/bridge.mjs';
+import { diagnostics } from './core/diagnostics.mjs';
 import {
   isRpcRequest,
   dispatchModern,
@@ -11,8 +11,8 @@ import {
   readJson,
   rpcError,
   MCP_INPUT_LIMIT,
-} from './protocol.mjs';
-import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED, assertBackendToken } from './http-config.mjs';
+} from './mcp/protocol.mjs';
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 
 const digest = (value) => createHash('sha256').update(value).digest();
 
@@ -51,10 +51,8 @@ async function parseBody(req) {
   }
 }
 
+// The token and port come from loadHttpConfig, which validates them.
 export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
-  if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 300000)
-    throw new Error('INVALID_WAIT_TIMEOUT');
-  assertBackendToken(token);
   const tokenDigest = digest(token),
     requests = new Map();
   let stopping = false,

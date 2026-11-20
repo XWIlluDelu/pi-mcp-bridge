@@ -4,7 +4,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { createDiagnostics, diagnosticRef } from '../src/diagnostics.mjs';
+import { createDiagnostics, diagnosticRef } from '../src/core/diagnostics.mjs';
 
 test('diagnostics isolate concurrent contexts and exclude unapproved fields and errors', async () => {
   const rows = [],

@@ -5,9 +5,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { discover, loadSession } from '../src/data.mjs';
-import { reserveOwner, releaseOwner, readClaim, AttachedRuntime } from '../src/attachments.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+import { discover, loadSession } from '../src/core/data.mjs';
+import {
+  reserveOwner,
+  releaseOwner,
+  readClaim,
+  AttachedRuntime,
+} from '../src/runtime/attachments.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
 

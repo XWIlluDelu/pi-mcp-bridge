@@ -1,7 +1,9 @@
 # Owner configuration and permissions
 
-Use a canonical JSON file owned by the service user with no group/other
-permissions. [The example](../deploy/owner.example.json) denies every operation;
+Use a JSON file owned by the service user that is not writable by group or other
+users (symlinks such as dotfiles and read-only modes like `0644` are allowed; secret
+files like `http.tokenFile` still require `0600` without symlinks).
+[The example](../deploy/owner.example.json) denies every operation;
 replace its paths with the projects and native session roots intended for access.
 The Bridge rejects unsafe configuration files without changing their permissions.
 
@@ -53,7 +55,7 @@ The settings reference below covers additional controls and later policy edits.
 
 ## Settings
 
-Unknown keys reject. Clients of one owner configuration share its policy.
+Unknown keys reject.
 
 | Key                       | Meaning                                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
@@ -93,9 +95,10 @@ Unknown keys reject. Clients of one owner configuration share its policy.
   Missing/empty cwd grants no project scope and cannot cold-start a writer;
   session/default permissions may still authorize history access.
 - Workspace removal does not revoke history, control or notification rights.
-  Create and cold startup require the project directory at its canonical path;
-  file or symlink replacements cannot redirect execution. Existing cooperating
-  owners remain controllable under their grants if their original cwd disappears.
+  Create and cold startup require the project path to resolve to an existing
+  directory (symlinks to directories are resolved; missing or non-directory paths
+  reject). Existing cooperating owners remain controllable under their grants if
+  their original cwd disappears.
 
 ### Native environment
 
@@ -141,10 +144,13 @@ extensions can access files, shell and network: denying the direct Bridge
 ### Herdr process placement
 
 With `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
-writers. Missing Herdr selects direct startup; installed but unavailable or
-incompatible Herdr fails without relaunching a possibly started writer elsewhere.
-Herdr requires Linux and a working user-systemd bus. Bridge may start its local
-daemon but does not restart an existing daemon or change service enablement/linger.
+writers so remote agents drive Pi inside Herdr just like local Herdr usage.
+Bridge starts the local Herdr daemon on demand without restarting an existing
+daemon or changing service enablement/linger. If Herdr is missing, unavailable,
+incompatible, or user-systemd is unavailable before a pane is launched, Bridge
+silently falls back to direct Pi startup so core sessions continue working. If
+failure occurs after a Herdr worker launch has already started, Bridge aborts
+without launching a duplicate writer elsewhere.
 
 Existing owners take priority. Edits affect subsequent new-session and cold-start
 launches without moving or stopping current writers; there is no per-call or

@@ -7,8 +7,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { Bridge } from '../src/bridge.mjs';
-import { readClaim, reserveOwner, ownerAlive, registryTransaction } from '../src/attachments.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+import {
+  readClaim,
+  reserveOwner,
+  ownerAlive,
+  registryTransaction,
+} from '../src/runtime/attachments.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
 
 const fixture = (t) =>

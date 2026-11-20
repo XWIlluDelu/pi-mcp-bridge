@@ -9,7 +9,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { launchStdio } from './fixtures/stdio-client.mjs';
-import { readClaim, ownerAlive } from '../src/attachments.mjs';
+import { readClaim, ownerAlive } from '../src/runtime/attachments.mjs';
 const exists = (file) =>
   fs.stat(file).catch((error) => {
     if (error.code !== 'ENOENT') throw error;

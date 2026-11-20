@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 
 import { savedSession } from './fixtures/saved-session.mjs';
 
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 import { fixture as nativeFixture } from './fixtures/model-runtime.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 for (const operation of ['command', 'stop']) {

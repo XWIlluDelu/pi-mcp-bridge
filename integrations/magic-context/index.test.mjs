@@ -9,9 +9,9 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import module, { createMagicContextReader } from './index.mjs';
-import { captureSessionRead, SessionReaders } from '../../src/session-readers.mjs';
-import { ContextReadCache } from '../../src/read-cache.mjs';
-import { prepareContextRead } from '../../src/context-read.mjs';
+import { captureSessionRead, SessionReaders } from '../../src/compat/session-readers.mjs';
+import { ContextReadCache } from '../../src/read/read-cache.mjs';
+import { prepareContextRead } from '../../src/read/context-read.mjs';
 import { buildSessionProjection } from '../../test/fixtures/pi.mjs';
 
 // Storage fields are based on MC 0.49.20; migration numbers are not a read contract.
@@ -248,6 +248,11 @@ test('stored summaries use existing MC tiers and source relationships without da
   ]);
   assert.deepEqual(await fs.readFile(f.database), before);
   assert.deepEqual(await fs.readdir(f.directory), ['context.db', 'project']);
+  assert.equal(
+    await reader.matches({ ...f.context, request: { leaf_id: null } }),
+    false,
+    'explicit leaf_id should fall back to native Session Context',
+  );
   await assert.rejects(
     reader.read({ ...f.context, request: { leaf_id: null } }),
     /MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED/,

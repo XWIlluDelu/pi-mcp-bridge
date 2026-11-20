@@ -4,13 +4,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { Bridge } from '../src/bridge.mjs';
-import { PiRpc, launchProfile } from '../src/rpc.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+import { PiRpc, launchProfile } from '../src/runtime/rpc.mjs';
 import { fileURLToPath } from 'node:url';
-import { scheduleAutoRelease } from '../src/auto-release.mjs';
-import { findHerdr, HerdrControl } from '../src/herdr-control.mjs';
-import { HerdrRpcTransport } from '../src/herdr-rpc-transport.mjs';
-import { ownerAlive, readClaim, processIdentity } from '../src/attachments.mjs';
+import { scheduleAutoRelease } from '../src/runtime/auto-release.mjs';
+import { findHerdr, HerdrControl } from '../src/runtime/herdr-control.mjs';
+import { HerdrRpcTransport } from '../src/runtime/herdr-rpc-transport.mjs';
+import { ownerAlive, readClaim, processIdentity } from '../src/runtime/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { restoreManifest, savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -59,7 +59,7 @@ test('Herdr discovery uses executable PATH/local installation, not a cached avai
   assert.equal(await findHerdr(env), null);
 });
 
-test('missing Herdr starts directly; an installed Herdr failure cleans reservation without fallback', async (t) => {
+test('unavailable Herdr preflight silently falls back to direct startup; post-launch failures clean up without fallback', async (t) => {
   const { dir, bridge, config, session } = await fixture(t, [
     { module: fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url)) },
   ]);
@@ -68,20 +68,46 @@ test('missing Herdr starts directly; an installed Herdr failure cleans reservati
   assert.equal(direct.child instanceof HerdrRpcTransport, false);
   await direct.stop();
   await fs.writeFile(path.join(dir, 'bin/herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  let sawFilteredEnv = false;
   t.mock.method(HerdrControl, 'open', async (_binary, daemonEnvironment) => {
     assert.equal(daemonEnvironment.PI_INTERCOM_TEST_SESSION, undefined);
     assert.equal(process.env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
     assert.equal(launchProfile({}).env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
+    sawFilteredEnv = true;
     throw new Error('HERDR_UNAVAILABLE');
   });
-  const rejected = new PiRpc({ ...config, attachmentDir: bridge.pool.attachmentDir }, session, {
-    compatibility: bridge.compatibilityServices,
-  });
-  await assert.rejects(rejected.start(), /HERDR_UNAVAILABLE/);
-  assert.ok(rejected.child instanceof HerdrRpcTransport);
-  assert.equal(rejected.child.pid, undefined);
+  const fallback = await bridge.pool.resolve(session);
+  assert.equal(sawFilteredEnv, true);
+  assert.equal(fallback.child instanceof HerdrRpcTransport, false);
+  assert.equal(fallback.alive, true);
+  await fallback.stop();
+  // Once a Herdr worker launch is underway (after preflight), failure must NOT spawn a second Pi.
+  const fakeControl = {
+    address: path.join(dir, 'herdr.sock'),
+    identity: '0:0:0',
+    async request(method) {
+      if (method === 'workspace.create')
+        return { tab: { tab_id: 't1' }, root_pane: { pane_id: 'p1' } };
+      if (method === 'layout.apply') throw new Error('HERDR_DISCONNECTED');
+      return {};
+    },
+  };
+  const failing = new HerdrRpcTransport(
+    path.join(dir, 'bin/herdr'),
+    {
+      command: process.execPath,
+      args: [],
+      cwd: dir,
+      env: process.env,
+    },
+    { control: fakeControl },
+  );
+  failing.scopeActive = async () => false;
+  await assert.rejects(failing.ready, /HERDR_DISCONNECTED/);
+  await failing.abortStartup();
+  assert.equal(failing.pid, undefined);
   assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
-  await assert.rejects(fs.stat(rejected.child.directory), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(failing.directory), { code: 'ENOENT' });
 });
 
 test(

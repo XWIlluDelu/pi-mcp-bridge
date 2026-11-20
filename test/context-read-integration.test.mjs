@@ -1,16 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { READ_CONTRACT, assertReadSnapshot } from '../src/context-read.mjs';
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { reserveOwner, updateOwner } from '../src/attachments.mjs';
-import { callBridgeTool } from '../src/protocol.mjs';
+import { READ_CONTRACT, assertReadSnapshot } from '../src/read/context-read.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { reserveOwner, updateOwner } from '../src/runtime/attachments.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
 import { SessionManager, buildSessionProjection } from './fixtures/pi.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { append, message, text } from './fixtures/native-history.mjs';
 import { readSource } from './fixtures/read-source.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 
 const image = { type: 'image', mimeType: 'image/png', data: 'A'.repeat(50000) };
 const entries = [

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSdkHostBinding, createRpcHostBinding } from '../src/host-bindings.mjs';
+import { createSdkHostBinding, createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
 import { sdkSession } from './fixtures/sdk-session.mjs';
 
 const idle = {

@@ -4,10 +4,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
-import { ContextReadCache } from '../src/read-cache.mjs';
+import { ContextReadCache } from '../src/read/read-cache.mjs';
 
 import { prepareContextRead } from './fixtures/read-pages.mjs';
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 
 async function fixture(t) {
   const f = await nativeOwner(t, { prefix: 'read-cache', factory: () => assert.fail('No writer') });

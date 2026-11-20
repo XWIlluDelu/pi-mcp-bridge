@@ -5,12 +5,16 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { ContextReadCache } from '../src/read-cache.mjs';
-import { prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/context-read.mjs';
-import { navigationDocuments, navigationOrder, navigationRow } from '../src/read-navigation.mjs';
-import { contextSelection, ALL_CONTENT } from '../src/read-schema.mjs';
+import { ContextReadCache } from '../src/read/read-cache.mjs';
+import { prepareContextRead, READ_SNAPSHOT_LIMIT } from '../src/read/context-read.mjs';
+import {
+  navigationDocuments,
+  navigationOrder,
+  navigationRow,
+} from '../src/read/read-navigation.mjs';
+import { contextSelection, ALL_CONTENT } from '../src/read/read-schema.mjs';
 
-import { jsonBytes } from '../src/response-budget.mjs';
+import { jsonBytes } from '../src/mcp/response-budget.mjs';
 
 import { buildSessionProjection, SessionManager } from './fixtures/pi.mjs';
 import { assertInvalidArguments } from './fixtures/tool-call.mjs';
@@ -337,4 +341,14 @@ test('Bridge reference expansion rejects a changed native cwd without reacquirin
   await fs.writeFile(f.session.file, lines.join('\n') + '\n');
   await assert.rejects(f.bridge.read({ refs: [page.items[0].ref] }), /INVALID_READ_REFERENCE/);
   assert.equal(f.acquisitions(), 1);
+});
+
+test('Bridge reference expansion supports refs from multiple captures of the same session', async (t) => {
+  const f = await bridgeFixture(t);
+  const first = await f.bridge.read({ session_id: f.id, range: { recent: 1 } });
+  const second = await f.bridge.search({ session_id: f.id, query: 'unique middle decision' });
+  const expanded = await f.bridge.read({ refs: [first.items[0].ref, second.items[0].ref] });
+  const text = JSON.stringify(expanded.items);
+  assert.match(text, /unique middle decision/);
+  assert.equal(expanded.presentation, 'source');
 });

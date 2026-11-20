@@ -4,10 +4,10 @@ import {
   ContextObservation,
   RetainedObservations,
   checkObservation,
-} from '../src/context-observation.mjs';
+} from '../src/read/context-observation.mjs';
 
-import { assertReadSnapshot } from '../src/context-read.mjs';
-import { LiveMessageObserver } from '../src/live-message.mjs';
+import { assertReadSnapshot } from '../src/read/context-read.mjs';
+import { LiveMessageObserver } from '../src/read/live-message.mjs';
 
 const args = { session_id: 'ps_observed', view: 'runtime' };
 function fixture() {

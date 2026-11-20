@@ -39,7 +39,7 @@ close before reopening. See [component versions](architecture.md#component-versi
 | Send text/images        | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
 | `idle_only` send        | Native admission check               | Native admission gate                                 | SDK gate; unsupported by RPC binding    |
 | Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
-| Prompt + model/thinking | Proven-idle only                     | Unsupported                                           | Unsupported                             |
+| Prompt + model/thinking | Proven-idle only                     | Supported via `set_model` then `send`                 | Supported via `set_model` then `send`   |
 | Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
 | Manual compact          | Idle by default; explicit interrupt  | Idle with admission gate; explicit interrupt          | SDK idle gate; RPC explicit interrupt   |
 | Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | SDK native reload; RPC host callback    |

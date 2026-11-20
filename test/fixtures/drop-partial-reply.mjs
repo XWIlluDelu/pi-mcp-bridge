@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { readLfLines } from '../../src/lf-lines.mjs';
+import { readLfLines } from '../../src/core/lf-lines.mjs';
 
 // Observe the partial frame after the production receiver parsed it, then
 // fail that connection without waiting for an arbitrary ACK deadline.

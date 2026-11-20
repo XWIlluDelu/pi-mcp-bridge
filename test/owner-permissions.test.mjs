@@ -5,8 +5,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { permitted, resolvePermission } from '../src/permissions.mjs';
-import { readOwnerConfig, editPermission, permissionDetails } from '../src/owner-config.mjs';
+import { permitted, resolvePermission } from '../src/core/permissions.mjs';
+import { readOwnerConfig, editPermission, permissionDetails } from '../src/core/owner-config.mjs';
 import ownerPermissions from '../src/owner-permissions-extension.mjs';
 
 async function fixture(t) {

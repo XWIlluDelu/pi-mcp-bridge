@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { callBridgeTool } from '../src/protocol.mjs';
-import { executeBatch } from '../src/batch.mjs';
-import { Bridge } from '../src/bridge.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
+import { executeBatch } from '../src/mcp/batch.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 
 test('single and batch mutation errors preserve uncertainty and independent outcomes', async () => {
   const failure = () => Object.assign(new Error('ACK_TIMEOUT'), { uncertain: true });
   const bridge = {
+    captureRequestContext: async () => ({}),
     inputs: new Set(),
     locks: new Map(),
     registerInput: Bridge.prototype.registerInput,
@@ -40,6 +41,7 @@ test('a huge malformed operation name cannot consume the batch response or hide 
   let calls = 0;
   const result = await executeBatch(
     {
+      captureRequestContext: async () => ({}),
       async list() {
         calls++;
         return { sessions: [] };

@@ -1,15 +1,15 @@
 import { append, message } from './fixtures/native-history.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { savedSession } from './fixtures/saved-session.mjs';
-import { readClaim, reserveOwner } from '../src/attachments.mjs';
+import { readClaim, reserveOwner } from '../src/runtime/attachments.mjs';
 
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
-import { executeBatch } from '../src/batch.mjs';
+import { executeBatch } from '../src/mcp/batch.mjs';
 import { fixture, releasedEntries, until } from './fixtures/model-runtime.mjs';
 
 const gate = () => Promise.withResolvers();

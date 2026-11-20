@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { META, MODERN_VERSION } from '../../src/protocol.mjs';
+import { META, MODERN_VERSION } from '../../src/mcp/protocol.mjs';
 
-const base = fileURLToPath(new URL('../../', import.meta.url));
+const base = fileURLToPath(new URL('../..', import.meta.url));
 const server = fileURLToPath(new URL('../../src/server.mjs', import.meta.url));
 const meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
 

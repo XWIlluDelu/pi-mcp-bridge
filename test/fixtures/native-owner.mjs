@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { Bridge } from '../../src/bridge.mjs';
-import { ownerAlive, readClaim, waitOwnerExit } from '../../src/attachments.mjs';
+import { Bridge } from '../../src/core/bridge.mjs';
+import { ownerAlive, readClaim, waitOwnerExit } from '../../src/runtime/attachments.mjs';
 import { isolatedRuntime, nativePiCli } from './isolated-runtime.mjs';
 import { denyAllPermissions } from './permissions.mjs';
 import { savedSession } from './saved-session.mjs';

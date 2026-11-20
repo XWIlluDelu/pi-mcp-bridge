@@ -2,7 +2,7 @@ import packageInfo from '../package.json' with { type: 'json' };
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
-import { META } from '../src/protocol.mjs';
+import { META } from '../src/mcp/protocol.mjs';
 import { launchStdio } from './fixtures/stdio-client.mjs';
 
 test('per-request MCP over stdio creates a session and reads it in a batch', async (t) => {

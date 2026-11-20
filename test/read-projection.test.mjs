@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { sdk } from './fixtures/pi.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 import {
   prepareContextRead,
   renderContextRead,
@@ -11,8 +11,8 @@ import {
   chronological,
 } from './fixtures/read-pages.mjs';
 
-import { prepareContextRead as prepareNativeContext } from '../src/context-read.mjs';
-import { CompatibilityServices } from '../src/compatibility-services.mjs';
+import { prepareContextRead as prepareNativeContext } from '../src/read/context-read.mjs';
+import { CompatibilityServices } from '../src/compat/compatibility-services.mjs';
 import intercomModule from '../integrations/intercom/index.mjs';
 
 const call = (id) => ({

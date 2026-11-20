@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { prepareTrash } from '../src/trash.mjs';
-import { opaqueId, syncDir } from '../src/storage.mjs';
+import { prepareTrash } from '../src/ops/trash.mjs';
+import { sessionKey, syncDir } from '../src/core/storage.mjs';
 
 async function fixture(t, sessionBase = os.tmpdir()) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-trash-state-'));
@@ -17,7 +17,7 @@ async function fixture(t, sessionBase = os.tmpdir()) {
   const file = path.join(sessions, 'session.jsonl');
   const header = { type: 'session', version: 3, id: 'native-public-fixture', cwd: root };
   await fs.writeFile(file, JSON.stringify(header) + '\n', { mode: 0o600 });
-  return { config, session: { file, header, id: opaqueId(`${file}\0${header.id}`) }, sessions };
+  return { config, session: { file, header, id: sessionKey(file, header.id) }, sessions };
 }
 
 async function records(f, token) {

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { nativeInstallation, isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 const exec = promisify(execFile);
@@ -66,8 +66,8 @@ for (const persistent of [false, true])
 const script = `
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {Bridge} from ${JSON.stringify(moduleUrl('src/bridge.mjs'))};
-import {launchProfile} from ${JSON.stringify(moduleUrl('src/rpc.mjs'))};
+import {Bridge} from ${JSON.stringify(moduleUrl('src/core/bridge.mjs'))};
+import {launchProfile} from ${JSON.stringify(moduleUrl('src/runtime/rpc.mjs'))};
 import {denyAllPermissions} from ${JSON.stringify(new URL('./fixtures/permissions.mjs', import.meta.url).href)};
 import {SessionManager, RpcClient} from ${JSON.stringify(sdkEntry)};
 const scenario=JSON.parse(process.argv[1]), home=process.env.HOME, project=path.join(home,'project');

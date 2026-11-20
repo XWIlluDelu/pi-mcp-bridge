@@ -12,7 +12,7 @@ import {
   postWebhook,
   signedHeaders,
   verifyCallback,
-} from '../src/event-webhook.mjs';
+} from '../src/events/event-webhook.mjs';
 
 const secret = 'whsec_' + Buffer.alloc(32, 7).toString('base64');
 function callbackReceiver(t, respond) {

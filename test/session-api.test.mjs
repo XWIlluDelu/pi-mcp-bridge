@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { loadSavedSession } from '../src/data.mjs';
+import { loadSavedSession } from '../src/core/data.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { prepareContextRead } from './fixtures/read-pages.mjs';
 

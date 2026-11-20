@@ -1,0 +1,84 @@
+import { z } from 'zod';
+import { utf16String } from '../mcp/schema.mjs';
+export const compactSchema = z
+  .object({
+    session_id: utf16String(128).min(1),
+    instructions: utf16String(100000).optional(),
+    interrupt: z.boolean().optional(),
+  })
+  .strict();
+const compactInputSchema = compactSchema.omit({ session_id: true });
+export function parseCompactInput(body) {
+  const input = compactInputSchema.safeParse(body);
+  if (!input.success) throw new Error('INVALID_ARGUMENTS');
+  return input.data;
+}
+
+// Exact native messages only: never forward provider, extension or history text.
+export function nativeCompactReason(message) {
+  if (
+    [
+      'Nothing to compact (session too small)',
+      'Already compacted',
+      'Compaction cancelled',
+    ].includes(message)
+  )
+    return message;
+}
+
+export function compactContext(ctx, customInstructions) {
+  return new Promise((onComplete, reject) =>
+    ctx.compact({
+      customInstructions,
+      onComplete,
+      onError: ({ message }) =>
+        reject(
+          Object.assign(new Error('PI_REJECTED'), { native_reason: nativeCompactReason(message) }),
+        ),
+    }),
+  );
+}
+
+// Native public APIs can interrupt but cannot attest unrelated input preflight.
+// A host with its own admission gate can implement idle compact separately.
+export function requireInterruptCompaction(input, state) {
+  if (input.interrupt) return;
+  if (
+    state.isIdle === false ||
+    state.isStreaming === true ||
+    state.isCompacting === true ||
+    state.pendingMessageCount > 0 ||
+    state.hasPendingMessages === true
+  )
+    throw new Error('COMPACT_BUSY');
+  throw new Error('COMPACT_IDLE_UNCONFIRMED');
+}
+export function compactMetadata(value) {
+  compactReceipt(value);
+  const { firstKeptEntryId, tokensBefore, estimatedTokensAfter } = value;
+  return {
+    firstKeptEntryId,
+    tokensBefore,
+    ...(estimatedTokensAfter !== undefined ? { estimatedTokensAfter } : {}),
+  };
+}
+// Compaction summaries contain read-protected history. Return only a bounded
+// completion receipt; clients with read permission can inspect the native entry.
+export function compactReceipt(value) {
+  if (
+    typeof value?.firstKeptEntryId !== 'string' ||
+    value.firstKeptEntryId.length > 128 ||
+    !Number.isSafeInteger(value.tokensBefore) ||
+    value.tokensBefore < 0
+  )
+    throw Object.assign(new Error('INVALID_COMPACT_RESULT'), { uncertain: true });
+  return {
+    status: 'completed',
+    first_kept_entry_id: value.firstKeptEntryId,
+    tokens_before: value.tokensBefore,
+    estimated_tokens_after:
+      Number.isSafeInteger(value.estimatedTokensAfter) && value.estimatedTokensAfter >= 0
+        ? value.estimatedTokensAfter
+        : null,
+  };
+}

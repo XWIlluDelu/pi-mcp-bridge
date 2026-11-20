@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { restoreManifest } from './fixtures/saved-session.mjs';
@@ -19,7 +19,7 @@ import {
   updateOwner,
   readClaim,
   AttachedRuntime,
-} from '../src/attachments.mjs';
+} from '../src/runtime/attachments.mjs';
 
 const fixture = (t, native = false) =>
   nativeOwner(t, {

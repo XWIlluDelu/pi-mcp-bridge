@@ -10,9 +10,9 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { companionHooks } from './fixtures/companion.mjs';
-import { reserveOwner, readClaim, ownerAlive } from '../src/attachments.mjs';
+import { reserveOwner, readClaim, ownerAlive } from '../src/runtime/attachments.mjs';
 const fixture = (t) => nativeOwner(t, { factory: () => assert.fail('Unexpected second writer') });
 const identity = (session) => ({ sessionFile: session.file, sessionId: session.header.id });
 const reserve = (f, session = f.session) =>

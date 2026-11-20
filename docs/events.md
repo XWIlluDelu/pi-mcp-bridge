@@ -16,7 +16,7 @@ subscribe and react in the subscribing chat through outbound signed HTTPS webhoo
   An authenticated incoming tunnel does not provide this outbound connection.
 
 The normal order is **subscribe, confirm verification, send, receive, unsubscribe**.
-The [calling workflow](collaboration.md#calling-workflow) explains when the
+The [calling workflow](api.md#calling-workflow) explains when the
 settlement excerpt is sufficient and when to read further.
 
 ## Scope and completion meaning

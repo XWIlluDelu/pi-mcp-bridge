@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { savedSessionName, runtimeMetadata } from '../src/session-metadata.mjs';
-import { readSessionIdentity } from '../src/data.mjs';
-import { AttachedRuntime } from '../src/attachments.mjs';
+import { savedSessionName, runtimeMetadata } from '../src/read/session-metadata.mjs';
+import { readSessionIdentity } from '../src/core/data.mjs';
+import { AttachedRuntime } from '../src/runtime/attachments.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('title cache reuses only unchanged files; append, incomplete record, truncation and replacement invalidate', async (t) => {

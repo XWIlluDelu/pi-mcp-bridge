@@ -89,7 +89,7 @@ JS
 
 A successful response identifies the server as `pi-session-bridge` and includes its version, supported protocol version and capabilities. Discovery does not start a Pi writer or require session grants; it verifies the local endpoint, not native session access. `401 UNAUTHORIZED` means the running service and caller do not share the same token.
 
-The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config and token must be canonical absolute paths to regular files owned by the service user, with no group/other access; symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
+The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config must be owned by the service user and not writable by group/other (symlinks and `0644` are allowed). The token file must be a canonical absolute regular file owned by the service user with no group/other access (`0600`); symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
 
 The HTTP service and each stdio proxy load the token once at startup. Replacing
 the file does not revoke the token already loaded by a running service or update
@@ -128,11 +128,11 @@ Results include `resultType:"complete"` and server identity metadata. Discovery 
 
 HTTP requests also require:
 
-| Header                 | Value                                                                         |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `MCP-Protocol-Version` | The body's protocol version                                                   |
-| `Mcp-Method`           | The body's method                                                             |
-| `Mcp-Name`             | `params.name` for tools/call and prompts/get; `params.uri` for resources/read |
+| Header                 | Value                        |
+| ---------------------- | ---------------------------- |
+| `MCP-Protocol-Version` | The body's protocol version  |
+| `Mcp-Method`           | The body's method            |
+| `Mcp-Name`             | `params.name` for tools/call |
 
 Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020` with message `Header mismatch`.
 

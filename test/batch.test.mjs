@@ -1,9 +1,10 @@
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 
 const mockBridge = (methods) => ({
+  captureRequestContext: async () => ({}),
   inputs: new Set(),
   locks: new Map(),
   registerInput: Bridge.prototype.registerInput,

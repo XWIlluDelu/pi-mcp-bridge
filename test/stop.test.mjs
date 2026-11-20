@@ -5,12 +5,12 @@ import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { PiRpc } from '../src/rpc.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 
-import { withdrawalCollector, requestStop } from '../src/stop-execution.mjs';
+import { withdrawalCollector, requestStop } from '../src/ops/stop-execution.mjs';
 import { sdkSession } from './fixtures/sdk-session.mjs';
-import { createSdkHostBinding } from '../src/host-bindings.mjs';
-import { reserveHostSession } from '../src/host-adapter.mjs';
+import { createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 const gate = () => Promise.withResolvers();
 async function fixture(t) {

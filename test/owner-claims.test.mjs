@@ -13,7 +13,7 @@ import {
   readOwnerRecord,
   reserveOwner,
   ownerAlive,
-} from '../src/attachments.mjs';
+} from '../src/runtime/attachments.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-owner-'));

@@ -9,9 +9,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { createHttpService } from '../src/http-server.mjs';
-import { loadHttpConfig, TOKEN_HEADER } from '../src/http-config.mjs';
+import { loadHttpConfig, TOKEN_HEADER } from '../src/mcp/http-config.mjs';
 
-import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/protocol.mjs';
+import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/mcp/protocol.mjs';
 
 const token = 'synthetic-http-test-token-never-a-real-credential';
 const rpc = (name, args = {}) => modern('tools/call', { name, arguments: args });
@@ -271,6 +271,11 @@ test('HTTP owner configuration requires canonical private token and config files
   await assert.rejects(loadHttpConfig(file), /INVALID_PRIVATE_FILE/);
   await fs.chmod(tokenFile, 0o600);
   await fs.chmod(file, 0o644);
+  assert.equal((await loadHttpConfig(file)).token, token);
+  const configLink = path.join(f.dir, 'owner-link.json');
+  await fs.symlink(file, configLink);
+  assert.equal((await loadHttpConfig(configLink)).token, token);
+  await fs.chmod(file, 0o666);
   await assert.rejects(loadHttpConfig(file), /OWNER_CONFIG_NOT_PRIVATE/);
   await fs.chmod(file, 0o600);
   const link = path.join(f.dir, 'token-link');

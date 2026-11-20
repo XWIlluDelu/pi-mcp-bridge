@@ -13,9 +13,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
 import { fauxAssistantMessage, fauxProvider, RpcClient } from './fixtures/pi.mjs';
-import { processIdentity, readClaim } from '../src/attachments.mjs';
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
+import { processIdentity, readClaim } from '../src/runtime/attachments.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 
 const base = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const deferred = () => Promise.withResolvers();

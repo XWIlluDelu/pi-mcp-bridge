@@ -1,8 +1,8 @@
 import { buildSessionProjection as hostProjection } from './pi.mjs';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
-import { reserveHostSession } from '../../src/host-adapter.mjs';
-import { processIdentity } from '../../src/attachments.mjs';
+import { reserveHostSession } from '../../src/runtime/host-adapter.mjs';
+import { processIdentity } from '../../src/runtime/attachments.mjs';
 const config = JSON.parse(await fs.readFile(process.argv[2], 'utf8'));
 // A separate fixture writer waits until its exact identity has been reserved.
 const writer = spawn(

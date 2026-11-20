@@ -1,4 +1,8 @@
-import { attachmentServer, listenPrivate, ownerEnvelope } from '../src/attachment-protocol.mjs';
+import {
+  attachmentServer,
+  listenPrivate,
+  ownerEnvelope,
+} from '../src/runtime/attachment-protocol.mjs';
 import packageInfo from '../package.json' with { type: 'json' };
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,9 +11,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fixture, until } from './fixtures/model-runtime.mjs';
-import { READ_CONTRACT } from '../src/context-read.mjs';
-import { atomicJson } from '../src/storage.mjs';
-import { reserveOwner, updateOwner, readClaim, claimFile } from '../src/attachments.mjs';
+import { READ_CONTRACT } from '../src/read/context-read.mjs';
+import { atomicJson } from '../src/core/storage.mjs';
+import { reserveOwner, updateOwner, readClaim, claimFile } from '../src/runtime/attachments.mjs';
 
 test('reload requires send and leaves saved sessions and explicit local pauses unopened', async (t) => {
   const f = await fixture(t),

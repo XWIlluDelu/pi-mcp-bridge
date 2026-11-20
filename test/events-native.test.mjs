@@ -5,8 +5,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Webhook } from 'standardwebhooks';
 import { createHttpService } from '../src/http-server.mjs';
-import { TOKEN_HEADER } from '../src/http-config.mjs';
-import { META, MODERN_VERSION } from '../src/protocol.mjs';
+import { TOKEN_HEADER } from '../src/mcp/http-config.mjs';
+import { META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
 import { nativeOwner, fauxArgs, gatedExtension } from './fixtures/native-owner.mjs';
 
 test(

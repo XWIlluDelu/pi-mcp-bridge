@@ -3,15 +3,15 @@ import {
   listenPrivate,
   ownerEnvelope,
   MAX_ATTACHMENT_REQUEST_BYTES,
-} from '../src/attachment-protocol.mjs';
+} from '../src/runtime/attachment-protocol.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 
-import { AttachedRuntime, claimFile, processIdentity } from '../src/attachments.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+import { AttachedRuntime, claimFile, processIdentity } from '../src/runtime/attachments.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-seal-'),
@@ -127,18 +127,14 @@ const compacted = { firstKeptEntryId: 'kept', tokensBefore: 1000 };
 
 function beforeWrite(t, gate) {
   const request = AttachedRuntime.prototype.request;
-  t.mock.method(AttachedRuntime.prototype, 'request', function (op, body, wait, check, transport) {
-    return request.call(
-      this,
-      op,
-      body,
-      wait,
-      async () => {
-        await check?.();
+  t.mock.method(AttachedRuntime.prototype, 'request', function (op, body, options = {}) {
+    return request.call(this, op, body, {
+      ...options,
+      beforeDispatch: async () => {
+        await options.beforeDispatch?.();
         await gate();
       },
-      transport,
-    );
+    });
   });
 }
 
@@ -189,7 +185,7 @@ test(
       entered.resolve();
       return resume.promise;
     });
-    const pending = rpc.dispatch(idleCompact, 1000);
+    const pending = rpc.dispatch(idleCompact, { timeout: 1000 });
     const rejected = assert.rejects(pending, { code: 'ACK_TIMEOUT', uncertain: false });
     await entered.promise;
     await rejected;
@@ -209,7 +205,7 @@ test('owned compact keeps its control connection and fence for a matching late r
   t.after(() => response.resolve({ data: compacted }));
   f.respond(() => response.promise);
   await assert.rejects(
-    rpc.dispatch(idleCompact, 100, (result) => late.resolve(result)),
+    rpc.dispatch(idleCompact, { timeout: 100, onLate: (result) => late.resolve(result) }),
     {
       code: 'ACK_TIMEOUT',
       uncertain: true,
@@ -236,8 +232,10 @@ test('owned compact rechecks Stop synchronously at the socket write boundary', a
     });
   });
   await assert.rejects(
-    rpc.dispatch(idleCompact, 5000, undefined, () => {
-      if (stopped) throw new Error('STOP_IN_PROGRESS');
+    rpc.dispatch(idleCompact, {
+      beforeDispatch: () => {
+        if (stopped) throw new Error('STOP_IN_PROGRESS');
+      },
     }),
     { code: 'STOP_IN_PROGRESS', uncertain: false },
   );

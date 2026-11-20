@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PiRpc, RuntimePool } from '../src/rpc.mjs';
-import { RuntimeEvents } from '../src/runtime-events.mjs';
+import { PiRpc, RuntimePool } from '../src/runtime/rpc.mjs';
+import { RuntimeEvents, boundRuntimeEvents } from '../src/read/runtime-events.mjs';
 import { assertContextReadResponse, prepareContextRead } from './fixtures/read-pages.mjs';
 import { message } from './fixtures/native-history.mjs';
-import { ContextReadCache } from '../src/read-cache.mjs';
-import { toolResultBytes } from '../src/response-budget.mjs';
+import { ContextReadCache } from '../src/read/read-cache.mjs';
+import { toolResultBytes } from '../src/mcp/response-budget.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const notify = (message) => ({ type: 'extension_ui_request', method: 'notify', message });
@@ -26,7 +26,7 @@ test('native errors and notifications belong only to their RPC generation, not p
   rpc.receiveResponse(error, 'other-generation');
   rpc.receiveResponse({ ...error, error: null }, generation);
   rpc.receiveResponse({ ...notify('ignored'), method: 'setStatus' }, generation);
-  assert.equal(rpc.runtimeEvents.snapshot(4096), null);
+  assert.equal(rpc.runtimeEvents.snapshot(), null);
   rpc.receiveResponse(error, generation);
   rpc.receiveResponse(notify('before ACK'), generation);
   assert.ok(rpc.hasPendingCommand('prompt'));
@@ -42,7 +42,7 @@ test('native errors and notifications belong only to their RPC generation, not p
   );
   assert.deepEqual(await pending, { disposition: 'handled' });
   rpc.receiveResponse(notify('after ACK'), generation);
-  const snapshot = rpc.runtimeEvents.snapshot(4096);
+  const snapshot = rpc.runtimeEvents.snapshot();
   assert.equal(snapshot.generation, generation);
   assert.deepEqual(
     snapshot.events.map((e) => e.type),
@@ -59,7 +59,7 @@ test('native errors and notifications belong only to their RPC generation, not p
   // A replacement generation replaces retained observations; other sessions are bounded.
   const replacement = new PiRpc({}, { id: 's' });
   pool.watchRuntime(replacement);
-  assert.equal(pool.runtimeEvents.get('s').snapshot(4096), null);
+  assert.equal(pool.runtimeEvents.get('s').snapshot(), null);
   for (let i = 0; i < 20; i++) pool.watchRuntime(new PiRpc({}, { id: 's' + i }));
   assert.equal(pool.runtimeEvents.size, 16);
 });
@@ -74,7 +74,7 @@ test('an observed native identity switch invalidates retained events even after 
   rpc.stop = async () => assert.fail('Identity observation must not stop the process');
   await assert.rejects(rpc.state(), { code: 'RUNTIME_SESSION_CHANGED' });
   rpc.receiveResponse(notify('after switch'), rpc.generation);
-  assert.equal(pool.runtimeEvents.get('s').snapshot(4096), null);
+  assert.equal(pool.runtimeEvents.get('s').snapshot(), null);
 });
 
 test('event retention and fresh read previews are bounded; cursor pages stay historical', () => {
@@ -82,7 +82,7 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
   for (let i = 0; i < 40; i++) events.observe(notify('long 😀\u0000'.repeat(1000)));
   assert.equal(events.events.length, 32);
   assert.ok(events.events.every((e) => e.message.length <= 2048));
-  const observations = events.snapshot(1024);
+  const observations = boundRuntimeEvents(events.snapshot(), 1024);
   assert.ok(bytes(observations) <= 1024);
   assert.equal(observations.events.at(-1).sequence, 40);
   assert.equal(observations.omitted_events, 40 - observations.events.length);

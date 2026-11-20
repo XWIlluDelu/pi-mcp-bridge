@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
 import { savedEntries } from './fixtures/saved-session.mjs';
 

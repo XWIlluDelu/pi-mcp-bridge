@@ -2,7 +2,7 @@
 // native classes, as Pi's loader does for attach-extension.mjs in the CLI.
 // Hand-built test APIs supply the members they observe; the remaining
 // ExtensionAPI members the companion uses are inert, never absent.
-import companion from '../../src/companion.mjs';
+import companion from '../../src/runtime/companion.mjs';
 import { AgentSession, buildSessionProjection } from './pi.mjs';
 
 const inert = {

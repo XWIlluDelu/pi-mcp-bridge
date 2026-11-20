@@ -1,6 +1,6 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { readSource } from './fixtures/read-source.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 
 import { test } from 'node:test';
 
@@ -13,7 +13,7 @@ import {
   fauxProvider,
   SessionManager,
 } from './fixtures/pi.mjs';
-import { loadSavedSession } from '../src/data.mjs';
+import { loadSavedSession } from '../src/core/data.mjs';
 
 async function sdk(t, f, factory, expectedCalls = 0, tools = []) {
   const manager = SessionManager.open(f.session.file),

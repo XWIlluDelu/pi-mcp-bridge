@@ -1,12 +1,12 @@
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 import { readSource } from './fixtures/read-source.mjs';
 import { releasedEntries } from './fixtures/model-runtime.mjs';
-import { ContextObservation } from '../src/context-observation.mjs';
+import { ContextObservation } from '../src/read/context-observation.mjs';
 
 async function fixture(t) {
   const f = await nativeOwner(t, {

@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
-import { loadSession } from '../src/data.mjs';
-import { assertNativeDirectory, assertPrivateDirectory } from '../src/storage.mjs';
-import { privateDirectory } from '../src/attachments.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+import { loadSession } from '../src/core/data.mjs';
+import { assertNativeDirectory, assertPrivateDirectory } from '../src/core/storage.mjs';
+import { privateDirectory } from '../src/runtime/attachments.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 test('native umask directories work below private ancestors without chmod; mutable ancestors and files are checked', async (t) => {

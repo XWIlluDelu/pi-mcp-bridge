@@ -1,16 +1,21 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { message } from './fixtures/native-history.mjs';
-import { readLfLines } from '../src/lf-lines.mjs';
-import { ownerEnvelope } from '../src/attachment-protocol.mjs';
+import { readLfLines } from '../src/core/lf-lines.mjs';
+import { ownerEnvelope } from '../src/runtime/attachment-protocol.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 import net from 'node:net';
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { READ_CONTRACT } from '../src/context-read.mjs';
-import { readClaim, claimFile, reserveOwner, AttachedRuntime } from '../src/attachments.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { READ_CONTRACT } from '../src/read/context-read.mjs';
+import {
+  readClaim,
+  claimFile,
+  reserveOwner,
+  AttachedRuntime,
+} from '../src/runtime/attachments.mjs';
 
 const gate = () => Promise.withResolvers();
 async function fixture(t) {

@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { CompatibilityModules } from '../../src/compatibility.mjs';
-import { CompatibilityServices } from '../../src/compatibility-services.mjs';
+import { CompatibilityModules } from '../../src/compat/compatibility.mjs';
+import { CompatibilityServices } from '../../src/compat/compatibility-services.mjs';
 
 const intercom = fileURLToPath(new URL('./index.mjs', import.meta.url));
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import { ACTIONS, permissionsHealth, permitted } from '../src/permissions.mjs';
+import { ACTIONS, permissionsHealth, permitted } from '../src/core/permissions.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 const open = () => Object.fromEntries(ACTIONS.map((action) => [action, true]));
 const closed = () => Object.fromEntries(ACTIONS.map((action) => [action, false]));

@@ -4,7 +4,7 @@ import { RpcClient } from './fixtures/pi.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
-import { ownerAlive, readClaim } from '../src/attachments.mjs';
+import { ownerAlive, readClaim } from '../src/runtime/attachments.mjs';
 
 test('an ordinary native RPC shares its session and keeps shutdown authority', async (t) => {
   const f = await nativeOwner(t);

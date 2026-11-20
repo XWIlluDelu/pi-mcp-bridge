@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 
-import { ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
+import { ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 
 const moduleUrl = (file) => new URL('../src/' + file, import.meta.url).href;
@@ -40,7 +40,7 @@ test(
       t,
       `
     process.env.PI_MODEL_GATE=${JSON.stringify(f.gate)};
-    import {Bridge} from ${JSON.stringify(moduleUrl('bridge.mjs'))};
+    import {Bridge} from ${JSON.stringify(moduleUrl('core/bridge.mjs'))};
     const bridge=await new Bridge(${JSON.stringify(f.config)}).init();
     const runtime=await bridge.pool.resolve(await bridge.session(${JSON.stringify(f.id)}));
     process.send(runtime.ownerRecord.owner);

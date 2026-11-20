@@ -1,14 +1,14 @@
 import { message, text } from './fixtures/native-history.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
-import { loadSession, readSessionIdentity } from '../src/data.mjs';
+import { loadSession, readSessionIdentity } from '../src/core/data.mjs';
 
 test('discarded broken branches do not block native current context; traversed cycles and duplicate IDs reject', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-history-branch-');

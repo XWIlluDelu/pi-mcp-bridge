@@ -3,15 +3,15 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import fs from 'node:fs/promises';
 import { SessionManager, fauxAssistantMessage } from './fixtures/pi.mjs';
-import { SettledObserver } from '../src/settled-observer.mjs';
+import { SettledObserver } from '../src/events/settled-observer.mjs';
 import { ownerSocket } from '../src/owner-runtime.mjs';
-import { hash } from '../src/storage.mjs';
+import { hash } from '../src/core/storage.mjs';
 import {
   captureSettledResult,
   SETTLED_RESULT_LIMIT,
   settledResultSchema,
-} from '../src/settled-result.mjs';
-import { Submissions } from '../src/submissions.mjs';
+} from '../src/events/settled-result.mjs';
+import { Submissions } from '../src/core/submissions.mjs';
 
 test(
   'settlement freezes its boundary and an unresponsive Bridge does not block later local work',

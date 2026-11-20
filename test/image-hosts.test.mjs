@@ -7,12 +7,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { loadSavedSession } from '../src/data.mjs';
+import { loadSavedSession } from '../src/core/data.mjs';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
 import { RpcClient, fauxProvider } from './fixtures/pi.mjs';
-import { processIdentity, readClaim } from '../src/attachments.mjs';
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding, createSdkHostBinding } from '../src/host-bindings.mjs';
+import { processIdentity, readClaim } from '../src/runtime/attachments.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 import { imageReply, imageInputExtension } from './fixtures/image-provider.mjs';
 

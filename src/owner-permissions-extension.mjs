@@ -1,9 +1,9 @@
 // Human TUI shortcut only: deliberately no slash command or model/MCP tool.
 import path from 'node:path';
-import { assertSingleSessionFile } from './data.mjs';
-import { inside } from './permissions.mjs';
-import { opaqueId } from './storage.mjs';
-import { readOwnerConfig, editPermission, permissionDetails } from './owner-config.mjs';
+import { assertSingleSessionFile } from './core/data.mjs';
+import { inside } from './core/permissions.mjs';
+import { sessionKey } from './core/storage.mjs';
+import { readOwnerConfig, editPermission, permissionDetails } from './core/owner-config.mjs';
 const labels = {
   list: 'List',
   read: 'Read',
@@ -68,7 +68,7 @@ export default function ownerPermissions(pi) {
           const header = ctx.sessionManager.getHeader();
           await assertSingleSessionFile(sessionFile, { allowMissing: true });
           target = {
-            session_id: opaqueId(`${sessionFile}\0${id}`),
+            session_id: sessionKey(sessionFile, id),
             cwd: header?.cwd ? path.resolve(header.cwd) : null,
           };
           title = 'This session';

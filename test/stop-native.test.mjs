@@ -8,10 +8,10 @@ import fs from 'node:fs/promises';
 
 import path from 'node:path';
 
-import { executeBatch } from '../src/batch.mjs';
-import { processIdentity } from '../src/attachments.mjs';
-import { reserveHostSession } from '../src/host-adapter.mjs';
-import { createRpcHostBinding } from '../src/host-bindings.mjs';
+import { executeBatch } from '../src/mcp/batch.mjs';
+import { processIdentity } from '../src/runtime/attachments.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
+import { createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';

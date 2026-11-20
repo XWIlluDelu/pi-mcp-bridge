@@ -1,9 +1,14 @@
 # Pi MCP Bridge
 
-Expose native [Pi](https://github.com/earendil-works/pi) sessions through MCP, with owner-controlled permissions and one cooperating writer per session. Local clients use stdio; multiple or remote clients share a loopback HTTP service behind an authenticated tunnel.
+Expose native local [Pi](https://github.com/earendil-works/pi) coding-agent sessions to external MCP agents (such as ChatGPT/Dot, Claude/Duet, Grok, or local MCP clients) with owner-controlled permissions and single-writer safety.
 
-[Follow a session](docs/collaboration.md) from dispatch to result, or see the
-[tool reference](docs/api.md).
+## Core design
+
+1. **Low-burden MCP tool design** ([tool reference](docs/api.md), [reading & search](docs/reading.md)): Coarse tools let external agents discover sessions (`list`, `models`), navigate and search context on demand (`read`, `search` with refs and cursors), and drive sessions (`create`, `send`, `set_model`, `command`, `stop`, `compact`, `reload`, `delete`, `batch`) without dumping full transcripts into context.
+2. **Pluggable extension compatibility** ([integrations](docs/compatibility.md)): Pi extensions that reshape context or memory (such as [Magic Context](integrations/magic-context/README.md) and [Intercom](integrations/intercom/README.md)) live under `integrations/` and are enabled explicitly via `compatibilityModules`. Bridge core does not depend on any specific Pi extension.
+3. **Atomic, inherited permissions** ([owner configuration](docs/configuration.md#seven-independent-rights)): Seven independent rights (`list`, `read`, `send`, `command`, `stop`, `create`, `delete`) resolve as `session > most-specific project > default` (deny by default). Unusual combinations (such as `send:true, read:false`) are flagged by `health` sanity checks rather than blocked.
+
+Transports, single-writer ownership, IPC coordination, and completion webhooks are supporting runtime details documented separately below.
 
 ## Start locally
 
@@ -35,8 +40,7 @@ For one stdio MCP client:
 }
 ```
 
-For multiple clients, use the shared HTTP service. Stdio-only clients can connect
-through its proxy. [Transport setup](docs/transports.md) covers both.
+For multiple or remote clients, use the shared loopback HTTP service behind an authenticated tunnel; stdio-only clients can connect through its proxy. [Transport setup](docs/transports.md) covers both.
 
 ### Verify the first connection
 
@@ -48,11 +52,23 @@ After your MCP client connects, call these tools with the indicated arguments:
 
 ## Documentation
 
-- [Owner configuration and diagnostics](docs/configuration.md)
-- [MCP transports](docs/transports.md)
-- [Companion registration, SDK hosts and terminal handoff](docs/runtime.md)
-- [Reading and search](docs/reading.md), [model controls](docs/model-control.md) and [completion events](docs/events.md)
-- [Optional integrations](docs/compatibility.md) and [architecture](docs/architecture.md)
+### Core design & usage
+
+- [Public tool API & calling workflow](docs/api.md) — all MCP tools, admission statuses, and end-to-end session flow
+- [Reading and search](docs/reading.md) — turn ranges, content kinds, refs, cursors, and budgets
+- [Owner configuration and permissions](docs/configuration.md) — setup, `owner.json` schema, 7 independent rights, and TUI menu
+- [Optional plugin compatibility modules](docs/compatibility.md) — external module lifecycle, input mappings, and session readers
+
+### Controls, transports & events
+
+- [Model discovery and native controls](docs/model-control.md) — `models`, `set_model`, prompt settings, and `compact`
+- [MCP transports](docs/transports.md) — stdio, loopback HTTP service, stdio proxy, and wire bounds
+- [Completion events](docs/events.md) — `session.settled` signed HTTPS webhooks (OpenAI MCP Events)
+
+### Architecture & runtime internals
+
+- [Architecture and module map](docs/architecture.md) — system layout, `src/` directory map, invariants, and verification
+- [Native runtime, ownership and local entry](docs/runtime.md) — single-writer registry, TUI companion, handoff, shutdown, and host bindings
 
 ## Development
 

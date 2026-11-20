@@ -6,12 +6,12 @@ import fs from 'node:fs/promises';
 
 import path from 'node:path';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 import { buildSessionProjection } from './fixtures/pi.mjs';
-import { prepareContextRead, assertReadSnapshot } from '../src/context-read.mjs';
-import { readSchema } from '../src/read-schema.mjs';
-import { captureSessionRead } from '../src/session-readers.mjs';
+import { prepareContextRead, assertReadSnapshot } from '../src/read/context-read.mjs';
+import { readSchema } from '../src/read/read-schema.mjs';
+import { captureSessionRead } from '../src/compat/session-readers.mjs';
 
 const body = 'MEMORY_CONTEXT 漢😀\n\n'.repeat(900);
 async function fixture(t) {
@@ -136,7 +136,7 @@ test('readers reuse one native capture for branch selection and may omit its con
       context,
       args,
     ),
-    /SESSION_READER_FAILED/,
+    (error) => error.message === 'SESSION_READER_FAILED' && error.detail === 'INVALID_SESSION_READ',
   );
   assert.equal(acquired, 3, 'changing the requested facts must not silently reacquire');
 });

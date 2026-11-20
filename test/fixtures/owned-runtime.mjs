@@ -1,5 +1,5 @@
-import { PiRpc } from '../../src/rpc.mjs';
-import { nativeBusy, pendingMessages } from '../../src/attachment-protocol.mjs';
+import { PiRpc } from '../../src/runtime/rpc.mjs';
+import { nativeBusy, pendingMessages } from '../../src/runtime/attachment-protocol.mjs';
 // Minimal Bridge-owned runtime double. Like PiRpc, status sampling reads
 // idleSnapshot(); here it derives from the double's own state().
 export function ownedRuntime(members) {

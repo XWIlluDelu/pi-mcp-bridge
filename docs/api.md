@@ -1,9 +1,27 @@
 # Public tool API
 
-Inputs are strict objects defined by [`src/tool-schemas.mjs`](../src/tool-schemas.mjs).
+Inputs are strict objects defined by [`src/mcp/tool-schemas.mjs`](../src/mcp/tool-schemas.mjs).
 Examples below are tool arguments; [transports](transports.md) defines their
-JSON-RPC envelopes. For the sequence from finding a session to continuing its
-work, see [the calling workflow](collaboration.md#calling-workflow).
+JSON-RPC envelopes.
+
+## Calling workflow
+
+1. Find a session with `list({})`, then inspect the last three turns with
+   `read({session_id})`. For new work, pick a `creatable_projects` path and call
+   `create({project})`.
+2. If you want push notifications, [subscribe](events.md) to the saved `session_id`
+   before sending. Submit work with `send({session_id,text})` and keep any
+   returned `submission_id`.
+3. After an `unknown` outcome, check `submission` for a late native ACK. If it is
+   unavailable, inspect `list` and `read` before deciding whether to submit again.
+4. On settlement, use the webhook excerpt or pass `data.read` directly to `read`
+   for that leaf. Without events, use `list({session_id})` for activity and
+   `read({session_id})` for results.
+
+Keep `session_id` across turns on the same native history. A
+[submission receipt](#submission-receipt) tracks one input's admission, whereas a
+[settlement event](events.md#scope-and-completion-meaning) covers the whole native
+run (which may consume multiple steering/follow-up inputs).
 
 Tools expose no timeout parameter. Native and owner acknowledgements normally
 have a five-second budget; companion and host reload confirmation waits up to ten
@@ -76,7 +94,7 @@ Both tools require read permission and never start Pi. `read` accepts one of:
 
 - `{session_id, range?, content?, view?, leaf_id?, max_bytes?}` to browse; the
   default is the last three input turns in source order.
-- `{refs, max_bytes?}` to expand up to eight refs from one result.
+- `{refs, max_bytes?}` to expand up to eight refs from one session.
 - `{cursor, max_bytes?}` to continue a read or search page.
 
 `search({session_id, query, content?, view?, leaf_id?, max_bytes?})` finds
@@ -117,6 +135,7 @@ state. The caller can use it after
 | `completed`, `owner_version`, `read_compatible` | Native reload finished for the same session. The version identifies the loaded Bridge component; compatibility says whether its read contract matches this Bridge. |
 | `skipped`, `reason:"no_active_owner"`           | No active owner to reload. Does not start Pi or clear an explicit local pause.                                                                                     |
 | `rejected`, `reason:"RELOAD_BUSY"`              | Active or pending work prevents reload. Nothing is interrupted or queued for later.                                                                                |
+| `rejected`, `reason:"RUNTIME_IDLE_UNCONFIRMED"` | Idle could not be established before dispatch. Nothing was interrupted or reloaded.                                                                                |
 | `rejected`, `reason:"RELOAD_UNSUPPORTED"`       | This owner does not implement reload.                                                                                                                              |
 | `unknown`, `reason:"RELOAD_UNCONFIRMED"`        | Refresh may have started; completion could not be confirmed. Companion and host confirmation waits up to ten seconds. Inspect `list/read` before another call.     |
 
@@ -151,7 +170,7 @@ or reject input. On `unknown`, check the [receipt](#submission-receipt) for late
 evidence. A command handled by an extension may report an error in owned
 [runtime events](reading.md#live-output-and-runtime-extension-events).
 
-Optional `model:{provider,id}` and/or `thinking_level` apply before input on a proven-idle Bridge-owned RPC. Busy, queued or unsupported owners refuse settings-bearing input. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
+Optional `model:{provider,id}` and/or `thinking_level` apply before input. On a Bridge-owned RPC they require a proven-idle session; on companions and hosts with `set_model` support, Bridge applies `set_model` first and then dispatches the prompt. Verified settings add `model_selection:{model:{provider,id},thinking_level}`. See [prompt settings](model-control.md#prompt-model-and-thinking-settings) for non-atomic changes and timeouts.
 
 Admission that cancelled an unsupported native dialog carries `reason:"EXTENSION_UI_CANCEL_SENT"`. [Runtime lifecycle](runtime.md#shutdown-and-in-flight-acks) describes dialog handling and automatic release.
 
@@ -165,7 +184,7 @@ Admission that cancelled an unsupported native dialog carries `reason:"EXTENSION
 
 Records are held in Bridge memory for at most one hour, with a limit of 256 newest submissions. Restart or eviction returns `SUBMISSION_UNAVAILABLE`, which says nothing about execution. A retained `unknown` is still uncertain; an external `dispatched` does not later turn into native admission evidence. Query requires current `read` or `send` permission, or current `create` permission for that initial-create receipt, and revalidates the saved session identity. It cannot recover an ID lost with the original response.
 
-Use `list({session_id})` for current activity and `read({session_id})` for current useful content. A submission is not a work unit: several steering/follow-up inputs can share a run, and queued input can be withdrawn. Completion events remain session-wide and include a bounded last-response excerpt; pass their `read` object as tool arguments for more context at that fixed native leaf. See [collaboration design](collaboration.md).
+Use `list({session_id})` for current activity and `read({session_id})` for current useful content. A submission is not a work unit: several steering/follow-up inputs can share a run, and queued input can be withdrawn. Completion events remain session-wide and include a bounded last-response excerpt; pass their `read` object as tool arguments for more context at that fixed native leaf. See [calling workflow](#calling-workflow).
 
 ### Image input (send and create)
 

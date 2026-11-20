@@ -4,9 +4,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { validateOwnerConfig, readOwnerConfig } from '../src/owner-config.mjs';
-import { loadHttpConfig } from '../src/http-config.mjs';
-import { Bridge } from '../src/bridge.mjs';
+import { validateOwnerConfig, readOwnerConfig } from '../src/core/owner-config.mjs';
+import { loadHttpConfig } from '../src/mcp/http-config.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-config-');
@@ -37,7 +37,9 @@ test('current policy validates without mutation and snapshot rejects invalid cha
   assert.strictEqual(validateOwnerConfig(f.config), f.config);
   assert.deepEqual(f.config, snapshot);
   const bridge = await f.start();
-  const { permissions } = await bridge.captureRequestContext();
+  const first = await bridge.captureRequestContext();
+  assert.strictEqual(await bridge.captureRequestContext(), first);
+  const { permissions } = first;
   assert.ok(Object.isFrozen(permissions.defaults) && Object.isFrozen(permissions.grants));
   await f.save({ ...f.config, defaults: { ...f.config.defaults, send: 'invalid' } });
   await assert.rejects(bridge.captureRequestContext(), /INVALID_OWNER_CONFIG/);

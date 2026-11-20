@@ -6,7 +6,7 @@ the wire contract and the operation's required capability. Remove obsolete
 protocol versions and their code, fixtures and documentation.
 
 Use `package.json` as the single Bridge product version source. Product releases
-identify components. Owner reads use the explicit contract in `src/context-read.mjs`;
+identify components. Owner reads use the explicit contract in `src/read/context-read.mjs`;
 change it only for incompatible read semantics, never for a product release alone.
 Keep control-interface checks independent. Main releases use a plain semantic
 version and a matching Git tag.

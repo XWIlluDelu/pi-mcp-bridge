@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
@@ -111,7 +111,7 @@ test('submission lookup checks current read/send/create grants and exact session
 test('a native late ACK winning the timeout race removes the obsolete uncertainty reason', async (t) => {
   const f = await fixture(t);
   Object.assign(f.config.defaults, { send: true, create: true });
-  f.runtime.command = async (_command, _timeout, onLate) => {
+  f.runtime.command = async (_command, { onLate }) => {
     await onLate({ ok: true, data: { disposition: 'started' } });
     throw Object.assign(new Error('ACK_TIMEOUT'), { code: 'ACK_TIMEOUT', uncertain: true });
   };

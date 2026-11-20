@@ -9,7 +9,7 @@ import {
   piLaunchEnvironment,
   loadPiSdk,
   loadPiAi,
-} from '../src/pi-installation.mjs';
+} from '../src/runtime/pi-installation.mjs';
 import { installation, sdk } from './fixtures/pi.mjs';
 
 async function fixture(t) {

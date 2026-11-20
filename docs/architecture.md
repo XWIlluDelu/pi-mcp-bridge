@@ -1,5 +1,42 @@
 # Architecture and verification
 
+## System shape
+
+```text
+MCP clients ──stdio──► server.mjs ────────┐
+(Dot/Duet/Grok) ─HTTP─► http-server.mjs ──┼──► protocol.mjs / batch.mjs
+stdio-only ──► stdio-proxy.mjs ──HTTP─────┘              │
+                                                         ▼
+                                               Bridge (bridge.mjs)
+                                    bridge-read · bridge-mutations · bridge-local
+                                    permissions · read-cache · submissions · events
+                                                         │
+                     ┌───────────────────────────────────┼───────────────────────────────┐
+                     │                                   │                               │
+                     ▼                                   ▼                               ▼
+          Bridge-owned Pi RPC                  Companion extension                Optional integrations
+        (rpc.mjs + rpc-observer.mjs)      (attach-extension.mjs / companion.mjs)   (integrations/*)
+                     └────────── single-writer registry (attachments.mjs) ───────────────┘
+                                              Native Pi JSONL files
+```
+
+Bridge never writes to a session file alongside another live Pi process. Each session has at most one live writer (a Bridge-owned Pi RPC child, a user's TUI/RPC companion, or an embedded SDK/RPC host), coordinated through the shared owner registry. Reads never start Pi.
+
+## Module map
+
+Runnable entry points and Pi extensions stay at top-level `src/` paths (so systemd units, MCP client configs and Pi settings never break). Internal modules are grouped by domain under `src/`, and optional Pi extension adapters live under `integrations/`:
+
+| Directory / Entry                   | Modules                                                                                                                                                                                                                                                                                                                                                                                 | Responsibility                                                                                                                                                                         |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`src/` (entry points)**           | `server.mjs`, `http-server.mjs`, `stdio-proxy.mjs`, `attach-extension.mjs`, `owner-permissions-extension.mjs`, `open.mjs`, `owner-runtime.mjs`                                                                                                                                                                                                                                          | Direct stdio MCP server, shared HTTP MCP server, stdio-to-HTTP proxy, Pi TUI/RPC companion, TUI permission menu, terminal handoff launcher, owner-local release/reset CLI              |
+| **`src/mcp/`**                      | `protocol.mjs`, `protocol-stdio.mjs`, `http-config.mjs`, `tool-schemas.mjs`, `schema.mjs`, `batch.mjs`, `response-budget.mjs`                                                                                                                                                                                                                                                           | Per-request MCP `2026-07-28` dispatch, Zod tool schemas, batch lane ordering, exact UTF-8 & duplicated wire budgeting                                                                  |
+| **`src/core/`**                     | `bridge.mjs`, `bridge-read.mjs`, `bridge-mutations.mjs`, `bridge-local.mjs`, `permissions.mjs`, `owner-config.mjs`, `storage.mjs`, `data.mjs`, `submissions.mjs`, `errors.mjs`, `diagnostics.mjs`, `kernel-lock.mjs`, `lf-lines.mjs`                                                                                                                                                    | Request policy snapshots, session locking & fences, read/mutation/local routing, 7-right permission resolution, JSONL discovery & storage, late-ACK receipts, error codes, diagnostics |
+| **`src/read/`**                     | `context-read.mjs`, `read-render.mjs`, `read-navigation.mjs`, `read-cache.mjs`, `read-schema.mjs`, `read-adapters.mjs`, `read-features.mjs`, `context-observation.mjs`, `live-message.mjs`, `runtime-events.mjs`, `session-metadata.mjs`                                                                                                                                                | Native projection selection, sanitization, code-point paging & rendering, preview rows & ref expansion, frozen LRU snapshot cache, runtime request observation, live streaming tail    |
+| **`src/compat/` & `integrations/`** | `compatibility.mjs`, `compatibility-services.mjs`, `session-readers.mjs`, `integrations/magic-context/`, `integrations/intercom/`                                                                                                                                                                                                                                                       | External module loader/lifecycle, input-mapping & session-reader service ports, optional extension adapters                                                                            |
+| **`src/ops/`**                      | `create-session.mjs`, `native-create.mjs`, `trash.mjs`, `prompt-input.mjs`, `models.mjs`, `model-catalog.mjs`, `native-model-catalog.mjs`, `set-model.mjs`, `compact.mjs`, `bash-execution.mjs`, `stop-execution.mjs`                                                                                                                                                                   | Session creation/forking, recoverable trash, prompt/image validation, model catalog & selection, compaction, bash & stop helpers                                                       |
+| **`src/runtime/`**                  | `rpc.mjs`, `runtime-pool.mjs`, `rpc-observer.mjs`, `rpc-ui.mjs`, `auto-release.mjs`, `pi-installation.mjs`, `reload-admission.mjs`, `attachments.mjs`, `attachment-protocol.mjs`, `companion.mjs`, `companion-profile.mjs`, `join-extension.mjs`, `idle-handoff.mjs`, `host-adapter.mjs`, `host-bindings.mjs`, `herdr-control.mjs`, `herdr-rpc-transport.mjs`, `herdr-worker-entry.mjs` | Owned Pi RPC lifecycle & pool, single-writer claims & companion IPC, `/bridge-join` terminal handoff, optional SDK/RPC host bindings & Herdr placement                                 |
+| **`src/events/`**                   | `events.mjs`, `event-webhook.mjs`, `settled-observer.mjs`, `settled-result.mjs`                                                                                                                                                                                                                                                                                                         | Completion webhooks (`session.settled`) and native settlement observation                                                                                                              |
+
 ## Component versions
 
 `package.json` defines the product version. The control envelope binds requests
@@ -10,28 +47,6 @@ request and reply shapes, and the required owner capability. Live reads use
 `READ_CONTRACT` and report `OWNER_READ_REFRESH_REQUIRED` when it differs.
 The writer claim remains in force through interface mismatches. See
 [AGENTS.md](../AGENTS.md) for the release and ownership rules.
-
-## Request path
-
-- `protocol.mjs` validates public tool arguments. Direct and proxied stdio
-  share framing and reply cancellation in `protocol-stdio.mjs`. The HTTP
-  service authenticates loopback requests. `batch.mjs` orders same-session
-  operations and allocates a shared response budget.
-- `bridge.mjs` applies the permission snapshot and coordinates reads, mutations
-  and lifecycle fences. `permissions.mjs` resolves rights. `submissions.mjs`
-  retains late admission receipts.
-- `data.mjs` validates native storage and discovers recorded identities.
-  `context-read.mjs` and `read-navigation.mjs` select and sanitize native
-  content. `read-cache.mjs` retains frozen pages and references.
-- `rpc.mjs` owns child lifecycle and ACK tracking. The native observer checks
-  activity and seals idle shutdown. `attachments.mjs` manages writer claims;
-  `companion.mjs` and `host-adapter.mjs` expose existing owners over private IPC.
-- `create-session.mjs`, `trash.mjs` and `idle-handoff.mjs` handle session
-  publication, recoverable deletion and transfer to a local writer. Optional
-  Herdr placement uses the same Bridge-owned RPC path.
-- [Integration modules](compatibility.md) provide input mappings, context
-  readers and daemon environment filters. [Completion events](events.md)
-  capture the native settlement boundary before asynchronous webhook delivery.
 
 ## Invariants
 

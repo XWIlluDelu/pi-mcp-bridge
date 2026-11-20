@@ -11,10 +11,10 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { RpcClient } from './fixtures/pi.mjs';
-import { Bridge } from '../src/bridge.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
-import { readClaim, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
-import { RpcFailure } from '../src/rpc.mjs';
+import { readClaim, ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
+import { RpcFailure } from '../src/runtime/rpc.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');

@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { openProfile, openSession } from '../src/open.mjs';
-import { opaqueId } from '../src/storage.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+import { opaqueId } from '../src/core/storage.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { sdk } from './fixtures/pi.mjs';
 test('open starts a fresh native TUI with normal configuration and automatic safe join, never the target file', async (t) => {

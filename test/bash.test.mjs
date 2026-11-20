@@ -1,13 +1,13 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
-import { callBridgeTool } from '../src/protocol.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
 import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { reserveHostSession } from '../src/host-adapter.mjs';
+import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
-import { validateGrants } from '../src/owner-config.mjs';
+import { validateGrants } from '../src/core/owner-config.mjs';
 import { dropPartialReply } from './fixtures/drop-partial-reply.mjs';
 async function fixture(t) {
   const f = await nativeOwner(t, {

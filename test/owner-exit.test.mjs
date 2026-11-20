@@ -9,7 +9,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
-import { ownerAlive, readClaim, reserveOwner, AttachedRuntime } from '../src/attachments.mjs';
+import {
+  ownerAlive,
+  readClaim,
+  reserveOwner,
+  AttachedRuntime,
+} from '../src/runtime/attachments.mjs';
 
 const exists = (file) => fs.stat(file).catch(() => null);
 const shutdownGate =

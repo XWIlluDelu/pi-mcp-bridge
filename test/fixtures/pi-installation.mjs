@@ -2,7 +2,7 @@
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { resolvePiInstallation } from '../../src/pi-installation.mjs';
+import { resolvePiInstallation } from '../../src/runtime/pi-installation.mjs';
 
 export const installation = await resolvePiInstallation(
   process.env.BRIDGE_TEST_PI_CLI ? { piExecutable: process.env.BRIDGE_TEST_PI_CLI } : {},

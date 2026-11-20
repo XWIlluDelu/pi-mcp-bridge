@@ -131,6 +131,7 @@ A verified historical endpoint can supply `source_entry_id` and
 remain provenance as supplied.
 
 Each fresh read selects a reader once. Multiple matches report
-`SESSION_READER_CONFLICT` and reader failures use `SESSION_READER_FAILED`.
+`SESSION_READER_CONFLICT` and reader failures report `SESSION_READER_FAILED`
+(including a safe uppercase module error code in `detail` when available).
 Bridge rechecks native identity before returning the capture. Subsequent
 pages and ordinary refs use that frozen capture and recheck authorization.

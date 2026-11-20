@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { readLfLines } from '../src/lf-lines.mjs';
+import { readLfLines } from '../src/core/lf-lines.mjs';
 import {
   dispatchModern,
   MODERN_VERSION,
@@ -10,11 +10,11 @@ import {
   MCP_INPUT_LIMIT,
   toolDefinitions,
   callBridgeTool,
-} from '../src/protocol.mjs';
-import { StdioTransport } from '../src/protocol-stdio.mjs';
-import { publicSchemas } from '../src/tool-schemas.mjs';
-import { CONTENT_KINDS } from '../src/read-schema.mjs';
-import { MAX_IMAGES } from '../src/prompt-input.mjs';
+} from '../src/mcp/protocol.mjs';
+import { StdioTransport } from '../src/mcp/protocol-stdio.mjs';
+import { publicSchemas } from '../src/mcp/tool-schemas.mjs';
+import { CONTENT_KINDS } from '../src/read/read-schema.mjs';
+import { MAX_IMAGES } from '../src/ops/prompt-input.mjs';
 
 const meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
 const message = (method, params = {}, id = 1) => ({
@@ -23,7 +23,9 @@ const message = (method, params = {}, id = 1) => ({
   method,
   params: { ...params, _meta: { ...meta } },
 });
-const stub = { list: async (args) => ({ sessions: [], args }) };
+// Every tool call captures its receive-time policy before execution.
+const captureRequestContext = async () => ({});
+const stub = { captureRequestContext, list: async (args) => ({ sessions: [], args }) };
 
 test('oversized input collections reject before inspecting elements or admitting work', async () => {
   const bridge = { captureRequestContext: () => assert.fail('Invalid request reached admission') };
@@ -137,6 +139,7 @@ test('public mutation payloads are validated before dispatch', async () => {
   ]);
   const calls = [];
   const bridge = {
+    captureRequestContext,
     create: async (args) => (calls.push(args), { status: 'started' }),
     reload: async (args) => (calls.push(args), { status: 'skipped', reason: 'no_active_owner' }),
   };
@@ -163,6 +166,7 @@ test('public mutation payloads are validated before dispatch', async () => {
 });
 test('owner read refresh is a lifecycle error in text and structured tool results', async () => {
   const bridge = {
+    captureRequestContext,
     read: async () => {
       throw new Error('OWNER_READ_REFRESH_REQUIRED');
     },
@@ -190,6 +194,7 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   const entered = Promise.withResolvers(),
     release = Promise.withResolvers();
   const bridge = {
+    captureRequestContext,
     list: async (_args, options) => {
       assert.equal(Object.hasOwn(options, 'signal'), false);
       entered.resolve();

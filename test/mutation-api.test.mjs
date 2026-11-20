@@ -1,10 +1,10 @@
-import { AttachedRuntime } from '../src/attachments.mjs';
+import { AttachedRuntime } from '../src/runtime/attachments.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { callBridgeTool } from '../src/protocol.mjs';
-import { executeBatch } from '../src/batch.mjs';
+import { callBridgeTool } from '../src/mcp/protocol.mjs';
+import { executeBatch } from '../src/mcp/batch.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';
 

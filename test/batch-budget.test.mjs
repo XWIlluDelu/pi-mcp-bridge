@@ -1,13 +1,13 @@
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { append, message, text } from './fixtures/native-history.mjs';
-import { ALL_CONTENT } from '../src/read-schema.mjs';
+import { ALL_CONTENT } from '../src/read/read-schema.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MCP_RESPONSE_LIMIT } from '../src/response-budget.mjs';
+import { MCP_RESPONSE_LIMIT } from '../src/mcp/response-budget.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-import { callBridgeTool, dispatchModern, META, MODERN_VERSION } from '../src/protocol.mjs';
+import { callBridgeTool, dispatchModern, META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
 async function nativeLongPath(dir) {
   let value = dir;
   const segment = '\x01'.repeat(200) + '漢😀\n"\\';

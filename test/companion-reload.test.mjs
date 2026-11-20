@@ -5,9 +5,9 @@ import fs from 'node:fs/promises';
 import { RpcClient } from './fixtures/pi.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
-import { launchProfile } from '../src/rpc.mjs';
+import { launchProfile } from '../src/runtime/rpc.mjs';
 import { gatedExtension } from './fixtures/native-owner.mjs';
-import { readClaim } from '../src/attachments.mjs';
+import { readClaim } from '../src/runtime/attachments.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(

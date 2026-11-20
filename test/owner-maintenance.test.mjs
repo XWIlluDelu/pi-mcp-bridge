@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import { gatedExtension } from './fixtures/native-owner.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
-import { readClaim, claimFile, ownerAlive } from '../src/attachments.mjs';
+import { readClaim, claimFile, ownerAlive } from '../src/runtime/attachments.mjs';
 
 test(
   'explicit owner interruption waits for native startup to unwind before releasing the writer',

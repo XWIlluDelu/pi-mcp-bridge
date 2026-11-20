@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
-import { loadSession, readSessionIdentity, discover } from '../src/data.mjs';
+import { loadSession, readSessionIdentity, discover } from '../src/core/data.mjs';
 
 async function fixture(t) {
   let starts = 0;
@@ -125,7 +125,7 @@ test('existing owned runtime retains project-authorized control after cwd disapp
   );
   assert.equal(f.starts(), 1);
 });
-test('file or symlink replacement preserves project identity and refuses cold execution', async (t) => {
+test('file replacement refuses cold execution while symlinked project directory stays usable under recorded identity', async (t) => {
   const f = await fixture(t);
   await fs.rename(f.cwd, f.cwd + '-moved');
   await fs.writeFile(f.cwd, 'fixture');
@@ -137,18 +137,16 @@ test('file or symlink replacement preserves project identity and refuses cold ex
     (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
   );
-  await fs.unlink(f.cwd);
-  await fs.symlink(f.cwd + '-moved', f.cwd);
-  assert.equal(
-    (await f.bridge.create({ project: f.cwd, text: 'first' })).reason,
-    'EXECUTION_CWD_UNAVAILABLE',
-  );
-  assert.equal(
-    (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).reason,
-    'EXECUTION_CWD_UNAVAILABLE',
-  );
   assert.equal(f.starts(), 0);
   assert.equal((await fs.readdir(f.config.sessionRoots[0])).length, 1);
+  await fs.unlink(f.cwd);
+  await fs.symlink(f.cwd + '-moved', f.cwd);
+  assert.ok(
+    ['started', 'queued', 'handled'].includes(
+      (await f.bridge.send({ session_id: f.session.id, text: 'fixture' })).status,
+    ),
+  );
+  // Recorded project identity remains the original configured path, not the symlink target.
   f.config.grants = [{ folder: f.cwd + '-moved', list: true, read: true }];
   assert.deepEqual((await f.bridge.list()).sessions, []);
   await assert.rejects(f.bridge.read({ session_id: f.session.id }), /NOT_FOUND_OR_DENIED/);

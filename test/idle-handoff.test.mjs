@@ -23,9 +23,9 @@ import {
   AttachedRuntime,
   updateOwner,
   assertNoOtherLiveOwner,
-} from '../src/attachments.mjs';
+} from '../src/runtime/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import joinExtension from '../src/join-extension.mjs';
+import joinExtension from '../src/runtime/join-extension.mjs';
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 const exists = (file) =>
   fs.stat(file).then(

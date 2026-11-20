@@ -1,6 +1,6 @@
 import { offlineModels } from './fixtures/native-sdk.mjs';
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
-import { ownerEnvelope } from '../src/attachment-protocol.mjs';
+import { ownerEnvelope } from '../src/runtime/attachment-protocol.mjs';
 import { until } from './fixtures/until.mjs';
 
 import test from 'node:test';
@@ -20,7 +20,7 @@ import {
 } from './fixtures/pi.mjs';
 
 import attachExtension from './fixtures/companion.mjs';
-import { claimFile, readClaim } from '../src/attachments.mjs';
+import { claimFile, readClaim } from '../src/runtime/attachments.mjs';
 
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 

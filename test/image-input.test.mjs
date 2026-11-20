@@ -3,9 +3,14 @@ import { releasedEntries } from './fixtures/model-runtime.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { imagesSchema, promptInput, MAX_IMAGE_BYTES, MAX_IMAGES } from '../src/prompt-input.mjs';
-import { publicSchemas } from '../src/tool-schemas.mjs';
-import { toolDefinitions } from '../src/protocol.mjs';
+import {
+  imagesSchema,
+  promptInput,
+  MAX_IMAGE_BYTES,
+  MAX_IMAGES,
+} from '../src/ops/prompt-input.mjs';
+import { publicSchemas } from '../src/mcp/tool-schemas.mjs';
+import { toolDefinitions } from '../src/mcp/protocol.mjs';
 
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 

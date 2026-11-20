@@ -89,7 +89,7 @@ test('native selection remains available during unresolved prompt preflight and 
   const f = await fixture(t),
     { bridge, id } = f;
   const runtime = await bridge.pool.resolve(await bridge.session(id));
-  const pending = runtime.command({ type: 'prompt', message: 'HOLD_PREFLIGHT' }, 5000);
+  const pending = runtime.command({ type: 'prompt', message: 'HOLD_PREFLIGHT' }, { timeout: 5000 });
   const stopEntered = Promise.withResolvers(),
     stopRelease = Promise.withResolvers();
   let stopping;
@@ -250,3 +250,36 @@ test(
     assert.equal(entries.findLast((e) => e.type === 'model_change').modelId, 'alpha');
   },
 );
+
+test('send with model and thinking_level works on attached owners via set_model then submit', async (t) => {
+  const f = await fixture(t);
+  const calls = [];
+  const attached = {
+    attached: true,
+    alive: true,
+    session: f.session,
+    async selectModel(model, { thinkingLevel }) {
+      calls.push({ op: 'selectModel', model, thinkingLevel });
+      return { model, thinking_level: thinkingLevel };
+    },
+    async submitPrompt(input) {
+      calls.push({ op: 'submitPrompt', input });
+      return { status: 'dispatched', admission: 'unobservable' };
+    },
+  };
+  t.mock.method(f.bridge.pool, 'forRead', async () => attached);
+  const result = await f.bridge.send({
+    session_id: f.id,
+    text: 'Run on companion',
+    model: choice('vision'),
+    thinking_level: 'high',
+  });
+  assert.equal(result.status, 'dispatched');
+  assert.equal(result.admission, 'unobservable');
+  assert.deepEqual(result.model_selection, { model: choice('vision'), thinking_level: 'high' });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].op, 'selectModel');
+  assert.equal(calls[1].op, 'submitPrompt');
+  assert.equal(calls[1].input.model, undefined);
+  assert.equal(calls[1].input.thinking_level, undefined);
+});

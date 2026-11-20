@@ -1,9 +1,9 @@
-import { readLfLines } from '../src/lf-lines.mjs';
+import { readLfLines } from '../src/core/lf-lines.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createStdioProxy } from '../src/stdio-proxy.mjs';
-import { META, MODERN_VERSION } from '../src/protocol.mjs';
+import { META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
 
 const token = 'synthetic-proxy-token-never-a-real-credential';
 function fixture(fetchImpl, port = 43123) {

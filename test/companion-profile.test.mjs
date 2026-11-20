@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { companionProfile } from '../src/companion-profile.mjs';
+import { companionProfile } from '../src/runtime/companion-profile.mjs';
 import attachExtension from './fixtures/companion.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
-import { reserveOwner, claimFile, processIdentity } from '../src/attachments.mjs';
+import { reserveOwner, claimFile, processIdentity } from '../src/runtime/attachments.mjs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
@@ -34,6 +34,8 @@ test('missing default profile stays inactive, but broken/explicit profiles fail 
     code: 'ENOENT',
   });
   await fs.chmod(f.file, 0o644);
+  assert.ok(await companionProfile({ HOME: f.dir }));
+  await fs.chmod(f.file, 0o666);
   await assert.rejects(companionProfile({ HOME: f.dir }), /OWNER_CONFIG_NOT_PRIVATE/);
   await fs.chmod(f.file, 0o600);
   await fs.writeFile(f.file, '{');
