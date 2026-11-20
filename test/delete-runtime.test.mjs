@@ -3,16 +3,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 
 import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
-import { nativeOwner } from './fixtures/native-owner.mjs';
+import { idleProcess, nativeOwner } from './fixtures/native-owner.mjs';
 import { restoreManifest } from './fixtures/saved-session.mjs';
 import { until } from './fixtures/until.mjs';
 import {
-  processIdentity,
   claimFile,
   ownerAlive,
   reserveOwner,
@@ -30,30 +27,6 @@ const fixture = (t, native = false) =>
     },
     factory: native ? undefined : () => assert.fail('Delete must not start Pi'),
   });
-async function writer(t) {
-  const child = spawn(
-    process.execPath,
-    [
-      '-e',
-      `
-    process.send('ready');
-    setInterval(() => {}, 1000);
-  `,
-    ],
-    { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
-  );
-  await once(child, 'message');
-  const owner = await processIdentity(child.pid);
-  t.after(async () => {
-    if (await ownerAlive(owner)) {
-      const exit = once(child, 'exit');
-      child.kill('SIGKILL');
-      await exit;
-    }
-  });
-  return { child, owner };
-}
-
 for (const stage of ['native readiness', 'failed startup cleanup'])
   test(
     `delete interrupts ${stage} without waiting for startup to finish`,
@@ -124,7 +97,7 @@ async function hostWriter(f, owner) {
 test('delete ends an unsupported live claim without treating its socket metadata as file authority', async (t) => {
   const f = await fixture(t),
     target = f.session,
-    live = await writer(t);
+    live = await idleProcess(t);
   const record = await reserveOwner(f.config.attachmentDir, target, 'extension', live.owner);
   const unrelated = path.join(f.dir, 'unrelated-data');
   await fs.writeFile(unrelated, 'KEEP');
@@ -137,10 +110,9 @@ test('delete ends an unsupported live claim without treating its socket metadata
       socket: unrelated,
     }),
   );
-  const exit = once(live.child, 'exit');
   const result = await f.bridge.delete({ session_id: target.id });
   assert.equal(result.status, 'deleted', JSON.stringify(result));
-  await exit;
+  await live.exited;
   assert.equal(await ownerAlive(live.owner), false);
   assert.equal(await fs.readFile(unrelated, 'utf8'), 'KEEP');
   assert.equal(await readClaim(f.config.attachmentDir, target), null);
@@ -152,8 +124,8 @@ for (const callback of ['cancel', 'release'])
       const f = await fixture(t),
         target = f.session,
         neighbor = await f.create(),
-        a = await writer(t);
-      const b = shared ? a : await writer(t);
+        a = await idleProcess(t);
+      const b = shared ? a : await idleProcess(t);
       const { ready } = await hostWriter(f, a.owner);
       await reserveOwner(f.config.attachmentDir, neighbor, 'rpc', b.owner);
       let failed = false,
@@ -191,7 +163,7 @@ test('lost release ACK uses confirmed target closure without terminating the sha
   const f = await fixture(t),
     target = f.session,
     neighbor = await f.create(),
-    a = await writer(t);
+    a = await idleProcess(t);
   // This case discards a completed ACK; it is not a short-timeout test.
   delete f.config.attachmentExitTimeoutMs;
   const { ready } = await hostWriter(f, a.owner);
@@ -223,7 +195,9 @@ test('lost release ACK uses confirmed target closure without terminating the sha
 test('a failing host release cannot authorize termination after its binding changes', async (t) => {
   const f = await fixture(t),
     target = f.session,
-    a = await writer(t);
+    a = await idleProcess(t);
+  // Exercise the replacement callback, not the fixture's short process-exit deadline.
+  delete f.config.attachmentExitTimeoutMs;
   const { host, ready } = await hostWriter(f, a.owner);
   await ready({
     release: async () => {
@@ -246,7 +220,7 @@ test('a failing host release cannot authorize termination after its binding chan
 test('denied delete or replaced target leaves the live owner and history alone', async (t) => {
   const f = await fixture(t),
     target = f.session,
-    a = await writer(t);
+    a = await idleProcess(t);
   await reserveOwner(f.config.attachmentDir, target, 'extension', a.owner);
   f.config.grants = [];
   const result = await f.bridge.delete({ session_id: target.id });
@@ -257,10 +231,10 @@ test('denied delete or replaced target leaves the live owner and history alone',
   f.config.defaults.delete = true;
   const locked = f.bridge.locked.bind(f.bridge);
   const replacement = { ...target.header, cwd: path.join(f.dir, 'replacement') };
-  t.mock.method(f.bridge, 'locked', async (key, run) => {
-    if (key === `delete:${target.id}`)
+  t.mock.method(f.bridge, 'locked', async (key, run, lane) => {
+    if (key === target.id && lane === 'delete')
       await fs.writeFile(target.file, JSON.stringify(replacement) + '\n');
-    return locked(key, run);
+    return locked(key, run, lane);
   });
   assert.equal(
     (await f.bridge.delete({ session_id: target.id })).reason,

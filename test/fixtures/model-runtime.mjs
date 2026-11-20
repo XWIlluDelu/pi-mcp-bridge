@@ -7,7 +7,7 @@ import { savedEntries } from './saved-session.mjs';
 export const choice = (id) => ({ provider: 'model-fixture', id });
 export { savedEntries } from './saved-session.mjs';
 export async function releasedEntries(bridge, id) {
-  await until(() => !bridge.pool.get(id) && !bridge.autoReleases.size);
+  await until(() => !bridge.pool.get(id) && !bridge.lane(id));
   return savedEntries(bridge, id);
 }
 export async function fixture(

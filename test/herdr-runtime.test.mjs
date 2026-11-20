@@ -5,11 +5,10 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Bridge } from '../src/core/bridge.mjs';
-import { PiRpc, launchProfile } from '../src/runtime/rpc.mjs';
+import { launchProfile } from '../src/runtime/rpc.mjs';
 import { fileURLToPath } from 'node:url';
-import { scheduleAutoRelease } from '../src/runtime/auto-release.mjs';
 import { findHerdr, HerdrControl } from '../src/runtime/herdr-control.mjs';
-import { HerdrRpcTransport } from '../src/runtime/herdr-rpc-transport.mjs';
+import { HerdrRpcTransport, prepareHerdr } from '../src/runtime/herdr-rpc-transport.mjs';
 import { ownerAlive, readClaim, processIdentity } from '../src/runtime/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
 import { restoreManifest, savedSession } from './fixtures/saved-session.mjs';
@@ -92,16 +91,7 @@ test('unavailable Herdr preflight silently falls back to direct startup; post-la
       return {};
     },
   };
-  const failing = new HerdrRpcTransport(
-    path.join(dir, 'bin/herdr'),
-    {
-      command: process.execPath,
-      args: [],
-      cwd: dir,
-      env: process.env,
-    },
-    { control: fakeControl },
-  );
+  const failing = new HerdrRpcTransport(fakeControl, { cwd: dir });
   failing.scopeActive = async () => false;
   await assert.rejects(failing.ready, /HERDR_DISCONNECTED/);
   await failing.abortStartup();
@@ -327,9 +317,9 @@ test(
       // Pi's normal EOF has completed, but auto-release still holds the lane
       // while the Herdr scope waits for its stubborn tool descendant.
       deleting.autoReleaseWanted = true;
-      scheduleAutoRelease(bridge, deleting);
+      bridge.scheduleAutoRelease(deleting);
       await until(async () => !(await ownerAlive(deleting.childIdentity)), 'native EOF', 5000);
-      assert.equal(bridge.handoffs.get(session.id)?.kind, 'auto_release');
+      assert.equal(bridge.handoff(session.id)?.kind, 'auto_release');
       assert.equal(await ownerAlive(toolOwner), true);
       const deleted = await bridge.delete({ session_id: session.id });
       assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
@@ -342,7 +332,7 @@ test(
     // Scope shutdown lets the native handler finish once. Its final output
     // exceeds socket buffers and must arrive before close.
     const bytes = 256 * 1024;
-    const drain = new HerdrRpcTransport(wrapper, {
+    const drain = new HerdrRpcTransport(await prepareHerdr(wrapper), {
       command: process.execPath,
       args: [
         '-e',

@@ -11,10 +11,10 @@ import { LiveMessageObserver } from '../read/live-message.mjs';
 import { SettledObserver } from '../events/settled-observer.mjs';
 import {
   ownerServer,
+  closeOwnerServer,
   listenPrivate,
-  ownerIdentity,
   ownerReadFeatures,
-  ownerRead,
+  nativeOwnerRead,
 } from './attachment-protocol.mjs';
 import { parseCompactInput, compactContext, compactMetadata } from '../ops/compact.mjs';
 import { sameModel, thinkingLevelSchema } from '../ops/models.mjs';
@@ -174,18 +174,10 @@ export default async function rpcObserver(pi) {
               nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
             );
           case 'read':
-            return body?.view === 'runtime'
-              ? { ...ownerIdentity(binding), ...observation.read(body, ctx) }
-              : ownerRead(
-                  binding,
-                  {
-                    entries: manager.getEntries(),
-                    leafId: manager.getLeafId(),
-                    live: live.snapshot(),
-                  },
-                  body,
-                  { ...sdk, readAdapters },
-                );
+            return nativeOwnerRead(binding, body, ctx, observation, live, {
+              buildSessionProjection: sdk.buildSessionProjection,
+              readAdapters,
+            });
           default:
             throw new Error('INVALID_ATTACHED_OPERATION');
         }
@@ -200,9 +192,8 @@ export default async function rpcObserver(pi) {
     observation.reset();
     // Reload/replacement recreates factories after shutdown handlers finish.
     // Close the owning listener (which unlinks its Unix socket) before rebinding.
-    for (const connection of connections) connection.destroy();
     const listener = server;
     server = undefined;
-    if (listener) await new Promise((resolve) => listener.close(resolve));
+    await closeOwnerServer(listener, connections);
   });
 }

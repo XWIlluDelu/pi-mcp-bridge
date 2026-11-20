@@ -10,6 +10,10 @@ import { nativeCompactReason } from '../ops/compact.mjs';
 export const MAX_ATTACHMENT_REQUEST_BYTES = 8 * 1024 * 1024;
 // Raw cooperative native snapshots are for fork, never a public read fallback.
 export const MAX_ATTACHMENT_SNAPSHOT_BYTES = 32 * 1024 * 1024;
+export const ownerProtocol = Object.freeze({
+  bridgeVersion: packageInfo.version,
+  readContract: READ_CONTRACT,
+});
 
 // The version slot identifies the endpoint to already-running owners of
 // this wire format. Operations and replies define control compatibility.
@@ -82,6 +86,22 @@ export function ownerRead(binding, source, args, projection) {
   return { ...ownerIdentity(binding), ...prepareContextRead(source, args, projection) };
 }
 
+export const nativeSnapshot = (manager) => ({
+  entries: manager.getEntries(),
+  leafId: manager.getLeafId(),
+});
+
+export function nativeOwnerRead(binding, args, ctx, observation, live, projection) {
+  return args?.view === 'runtime'
+    ? { ...ownerIdentity(binding), ...observation.read(args, ctx) }
+    : ownerRead(
+        binding,
+        { ...nativeSnapshot(ctx.sessionManager), live: live.snapshot() },
+        args,
+        projection,
+      );
+}
+
 export const validNativeSnapshot = (snapshot) =>
   Array.isArray(snapshot?.entries) &&
   snapshot.entries.every((entry) => typeof entry?.id === 'string' && entry.id.length <= 128) &&
@@ -90,20 +110,20 @@ export const validNativeSnapshot = (snapshot) =>
 
 // Owner endpoints accept one newline-terminated JSON request per connection.
 export function readRequest(socket, maxBytes, onRequest) {
-  let bytes = 0;
-  const bound = (chunk) => {
-    bytes += chunk.length;
-    if (bytes > maxBytes) {
+  const lines = readLfLines(
+    socket,
+    (line) => {
       lines.close();
-      socket.destroy();
-    }
-  };
-  socket.on('data', bound);
-  const lines = readLfLines(socket, (line) => {
-    socket.off('data', bound);
-    lines.close();
-    Promise.resolve(onRequest(line, socket)).catch(() => socket.destroy());
-  });
+      Promise.resolve(onRequest(line, socket)).catch(() => socket.destroy());
+    },
+    {
+      maxBytes: maxBytes - 1,
+      onOverflow: () => {
+        lines.close();
+        socket.destroy();
+      },
+    },
+  );
   socket.once('close', lines.close);
 }
 
@@ -126,4 +146,9 @@ export async function listenPrivate(server, socketPath) {
     server.listen(socketPath, resolve);
   });
   await fs.chmod(socketPath, 0o600);
+}
+
+export async function closeOwnerServer(server, connections) {
+  for (const socket of connections) socket.destroy();
+  if (server) await new Promise((resolve) => server.close(resolve));
 }

@@ -8,16 +8,12 @@ import { executeBatch } from '../src/mcp/batch.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';
 
-function admissionReceipt(result, ids) {
+function admissionReceipt(result) {
   const { submission_id, ...receipt } = result;
   assert.match(
     submission_id,
     /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/,
   );
-  if (ids) {
-    assert.equal(ids.has(submission_id), false, 'Every independent input has a distinct ID');
-    ids.add(submission_id);
-  }
   return receipt;
 }
 

@@ -1,6 +1,7 @@
 // Owner-side configuration edits only. Not exposed as an MCP operation.
 import { validateCompatibilityModules } from '../compat/compatibility.mjs';
 import path from 'node:path';
+import { z } from 'zod';
 import { ACTIONS, resolvePermission, inside } from './permissions.mjs';
 import { hash, atomicJson, readPrivateFile } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
@@ -9,26 +10,36 @@ const MAX_OWNER_CONFIG_BYTES = 1024 * 1024;
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const absolute = (value) =>
   typeof value === 'string' && path.isAbsolute(value) && !value.includes('\0');
+const absolutePath = z.string().refine(absolute);
+const textArgument = z.string().refine((value) => !value.includes('\0'));
+const projectFolder = z.strictObject({ path: absolutePath });
+const ownerShape = z.strictObject({
+  stateDir: absolutePath,
+  sessionRoots: z.array(absolutePath).min(1),
+  attachmentDir: absolutePath.optional(),
+  attachmentExitTimeoutMs: z.number().int().min(50).max(30000).optional(),
+  folders: z.array(z.unknown()),
+  defaults: z.unknown().optional(),
+  grants: z.unknown().optional(),
+  http: z.unknown().optional(),
+  piExecutable: absolutePath.optional(),
+  piArgs: z.array(textArgument).optional(),
+  piRuntime: z.unknown().optional(),
+  compatibilityModules: z.unknown().optional(),
+  herdr: z.boolean().optional(),
+});
+const piRuntimeShape = z.strictObject({
+  agentDir: absolutePath.optional(),
+  inheritEnv: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).nullish(),
+  tools: z.array(textArgument.refine((value) => Boolean(value.trim()))).nullish(),
+});
+const httpShape = z.strictObject({
+  port: z.number().int().min(1).max(65535),
+  tokenFile: absolutePath,
+});
 // The one shared owner registry for every cooperating writer of this configuration.
 export const registryDirectory = (config) =>
   config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-function validatePiRuntime(profile = {}) {
-  if (
-    !object(profile) ||
-    Object.keys(profile).some((key) => !['agentDir', 'inheritEnv', 'tools'].includes(key)) ||
-    !Array.isArray(profile.inheritEnv ?? []) ||
-    (profile.inheritEnv ?? []).some(
-      (name) => typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name),
-    ) ||
-    !Array.isArray(profile.tools ?? []) ||
-    (profile.tools ?? []).some(
-      (selector) => typeof selector !== 'string' || !selector.trim() || selector.includes('\0'),
-    ) ||
-    (profile.agentDir !== undefined && !absolute(profile.agentDir))
-  )
-    throw new Error('INVALID_PI_RUNTIME');
-  return profile;
-}
 // Owner arguments follow the launcher's complete arguments. Use the selected
 // Pi's parsing rules to distinguish a selector from an option's value.
 export async function validateLaunchArgs(installation, args = [], mode) {
@@ -56,76 +67,25 @@ export async function validateLaunchArgs(installation, args = [], mode) {
 // Shape validation is shared by initialization, file reload and both transports.
 // Filesystem existence/privacy and execution-time cwd checks remain separate.
 export function validateOwnerConfig(config) {
-  if (
-    !object(config) ||
-    !absolute(config.stateDir) ||
-    !Array.isArray(config.sessionRoots) ||
-    !config.sessionRoots.length ||
-    config.sessionRoots.some((root) => !absolute(root)) ||
-    !Array.isArray(config.folders)
-  )
-    throw new Error('INVALID_OWNER_CONFIG');
-  const fields = new Set([
-    'stateDir',
-    'sessionRoots',
-    'attachmentDir',
-    'attachmentExitTimeoutMs',
-    'folders',
-    'defaults',
-    'grants',
-    'http',
-    'piExecutable',
-    'piArgs',
-    'piRuntime',
-    'compatibilityModules',
-    'herdr',
-  ]);
-  if (Object.keys(config).some((key) => !fields.has(key))) throw new Error('INVALID_OWNER_CONFIG');
+  if (!ownerShape.safeParse(config).success) throw new Error('INVALID_OWNER_CONFIG');
   const paths = new Set();
   for (const folder of config.folders) {
-    if (
-      !object(folder) ||
-      paths.has(folder.path) ||
-      Object.keys(folder).some((key) => key !== 'path') ||
-      !absolute(folder.path)
-    )
+    if (!projectFolder.safeParse(folder).success || paths.has(folder.path))
       throw new Error('INVALID_PROJECT_FOLDER');
     paths.add(folder.path);
   }
   validatePermissionValues(config.defaults);
   validateGrants(config.grants);
   validateCompatibilityModules(config.compatibilityModules);
-  if (
-    (config.herdr !== undefined && typeof config.herdr !== 'boolean') ||
-    (config.attachmentDir !== undefined && !absolute(config.attachmentDir)) ||
-    (config.attachmentExitTimeoutMs !== undefined &&
-      (!Number.isInteger(config.attachmentExitTimeoutMs) ||
-        config.attachmentExitTimeoutMs < 50 ||
-        config.attachmentExitTimeoutMs > 30000)) ||
-    (config.piExecutable !== undefined && !absolute(config.piExecutable)) ||
-    (config.piArgs !== undefined &&
-      (!Array.isArray(config.piArgs) ||
-        config.piArgs.some((arg) => typeof arg !== 'string' || arg.includes('\0'))))
-  )
-    throw new Error('INVALID_OWNER_CONFIG');
-  validatePiRuntime(config.piRuntime);
+  if (config.piRuntime !== undefined && !piRuntimeShape.safeParse(config.piRuntime).success)
+    throw new Error('INVALID_PI_RUNTIME');
   const dirs = [config.stateDir, ...config.sessionRoots];
   for (let i = 0; i < dirs.length; i++)
     for (let j = i + 1; j < dirs.length; j++)
       if (inside(dirs[i], dirs[j]) || inside(dirs[j], dirs[i]))
         throw new Error('OVERLAPPING_STORAGE');
-  if (config.http !== undefined) {
-    const settings = config.http;
-    if (
-      !object(settings) ||
-      !Number.isInteger(settings.port) ||
-      settings.port < 1 ||
-      settings.port > 65535 ||
-      !absolute(settings.tokenFile) ||
-      Object.keys(settings).some((key) => !['port', 'tokenFile'].includes(key))
-    )
-      throw new Error('INVALID_HTTP_CONFIG');
-  }
+  if (config.http !== undefined && !httpShape.safeParse(config.http).success)
+    throw new Error('INVALID_HTTP_CONFIG');
   return config;
 }
 function validatePermissionValues(values, scopeKeys = []) {

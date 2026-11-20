@@ -63,7 +63,7 @@ test(
     assert.equal((await f.bridge.submission(query)).receipt.status, 'unknown');
     await f.mark('release-input');
     await until(async () => (await f.bridge.submission(query)).receipt.status === 'handled');
-    await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
+    await until(() => !f.bridge.pool.get(f.id) && !f.bridge.lane(f.id));
     assert.equal(await fs.readFile(path.join(f.dir, 'calls'), 'utf8'), 'input\n');
     t.mock.method(f.bridge.pool, 'forRead', () =>
       assert.fail('Receipt lookup must not contact an owner'),

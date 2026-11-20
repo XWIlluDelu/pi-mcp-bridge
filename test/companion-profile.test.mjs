@@ -1,3 +1,4 @@
+import { idleProcess } from './fixtures/native-owner.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -5,9 +6,7 @@ import path from 'node:path';
 import { companionProfile } from '../src/runtime/companion-profile.mjs';
 import attachExtension from './fixtures/companion.mjs';
 import { SessionManager } from './fixtures/pi.mjs';
-import { reserveOwner, claimFile, processIdentity } from '../src/runtime/attachments.mjs';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
+import { reserveOwner, claimFile } from '../src/runtime/attachments.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 async function fixture(t) {
@@ -85,20 +84,11 @@ test('scope removal preserves resume protection for an existing live writer', as
   assert.equal(await resume(outside), undefined);
   await assert.rejects(fs.stat(dir), { code: 'ENOENT' });
 
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
-    stdio: 'ignore',
-  });
-  t.after(async () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const exited = once(child, 'exit');
-    child.kill('SIGTERM');
-    await exited;
-  });
-  await once(child, 'spawn');
+  const { child, owner } = await idleProcess(t);
   const manager = SessionManager.create(f.dir, f.config.sessionRoots[0]),
     session = { file: manager.getSessionFile(), header: manager.getHeader() };
   await fs.writeFile(session.file, JSON.stringify(session.header) + '\n');
-  await reserveOwner(dir, session, 'host', await processIdentity(child.pid));
+  await reserveOwner(dir, session, 'host', owner);
   const claim = await fs.readFile(claimFile(dir, session));
   assert.deepEqual(await resume(session.file), { cancel: true });
 

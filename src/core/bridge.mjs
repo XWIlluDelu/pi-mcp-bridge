@@ -8,18 +8,17 @@ import { inside, permitted } from './permissions.mjs';
 import { ContextReadCache } from '../read/read-cache.mjs';
 import { CompatibilityModules } from '../compat/compatibility.mjs';
 import { CompatibilityServices } from '../compat/compatibility-services.mjs';
-import { discover, readSessionIdentity } from './data.mjs';
+import { discover, readSessionIdentity, sameSessionIdentity } from './data.mjs';
 import { assertPrivateDirectory, assertNativeDirectory } from './storage.mjs';
 import { kernelLock } from './kernel-lock.mjs';
-import { PiRpc, RuntimePool } from '../runtime/rpc.mjs';
+import { PiRpc } from '../runtime/rpc.mjs';
+import { RuntimePool } from '../runtime/runtime-pool.mjs';
 import { privateDirectory, readOwnerRecord } from '../runtime/attachments.mjs';
 import { serveOwnerControl } from '../owner-runtime.mjs';
 import { readOwnerConfig, validateOwnerConfig } from './owner-config.mjs';
 import { diagnostics } from './diagnostics.mjs';
-import { idleHandoff, cancelHandoff } from '../runtime/idle-handoff.mjs';
-import { scheduleAutoRelease } from '../runtime/auto-release.mjs';
+import { inputOperations } from '../mcp/tool-schemas.mjs';
 import {
-  acquireNativeRead,
   getHealth,
   getSubmission,
   listModels,
@@ -38,6 +37,8 @@ import {
   stopSession,
 } from './bridge-mutations.mjs';
 import {
+  idleHandoff,
+  cancelHandoff,
   idleCandidateForLocal,
   releaseForLocal,
   resetColdResume,
@@ -50,7 +51,35 @@ function scopeSnapshot(config) {
   return Object.freeze({ folders, sessionRoots });
 }
 
+const queries = {
+  list: listSessions,
+  read: readSession,
+  search: searchSession,
+  models: listModels,
+  health: getHealth,
+  submission: getSubmission,
+};
+const mutations = {
+  send: [sendPrompt, 'send'],
+  command: [runCommand, 'command'],
+  compact: [compactSession, 'send'],
+  reload: [reloadSession, 'send'],
+  set_model: [setSessionModel, 'send'],
+  stop: [stopSession, 'stop'],
+  create: [createSession],
+  delete: [deleteSession, 'delete'],
+};
+const ownerOperations = {
+  settledForLocal,
+  handoffForLocal: idleHandoff,
+  cancelHandoff,
+  idleCandidateForLocal,
+  releaseForLocal,
+  resetColdResume,
+};
+
 export class Bridge {
+  #jobs = new Map();
   constructor(config, factory, { configFile } = {}) {
     this.config = config;
     this.configFile = configFile;
@@ -67,18 +96,20 @@ export class Bridge {
       configFile,
       completionControl: { stateDir: config.stateDir, attachmentDir: config.attachmentDir },
     });
-    this.pendingMutations = new Set();
-    this.locks = new Map();
-    this.handoffs = new Map();
-    this.inputs = new Set();
+    // A batch can register an input before its job has a work promise.
+    this.mutations = new Set();
     this.sessionFiles = new Map();
     this.titleCache = new Map();
     this.readCache = new ContextReadCache();
-    this.autoReleases = new Set();
     this.events = new EventSubscriptions(this);
     this.completionSequences = new Map();
     this.submissions = new Submissions();
-    this.pool.onIdleCandidate = (runtime) => scheduleAutoRelease(this, runtime);
+    this.pool.onIdleCandidate = (runtime) => this.scheduleAutoRelease(runtime);
+    for (const [name, query] of Object.entries(queries))
+      this[name] = async (args, options) => query(this, args, await this.#requestOptions(options));
+    for (const name of Object.keys(mutations)) this[name] = this.#mutation.bind(this, name);
+    for (const [name, operation] of Object.entries(ownerOperations))
+      this[name] = operation.bind(null, this);
   }
   async init() {
     validateOwnerConfig(this.config);
@@ -107,44 +138,112 @@ export class Bridge {
     }
     return this;
   }
-  async locked(id, fn) {
-    const prior = this.locks.get(id) ?? Promise.resolve();
-    const next = prior.catch(() => {}).then(fn);
-    this.locks.set(id, next);
-    try {
-      return await next;
-    } finally {
-      if (this.locks.get(id) === next) this.locks.delete(id);
-    }
+  lane(id, name = 'work') {
+    return this.#jobs.get(id)?.[name];
   }
-  registerInput(sessionId) {
-    const input = { sessionId, stopped: this.locks.has(`stop:${sessionId}`) };
-    this.inputs.add(input);
-    return input;
-  }
-  async withInput(sessionId, input, fn) {
-    input ??= this.registerInput(sessionId);
-    // Keep cancellation across batch lanes, permission and state I/O.
-    // A completed stop must not revive input that has not reached Pi yet.
-    const beforeDispatch = () => {
-      this.assertOpen();
-      if (input.stopped || this.locks.has(`stop:${sessionId}`)) throw new Error('STOP_IN_PROGRESS');
-      if (this.handoffs.get(sessionId)?.kind === 'delete') throw new Error('HANDOFF_PENDING');
-    };
-    try {
-      return await fn(beforeDispatch);
-    } finally {
-      this.inputs.delete(input);
-    }
-  }
-  // Lifecycle markers fence admission for one session; only the owner removes its own.
-  async withHandoff(id, marker, fn) {
-    this.handoffs.set(id, marker);
+  async #occupy(id, name, value, fn) {
+    let job = this.#jobs.get(id);
+    if (!job) this.#jobs.set(id, (job = {}));
+    job[name] = value;
     try {
       return await fn();
     } finally {
-      if (this.handoffs.get(id) === marker) this.handoffs.delete(id);
+      if (job[name] === value) delete job[name];
+      if (!Object.keys(job).length && this.#jobs.get(id) === job) this.#jobs.delete(id);
     }
+  }
+  locked(id, fn, lane = 'work') {
+    const next = Promise.resolve(this.lane(id, lane))
+      .catch(() => {})
+      .then(fn);
+    return this.#occupy(id, lane, next, () => next);
+  }
+  registerInput(sessionId, mutation = {}) {
+    mutation.sessionId = sessionId;
+    mutation.stopped = Boolean(this.lane(sessionId, 'stop'));
+    this.mutations.add(mutation);
+    return mutation;
+  }
+  assertInput({ sessionId, stopped }) {
+    // Keep cancellation across batch lanes, permission and state I/O.
+    // A completed stop must not revive input that has not reached Pi yet.
+    this.assertOpen();
+    if (stopped || this.lane(sessionId, 'stop')) throw new Error('STOP_IN_PROGRESS');
+    if (this.handoff(sessionId)?.kind === 'delete') throw new Error('HANDOFF_PENDING');
+  }
+  handoff(id) {
+    return this.lane(id, 'handoff');
+  }
+  withHandoff(id, marker, fn) {
+    return this.#occupy(id, 'handoff', marker, fn);
+  }
+  autoReleaseInProgress(id) {
+    const handoff = this.handoff(id);
+    return handoff?.kind === 'auto_release' ? handoff.runtime.autoReleaseTask : undefined;
+  }
+  scheduleAutoRelease(runtime) {
+    if (!runtime.autoReleaseWanted || this.closing || !runtime.alive) return;
+    if (runtime.autoReleaseTask) {
+      runtime.autoReleaseAgain = true;
+      return runtime.autoReleaseTask;
+    }
+    if (runtime.exitSeal) return;
+
+    const { id } = runtime.session;
+    const eligible = () =>
+      !this.closing &&
+      runtime.alive &&
+      !runtime.exitSeal &&
+      this.pool.instances.get(id) === runtime &&
+      !this.handoff(id) &&
+      !this.lane(id, 'stop') &&
+      !this.lane(id, 'bash') &&
+      !runtime.activeReads &&
+      !runtime.hasUnsettledWork();
+
+    runtime.autoReleaseTask = this.locked(id, async () => {
+      runtime.autoReleaseAgain = false;
+      if (!eligible()) return;
+      const { status } = await runtime.idleSnapshot();
+      if (status !== 'idle' || !eligible()) return;
+      const marker = { kind: 'auto_release', runtime, controller: new AbortController() };
+      try {
+        await this.withHandoff(id, marker, () =>
+          this.pool.shutdown(runtime, marker.controller.signal, { mode: 'proven_idle' }),
+        );
+        diagnostics.emit('runtime.auto_released', { kind: 'rpc', generation: runtime.generation });
+      } catch (error) {
+        if (!marker.controller.signal.aborted && error.code !== 'RUNTIME_BUSY') throw error;
+      }
+    })
+      .catch((error) => {
+        diagnostics.emit('runtime.auto_release_failed', {
+          code: error.code ?? error.message,
+          generation: runtime.generation,
+          uncertain: error.uncertain === true,
+        });
+      })
+      .finally(() => {
+        runtime.autoReleaseTask = null;
+        // A fresh idle signal can precede a definite busy refusal.
+        if (runtime.autoReleaseAgain) this.scheduleAutoRelease(runtime);
+      });
+    return runtime.autoReleaseTask;
+  }
+  async localHandoff(id, marker, fn) {
+    const release = this.autoReleaseInProgress(id);
+    if (release) await release;
+    if (this.handoff(id)) throw new Error('HANDOFF_PENDING');
+    const priorStop = this.lane(id, 'stop');
+    return this.withHandoff(id, marker, () =>
+      this.locked(id, async () => {
+        // Fence new stops before draining the one already admitted.
+        await priorStop?.catch(() => {});
+        this.assertOpen();
+        marker.controller.signal.throwIfAborted();
+        return fn();
+      }),
+    );
   }
   async sessions(requestContext) {
     // Owner-local identity lookup is not business admission and remains available
@@ -159,11 +258,11 @@ export class Bridge {
     this.sessionFiles = new Map(sessions.map((s) => [s.id, s.file]));
     return sessions;
   }
-  async mutationLock(id, action, requestContext, fn, lockId = id) {
+  async mutationLock(id, action, requestContext, fn, lane) {
     const blockedReason = () =>
-      this.handoffs.has(id) && this.handoffs.get(id).kind !== 'auto_release'
+      this.handoff(id) && this.handoff(id).kind !== 'auto_release'
         ? 'HANDOFF_PENDING'
-        : action === 'send' && this.locks.has(`stop:${id}`)
+        : action === 'send' && this.lane(id, 'stop')
           ? 'STOP_IN_PROGRESS'
           : null;
     const blocked = async (reason) => {
@@ -174,12 +273,17 @@ export class Bridge {
         return { status: 'rejected', reason: this.safeReason(error) };
       }
     };
+    // The caller just authorized the target before entering this lane.
     const reason = blockedReason();
-    if (reason) return blocked(reason);
-    return this.locked(lockId, () => {
-      const reason = blockedReason();
-      return reason ? blocked(reason) : fn();
-    });
+    if (reason) return { status: 'rejected', reason };
+    return this.locked(
+      id,
+      () => {
+        const reason = blockedReason();
+        return reason ? blocked(reason) : fn();
+      },
+      lane,
+    );
   }
   async captureRequestContext() {
     this.assertOpen();
@@ -240,6 +344,11 @@ export class Bridge {
     if (!s) throw new Error('NOT_FOUND_OR_DENIED');
     return s;
   }
+  async revalidateSession(session, requestContext) {
+    const current = await this.session(session.id, requestContext);
+    if (!sameSessionIdentity(current, session)) throw new Error('RUNTIME_SESSION_CHANGED');
+    return current;
+  }
   // Request policy is immutable. Check at admission and after refreshing a
   // target identity, not repeatedly across awaits with the same target/policy.
   check(action, s, requestContext) {
@@ -252,95 +361,49 @@ export class Bridge {
     diagnostics.emit('operation.failure', { code, uncertain: error.uncertain === true });
     return code;
   }
-  acquireNativeRead(session, runtime, args) {
-    return acquireNativeRead(this, session, runtime, args);
-  }
-  list(args, options) {
-    return listSessions(this, args, options);
-  }
-  read(args, options) {
-    return readSession(this, args, options);
-  }
-  search(args, options) {
-    return searchSession(this, args, options);
-  }
-  models(args, options) {
-    return listModels(this, args, options);
-  }
-  health(args, options) {
-    return getHealth(this, args, options);
-  }
-  submission(args, options) {
-    return getSubmission(this, args, options);
-  }
-  set_model(args, options) {
-    return this.#mutation(args, options, setSessionModel);
-  }
-  send(args, options) {
-    return this.#mutation(args, options, sendPrompt, true);
-  }
-  create(args, options) {
-    return this.#mutation(args, options, createSession);
-  }
-  command(args, options) {
-    return this.#mutation(args, options, runCommand, true);
-  }
-  stop(args, options) {
-    return this.#mutation(args, options, stopSession);
-  }
-  reload(args, options) {
-    return this.#mutation(args, options, reloadSession, true);
-  }
-  compact(args, options) {
-    return this.#mutation(args, options, compactSession, true);
-  }
-  delete(args, options) {
-    return this.#mutation(args, options, deleteSession);
-  }
-  async #mutation(args, options, action, tracksInput = false) {
+  async #requestOptions(options) {
+    const requestContext = await (options?.requestContext ?? this.captureRequestContext());
     this.assertOpen();
+    return { ...options, requestContext };
+  }
+  async #mutation(name, args, options) {
+    this.assertOpen();
+    const mutation = options?.pendingInput ?? {};
+    if (inputOperations.has(name) && !options?.pendingInput)
+      this.registerInput(args.session_id, mutation);
+    else this.mutations.add(mutation);
     let releaseCandidate;
-    const run = async (checkInput) => {
-      const requestContext = await (options?.requestContext ?? this.captureRequestContext());
-      this.assertOpen();
+    mutation.work = this.#requestOptions(options).then(async (request) => {
+      const [action, right] = mutations[name];
+      let target;
+      if (right) {
+        try {
+          target = await this.session(args.session_id, request.requestContext);
+          this.check(right, target, request.requestContext);
+        } catch (error) {
+          if (name !== 'send' && name !== 'delete') throw error;
+          return { status: 'rejected', reason: 'NOT_FOUND_OR_DENIED' };
+        }
+      }
       return action(this, args, {
-        ...options,
-        requestContext,
-        checkInput,
+        ...request,
+        target,
+        mutation,
+        checkInput: () => this.assertInput(mutation),
         markForAutoRelease: (runtime) => {
           if (runtime instanceof PiRpc) releaseCandidate = runtime;
         },
       });
-    };
-    const work = tracksInput ? this.withInput(args.session_id, options?.pendingInput, run) : run();
-    this.pendingMutations.add(work);
+    });
     try {
-      return await work;
+      return await mutation.work;
     } finally {
-      this.pendingMutations.delete(work);
+      this.mutations.delete(mutation);
       if (releaseCandidate) {
         releaseCandidate.autoReleaseWanted = true;
         releaseCandidate.onIdleCandidate?.();
       }
     }
-  }
-  settledForLocal(request) {
-    return settledForLocal(this, request);
-  }
-  handoffForLocal(request, options) {
-    return idleHandoff(this, request, options);
-  }
-  cancelHandoff(request) {
-    return cancelHandoff(this, request);
-  }
-  idleCandidateForLocal(request) {
-    return idleCandidateForLocal(this, request);
-  }
-  releaseForLocal(request) {
-    return releaseForLocal(this, request);
-  }
-  resetColdResume(request) {
-    return resetColdResume(this, request);
   }
   assertOpen() {
     if (this.closing) throw new Error('BRIDGE_CLOSING');
@@ -362,10 +425,13 @@ export class Bridge {
     this.closePromise = (async () => {
       await this.prepareClose();
       this.completionSequences.clear();
-      while (this.pendingMutations.size) await Promise.allSettled([...this.pendingMutations]);
-      await this.pool.drainAcks();
+      // Closing has fenced every new mutation. The pool drains received ACKs
+      // before stopping its runtimes.
+      await Promise.allSettled(this.mutations.values().map((mutation) => mutation.work));
       await this.pool.close();
-      await Promise.allSettled([...this.autoReleases]);
+      await Promise.allSettled(
+        this.#jobs.values().flatMap(({ handoff, ...lanes }) => Object.values(lanes)),
+      );
       // Modules remain active until writers, ACKs and release captures drain.
       try {
         await this.compatibility.stop();

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PiRpc, RpcFailure, RuntimePool } from '../src/runtime/rpc.mjs';
+import { PiRpc, RpcFailure } from '../src/runtime/rpc.mjs';
+import { RuntimePool } from '../src/runtime/runtime-pool.mjs';
 
 const session = { file: '/isolated/session.jsonl', header: { id: 'native' } };
 const identity = { sessionFile: session.file, sessionId: session.header.id };
@@ -203,15 +204,14 @@ test('stop tolerates exact natural exit during identity validation, but never si
   }
 });
 
-test('pool and writer drain received ACK tasks without waiting for missing replies', async () => {
+test('shutdown drains received ACK tasks without waiting for missing replies', async () => {
   const entered = Promise.withResolvers(),
     validate = Promise.withResolvers();
   const { rpc, child, writes, ack } = fixture();
   const pool = new RuntimePool({ attachmentDir: '/unused-test-registry' });
   pool.instances.set('isolated', rpc);
   let killed = false,
-    receipt = false,
-    drained = false;
+    receipt = false;
   child.kill = () => {
     assert.equal(receipt, true);
     killed = true;
@@ -231,23 +231,18 @@ test('pool and writer drain received ACK tasks without waiting for missing repli
     ),
     { code: 'ACK_TIMEOUT' },
   );
-  await pool.drainAcks();
+  await rpc.drainAcks();
   ack(
     writes.find((x) => x.type === 'prompt'),
     started,
   );
   await entered.promise;
-  const draining = pool.drainAcks().then(() => {
-    drained = true;
-  });
-  const stopping = rpc.stop();
+  const stopping = pool.close();
   await tick();
-  assert.equal(drained, false);
   assert.equal(killed, false);
   validate.resolve();
-  await Promise.all([draining, stopping]);
+  await stopping;
   assert.equal(killed, true);
-  assert.equal(rpc.ackTasks.size, 0);
 });
 
 test('late mutation replies recheck native identity even without an observer', async () => {

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PiRpc, RuntimePool } from '../src/runtime/rpc.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
+import { RuntimePool } from '../src/runtime/runtime-pool.mjs';
 import { RuntimeEvents, boundRuntimeEvents } from '../src/read/runtime-events.mjs';
 import { assertContextReadResponse, prepareContextRead } from './fixtures/read-pages.mjs';
 import { message } from './fixtures/native-history.mjs';

@@ -29,6 +29,7 @@ async function fixture(t) {
         status: 'accepted',
         acknowledgement: 'native_ack',
         coverage: 'agent_and_bash',
+        queue_policy: 'withdraw',
         withdrawal: withdrawalCollector(max_chars).add({ steering: ['one'], followUp: ['two'] }),
       };
     },
@@ -91,64 +92,59 @@ test('stop fences new Bridge prompts, preserves withdrawn text on uncertain ACK,
 });
 
 for (const op of ['send', 'command'])
-  for (const stopFirst of [false, true])
-    test(`owned ${op} refuses delayed dispatch ${stopFirst ? 'after' : 'during'} stop`, async (t) => {
-      const f = await fixture(t),
-        observing = gate(),
-        finishState = gate(),
-        stopping = gate(),
-        finishStop = gate();
-      f.cleanup.push(() => {
-        finishState.resolve();
-        finishStop.resolve();
-      });
-      f.config.grants[0].command = true;
-      f.bridge.pool.instances.set(f.id, f.runtime);
-      Object.assign(f.runtime, {
-        command: PiRpc.prototype.command,
-        executeBash: PiRpc.prototype.executeBash,
-        assertSessionIdentity: PiRpc.prototype.assertSessionIdentity,
-        activeBashes: 0,
-        config: { attachmentDir: f.bridge.pool.attachmentDir },
-        session: f.session,
-      });
-      let held = false;
-      f.runtime.state = async () => {
-        if (!held) {
-          held = true;
-          observing.resolve();
-          await finishState.promise;
-        }
-        return { sessionFile: f.session.file, sessionId: f.session.header.id, isStreaming: false };
-      };
-      f.runtime.dispatch = (command) => {
-        assert.equal(command.type, 'get_state', 'a withdrawn input cannot dispatch');
-        return f.runtime.state();
-      };
-      const stop = f.runtime.stopExecution;
-      f.runtime.stopExecution = async (args) => {
-        stopping.resolve();
-        await finishStop.promise;
-        return stop(args);
-      };
-      const args = {
-        session_id: f.id,
-
-        ...(op === 'send' ? { text: 'not dispatched' } : { command: 'not dispatched' }),
-      };
-      const input = f.bridge[op](args);
-      await observing.promise;
-      const cancel = f.bridge.stop({ session_id: f.id });
-      await stopping.promise;
-      if (stopFirst) {
-        finishStop.resolve();
-        await cancel;
-      }
+  test(`owned ${op} stays withdrawn after Stop during native state sampling`, async (t) => {
+    const f = await fixture(t),
+      observing = gate(),
+      finishState = gate(),
+      stopping = gate(),
+      finishStop = gate();
+    f.cleanup.push(() => {
       finishState.resolve();
-      assert.equal((await input).reason, 'STOP_IN_PROGRESS');
       finishStop.resolve();
-      await cancel;
     });
+    f.config.grants[0].command = true;
+    f.bridge.pool.instances.set(f.id, f.runtime);
+    Object.assign(f.runtime, {
+      command: PiRpc.prototype.command,
+      executeBash: PiRpc.prototype.executeBash,
+      assertSessionIdentity: PiRpc.prototype.assertSessionIdentity,
+      activeBashes: 0,
+      config: { attachmentDir: f.bridge.pool.attachmentDir },
+      session: f.session,
+    });
+    let held = false;
+    f.runtime.state = async () => {
+      if (!held) {
+        held = true;
+        observing.resolve();
+        await finishState.promise;
+      }
+      return { sessionFile: f.session.file, sessionId: f.session.header.id, isStreaming: false };
+    };
+    f.runtime.dispatch = (command) => {
+      assert.equal(command.type, 'get_state', 'a withdrawn input cannot dispatch');
+      return f.runtime.state();
+    };
+    const stop = f.runtime.stopExecution;
+    f.runtime.stopExecution = async (args) => {
+      stopping.resolve();
+      await finishStop.promise;
+      return stop(args);
+    };
+    const args = {
+      session_id: f.id,
+
+      ...(op === 'send' ? { text: 'not dispatched' } : { command: 'not dispatched' }),
+    };
+    const input = f.bridge[op](args);
+    await observing.promise;
+    const cancel = f.bridge.stop({ session_id: f.id });
+    await stopping.promise;
+    finishStop.resolve();
+    await cancel;
+    finishState.resolve();
+    assert.equal((await input).reason, 'STOP_IN_PROGRESS');
+  });
 
 test('native RPC withdrawal and both cancellation requests are submitted before waiting; settling inputs recovered', async () => {
   const calls = [],

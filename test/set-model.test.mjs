@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { fixture, until, choice, releasedEntries } from './fixtures/model-runtime.mjs';
 import { pngImage } from './fixtures/image-input.mjs';
+import { ackTimeout } from './fixtures/ack-timeout.mjs';
+import { AttachedRuntime } from '../src/runtime/attachments.mjs';
 
 const exists = (file) =>
   fs.stat(file).then(
@@ -57,10 +59,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
   const f = await fixture(t),
     { bridge, id } = f;
   const runtime = await bridge.pool.resolve(await bridge.session(id));
-  const command = runtime.command.bind(runtime);
-  t.mock.method(runtime, 'command', (input, timeout, ...rest) =>
-    command(input, input.type === 'set_model' ? 50 : timeout, ...rest),
-  );
+  ackTimeout(t, ['set_model']);
   await fs.writeFile(f.gate + '.hold-selection', 'hold');
   await assert.rejects(
     bridge.set_model({
@@ -126,7 +125,7 @@ test('native selection remains available during unresolved prompt preflight and 
     });
     stopping = bridge.stop({ session_id: id });
     await stopEntered.promise;
-    assert.ok(bridge.locks.has('stop:' + id));
+    assert.ok(Boolean(bridge.lane(id, 'stop')));
     assert.deepEqual(await bridge.set_model({ session_id: id, model: choice('alpha') }), {
       model: choice('alpha'),
       thinking_level: 'off',
@@ -253,20 +252,11 @@ test(
 
 test('send with model and thinking_level works on attached owners via set_model then submit', async (t) => {
   const f = await fixture(t);
-  const calls = [];
-  const attached = {
-    attached: true,
-    alive: true,
-    session: f.session,
-    async selectModel(model, { thinkingLevel }) {
-      calls.push({ op: 'selectModel', model, thinkingLevel });
-      return { model, thinking_level: thinkingLevel };
-    },
-    async submitPrompt(input) {
-      calls.push({ op: 'submitPrompt', input });
-      return { status: 'dispatched', admission: 'unobservable' };
-    },
-  };
+  const attached = new AttachedRuntime(f.config, f.session, {});
+  const request = t.mock.method(attached, 'request', async (op, body, { beforeDispatch }) => {
+    beforeDispatch();
+    return op === 'set_model' ? body : { status: 'dispatched', admission: 'unobservable' };
+  });
   t.mock.method(f.bridge.pool, 'forRead', async () => attached);
   const result = await f.bridge.send({
     session_id: f.id,
@@ -277,9 +267,11 @@ test('send with model and thinking_level works on attached owners via set_model 
   assert.equal(result.status, 'dispatched');
   assert.equal(result.admission, 'unobservable');
   assert.deepEqual(result.model_selection, { model: choice('vision'), thinking_level: 'high' });
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].op, 'selectModel');
-  assert.equal(calls[1].op, 'submitPrompt');
-  assert.equal(calls[1].input.model, undefined);
-  assert.equal(calls[1].input.thinking_level, undefined);
+  assert.deepEqual(
+    request.mock.calls.map(({ arguments: args }) => args.slice(0, 2)),
+    [
+      ['set_model', { model: choice('vision'), thinking_level: 'high' }],
+      ['send', { text: 'Run on companion', mode: 'steer', images: undefined }],
+    ],
+  );
 });

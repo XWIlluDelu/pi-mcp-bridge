@@ -1,5 +1,5 @@
 import { until } from './fixtures/until.mjs';
-import { aiEntry, buildSessionProjection, RpcClient } from './fixtures/pi.mjs';
+import { aiEntry } from './fixtures/pi.mjs';
 
 import { savedEntries } from './fixtures/saved-session.mjs';
 import { test } from 'node:test';
@@ -9,10 +9,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { executeBatch } from '../src/mcp/batch.mjs';
-import { processIdentity } from '../src/runtime/attachments.mjs';
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding } from '../src/runtime/host-bindings.mjs';
-import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { nativeRpcHost } from './fixtures/native-rpc.mjs';
 
 import { nativeOwner } from './fixtures/native-owner.mjs';
 
@@ -24,11 +22,9 @@ async function fixture(t, owned = false) {
       const extension = path.join(dir, 'provider.mjs');
       await fs.writeFile(
         extension,
-        `import fs from 'node:fs';
- import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(aiEntry)};
+        `import {fauxProvider,fauxAssistantMessage} from ${JSON.stringify(aiEntry)};
  export default pi=>{
    globalThis.fetch=async()=>{throw new Error('offline fixture blocks network');};
-   fs.writeFileSync(${JSON.stringify(path.join(dir, 'pid.json'))},JSON.stringify(process.pid));
    const faux=fauxProvider({provider:'stop-native-fixture',models:[{id:'slow'}],tokensPerSecond:40,tokenSize:{min:4,max:4}});
    faux.setResponses(Array.from({length:20},()=>async(context)=>fauxAssistantMessage(JSON.stringify(context.messages.findLast(m=>m.role==='user')?.content).includes('CONTINUE_NORMALLY')?'AFTER_STOP_REPLY':'slow response '.repeat(1000))));
    pi.registerProvider(faux.provider);
@@ -90,14 +86,14 @@ for (const op of ['send', 'command'])
         ],
       });
       await entered.promise;
-      assert.equal(f.bridge.inputs.size, 1);
+      assert.equal(f.bridge.mutations.size, 1);
       const stopped = await f.bridge.stop({ session_id: id });
       assert.equal(stopped.status, 'accepted', JSON.stringify(stopped));
       assert.equal(stopped.acknowledgement, 'native_ack');
       finish.resolve();
       const result = await batch;
       assert.equal(result.results[2].result.reason, 'STOP_IN_PROGRESS', JSON.stringify(result));
-      assert.equal(f.bridge.inputs.size, 0);
+      assert.equal(f.bridge.mutations.size, 0);
       assert.ok(!(await fs.readFile(f.session.file, 'utf8')).includes('MUST_NOT_DISPATCH'));
       const fresh = {
         op,
@@ -112,37 +108,17 @@ for (const op of ['send', 'command'])
         operations: [{ op: 'stop', args: { session_id: id } }, fresh],
       });
       assert.equal(restarted.results[1].result.status, op === 'send' ? 'started' : 'completed');
-      assert.equal(f.bridge.inputs.size, 0);
+      assert.equal(f.bridge.mutations.size, 0);
     },
   );
 
 async function hostedClient(f) {
-  const controller = await reserveHostSession({
-    buildSessionProjection,
-    attachmentDir: f.config.attachmentDir,
-    session: f.session,
-  });
   const env = Object.fromEntries(Object.keys(process.env).map((key) => [key, undefined]));
-  const client = new RpcClient({
-    cliPath: nativePiCli,
-    cwd: f.cwd,
+  const { client, controller } = await nativeRpcHost(f, {
     env: { ...env, ...f.env },
-    args: ['--session', f.session.file, ...f.config.piArgs],
+    args: f.config.piArgs,
   });
-  f.cleanup.push(async () => {
-    try {
-      await client.stop();
-    } finally {
-      await controller.close();
-    }
-  });
-  await client.start();
-  await client.getState();
-  await controller.ready(createRpcHostBinding(client), {
-    owner: await processIdentity(
-      JSON.parse(await fs.readFile(path.join(f.dir, 'pid.json'), 'utf8')),
-    ),
-  });
+  await controller.ready(createRpcHostBinding(client));
   return client;
 }
 
@@ -183,7 +159,7 @@ for (const owned of [true, false])
       assert.equal(stopped.withdrawn_complete, false);
       assert.equal((await bash).cancelled, true);
       const released = async (rpc) => {
-        await until(() => rpc.exited && !f.bridge.autoReleases.size);
+        await until(() => rpc.exited && !rpc.autoReleaseTask);
         assert.equal(rpc.child.exitCode, 0);
       };
       if (client) {

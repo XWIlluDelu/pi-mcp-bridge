@@ -1,9 +1,16 @@
 import {
   batchOperationSchema,
+  inputOperations,
   publicOperationSchemas,
   publicAnnotations,
 } from './tool-schemas.mjs';
-import { TOOL_RESULT_LIMIT, toolResultBytes, jsonBytes, fitsResult } from './response-budget.mjs';
+import {
+  TOOL_RESULT_LIMIT,
+  toolResultBytes,
+  jsonBytes,
+  fitsResult,
+  largestFittingSize,
+} from './response-budget.mjs';
 import { toolFailure } from '../core/errors.mjs';
 
 const BATCH_RESPONSE_LIMIT = 196608; // UTF-8 bytes, inside the MCP envelope.
@@ -58,22 +65,13 @@ function fitQuery(op, result, args, budget) {
   if (op === 'models' || op === 'list') {
     const key = op === 'models' ? 'models' : 'sessions',
       rows = result[key];
-    let low = 1,
-      high = rows.length - 1,
-      best;
-    while (low <= high) {
-      const count = Math.floor((low + high) / 2);
-      const page = {
-        ...result,
-        [key]: rows.slice(0, count),
-        next_offset: (args.offset ?? 0) + count,
-      };
-      if (fitsResult(page, budget)) {
-        best = page;
-        low = count + 1;
-      } else high = count - 1;
-    }
-    if (best) return best;
+    const page = (count) => ({
+      ...result,
+      [key]: rows.slice(0, count),
+      next_offset: (args.offset ?? 0) + count,
+    });
+    const count = largestFittingSize(rows.length - 1, (size) => fitsResult(page(size), budget));
+    if (count) return page(count);
   }
   throw new Error('BATCH_QUERY_BUDGET_TOO_SMALL');
 }
@@ -98,9 +96,7 @@ export async function executeBatch(bridge, { operations }, { requestContext } = 
         return { index, op, error: toolFailure(error) };
       }
     }
-    const pendingInput = ['send', 'command', 'compact', 'reload'].includes(op)
-      ? bridge.registerInput(sessionId)
-      : undefined;
+    const pendingInput = inputOperations.has(op) ? bridge.registerInput(sessionId) : undefined;
     if (pendingInput) inputs.add(pendingInput);
     const lane = sessionId ?? args.fork_from ?? index;
     const previous = lanes.get(lane) ?? Promise.resolve();
@@ -132,6 +128,6 @@ export async function executeBatch(bridge, { operations }, { requestContext } = 
     return envelope(results);
   } finally {
     for (const release of readPins) release();
-    for (const input of inputs) bridge.inputs.delete(input);
+    for (const input of inputs) bridge.mutations.delete(input);
   }
 }

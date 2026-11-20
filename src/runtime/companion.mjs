@@ -1,4 +1,3 @@
-import packageInfo from '../../package.json' with { type: 'json' };
 // Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
@@ -15,14 +14,16 @@ import {
   sameSessionIdentity,
 } from '../core/data.mjs';
 import { atomicJson } from '../core/storage.mjs';
-import { READ_CONTRACT } from '../read/context-read.mjs';
 import { attachedPromptInput, remotePromptRejection } from '../ops/prompt-input.mjs';
 import {
   ownerServer,
+  closeOwnerServer,
   listenPrivate,
   ownerIdentity,
+  ownerProtocol,
   ownerReadFeatures,
-  ownerRead,
+  nativeSnapshot,
+  nativeOwnerRead,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
 import {
@@ -153,12 +154,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
     if (other && !['rpc', 'host', 'handoff'].includes(other.kind) && sameOwner(other.owner, owner))
       await retireClaim(dir, replacement.session, other);
   }
-  async function closeServer(runtime) {
-    if (!runtime) return;
-    runtime.ready = false;
-    for (const socket of runtime.connections) socket.destroy();
-    if (runtime.server) await new Promise((resolve) => runtime.server.close(resolve));
-  }
   async function validateStorage(runtime) {
     try {
       if (
@@ -224,10 +219,11 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
     try {
       await updateOwner(dir, current.session, current.record, { phase: 'transitioning' });
     } finally {
-      await closeServer(runtime);
-      // IPC disconnect is not completion: keep the old claim and native
-      // context until admitted setters/compaction can no longer append.
-      await Promise.allSettled(runtime ? [...runtime.mutations] : []);
+      if (runtime) {
+        await closeOwnerServer(runtime.server, runtime.connections);
+        // IPC disconnect does not end admitted native work.
+        await Promise.allSettled(runtime.mutations);
+      }
       if (['reload', 'new', 'resume', 'fork'].includes(event.reason))
         replacements.set(replacementKey(dir, current.session.file), {
           ...current,
@@ -400,18 +396,14 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               record,
               nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
             );
-          else if (request.op === 'read' && args.view === 'runtime')
-            data = { ...ownerIdentity(record), ...runtime.observation.read(args, ctx) };
-          else if (['read', 'snapshot'].includes(request.op)) {
-            const source = { entries: manager.getEntries(), leafId: manager.getLeafId() };
-            data =
-              request.op === 'snapshot'
-                ? { ...ownerIdentity(record), ...source }
-                : ownerRead(record, { ...source, live: runtime.liveMessage.snapshot() }, args, {
-                    buildSessionProjection,
-                    readAdapters: request.readAdapters,
-                  });
-          } else if (request.op === 'reload') {
+          else if (request.op === 'snapshot')
+            data = { ...ownerIdentity(record), ...nativeSnapshot(manager) };
+          else if (request.op === 'read')
+            data = nativeOwnerRead(record, args, ctx, runtime.observation, runtime.liveMessage, {
+              buildSessionProjection,
+              readAdapters: request.readAdapters,
+            });
+          else if (request.op === 'reload') {
             if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
             const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
             runtime.reload = operation;
@@ -501,8 +493,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       await updateOwner(dir, session, record, {
         phase: 'ready',
         imagesSupported: true,
-        bridgeVersion: packageInfo.version,
-        readContract: READ_CONTRACT,
+        ...ownerProtocol,
         reloadSupported: true,
       });
     } catch (error) {

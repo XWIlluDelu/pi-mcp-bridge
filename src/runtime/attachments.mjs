@@ -17,7 +17,6 @@ import { knownErrorCode } from '../core/errors.mjs';
 // Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
 import { modelSettings } from '../ops/set-model.mjs';
-import { constants } from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { assertReadFeatures } from '../read/read-features.mjs';
@@ -33,7 +32,7 @@ import {
   atomicJson,
   sessionKey,
   assertPrivateDirectory,
-  readBoundedText,
+  readPrivateInode,
 } from '../core/storage.mjs';
 import { kernelLock } from '../core/kernel-lock.mjs';
 export class AttachmentFailure extends Error {
@@ -113,16 +112,9 @@ export async function readClaim(dir, session) {
   return readOwnerRecord(claimFile(dir, session), { expectedFile: session.file });
 }
 export async function readOwnerRecord(file, { expectedFile, target, owner } = {}) {
-  let handle;
   try {
-    // Validate the opened inode and bound the read itself, including growth after stat.
-    // NONBLOCK also prevents a replaced special file from hanging registry scans.
-    handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const stat = await handle.stat();
-    if (!stat.isFile() || stat.uid !== process.getuid() || stat.mode & 0o077) throw new Error();
-    const record = JSON.parse(
-      await readBoundedText(handle, stat.size, 8192, 'INVALID_ATTACHMENT_RECORD'),
-    );
+    const { text } = await readPrivateInode(file, 8192);
+    const record = JSON.parse(text);
     const identified =
       Number.isSafeInteger(record?.owner?.pid) &&
       record.owner.pid > 0 &&
@@ -153,8 +145,6 @@ export async function readOwnerRecord(file, { expectedFile, target, owner } = {}
   } catch (e) {
     if (e.code === 'ENOENT') return null;
     throw new AttachmentFailure('INVALID_ATTACHMENT_RECORD');
-  } finally {
-    await handle?.close();
   }
 }
 // Call while holding registryTransaction: a changed header must not bypass
@@ -204,15 +194,20 @@ export async function assertNoOtherLiveOwner(dir, session, options) {
   }
   return current;
 }
-export async function reserveOwner(dir, session, kind, owner = undefined) {
+export async function vacantClaim(dir, session) {
+  const current = await assertNoOtherLiveOwner(dir, session);
+  if (current && (await ownerAlive(current.owner)))
+    throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+  return current;
+}
+export async function reserveOwner(dir, session, kind, owner = undefined, handoff) {
   return registryTransaction(dir, async () => {
-    await assertSingleSessionFile(session.file);
-    const old = await assertNoOtherLiveOwner(dir, session);
-    if (old && (await ownerAlive(old.owner))) throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-    // Only explicit owner-local release pauses cold resume. Ordinary join
-    // reservations are protected by their exact live process identity.
+    if (!handoff) await assertSingleSessionFile(session.file);
+    const old = await vacantClaim(dir, session);
     if (kind === 'rpc' && old?.noColdReacquire)
       throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
+    if (handoff && !(await ownerAlive(owner)))
+      throw new AttachmentFailure('HANDOFF_REQUESTER_GONE');
     const generation = randomUUID();
     const record = {
       ...(old?.noColdReacquire ? { noColdReacquire: true } : {}),
@@ -220,10 +215,15 @@ export async function reserveOwner(dir, session, kind, owner = undefined) {
       file: session.file,
       sessionId: session.header.id,
       generation,
-      socket: path.join(dir, `${process.pid}-${generation.slice(0, 8)}.sock`),
       owner: owner ?? (await processIdentity()),
-      phase: 'starting',
+      ...(handoff
+        ? { phase: 'reserved', handoffId: handoff.id }
+        : {
+            phase: 'starting',
+            socket: path.join(dir, `${process.pid}-${generation.slice(0, 8)}.sock`),
+          }),
     };
+    handoff?.signal.throwIfAborted();
     await atomicJson(claimFile(dir, session), record);
     return record;
   });
@@ -386,8 +386,8 @@ async function terminateOwnerForDelete(config, session, record) {
           if (error.code !== 'ENOENT') throw error;
         });
     }
+    await retireClaim(config.attachmentDir, session, current);
   });
-  await releaseOwner(config.attachmentDir, session, record);
 }
 // Owner refusals that prove the operation took no effect. Any other error
 // after a mutating request was written leaves its outcome uncertain.
@@ -421,6 +421,7 @@ const DEFINITE_REFUSALS = {
   ],
   bash: ['BASH_UNSUPPORTED'],
   stop: ['STOP_UNSUPPORTED'],
+  release: [],
 };
 // Another admitted operation holds the owner; nothing was dispatched.
 const BUSY_REFUSALS = ['STOP_IN_PROGRESS', 'BASH_IN_PROGRESS', 'RELOAD_IN_PROGRESS'];
@@ -430,23 +431,12 @@ const OWNED_COMPACT_REFUSALS = [
   'INVALID_ARGUMENTS',
   'RUNTIME_SHUTTING_DOWN',
 ];
-const MUTATING_OPS = new Set([
-  'set_model',
-  'send',
-  'stop',
-  'bash',
-  'compact',
-  'reload',
-  'seal',
-  'release',
-]);
 export class AttachedRuntime {
   constructor(config, session, record, { compatibility } = {}) {
     this.compatibility = compatibility;
     this.config = config;
     this.session = session;
     this.record = record;
-    this.alive = true;
     this.attached = true;
   }
   // One owner exchange. A null timeout leaves the wait to the caller's signal.
@@ -493,7 +483,7 @@ export class AttachedRuntime {
     if (Buffer.byteLength(serialized) > MAX_ATTACHMENT_REQUEST_BYTES)
       throw new AttachmentFailure('ATTACHMENT_REQUEST_TOO_LARGE');
     const ownedCompact = op === 'compact' && current.kind === 'rpc';
-    const mutating = MUTATING_OPS.has(op);
+    const mutating = Object.hasOwn(DEFINITE_REFUSALS, op);
     signal?.throwIfAborted();
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(current.socket);
@@ -512,17 +502,15 @@ export class AttachedRuntime {
         if (error && partial !== undefined) error.result = partial;
         error ? reject(error) : resolve(value);
       };
+      const fail = (code, { definite = false, nativeReason } = {}) => {
+        const error = new AttachmentFailure(code, written && mutating && !definite);
+        if (nativeReason !== undefined) error.native_reason = nativeReason;
+        finish(error);
+      };
       // Owned compaction has one timer/late-ACK ledger in PiRpc. Its transport
       // remains open after that caller times out, until a reply or exact exit.
-      const abort = () =>
-        finish(new AttachmentFailure('LIVE_OWNER_UNREACHABLE', written && mutating));
-      const timer =
-        timeout === null
-          ? undefined
-          : setTimeout(
-              () => finish(new AttachmentFailure('ACK_TIMEOUT', written && mutating)),
-              timeout,
-            );
+      const abort = () => fail('LIVE_OWNER_UNREACHABLE');
+      const timer = timeout === null ? undefined : setTimeout(() => fail('ACK_TIMEOUT'), timeout);
       signal?.addEventListener('abort', abort, { once: true });
       socket.on('error', abort);
       socket.on('end', abort);
@@ -552,12 +540,7 @@ export class AttachedRuntime {
               ? MAX_ATTACHMENT_REQUEST_BYTES
               : 256 * 1024 + 2048)
         )
-          finish(
-            new AttachmentFailure(
-              op === 'snapshot' ? 'SESSION_TOO_LARGE' : 'INVALID_ATTACHMENT_RESPONSE',
-              written && mutating,
-            ),
-          );
+          fail(op === 'snapshot' ? 'SESSION_TOO_LARGE' : 'INVALID_ATTACHMENT_RESPONSE');
       });
       lines = readLfLines(socket, (line) => {
         if (done) return;
@@ -569,7 +552,7 @@ export class AttachedRuntime {
             response.file !== this.session.file ||
             response.sessionId !== this.session.header.id
           )
-            return finish(new AttachmentFailure('RUNTIME_SESSION_CHANGED', written && mutating));
+            return fail('RUNTIME_SESSION_CHANGED');
           const failed = Object.hasOwn(response, 'error');
           const partialReply = response.partial === true;
           if (
@@ -580,19 +563,16 @@ export class AttachedRuntime {
           )
             throw new Error('INVALID_ATTACHMENT_RESPONSE');
           const { error, data } = response;
-          if (error === 'OWNER_COMPONENT_UPDATE_REQUIRED')
-            return finish(new AttachmentFailure(error));
+          if (error === 'OWNER_COMPONENT_UPDATE_REQUIRED') return fail(error, { definite: true });
           if (failed) {
             const refusals = ownedCompact ? OWNED_COMPACT_REFUSALS : DEFINITE_REFUSALS[op];
             const definite =
               refusals?.includes(error) ||
               (!ownedCompact && op !== 'seal' && BUSY_REFUSALS.includes(error));
-            const failure = new AttachmentFailure(
-              knownErrorCode(error, 'ATTACHED_OPERATION_FAILED'),
-              written && mutating && !definite,
-            );
-            if (ownedCompact) failure.native_reason = nativeCompactReason(response.native_reason);
-            return finish(failure);
+            return fail(knownErrorCode(error, 'ATTACHED_OPERATION_FAILED'), {
+              definite,
+              nativeReason: ownedCompact ? nativeCompactReason(response.native_reason) : undefined,
+            });
           }
           if (ownedCompact) return finish(null, compactMetadata(data));
           if (op === 'seal') {
@@ -611,7 +591,7 @@ export class AttachedRuntime {
           }
           finish(null, data);
         } catch {
-          finish(new AttachmentFailure('INVALID_ATTACHMENT_RESPONSE', written && mutating));
+          fail('INVALID_ATTACHMENT_RESPONSE');
         }
       });
     });
@@ -662,39 +642,46 @@ export class AttachedRuntime {
       throw new AttachmentFailure('INVALID_HOST_SNAPSHOT');
     return result;
   }
-  async selectModel(model, { thinkingLevel, beforeDispatch } = {}) {
-    const value = await this.request(
+  async #mutationResult(op, body, beforeDispatch, parse) {
+    const value = await this.request(op, body, { beforeDispatch });
+    try {
+      return parse(value);
+    } catch (error) {
+      // A malformed result cannot prove the dispatched mutation failed.
+      error.uncertain = true;
+      throw error;
+    }
+  }
+  selectModel(model, { thinkingLevel, beforeDispatch } = {}) {
+    return this.#mutationResult(
       'set_model',
       {
         ...(model ? { model } : {}),
         ...(thinkingLevel !== undefined ? { thinking_level: thinkingLevel } : {}),
       },
-      { beforeDispatch },
+      beforeDispatch,
+      modelSettings,
     );
-    try {
-      return modelSettings(value);
-    } catch (error) {
-      error.uncertain = true;
-      throw error;
-    }
   }
-  async submitPrompt(input, { authorize }) {
-    if (hasPromptSettings(input)) throw new AttachmentFailure('MODEL_SELECTION_UNSUPPORTED');
-    const { images, text, mode } = input;
+  async submitPrompt(input, { authorize, selection }) {
+    const { images, text, mode, model, thinking_level } = input;
+    if (hasPromptSettings(input)) {
+      // Owners accept settings and input as distinct operations. Keep the
+      // observed selection in the receipt even if dispatch is later refused.
+      selection.model_selection = await this.selectModel(model, {
+        thinkingLevel: thinking_level,
+        beforeDispatch: authorize,
+      });
+      await authorize?.();
+    }
     if (images && this.record.imagesSupported !== true)
       throw new AttachmentFailure('IMAGE_INPUT_UNSUPPORTED');
     return attachedPromptResult(
       await this.request('send', { text, images, mode }, { beforeDispatch: authorize }),
     );
   }
-  async executeBash({ command, max_chars, beforeDispatch }) {
-    const result = await this.request('bash', { command, max_chars }, { beforeDispatch });
-    try {
-      return inlineBashResult(result);
-    } catch (error) {
-      error.uncertain = true;
-      throw error;
-    }
+  executeBash({ command, max_chars, beforeDispatch }) {
+    return this.#mutationResult('bash', { command, max_chars }, beforeDispatch, inlineBashResult);
   }
   async reload(beforeDispatch) {
     if (this.record.reloadSupported !== true) throw new AttachmentFailure('RELOAD_UNSUPPORTED');
@@ -776,18 +763,12 @@ export class AttachedRuntime {
   compact(body, beforeDispatch) {
     return this.request('compact', body, { beforeDispatch });
   }
-  async stopExecution({ max_chars } = {}) {
-    const result = await this.request('stop', { max_chars });
-    try {
-      return { ...stopReceipt(result), withdrawal: inlineWithdrawal(result?.withdrawal) };
-    } catch (error) {
-      error.uncertain = true;
-      throw error;
-    }
+  stopExecution({ max_chars } = {}) {
+    return this.#mutationResult('stop', { max_chars }, undefined, (result) => ({
+      ...stopReceipt(result),
+      withdrawal: inlineWithdrawal(result.withdrawal),
+    }));
   }
-  async stop() {
-    this.alive = false;
-  } // Disconnect only. Never shut down external Pi on bridge close.
   async stopForDelete() {
     if (this.record.kind === 'host') {
       // Prefer session-local close for SDK hosts that may share a process.
@@ -808,11 +789,9 @@ export class AttachedRuntime {
         const current = await readClaim(this.config.attachmentDir, this.session);
         if (current && !(isReleasedOwner(current) && current.generation === this.record.generation))
           throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
-        this.alive = false;
         return;
       }
     }
     await terminateOwnerForDelete(this.config, this.session, this.record);
-    this.alive = false;
   }
 }

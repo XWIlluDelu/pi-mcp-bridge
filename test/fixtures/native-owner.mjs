@@ -1,8 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { Bridge } from '../../src/core/bridge.mjs';
-import { ownerAlive, readClaim, waitOwnerExit } from '../../src/runtime/attachments.mjs';
+import {
+  ownerAlive,
+  processIdentity,
+  readClaim,
+  waitOwnerExit,
+} from '../../src/runtime/attachments.mjs';
 import { isolatedRuntime, nativePiCli } from './isolated-runtime.mjs';
 import { denyAllPermissions } from './permissions.mjs';
 import { savedSession } from './saved-session.mjs';
@@ -11,6 +17,18 @@ import { until } from './until.mjs';
 const faux = new URL('./faux-extension.mjs', import.meta.url).pathname;
 const companion = new URL('../../src/attach-extension.mjs', import.meta.url).pathname;
 export const fauxArgs = ['-e', faux, '--provider', 'bridge-fixture', '--model', 'deterministic'];
+
+export async function idleProcess(t) {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  const exited = once(child, 'exit');
+  void exited.catch(() => {});
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    await exited;
+  });
+  await once(child, 'spawn');
+  return { child, exited, owner: await processIdentity(child.pid) };
+}
 
 export async function nativeOwner(
   t,

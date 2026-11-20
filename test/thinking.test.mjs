@@ -131,7 +131,7 @@ test(
 );
 
 test(
-  'prompt ACK timeout retains verified settings and a late ACK never resubmits',
+  'a missing prompt ACK retains settings and the writer until exact late admission',
   { timeout: 15000 },
   async (t) => {
     const f = await fixture(t),
@@ -158,6 +158,10 @@ test(
     assert.equal(unknown.status, 'unknown');
     assert.equal(unknown.model_selection.thinking_level, 'high');
     await until(() => rpc.settlementSequence > 0);
+    await rpc.autoReleaseTask;
+    assert.ok(held);
+    assert.ok(rpc.hasPendingCommand('prompt'));
+    assert.equal(rpc.child.stdin.writableEnded, false);
     receive(...held);
     const entries = await releasedEntries(bridge, id);
     assert.equal(entries.filter((e) => e.message?.role === 'user').length, 1);

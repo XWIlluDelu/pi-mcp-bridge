@@ -1,4 +1,3 @@
-import packageInfo from '../../package.json' with { type: 'json' };
 import fs from 'node:fs/promises';
 import {
   resolvePiInstallation,
@@ -11,8 +10,7 @@ import { findHerdr } from './herdr-control.mjs';
 import { HerdrRpcTransport, prepareHerdr } from './herdr-rpc-transport.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { readLfLines } from '../core/lf-lines.mjs';
-import { READ_CONTRACT } from '../read/context-read.mjs';
-import { nativeBusy, pendingMessages } from './attachment-protocol.mjs';
+import { nativeBusy, pendingMessages, ownerProtocol } from './attachment-protocol.mjs';
 import { sameModel, assertThinkingLevel } from '../ops/models.mjs';
 import {
   assertPromptSelection,
@@ -20,12 +18,11 @@ import {
   promptOptions,
   promptResult,
 } from '../ops/prompt-input.mjs';
-import { modelSettings } from '../ops/set-model.mjs';
+import { applyModelSettings, modelSettings } from '../ops/set-model.mjs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   loadSavedSession,
-  sameSessionIdentity,
   servesSession,
   traceSessionBranch,
   validateExecutionCwd,
@@ -87,7 +84,6 @@ export class PiRpc {
     this.activeBashes = 0;
     this.uiFacts = uiFacts();
     this.phase = 'startup';
-    this.ackTasks = new Set();
     this.alive = false;
     this.exited = false;
     this.generation = randomUUID();
@@ -169,15 +165,14 @@ export class PiRpc {
       }
       signal?.throwIfAborted();
       this.child = herdrControl
-        ? new HerdrRpcTransport(herdr, launch, { signal, control: herdrControl })
+        ? new HerdrRpcTransport(herdrControl, launch, { signal })
         : spawn(launch.command, launch.args, {
             cwd: launch.cwd,
             env: launch.env,
             stdio: ['pipe', 'pipe', 'pipe'],
           });
     } catch (error) {
-      if (this.ownerRecord)
-        await releaseOwner(this.config.attachmentDir, this.session, this.ownerRecord);
+      await this.#releaseClaim();
       throw error;
     }
     this.alive = true;
@@ -197,7 +192,6 @@ export class PiRpc {
     });
     this.child.once('exit', () => {
       runtimeLog('runtime.exited', { kind: 'rpc', generation: this.generation });
-      this.exited = true;
       fail();
     });
     this.child.stdin.on('error', fail);
@@ -219,8 +213,7 @@ export class PiRpc {
       await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
         owner,
         phase: 'ready',
-        bridgeVersion: packageInfo.version,
-        readContract: READ_CONTRACT,
+        ...ownerProtocol,
       });
       // Launch identity is now usable even if native readiness or its failure
       // cleanup never finishes. Delete need not wait for the ready promise.
@@ -243,20 +236,14 @@ export class PiRpc {
     }
   }
   clearPending() {
-    for (const request of this.pending.values()) {
-      clearTimeout(request.timer);
-      request.controller?.abort();
-      request.reject(
-        Object.assign(
-          new RpcFailure(
-            this.startFailure?.code ?? 'RUNTIME_DISCONNECTED',
-            request.written && !READ_COMMANDS.has(request.commandType),
-          ),
-          uiSnapshot(request.uiFacts),
-        ),
+    for (const req of this.pending.values()) {
+      if (req.ack) continue; // Already received. Let the receipt finish.
+      this.#forget(req);
+      req.controller?.abort();
+      req.waiter?.reject(
+        this.startFailure ?? this.#failure(req, 'RUNTIME_DISCONNECTED', req.written),
       );
     }
-    this.pending.clear();
   }
   receiveResponse(event, generation) {
     if (generation !== this.generation || !event) return;
@@ -276,7 +263,7 @@ export class PiRpc {
       this.uiFacts[phase].add(event.method);
       let log = diagnostics.capture();
       for (const request of this.pending.values()) {
-        if (request.commandType !== 'prompt') continue;
+        if (request.type !== 'prompt' || request.ack) continue;
         (request.uiFacts ??= uiFacts())[phase].add(event.method);
         log = request.log;
       }
@@ -294,11 +281,7 @@ export class PiRpc {
         );
       } else if (phase === 'startup') {
         this.startFailure = Object.assign(new RpcFailure(code), uiSnapshot(this.uiFacts));
-        for (const [id, request] of this.pending) {
-          clearTimeout(request.timer);
-          request.reject(this.startFailure);
-          this.pending.delete(id);
-        }
+        this.clearPending();
       }
       return;
     }
@@ -312,16 +295,16 @@ export class PiRpc {
     const req = this.pending.get(event.id);
     if (
       !req ||
-      req.generation !== generation ||
       req.controller ||
-      event.command !== req.commandType ||
+      req.ack ||
+      event.command !== req.type ||
       typeof event.success !== 'boolean'
     )
       return;
     // Only the matching prompt ACK is evidence of completed admission. State,
     // timers, unrelated events and malformed responses cannot clear uncertainty.
     if (
-      req.commandType === 'prompt' &&
+      req.type === 'prompt' &&
       event.success &&
       !['started', 'queued', 'handled'].includes(event.data?.disposition)
     )
@@ -332,81 +315,97 @@ export class PiRpc {
       : {
           ok: false,
           code: 'PI_REJECTED',
-          ...(req.commandType === 'compact'
-            ? { native_reason: nativeCompactReason(event.error) }
-            : {}),
+          ...(req.type === 'compact' ? { native_reason: nativeCompactReason(event.error) } : {}),
           ...ui,
         };
-    this.settleResponse(event.id, generation, result);
+    this.#receive(req, result);
   }
-  settleResponse(id, generation, result) {
-    if (generation !== this.generation) return;
-    const req = this.pending.get(id);
-    if (!req || req.generation !== generation) return;
-    this.pending.delete(id);
+  #forget(req) {
+    this.pending.delete(req.id);
+    clearTimeout(req.timer);
+  }
+  #failure(req, code, written = false, native_reason) {
+    return Object.assign(new RpcFailure(code, written && !req.read), uiSnapshot(req.uiFacts), {
+      native_reason,
+    });
+  }
+  #loseResponse(req, code) {
+    if (this.pending.get(req.id) !== req || !req.waiter) return;
+    const { reject } = req.waiter;
+    clearTimeout(req.timer);
+    req.waiter = null;
+    if (req.read || !req.written) {
+      this.pending.delete(req.id);
+      req.controller?.abort();
+    }
+    reject(this.#failure(req, code, req.written));
+    if (!req.read && !req.written) this.onIdleCandidate?.();
+  }
+  #receive(req, result) {
+    if (this.pending.get(req.id) !== req || req.ack) return;
     clearTimeout(req.timer);
     // A started/queued ACK is admission, never completion. In the supported
     // owned RPC path its run must subsequently settle, including queued work.
     if (
-      req.commandType === 'prompt' &&
+      req.type === 'prompt' &&
       result.ok &&
       ['started', 'queued'].includes(result.data?.disposition)
     )
       this.requiredSettlementSequence = Math.max(
         this.requiredSettlementSequence,
-        (req.settlementSequence ?? this.settlementSequence) + 1,
+        req.settlementSequence + 1,
       );
-    const notifyIdle = () => {
-      if (!READ_COMMANDS.has(req.commandType)) this.onIdleCandidate?.();
-    };
-    const ui = uiSnapshot(req.uiFacts);
-    if (req.timedOut) {
-      req.log?.('rpc.late_ack', {
-        op: req.commandType,
-        generation,
+    if (req.waiter) {
+      this.#forget(req);
+      if (result.ok) req.waiter.resolve(result.data);
+      else req.waiter.reject(this.#failure(req, result.code, false, result.native_reason));
+    } else {
+      req.log('rpc.late_ack', {
+        op: req.type,
+        generation: this.generation,
         late: true,
         status: result.ok ? 'ok' : 'error',
       });
-      if (req.onLate) this.trackAck(() => req.onLate(result));
-      notifyIdle();
-      return;
+      if (!req.onLate) this.#forget(req);
+      else {
+        const done = Promise.withResolvers();
+        req.ack = done.promise;
+        void (async () => {
+          try {
+            await req.onLate(result);
+          } catch (error) {
+            diagnostics.emit('operation.failure', {
+              code: error.code ?? 'OTHER_ERROR',
+              uncertain: true,
+            });
+          } finally {
+            this.#forget(req);
+            done.resolve();
+            this.onIdleCandidate?.();
+          }
+        })();
+        return;
+      }
     }
-    if (result.ok) req.resolve(result.data);
-    else
-      req.reject(
-        Object.assign(new RpcFailure(result.code), ui, { native_reason: result.native_reason }),
-      );
-    notifyIdle();
-  }
-  trackAck(work) {
-    let task;
-    try {
-      task = Promise.resolve(work());
-    } catch (error) {
-      task = Promise.reject(error);
-    }
-    this.ackTasks.add(task);
-    task.then(
-      () => this.ackTasks.delete(task),
-      (error) => {
-        this.ackTasks.delete(task);
-        diagnostics.emit('operation.failure', {
-          code: error.code ?? 'OTHER_ERROR',
-          uncertain: true,
-        });
-      },
-    );
-    return task;
+    if (!req.read) this.onIdleCandidate?.();
   }
   async drainAcks() {
-    // Only ACKs already received create work here. Missing ACKs must not turn
-    // normal shutdown into an unlimited wait for a disconnected runtime.
-    while (this.ackTasks.size) await Promise.allSettled([...this.ackTasks]);
+    for (;;) {
+      const received = this.pending
+        .values()
+        .map(({ ack }) => ack)
+        .filter(Boolean)
+        .toArray();
+      if (!received.length) return;
+      await Promise.all(received);
+    }
   }
   async command(command, { onLate, beforeDispatch, ...options } = {}) {
     await this.state();
+    const bash = command.type === 'bash';
+    const recheck = bash || ADMISSION_COMMANDS.has(command.type);
     const late =
-      (ADMISSION_COMMANDS.has(command.type) || onLate) &&
+      (recheck || onLate) &&
       (async (result) => {
         await this.state();
         await onLate?.(result);
@@ -416,13 +415,15 @@ export class PiRpc {
     try {
       result = await this.dispatch(command, { ...options, onLate: late, beforeDispatch });
     } catch (error) {
+      if (bash && error.code === 'PI_REJECTED') error.uncertain = true;
+      if (bash) throw error;
       if (error.code !== 'PI_REJECTED') throw error;
       rejection = error;
     }
     try {
       await this.state();
     } catch (error) {
-      if (ADMISSION_COMMANDS.has(command.type)) error.uncertain = true;
+      if (recheck) error.uncertain = true;
       const observedUI = result?.ui ?? rejection?.ui;
       if (observedUI && !error.ui) error.ui = observedUI;
       throw error;
@@ -440,112 +441,84 @@ export class PiRpc {
       () => this.#write(command, options),
     );
   }
-  #write(command, { timeout = 5000, onLate, beforeDispatch, allowBusySelection = false }) {
-    if (this.startFailure) return Promise.reject(this.startFailure);
-    if (!this.alive) return Promise.reject(new RpcFailure('RUNTIME_DISCONNECTED'));
-    if (this.handoffPending && !['get_state', 'get_entries'].includes(command.type))
-      return Promise.reject(new RpcFailure('HANDOFF_PENDING'));
-    if (this.gracefulExitPromise) return Promise.reject(new RpcFailure('RUNTIME_SHUTTING_DOWN'));
-    if (
-      ADMISSION_COMMANDS.has(command.type) &&
-      this.hasPendingCommand('compact') &&
-      !(allowBusySelection && MODEL_COMMANDS.has(command.type))
-    )
-      return Promise.reject(new RpcFailure('COMPACTION_PENDING'));
-    if (ADMISSION_COMMANDS.has(command.type) && this.hasPendingModelSelection())
-      return Promise.reject(new RpcFailure('MODEL_SELECTION_PENDING'));
-    if (['prompt', 'compact'].includes(command.type) && this.hasPendingCommand('prompt'))
-      return Promise.reject(new RpcFailure('PROMPT_ADMISSION_PENDING'));
-    const id = command.id ?? randomUUID(),
-      generation = this.generation;
+  async #write(
+    { id: requestId, type, idleOnly, ...body },
+    { timeout = 5000, onLate, beforeDispatch, allowBusySelection = false },
+  ) {
+    if (this.startFailure) throw this.startFailure;
+    if (!this.alive) throw new RpcFailure('RUNTIME_DISCONNECTED');
+    if (this.handoffPending && type !== 'get_state' && type !== 'get_entries')
+      throw new RpcFailure('HANDOFF_PENDING');
+    if (this.gracefulExitPromise) throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+    if (ADMISSION_COMMANDS.has(type)) {
+      if (this.hasPendingCommand('compact') && !(allowBusySelection && MODEL_COMMANDS.has(type)))
+        throw new RpcFailure('COMPACTION_PENDING');
+      if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
+      if ((type === 'prompt' || type === 'compact') && this.hasPendingCommand('prompt'))
+        throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    }
+    const id = requestId ?? randomUUID();
     if (typeof id !== 'string' || !id.length || id.length > 128 || this.pending.has(id))
-      return Promise.reject(new RpcFailure('INVALID_ARGUMENTS'));
-    const { idleOnly, ...nativeCommand } = command;
-    const guardedCompact = command.type === 'compact' && idleOnly === true;
-    const read = READ_COMMANDS.has(command.type);
+      throw new RpcFailure('INVALID_ARGUMENTS');
+    const guardedCompact = type === 'compact' && idleOnly === true;
     if (guardedCompact && !this.ownerRecord)
-      return Promise.reject(new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED'));
-    const serialized = `${JSON.stringify({ ...nativeCommand, id })}\n`;
-    return new Promise((resolve, reject) => {
-      const req = {
-        resolve,
-        reject,
-        onLate: onLate && diagnostics.bind(onLate),
-        generation,
-        commandType: command.type,
-        settlementSequence: this.settlementSequence,
-        written: false,
-        timedOut: false,
-        log: diagnostics.capture(),
-      };
-      const lostResponse = (code) => {
-        req.timedOut = true;
-        if (read) this.pending.delete(id); // No late result or mutation fence to retain.
-        reject(Object.assign(new RpcFailure(code, !read && req.written), uiSnapshot(req.uiFacts)));
-      };
-      req.timer = setTimeout(() => {
-        if (guardedCompact && !req.written) {
-          this.settleResponse(id, generation, { ok: false, code: 'ACK_TIMEOUT' });
-          req.controller.abort();
-          return;
-        }
-        lostResponse('ACK_TIMEOUT');
-      }, timeout);
-      this.pending.set(id, req);
-      if (guardedCompact) {
-        req.controller = new AbortController();
-        const transport = new AttachedRuntime(this.config, this.session, this.ownerRecord);
-        void transport
-          .request(
-            'compact',
-            { instructions: command.customInstructions ?? '' },
-            {
-              timeout: null,
-              signal: req.controller.signal,
-              onWrite: () => {
-                // This is Bridge's synchronous input fence. No await may
-                // separate the final Stop/lifecycle check from the actual write.
-                beforeDispatch?.();
-                if (!this.alive || this.handoffPending || this.gracefulExitPromise)
-                  throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
-                req.written = true;
-              },
-            },
-          )
-          .then(
-            (data) => this.settleResponse(id, generation, { ok: true, data }),
-            (error) => {
-              if (!this.pending.has(id)) return;
-              if (error.uncertain) {
-                // Lost control transport is not evidence of native completion.
-                clearTimeout(req.timer);
-                req.timedOut = true;
-                req.reject(new RpcFailure(error.code ?? 'WRITE_UNKNOWN', true));
-              } else
-                this.settleResponse(id, generation, {
-                  ok: false,
-                  code: error.code ?? error.message,
-                  native_reason: error.native_reason,
-                });
-            },
-          );
-        return;
-      }
-      req.written = true;
-      const writeFailed = () => {
-        clearTimeout(req.timer);
-        // A write error does not prove that Pi failed to receive the command.
-        // Keep matching ACK recovery possible and keep the admission fence.
-        lostResponse('WRITE_UNKNOWN');
-      };
+      throw new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
+    const frame = guardedCompact ? null : `${JSON.stringify({ type, ...body, id })}\n`;
+    const waiter = Promise.withResolvers();
+    const req = {
+      id,
+      type,
+      waiter,
+      read: READ_COMMANDS.has(type),
+      settlementSequence: this.settlementSequence,
+      onLate: onLate && diagnostics.bind(onLate),
+      log: diagnostics.capture(),
+      written: false,
+      controller: guardedCompact ? new AbortController() : undefined,
+    };
+    this.pending.set(id, req);
+    req.timer = setTimeout(() => this.#loseResponse(req, 'ACK_TIMEOUT'), timeout);
+    if (guardedCompact) void this.#writeCompact(req, body.customInstructions ?? '', beforeDispatch);
+    else {
       try {
-        this.child.stdin.write(serialized, (err) => {
-          if (err) writeFailed();
+        req.written = true;
+        this.child.stdin.write(frame, (error) => {
+          if (error) this.#loseResponse(req, 'WRITE_UNKNOWN');
         });
       } catch {
-        writeFailed();
+        this.#loseResponse(req, 'WRITE_UNKNOWN');
       }
-    });
+    }
+    return waiter.promise;
+  }
+  async #writeCompact(req, instructions, beforeDispatch) {
+    const transport = new AttachedRuntime(this.config, this.session, this.ownerRecord);
+    try {
+      const data = await transport.request(
+        'compact',
+        { instructions },
+        {
+          timeout: null,
+          signal: req.controller.signal,
+          onWrite: () => {
+            // No await between Bridge's final Stop/lifecycle fence and socket write.
+            beforeDispatch?.();
+            if (!this.alive || this.handoffPending || this.gracefulExitPromise)
+              throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+            req.written = true;
+          },
+        },
+      );
+      this.#receive(req, { ok: true, data });
+    } catch (error) {
+      if (error.uncertain) this.#loseResponse(req, error.code ?? 'WRITE_UNKNOWN');
+      else
+        this.#receive(req, {
+          ok: false,
+          code: error.code ?? error.message,
+          native_reason: error.native_reason,
+        });
+    }
   }
   assertSessionIdentity(state) {
     if (!servesSession(state, this.session)) {
@@ -584,21 +557,19 @@ export class PiRpc {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
   }
   hasPendingCommand(type) {
-    return [...this.pending.values()].some((request) => request.commandType === type);
+    return this.pending.values().some((req) => !req.ack && req.type === type);
   }
   hasPendingModelSelection() {
-    return [...this.pending.values()].some((request) => MODEL_COMMANDS.has(request.commandType));
+    return this.pending.values().some((req) => !req.ack && MODEL_COMMANDS.has(req.type));
   }
   hasPendingAdmission() {
-    return [...this.pending.values()].some((request) =>
-      ADMISSION_COMMANDS.has(request.commandType),
-    );
+    return this.pending.values().some((req) => !req.ack && ADMISSION_COMMANDS.has(req.type));
   }
   hasUnsettledWork() {
     return Boolean(
       this.activeBashes > 0 ||
       this.settlementSequence < this.requiredSettlementSequence ||
-      [...this.pending.values()].some((r) => !READ_COMMANDS.has(r.commandType)),
+      this.pending.values().some((req) => !req.read),
     );
   }
   async idleSnapshot() {
@@ -644,40 +615,37 @@ export class PiRpc {
     const ai =
       !nativeThinking && thinkingLevel !== undefined ? await loadPiAi(this.installation) : null;
     if (requested) assertThinkingLevel(requested, thinkingLevel, ai);
-    const state = idle ? await this.assertIdle() : await this.state();
-    const target = requested ?? state.model;
-    if (!target) throw new RpcFailure('MODEL_UNAVAILABLE');
+    const selected = () => (idle ? this.assertIdle() : this.state());
+    const first = await selected();
+    if (!requested && !first.model) throw new RpcFailure('MODEL_UNAVAILABLE');
     await beforeDispatch?.();
-    if (!requested) assertThinkingLevel(target, thinkingLevel, ai);
-    let level = thinkingLevel;
-    if (model && !sameModel(state.model, target)) {
-      // Keep current effort rather than model-switch defaults; Pi owns clamping.
-      level ??= state.thinkingLevel;
-      // A timed-out setter keeps input fenced until its matching native ACK.
-      // command() verifies late identity but never submits a prompt from that ACK.
-      const changed = await this.command(
-        { type: 'set_model', provider: target.provider, modelId: target.id },
-        { beforeDispatch, allowBusySelection: !idle },
-      );
-      if (!sameModel(changed, target)) throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
-    }
-    let selected = idle ? await this.assertIdle() : await this.state();
-    if (model && !sameModel(selected.model, target))
-      throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
-    assertThinkingLevel(selected.model, thinkingLevel, ai);
-    if (level !== undefined && selected.thinkingLevel !== level) {
-      await this.command(
-        { type: 'set_thinking_level', level },
-        { beforeDispatch, allowBusySelection: !idle },
-      );
-      selected = await this.state();
-      if (
-        (model && !sameModel(selected.model, target)) ||
-        (!nativeThinking && thinkingLevel !== undefined && selected.thinkingLevel !== thinkingLevel)
-      )
+    if (!requested) assertThinkingLevel(first.model, thinkingLevel, ai);
+    const options = { beforeDispatch, allowBusySelection: !idle };
+    try {
+      return await applyModelSettings(first, requested, thinkingLevel, {
+        refresh: selected,
+        validate: (actual) => assertThinkingLevel(actual, thinkingLevel, ai),
+        setModel: async (target) => {
+          const changed = await this.command(
+            { type: 'set_model', provider: target.provider, modelId: target.id },
+            options,
+          );
+          if (!sameModel(changed, target)) throw new Error('MODEL_SELECTION_CHANGED');
+          return selected();
+        },
+        setThinkingLevel: async (level) => {
+          await this.command({ type: 'set_thinking_level', level }, options);
+          const actual = await this.state();
+          if (ai && actual.thinkingLevel !== thinkingLevel)
+            throw new Error('MODEL_SELECTION_CHANGED');
+          return actual;
+        },
+      });
+    } catch (error) {
+      if (error.message === 'MODEL_SELECTION_CHANGED')
         throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
+      throw error;
     }
-    return modelSettings({ model: selected.model, thinking_level: selected.thinkingLevel });
   }
   async submitPrompt(input, { submissionId, onLate, authorize, selection, onAdmitted }) {
     const settings = hasPromptSettings(input);
@@ -737,19 +705,11 @@ export class PiRpc {
   async executeBash({ command, max_chars, beforeDispatch }) {
     this.activeBashes++;
     try {
-      await this.state();
-      await beforeDispatch?.();
-      let acknowledged = false;
+      const result = await this.command({ type: 'bash', command }, { beforeDispatch });
       try {
-        const result = await this.dispatch(
-          { type: 'bash', command },
-          { onLate: () => this.state() },
-        );
-        acknowledged = true;
-        await this.state();
         return limitBashResult(result, max_chars);
       } catch (error) {
-        if (acknowledged || error.code === 'PI_REJECTED') error.uncertain = true;
+        error.uncertain = true;
         throw error;
       }
     } finally {
@@ -862,12 +822,10 @@ export class PiRpc {
         throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
       // Parent observations reject known work early. The child's atomic seal
       // also excludes native work started since the last idle observation.
-      if (this.hasUnsettledWork() || this.activeReads || this.ackTasks.size)
-        throw new RpcFailure('RUNTIME_BUSY');
+      if (this.hasUnsettledWork() || this.activeReads) throw new RpcFailure('RUNTIME_BUSY');
       const sealed = await new AttachedRuntime(this.config, this.session, record).seal(() => {
         signal?.throwIfAborted();
-        if (this.hasUnsettledWork() || this.activeReads || this.ackTasks.size)
-          throw new RpcFailure('RUNTIME_BUSY');
+        if (this.hasUnsettledWork() || this.activeReads) throw new RpcFailure('RUNTIME_BUSY');
         // Close read admission across the control request's await. A read
         // already admitted above keeps this attempt from sealing the writer.
         this.sealPending = true;
@@ -890,8 +848,7 @@ export class PiRpc {
         await exit.closed; // Drain final UI diagnostics as well as observing exact death.
         if (await ownerAlive(record.owner)) throw new RpcFailure('OWNER_STILL_ALIVE');
         this.lines?.close();
-        await releaseOwner(this.config.attachmentDir, this.session, record);
-        this.ownerRecord = null;
+        await this.#releaseClaim(record);
         if (result.code !== 0 || result.signal) throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
         // UI availability is a shutdown diagnostic, not another writer claim.
         return this.uiFacts.shutdown.size ? uiSnapshot(this.uiFacts) : {};
@@ -918,17 +875,16 @@ export class PiRpc {
     if (!identity || identity.pid !== child.pid || !(await ownerAlive(identity)))
       throw new RpcFailure('RUNTIME_SESSION_CHANGED');
   }
+  async #releaseClaim(record = this.ownerRecord) {
+    if (!record) return;
+    await releaseOwner(this.config.attachmentDir, this.session, record);
+    if (this.ownerRecord === record) this.ownerRecord = null;
+  }
   async stop() {
     await this.drainAcks();
-    const release = async () => {
-      if (this.ownerRecord) {
-        await releaseOwner(this.config.attachmentDir, this.session, this.ownerRecord);
-        this.ownerRecord = null;
-      }
-    };
     if (!this.child || this.exited) {
       this.clearPending();
-      await release();
+      await this.#releaseClaim();
       return;
     }
     if (this.stopPromise) return this.stopPromise;
@@ -956,14 +912,13 @@ export class PiRpc {
         await exit.promise;
       }
       await exit.closed;
-      this.exited = true;
       this.clearPending();
       this.lines?.close();
       if (this.ownerRecord?.socket)
         await fs.unlink(this.ownerRecord.socket).catch((error) => {
           if (error.code !== 'ENOENT') throw error;
         });
-      await release();
+      await this.#releaseClaim();
     })();
     try {
       return await this.stopPromise;
@@ -974,4 +929,3 @@ export class PiRpc {
     }
   }
 }
-export { RuntimePool } from './runtime-pool.mjs';

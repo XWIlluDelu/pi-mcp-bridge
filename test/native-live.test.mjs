@@ -54,7 +54,7 @@ test(
     });
     assert.equal(historical.live, null);
     await finish(1);
-    await until(() => !bridge.pool.get(session.id) && !bridge.autoReleases.size);
+    await until(() => !bridge.pool.get(session.id) && !bridge.lane(session.id));
     assert.equal((await status()).state, 'saved');
     assert.equal(Object.hasOwn(await status(), 'capabilities'), false);
     const final = await bridge.read({ session_id: session.id, max_bytes: 4096 });

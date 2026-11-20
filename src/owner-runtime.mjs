@@ -35,8 +35,7 @@ export async function serveOwnerControl(bridge) {
     await fs.unlink(socket);
   }
   const connections = new Set(),
-    operations = new Set(),
-    handoffs = new Set();
+    operations = new Map();
   let closing = false;
   const server = net.createServer({ allowHalfOpen: true }, (connection) => {
     connections.add(connection);
@@ -64,7 +63,6 @@ export async function serveOwnerControl(bridge) {
             throw new Error('INVALID_OWNER_COMMAND');
           if (request.op === 'handoff') {
             controller = new AbortController();
-            handoffs.add(controller);
             connection.setTimeout(0);
           }
           const data = await bridge[methods[request.op]](request, { signal: controller?.signal });
@@ -81,11 +79,9 @@ export async function serveOwnerControl(bridge) {
               },
             }) + '\n',
           );
-        } finally {
-          if (controller) handoffs.delete(controller);
         }
       })();
-      operations.add(task);
+      operations.set(task, controller);
       void task.finally(() => operations.delete(task)).catch(() => {});
     });
   });
@@ -98,9 +94,9 @@ export async function serveOwnerControl(bridge) {
   return {
     async close() {
       closing = true;
-      for (const controller of handoffs) controller.abort();
+      for (const controller of operations.values()) controller?.abort();
       const stopped = new Promise((resolve) => server.close(resolve));
-      await Promise.allSettled([...operations]);
+      await Promise.allSettled(operations.keys());
       for (const connection of connections) connection.destroy();
       await stopped;
     },

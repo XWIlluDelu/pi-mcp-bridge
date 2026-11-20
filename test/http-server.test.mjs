@@ -148,7 +148,7 @@ test('HTTP response deadline reports uncertainty and does not replay admitted wo
   assert.equal(f.bridge.closing, undefined);
   assert.match(JSON.stringify(expired.body), /OUTCOME_UNKNOWN/);
   release.resolve();
-  await Promise.allSettled([...f.bridge.pendingMutations]);
+  await Promise.allSettled(f.bridge.mutations.values().map((mutation) => mutation.work));
   assert.equal(f.runtime.calls.length, 1);
 });
 

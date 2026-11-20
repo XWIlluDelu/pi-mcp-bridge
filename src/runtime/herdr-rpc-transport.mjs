@@ -28,8 +28,9 @@ export async function prepareHerdr(binary, { signal, daemonEnvironment = process
 // Same child-shaped byte transport as spawn(). The scope covers the worker and
 // Pi (including detached native tool children); it is not a session owner registry.
 export class HerdrRpcTransport extends EventEmitter {
-  constructor(binary, launch, { signal, daemonEnvironment = process.env, control } = {}) {
+  constructor(control, launch, { signal } = {}) {
     super();
+    this.control = control;
     this.stdin = new PassThrough();
     this.stdout = new PassThrough();
     this.stderr = new PassThrough();
@@ -37,9 +38,7 @@ export class HerdrRpcTransport extends EventEmitter {
     this.sockets = new Set();
     this.channels = {};
     this.token = randomBytes(32).toString('hex');
-    this.ready = Promise.resolve().then(() =>
-      this.start(binary, launch, signal, daemonEnvironment, control),
-    );
+    this.ready = Promise.resolve().then(() => this.start(launch, signal));
   }
   async scopeActive() {
     const { stdout } = await exec(
@@ -59,7 +58,7 @@ export class HerdrRpcTransport extends EventEmitter {
       await delay(25);
     }
   }
-  async start(binary, launch, cancellation, daemonEnvironment, preflightControl) {
+  async start(launch, cancellation) {
     const timeout = AbortSignal.timeout(30000);
     const signal = cancellation ? AbortSignal.any([timeout, cancellation]) : timeout;
     signal.throwIfAborted();
@@ -97,13 +96,6 @@ export class HerdrRpcTransport extends EventEmitter {
       flag: 'wx',
       mode: 0o600,
     });
-    if (preflightControl) {
-      this.control = preflightControl;
-    } else {
-      this.control = await HerdrControl.open(binary, daemonEnvironment);
-      // A scope is required before granting Pi startup. No force-kill timeout is used.
-      await exec('systemctl', ['--user', 'show-environment'], { timeout: 8000 });
-    }
     signal.throwIfAborted();
     const created = await this.control.request('workspace.create', {
       cwd: launch.cwd,
@@ -217,31 +209,30 @@ export class HerdrRpcTransport extends EventEmitter {
     // PiRpc has already validated the writer identity before requesting stop.
     await this.terminateScope();
   }
-  async cleanup() {
+  async cleanup({ abortStartup = false } = {}) {
+    // Close the listener before terminating a partially started scope. A late
+    // worker cannot receive a launch grant even after an uncertain layout ACK.
     for (const socket of this.sockets) socket.destroy();
     this.stdin.destroy();
     this.stdout.end();
     this.stderr.end();
     if (this.server) await new Promise((resolve) => this.server.close(resolve));
-    if (this.pane) {
-      try {
-        await this.control.request('pane.close', { pane_id: this.pane });
-      } catch (error) {
-        if (error.code !== 'pane_not_found')
-          diagnostics.emit('operation.failure', { code: 'HERDR_PANE_CLEANUP_FAILED' });
-      }
-      this.pane = null;
-    }
-    if (this.directory) await fs.rm(this.directory, { recursive: true, force: true });
-  }
-  async abortStartup() {
-    // Prevent a late worker from receiving a grant, including uncertain layout ACKs.
-    for (const socket of this.sockets) socket.destroy();
-    if (this.directory) await fs.rm(this.directory, { recursive: true, force: true });
     try {
-      await this.terminateScope();
+      if (abortStartup) await this.terminateScope();
     } finally {
-      await this.cleanup();
+      if (this.pane) {
+        try {
+          await this.control.request('pane.close', { pane_id: this.pane });
+        } catch (error) {
+          if (error.code !== 'pane_not_found')
+            diagnostics.emit('operation.failure', { code: 'HERDR_PANE_CLEANUP_FAILED' });
+        }
+        this.pane = null;
+      }
+      if (this.directory) await fs.rm(this.directory, { recursive: true, force: true });
     }
+  }
+  abortStartup() {
+    return this.cleanup({ abortStartup: true });
   }
 }

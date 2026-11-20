@@ -1,6 +1,6 @@
 import { HerdrRpcTransport } from './herdr-rpc-transport.mjs';
 import { RetainedObservations } from '../read/context-observation.mjs';
-import { sameSessionIdentity } from '../core/data.mjs';
+import { sameSessionIdentity, validateExecutionCwd } from '../core/data.mjs';
 import { diagnostics } from '../core/diagnostics.mjs';
 import { readOwnerConfig, registryDirectory } from '../core/owner-config.mjs';
 import {
@@ -79,19 +79,20 @@ export class RuntimePool {
     }
     return runtime;
   }
-  async forRead(session) {
+  async forRead(session, claim) {
+    if (claim === undefined) claim = await readClaim(this.attachmentDir, session);
+    const live = claim && (await ownerAlive(claim.owner));
     const existing = this.instances.get(session.id);
-    const claim = await readClaim(this.attachmentDir, session);
-    if (claim && (await ownerAlive(claim.owner))) {
+    if (live) {
       if (claim.kind === 'rpc') {
         if (existing?.alive && existing.ownerRecord?.generation === claim.generation)
           return this.boundRuntime(existing, session);
         throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
       }
       if (claim.phase !== 'ready') throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
-      if (existing?.attached && existing.alive && existing.record.generation === claim.generation)
+      if (existing?.attached && existing.record.generation === claim.generation)
         return this.boundRuntime(existing, session);
-      if (existing) await existing.stop();
+      if (existing && !existing.attached) await existing.stop();
       const attached = new AttachedRuntime(
         { ...this.config, attachmentDir: this.attachmentDir },
         session,
@@ -107,7 +108,6 @@ export class RuntimePool {
         kind: 'attached',
         generation: existing.record.generation,
       });
-      await existing.stop();
       this.instances.delete(session.id);
       return null;
     }
@@ -118,39 +118,49 @@ export class RuntimePool {
       throw new RpcFailure('RUNTIME_SESSION_CHANGED');
     return runtime;
   }
-  async resolve(session) {
-    if (this.starting.has(session.id))
-      return this.boundRuntime(await this.starting.get(session.id).promise, session);
-    const attached = await this.forRead(session);
-    if (attached) {
-      diagnostics.emit('runtime.reused', {
-        kind: attached.attached ? 'attached' : 'rpc',
-        generation: attached.generation ?? attached.record?.generation,
-      });
-      return attached;
-    }
-    const claim = await readClaim(this.attachmentDir, session);
-    if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
-    const existing = this.instances.get(session.id);
-    if (existing?.alive) return this.boundRuntime(existing, session);
-    if (existing) await existing.stop();
-    if (this.starting.has(session.id))
-      return this.boundRuntime(await this.starting.get(session.id).promise, session);
-    const start = { controller: new AbortController() };
-    this.starting.set(session.id, start);
-    start.promise = diagnostics
-      .measure('runtime.start', { kind: 'rpc' }, () => this.factory(session))
-      .then((runtime) => {
-        this.watchRuntime(runtime);
-        this.instances.set(session.id, runtime);
+  async resolve(session, { beforeStart, onStart } = {}) {
+    const id = session.id;
+    // A start can publish its claim while this caller is reading the registry.
+    const claim = this.starting.has(id) ? null : await readClaim(this.attachmentDir, session);
+    let start = this.starting.get(id);
+    if (!start) {
+      const runtime = await this.forRead(session, claim);
+      if (runtime) {
+        diagnostics.emit('runtime.reused', {
+          kind: runtime.attached ? 'attached' : 'rpc',
+          generation: runtime.generation ?? runtime.record?.generation,
+        });
         return runtime;
-      })
-      .finally(() => this.starting.delete(session.id));
-    return start.promise;
+      }
+      if (beforeStart) await validateExecutionCwd(session.cwd);
+      if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
+      const previous = this.instances.get(id);
+      if (previous && !previous.alive) await previous.stop?.();
+      await beforeStart?.();
+      start = this.starting.get(id);
+      if (!start) {
+        const current = this.get(id);
+        if (current) return this.boundRuntime(current, session);
+        // The factory reserves against the authoritative registry before spawn.
+        start = { controller: new AbortController() };
+        this.starting.set(id, start);
+        start.promise = diagnostics
+          .measure('runtime.start', { kind: 'rpc' }, () => this.factory(session))
+          .then((started) => {
+            this.watchRuntime(started);
+            this.instances.set(id, started);
+            return started;
+          })
+          .finally(() => this.starting.delete(id));
+      }
+    }
+    const runtime = this.boundRuntime(await start.promise, session);
+    onStart?.(runtime);
+    return runtime;
   }
   get(id) {
     const r = this.instances.get(id);
-    return r?.alive ? r : null;
+    return r?.alive || r?.attached ? r : null;
   }
   async stopForDelete(session) {
     const pending = this.starting.get(session.id);
@@ -204,12 +214,8 @@ export class RuntimePool {
     const pending = this.starting.get(id);
     if (pending) await pending.promise.catch(() => {});
     const runtime = this.instances.get(id);
-    await runtime?.stop();
-    this.instances.delete(id);
-  }
-  async drainAcks() {
-    await Promise.all([...this.starting.values()].map((start) => start.promise.catch(() => {})));
-    await Promise.all([...this.instances.values()].map((runtime) => runtime.drainAcks?.()));
+    await runtime?.stop?.();
+    if (this.instances.get(id) === runtime) this.instances.delete(id);
   }
   prepareClose() {
     this.closing = true;
@@ -226,7 +232,6 @@ export class RuntimePool {
   }
   async close() {
     await this.prepareClose();
-    await this.drainAcks();
     await Promise.all(
       [...new Set([...this.instances.keys(), ...this.starting.keys()])].map((id) => this.stop(id)),
     );

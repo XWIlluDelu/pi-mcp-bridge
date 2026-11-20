@@ -54,7 +54,7 @@ test(
         status,
       );
     await f.mark('release');
-    await until(() => runtime.exited && !bridge.autoReleases.size);
+    await until(() => runtime.exited && !runtime.autoReleaseTask);
     const images = (await savedEntries(bridge, made.session_id))
       .filter((e) => e.message?.role === 'user')
       .flatMap((e) =>

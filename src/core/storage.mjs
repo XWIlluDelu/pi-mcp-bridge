@@ -118,10 +118,24 @@ export async function readPrivateFile(
   if (typeof file !== 'string' || !path.isAbsolute(file)) throw new Error(pathError);
   const resolved = await fs.realpath(file);
   if (!followSymlinks && resolved !== file) throw new Error(pathError);
-  const fd = await fs.open(
+  return {
+    ...(await readPrivateInode(resolved, limit, { pathError, privacyError, allowGroupOtherRead })),
     resolved,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
+  };
+}
+
+// The registry already checked the parent directory. Open the supplied entry
+// directly so even a dangling symlink is an invalid claim, never a missing one.
+export async function readPrivateInode(
+  file,
+  limit,
+  {
+    pathError = 'INVALID_PRIVATE_FILE',
+    privacyError = pathError,
+    allowGroupOtherRead = false,
+  } = {},
+) {
+  const fd = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await fd.stat();
     if (!stat.isFile()) throw new Error(pathError);
@@ -130,7 +144,6 @@ export async function readPrivateFile(
     return {
       text: await readBoundedText(fd, stat.size, limit, pathError),
       mode: stat.mode & 0o777,
-      resolved,
     };
   } finally {
     await fd.close();

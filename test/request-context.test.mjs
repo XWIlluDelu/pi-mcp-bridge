@@ -148,7 +148,7 @@ for (const operation of ['send', 'command'])
         ...(operation === 'send' ? { text: 'MUST_NOT_RUN' } : { command: 'printf MUST_NOT_RUN' }),
       });
       await entered.promise;
-      assert.equal(f.bridge.inputs.size, 1);
+      assert.equal(f.bridge.mutations.size, 1);
       assert.equal((await f.bridge.stop({ session_id: f.id })).status, 'accepted');
       release.resolve();
       const response = await pending;
@@ -202,7 +202,7 @@ test('one batch snapshot retains permissions and directory scope across late lan
   const fresh = await f.bridge.list({ session_id: f.id });
   assert.deepEqual(fresh.sessions, []);
   assert.deepEqual(fresh.creatable_projects, []);
-  await until(() => !f.bridge.pool.get(f.id) && !f.bridge.autoReleases.size);
+  await until(() => !f.bridge.pool.get(f.id) && !f.bridge.lane(f.id));
 });
 
 test('scope reload applies to cached IDs and cursors while preserving cleanup identity', async (t) => {

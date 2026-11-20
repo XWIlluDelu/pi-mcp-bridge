@@ -5,7 +5,7 @@ import { savedSessionName, runtimeMetadata } from '../read/session-metadata.mjs'
 import { prepareContextRead } from '../read/context-read.mjs';
 import { captureSessionRead } from '../compat/session-readers.mjs';
 import { checkObservation, unavailableObservation } from '../read/context-observation.mjs';
-import { readSessionIdentity, loadSavedSession, sameSessionIdentity } from './data.mjs';
+import { readSessionIdentity, loadSavedSession } from './data.mjs';
 import { PiRpc, launchProfile } from '../runtime/rpc.mjs';
 import { nativeSdk } from '../runtime/pi-installation.mjs';
 import { diagnostics } from './diagnostics.mjs';
@@ -15,7 +15,7 @@ import { ownerReadFeatures } from '../read/read-features.mjs';
 // reselects the current owner under the same request policy.
 export async function readableOwner(bridge, session, requestContext) {
   let runtime = await bridge.pool.forRead(session);
-  while (runtime && bridge.handoffs.get(session.id)?.runtime === runtime) {
+  while (runtime && bridge.handoff(session.id)?.runtime === runtime) {
     await runtime.autoReleaseTask;
     bridge.assertOpen();
     session = await bridge.session(session.id, requestContext);
@@ -25,7 +25,7 @@ export async function readableOwner(bridge, session, requestContext) {
   return { session, runtime };
 }
 
-export async function acquireNativeRead(bridge, session, runtime, args) {
+async function acquireNativeRead(bridge, session, runtime, args) {
   if (runtime) return runtime.read(args);
   const sdk = await nativeSdk(bridge.config, launchProfile(bridge.config).env);
   session = await loadSavedSession(session, { omitImageData: true, sdk });
@@ -35,9 +35,7 @@ export async function acquireNativeRead(bridge, session, runtime, args) {
   });
 }
 
-export async function listModels(bridge, args = {}, { requestContext } = {}) {
-  requestContext = await (requestContext ?? bridge.captureRequestContext());
-  bridge.assertOpen();
+export async function listModels(bridge, args = {}, { requestContext }) {
   const policy = requestContext.permissions;
   let allowed = requestContext.scope.folders.some((folder) =>
     ['send', 'command', 'create'].some((action) => permitted(policy, action, { cwd: folder.path })),
@@ -58,9 +56,7 @@ export async function listModels(bridge, args = {}, { requestContext } = {}) {
   return loadModelCatalog(bridge.config, args);
 }
 
-export async function getSubmission(bridge, args, { requestContext } = {}) {
-  requestContext = await (requestContext ?? bridge.captureRequestContext());
-  bridge.assertOpen();
+export async function getSubmission(bridge, args, { requestContext }) {
   const session = await bridge.session(args.session_id, requestContext);
   const policy = requestContext.permissions;
   const canInspect = permitted(policy, 'read', session) || permitted(policy, 'send', session);
@@ -70,9 +66,7 @@ export async function getSubmission(bridge, args, { requestContext } = {}) {
   return record;
 }
 
-export async function listSessions(bridge, args = {}, { requestContext } = {}) {
-  requestContext = await (requestContext ?? bridge.captureRequestContext());
-  bridge.assertOpen();
+export async function listSessions(bridge, args = {}, { requestContext }) {
   const sessions = args.session_id
     ? await bridge.session(args.session_id, requestContext).then(
         (s) => [s],
@@ -160,9 +154,7 @@ export async function listSessions(bridge, args = {}, { requestContext } = {}) {
   };
 }
 
-export async function getHealth(bridge, { session_id } = {}, { requestContext } = {}) {
-  requestContext = await (requestContext ?? bridge.captureRequestContext());
-  bridge.assertOpen();
+export async function getHealth(bridge, { session_id } = {}, { requestContext }) {
   // Diagnose only the requested session, without its metadata or source paths.
   if (session_id) {
     const target = await bridge.session(session_id, requestContext).catch(() => ({
@@ -205,10 +197,8 @@ export async function searchSession(bridge, { query, content, ...args }, options
 export async function readSession(
   bridge,
   args,
-  { requestContext, resultBudget, readPins, searchQuery } = {},
+  { requestContext, resultBudget, readPins, searchQuery },
 ) {
-  requestContext = await (requestContext ?? bridge.captureRequestContext());
-  bridge.assertOpen();
   // Routing metadata only. Cached content is accessed after authorization and
   // today's canonical path/native identity check; a cursor is never a grant.
   const id = bridge.readCache.target(args);
@@ -261,33 +251,28 @@ export async function readSession(
     retained = !runtime;
   } else {
     const nativeRead = ({ entry_ids } = {}) =>
-      bridge.acquireNativeRead(s, runtime, {
+      acquireNativeRead(bridge, s, runtime, {
         ...args,
         view: 'session',
         ...(entry_ids !== undefined ? { entry_ids } : {}),
         ...(searchQuery ? { search_query: searchQuery } : {}),
       });
-    const acquire = async () => {
-      // Only an explicit view selects a source. Modules assess session-local
-      // evidence even without a live owner; reading never starts Pi.
-      if (bridge.compatibilityServices.sessionReaders.readers.size && args.view !== 'session') {
+    const readers = bridge.compatibilityServices.sessionReaders;
+    if (args.view === 'session' || !readers.readers.size) captured = await nativeRead();
+    else {
+      const acquire = async () => {
         const context = {
-          session: Object.freeze({
-            id,
-            file: s.file,
-            native_id: s.header.id,
-            cwd: s.header.cwd,
-          }),
+          session: Object.freeze({ id, file: s.file, native_id: s.header.id, cwd: s.header.cwd }),
           owner: await ownerReadFeatures(runtime),
           request: args,
           nativeRead,
         };
-        const reader = await bridge.compatibilityServices.sessionReaders.select(context);
-        if (reader) return captureSessionRead(reader, context, args, searchQuery);
-      }
-      return nativeRead();
-    };
-    captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
+        const reader = await readers.select(context);
+        return reader ? captureSessionRead(reader, context, args, searchQuery) : nativeRead();
+      };
+      // Keep the owner through feature discovery and the reader's full capture.
+      captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
+    }
   }
   const runtimeObservation = runtime && captured.view === 'runtime' ? captured : null;
   let currentLeaf;
@@ -305,12 +290,11 @@ export async function readSession(
       ownerActive: false,
     });
   }
-  const current = await bridge.session(id, requestContext);
-  if (!sameSessionIdentity(current, target)) throw new Error('RUNTIME_SESSION_CHANGED');
+  const current = await bridge.revalidateSession(target, requestContext);
   bridge.check('read', current, requestContext);
   if (
     runtimeObservation &&
-    runtime?.alive &&
+    (runtime.attached || runtime.alive) &&
     !runtime.handoffPending &&
     bridge.pool.instances.get(id) === runtime
   )

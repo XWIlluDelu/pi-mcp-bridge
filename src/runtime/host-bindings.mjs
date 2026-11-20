@@ -8,6 +8,7 @@ import { modelState } from '../ops/models.mjs';
 import { createModelSetter } from '../ops/set-model.mjs';
 import { requestStop } from '../ops/stop-execution.mjs';
 import { reloadAdmission } from './reload-admission.mjs';
+import { nativeSnapshot } from './attachment-protocol.mjs';
 const unknown = () => ({
   status: 'unknown',
   reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
@@ -17,6 +18,20 @@ function assertIdentity(before, after) {
   if (before.sessionFile !== after.sessionFile || before.sessionId !== after.sessionId)
     throw new Error('RUNTIME_SESSION_CHANGED');
 }
+async function bound(state, expected, run) {
+  const before = await state();
+  assertIdentity(expected ?? before, before);
+  const verify = async () => assertIdentity(before, await state());
+  const result = await run(before, verify);
+  await verify();
+  return result;
+}
+
+function bashReceipt(result, onResult) {
+  const output = nativeBashResult(result);
+  return Promise.resolve(onResult(output)).then(() => output);
+}
+
 function tracker(release, onError) {
   const pending = new Set();
   function track(work) {
@@ -86,10 +101,9 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       ),
     snapshot: async () => {
       const before = identity(session);
-      const entries = session.sessionManager.getEntries(),
-        leafId = session.sessionManager.getLeafId();
+      const snapshot = nativeSnapshot(session.sessionManager);
       assertIdentity(before, identity(session));
-      return { ...before, entries, leafId };
+      return { ...before, ...snapshot };
     },
     supportsImages: true,
     supportsIdleOnly: true,
@@ -106,29 +120,21 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         operation.cancel();
       }
     },
-    compact: async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
-      const before = await state();
-      assertIdentity(expected, before);
-      const compact = async () => {
-        beforeDispatch?.();
-        assertIdentity(before, identity(session));
-        try {
-          return await tracked.track(session.compact(instructions));
-        } catch {
-          throw new Error('PI_REJECTED');
-        }
-      };
-      const result = interrupt
-        ? await compact()
-        : await admission.compact(
-            session.sessionManager,
-            nativeActivity,
-            compact,
-            pendingBashes > 0,
-          );
-      assertIdentity(before, await state());
-      return result;
-    },
+    compact: ({ instructions, interrupt, beforeDispatch, ...expected }) =>
+      bound(state, expected, (before) => {
+        const compact = async () => {
+          beforeDispatch?.();
+          assertIdentity(before, identity(session));
+          try {
+            return await tracked.track(session.compact(instructions));
+          } catch {
+            throw new Error('PI_REJECTED');
+          }
+        };
+        return interrupt
+          ? compact()
+          : admission.compact(session.sessionManager, nativeActivity, compact, pendingBashes > 0);
+      }),
     setModel: createModelSetter({
       state,
       models: () => session.modelRuntime.getAvailableSnapshot(),
@@ -182,9 +188,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
           );
         }
         assertIdentity(before, identity(session));
-        const output = nativeBashResult(result);
-        await onResult(output);
-        return output;
+        return await bashReceipt(result, onResult);
       } finally {
         pendingBashes--;
       }
@@ -241,28 +245,19 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
   };
   return {
     state,
-    readFeatures: async () => {
-      const before = await state();
-      const commands = await client.getCommands();
-      const snapshot = await client.getEntries();
-      assertIdentity(before, await state());
-      return nativeReadFeatures(
-        undefined,
-        commands.filter((command) => command.source === 'extension'),
-        snapshot.leafId,
-      );
-    },
-    snapshot: async () => {
-      const before = await state(),
-        snapshot = await client.getEntries(),
-        after = await state();
-      assertIdentity(before, after);
-      return {
-        ...identity(after),
-        entries: snapshot.entries,
-        leafId: snapshot.leafId,
-      };
-    },
+    readFeatures: () =>
+      bound(state, null, async () =>
+        nativeReadFeatures(
+          undefined,
+          (await client.getCommands()).filter((command) => command.source === 'extension'),
+          (await client.getEntries()).leafId,
+        ),
+      ),
+    snapshot: () =>
+      bound(state, null, async (before) => {
+        const { entries, leafId } = await client.getEntries();
+        return { ...identity(before), entries, leafId };
+      }),
     supportsImages: true,
     // RpcClient has no reload command. The host callback must atomically refuse
     // busy local work, invoke beforeDispatch immediately before native reload,
@@ -270,29 +265,23 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
     // replacing the writer belongs to the host's registration lifecycle.
     reload:
       typeof reload === 'function'
-        ? async ({ beforeDispatch, ...expected }) => {
-            const before = await state();
-            assertIdentity(expected, before);
-            const result = await tracked.track(reload({ ...identity(before), beforeDispatch }));
-            if (result?.reloaded !== true) throw new Error('RELOAD_UNCONFIRMED');
-            assertIdentity(before, await state());
-            return { reloaded: true };
-          }
+        ? ({ beforeDispatch, ...expected }) =>
+            bound(state, expected, async (before) => {
+              const result = await tracked.track(reload({ ...identity(before), beforeDispatch }));
+              if (result?.reloaded !== true) throw new Error('RELOAD_UNCONFIRMED');
+              return { reloaded: true };
+            })
         : undefined,
-    compact: async ({ instructions, interrupt, beforeDispatch, ...expected }) => {
-      const before = await state();
-      assertIdentity(expected, before);
-      requireInterruptCompaction({ interrupt }, before);
-      beforeDispatch?.();
-      let result;
-      try {
-        result = await tracked.track(client.compact(instructions));
-      } catch {
-        throw new Error('HOST_COMPACT_UNCERTAIN');
-      }
-      assertIdentity(before, await state());
-      return result;
-    },
+    compact: ({ instructions, interrupt, beforeDispatch, ...expected }) =>
+      bound(state, expected, async (before) => {
+        requireInterruptCompaction({ interrupt }, before);
+        beforeDispatch?.();
+        try {
+          return await tracked.track(client.compact(instructions));
+        } catch {
+          throw new Error('HOST_COMPACT_UNCERTAIN');
+        }
+      }),
     setModel: createModelSetter({
       state,
       models: () => client.getAvailableModels(),
@@ -318,28 +307,22 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
         return unknown();
       }
     },
-    bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
-      const before = await state();
-      assertIdentity(expected, before);
-      beforeDispatch?.();
-      const result = await tracked.track(client.bash(command));
-      assertIdentity(before, await state());
-      const output = nativeBashResult(result);
-      await onResult(output);
-      return output;
-    },
-    stop: async ({ onWithdraw, ...expected } = {}) => {
-      const before = await state();
-      assertIdentity(expected, before);
-      const result = await tracked.track(
-        requestStop(client, async (value) => {
-          assertIdentity(before, await state());
-          await onWithdraw(value);
-        }),
-      );
-      assertIdentity(before, await state());
-      return result;
-    },
+    bash: ({ command, onResult, beforeDispatch, ...expected }) =>
+      bound(state, expected, async (_before, verify) => {
+        beforeDispatch?.();
+        const result = await tracked.track(client.bash(command));
+        await verify();
+        return bashReceipt(result, onResult);
+      }),
+    stop: ({ onWithdraw, ...expected } = {}) =>
+      bound(state, expected, (_before, verify) =>
+        tracked.track(
+          requestStop(client, async (value) => {
+            await verify();
+            await onWithdraw(value);
+          }),
+        ),
+      ),
     ...(tracked.release
       ? {
           cancel: async () => {

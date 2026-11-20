@@ -1,10 +1,8 @@
-import packageInfo from '../../package.json' with { type: 'json' };
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import { readSessionIdentity, sameSessionIdentity, servesSession } from '../core/data.mjs';
 
 import { parseCompactInput, compactMetadata } from '../ops/compact.mjs';
-import { READ_CONTRACT } from '../read/context-read.mjs';
 import { assertReadFeatures } from '../read/read-features.mjs';
 import { unavailableObservation } from '../read/context-observation.mjs';
 import { attachedPromptInput, remotePromptRejection } from '../ops/prompt-input.mjs';
@@ -15,6 +13,8 @@ import { stopReceipt, withdrawalCollector } from '../ops/stop-execution.mjs';
 import { ownerControlSchemas } from '../mcp/tool-schemas.mjs';
 import {
   ownerServer,
+  closeOwnerServer,
+  ownerProtocol,
   listenPrivate,
   ownerEnvelope,
   ownerIdentity,
@@ -67,23 +67,21 @@ export async function reserveHostSession({
   owner ??= await processIdentity();
   if (!owner || !(await ownerAlive(owner))) fail('PROCESS_IDENTITY_UNAVAILABLE');
   const record = await reserveOwner(attachmentDir, target, 'host', owner);
+  const identity = ownerIdentity(record);
   let callbacks,
     server,
     ready = false,
     closed = false,
-    stopping = false,
     stopSequence = 0,
-    bashing = false,
-    settingModel = false,
-    compacting = false,
-    submitting = 0,
-    reloading = false,
     releasing = false,
     writerReleased = false,
     releasePromise,
     closePromise;
   const sockets = new Set(),
     operations = new Set();
+  const active = (op) =>
+    operations.values().some((job) => job.lane && (op === undefined || job.lane === op));
+  const drain = () => Promise.allSettled(operations.values().map((job) => job.task));
   function assertNativeIdentity(value) {
     if (!servesSession(value, target)) fail('RUNTIME_SESSION_CHANGED');
   }
@@ -121,13 +119,12 @@ export async function reserveHostSession({
         // finish. An explicit retry resumes close, never the original business.
         await assertIdentity();
         if (callbacks.cancel) await callbacks.cancel();
-        else if (bashing && !stopping)
+        else if (active('bash') && !active('stop'))
           await callbacks.stop({
-            sessionFile: target.file,
-            sessionId: target.header.id,
+            ...identity,
             onWithdraw: async () => {},
           });
-        await Promise.allSettled([...operations]);
+        await drain();
         await assertIdentity();
         const result = await callbacks.release();
         if (result?.released !== true) fail('HOST_RELEASE_FAILED');
@@ -152,9 +149,19 @@ export async function reserveHostSession({
   const supportsBash = () =>
     typeof callbacks.bash === 'function' &&
     (typeof callbacks.cancel === 'function' || typeof callbacks.stop === 'function');
-  async function operate(request, partial) {
+  async function operate(request, job, partial) {
+    const { op } = request;
     const args = request.body ?? {};
-    if (request.op === 'snapshot' || (request.op === 'read' && args.view !== 'runtime')) {
+    // Native work retains its lane even when the requesting socket goes away.
+    const runActive = async (run) => {
+      job.lane = op;
+      try {
+        return await run();
+      } finally {
+        job.lane = null;
+      }
+    };
+    if (op === 'snapshot' || (op === 'read' && args.view !== 'runtime')) {
       // A snapshot callback binds its capture to the actual native session.
       // The RPC binding already samples native identity on each side of getEntries.
       const snapshot = await callbacks.snapshot();
@@ -162,8 +169,8 @@ export async function reserveHostSession({
       if (!validNativeSnapshot(snapshot)) fail('INVALID_HOST_SNAPSHOT');
       const { entries, leafId } = snapshot;
       const data =
-        request.op === 'snapshot'
-          ? { ...ownerIdentity(record), entries: structuredClone(entries), leafId }
+        op === 'snapshot'
+          ? { ...identity, entries: structuredClone(entries), leafId }
           : ownerRead(
               record,
               { ...snapshot, live: snapshot.live ?? { available: false, source: 'host_snapshot' } },
@@ -174,35 +181,26 @@ export async function reserveHostSession({
       return data;
     }
     const entryStopSequence = stopSequence,
-      stoppingAtEntry = stopping;
+      stoppingAtEntry = active('stop');
     const observed = await state();
-    if (reloading && !['state', 'read', 'read_features'].includes(request.op))
+    if (active('reload') && !['state', 'read', 'read_features'].includes(op))
       fail('RELOAD_IN_PROGRESS');
-    if (
-      Object.hasOwn(ownerControlSchemas, request.op) &&
-      !ownerControlSchemas[request.op].safeParse(args).success
-    )
+    if (Object.hasOwn(ownerControlSchemas, op) && !ownerControlSchemas[op].safeParse(args).success)
       fail('INVALID_ARGUMENTS');
     let data;
     const beforeDispatch = () => {
-      if (stoppingAtEntry || stopping || entryStopSequence !== stopSequence)
+      if (stoppingAtEntry || active('stop') || entryStopSequence !== stopSequence)
         fail('STOP_IN_PROGRESS');
       if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
     };
-    if (request.op === 'state')
+    if (op === 'state')
       return {
-        sessionFile: target.file,
-        sessionId: target.header.id,
+        ...identity,
         generation: record.generation,
         ...(typeof observed.sessionName === 'string' || observed.sessionName === null
           ? { sessionName: observed.sessionName }
           : {}),
-        isIdle:
-          bashing || stopping || settingModel || compacting || reloading || submitting
-            ? false
-            : typeof observed.isIdle === 'boolean'
-              ? observed.isIdle
-              : null,
+        isIdle: active() ? false : typeof observed.isIdle === 'boolean' ? observed.isIdle : null,
         isStreaming: typeof observed.isStreaming === 'boolean' ? observed.isStreaming : null,
         isCompacting: typeof observed.isCompacting === 'boolean' ? observed.isCompacting : null,
         isBashRunning: typeof observed.isBashRunning === 'boolean' ? observed.isBashRunning : null,
@@ -214,58 +212,52 @@ export async function reserveHostSession({
           stop: typeof callbacks.stop === 'function',
         },
       };
-    if (request.op === 'read_features') {
+    if (op === 'read_features') {
       const features = callbacks.readFeatures
         ? assertReadFeatures(await callbacks.readFeatures())
         : { available: false, tools: [], commands: [], leaf_id: null };
       data = ownerReadFeatures(record, features);
-    } else if (request.op === 'read')
+    } else if (op === 'read')
       data = {
-        ...ownerIdentity(record),
+        ...identity,
         ...unavailableObservation(args.session_id, 'host_observer_unavailable'),
       };
-    else if (request.op === 'reload') {
+    else if (op === 'reload') {
       if (typeof callbacks.reload !== 'function') fail('RELOAD_UNSUPPORTED');
       if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
-      if (bashing || stopping || settingModel || compacting || submitting || nativeBusy(observed))
-        fail('RELOAD_BUSY');
+      if (active() || nativeBusy(observed)) fail('RELOAD_BUSY');
       beforeDispatch();
-      reloading = true;
-      let dispatched = false;
-      try {
-        const result = await callbacks.reload({
-          sessionFile: target.file,
-          sessionId: target.header.id,
-          beforeDispatch: () => {
-            beforeDispatch();
-            dispatched = true;
-          },
-        });
-        if (!dispatched || result?.reloaded !== true) fail('RELOAD_UNCONFIRMED');
-        data = { reloaded: true };
-      } catch (error) {
-        if (dispatched) fail('RELOAD_UNCONFIRMED');
-        throw error;
-      } finally {
-        reloading = false;
-      }
-    } else if (request.op === 'set_model') {
+      data = await runActive(async () => {
+        let dispatched = false;
+        try {
+          const result = await callbacks.reload({
+            ...identity,
+            beforeDispatch: () => {
+              beforeDispatch();
+              dispatched = true;
+            },
+          });
+          if (dispatched && result?.reloaded === true) return { reloaded: true };
+        } catch (error) {
+          if (!dispatched) throw error;
+        }
+        fail('RELOAD_UNCONFIRMED');
+      });
+    } else if (op === 'set_model') {
       if (typeof callbacks.setModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
       const input = modelSettingsSchema.safeParse(args);
       if (!input.success) fail('INVALID_ARGUMENTS');
-      if (settingModel) fail('MODEL_SELECTION_PENDING');
+      if (active('set_model')) fail('MODEL_SELECTION_PENDING');
       const beforeModelDispatch = () => {
         if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
-        if (reloading) fail('RELOAD_IN_PROGRESS');
+        if (active('reload')) fail('RELOAD_IN_PROGRESS');
       };
       beforeModelDispatch();
-      settingModel = true;
-      try {
+      return runActive(async () => {
         const value = modelSettings(
           await callbacks.setModel({
             ...input.data,
-            sessionFile: target.file,
-            sessionId: target.header.id,
+            ...identity,
             beforeDispatch: beforeModelDispatch,
           }),
         );
@@ -273,74 +265,53 @@ export async function reserveHostSession({
         if (!sameModel(value.model, actual.model) || value.thinking_level !== actual.thinkingLevel)
           fail('MODEL_SELECTION_CHANGED');
         return value;
-      } finally {
-        settingModel = false;
-      }
-    } else if (request.op === 'compact') {
+      });
+    } else if (op === 'compact') {
       if (typeof callbacks.compact !== 'function') fail('COMPACT_UNSUPPORTED');
       const input = parseCompactInput(args);
-      if (compacting) fail('COMPACTION_PENDING');
+      if (active('compact')) fail('COMPACTION_PENDING');
       beforeDispatch();
-      compacting = true;
-      try {
-        data = compactMetadata(
-          await callbacks.compact({
-            ...input,
-            sessionFile: target.file,
-            sessionId: target.header.id,
-            beforeDispatch,
-          }),
-        );
-      } finally {
-        compacting = false;
-      }
-    } else if (request.op === 'send') {
-      if (compacting) fail('COMPACTION_PENDING');
-      if (settingModel) fail('MODEL_SELECTION_PENDING');
+      data = await runActive(async () =>
+        compactMetadata(await callbacks.compact({ ...input, ...identity, beforeDispatch })),
+      );
+    } else if (op === 'send') {
+      if (active('compact')) fail('COMPACTION_PENDING');
+      if (active('set_model')) fail('MODEL_SELECTION_PENDING');
       beforeDispatch();
       const input = attachedPromptInput(args);
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
-      submitting++;
-      try {
-        data =
-          remotePromptRejection(input.text) ??
-          receipt(await callbacks.submit({ ...input, beforeDispatch }));
-      } finally {
-        submitting--;
-      }
-    } else if (request.op === 'bash') {
+      data =
+        remotePromptRejection(input.text) ??
+        (await runActive(async () =>
+          receipt(await callbacks.submit({ ...input, beforeDispatch })),
+        ));
+    } else if (op === 'bash') {
       if (!supportsBash()) fail('BASH_UNSUPPORTED');
       beforeDispatch();
-      if (bashing) fail('BASH_IN_PROGRESS');
-      bashing = true;
-      try {
+      if (active('bash')) fail('BASH_IN_PROGRESS');
+      data = await runActive(async () => {
         const result = await callbacks.bash({
           command: args.command,
-          sessionFile: target.file,
-          sessionId: target.header.id,
+          ...identity,
           beforeDispatch,
           onResult: async (value) => {
             await state();
             partial(limitBashResult(value, args.max_chars));
           },
         });
-        data = limitBashResult(result, args.max_chars);
-      } finally {
-        bashing = false;
-      }
-    } else if (request.op === 'stop') {
+        return limitBashResult(result, args.max_chars);
+      });
+    } else if (op === 'stop') {
       if (typeof callbacks.stop !== 'function') fail('STOP_UNSUPPORTED');
-      if (stopping) fail('STOP_IN_PROGRESS');
+      if (active('stop')) fail('STOP_IN_PROGRESS');
       const withdrawn = withdrawalCollector(args.max_chars);
-      stopping = true;
       stopSequence++;
-      try {
-        data = stopReceipt(
+      data = await runActive(async () => {
+        const receipt = stopReceipt(
           await callbacks.stop({
-            sessionFile: target.file,
-            sessionId: target.header.id,
+            ...identity,
             onWithdraw: async (value) => {
               await state();
               partial({ withdrawal: { ...withdrawn.add(value), complete: false } });
@@ -348,10 +319,8 @@ export async function reserveHostSession({
           }),
         );
         if (!withdrawn.value) fail('INVALID_STOP_RECEIPT');
-        data = { ...data, withdrawal: withdrawn.value };
-      } finally {
-        stopping = false;
-      }
+        return { ...receipt, withdrawal: withdrawn.value };
+      });
     } else fail('INVALID_ATTACHED_OPERATION');
     await state();
     return data;
@@ -364,9 +333,8 @@ export async function reserveHostSession({
       try {
         await retire();
       } finally {
-        await Promise.allSettled([...operations]);
-        for (const socket of sockets) socket.destroy();
-        if (server) await new Promise((resolve) => server.close(resolve));
+        await drain();
+        await closeOwnerServer(server, sockets);
       }
       // Controller disconnect is not proof the actual writer has exited.
       if (!(await ownerAlive(record.owner))) await releaseOwner(attachmentDir, target, record);
@@ -397,15 +365,19 @@ export async function reserveHostSession({
             fail('RUNTIME_SESSION_CHANGED');
           if (request.op === 'release') return release();
           if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
-          const operation = operate(request, (data) => {
-            if (!socket.destroyed && !socket.writableEnded)
-              socket.write(ownerEnvelope(record, { partial: true, data }));
-          });
-          operations.add(operation);
+          const job = {
+            task: Promise.resolve().then(() =>
+              operate(request, job, (data) => {
+                if (!socket.destroyed && !socket.writableEnded)
+                  socket.write(ownerEnvelope(record, { partial: true, data }));
+              }),
+            ),
+          };
+          operations.add(job);
           try {
-            return await operation;
+            return await job.task;
           } finally {
-            operations.delete(operation);
+            operations.delete(job);
           }
         },
         'HOST_OPERATION_FAILED',
@@ -417,8 +389,7 @@ export async function reserveHostSession({
         phase: 'ready',
         imagesSupported: callbacks.supportsImages === true,
         idleOnlySupported: callbacks.supportsIdleOnly === true,
-        bridgeVersion: packageInfo.version,
-        readContract: READ_CONTRACT,
+        ...ownerProtocol,
         reloadSupported: typeof callbacks.reload === 'function',
       });
       if (closed || releasing) {
@@ -429,8 +400,7 @@ export async function reserveHostSession({
       return controller;
     } catch (error) {
       ready = false;
-      for (const socket of sockets) socket.destroy();
-      if (server) await new Promise((resolve) => server.close(resolve));
+      await closeOwnerServer(server, sockets);
       // Retain the blocking claim even when endpoint publication fails.
       throw error;
     }

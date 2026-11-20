@@ -112,7 +112,7 @@ test(
     assert.equal(first.data.result.text, 'Synthetic response 2. (FIRST)');
     assert.equal(bridge.pool.get(id).exited, false, 'completion precedes exit');
     await f.mark('release-shutdown');
-    await until(() => !bridge.pool.get(id) && !bridge.autoReleases.size);
+    await until(() => !bridge.pool.get(id) && !bridge.lane(id));
     await send('SECOND');
     await until(() => events.length === 2);
     assert.notEqual(first.data.leaf_id, events[1].data.leaf_id);

@@ -1,4 +1,10 @@
-import { nativeOwner, nativeTui, fauxArgs, gatedExtension } from './fixtures/native-owner.mjs';
+import {
+  idleProcess,
+  nativeOwner,
+  nativeTui,
+  fauxArgs,
+  gatedExtension,
+} from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 
@@ -10,8 +16,6 @@ import { readFileSync } from 'node:fs';
 
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import {
@@ -147,7 +151,7 @@ for (const stage of ['running', 'busy_handoff', 'handoff_eof', 'release_eof'])
       (value) => ({ value }),
       (error) => ({ error }),
     );
-    if (lifecycle) await until(() => f.bridge.handoffs.has(f.id));
+    if (lifecycle) await until(() => Boolean(f.bridge.handoff(f.id)));
     if (stage === 'handoff_eof') await f.mark('settle');
     if (['handoff_eof', 'release_eof'].includes(stage))
       await until(() => exists(path.join(f.dir, 'shutdown')));
@@ -157,7 +161,7 @@ for (const stage of ['running', 'busy_handoff', 'handoff_eof', 'release_eof'])
       assert.ok((await outcome).error, 'cancelled lifecycle must not report a successful handoff');
     assert.equal(await ownerAlive(owner), false);
     assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
-    assert.equal(f.bridge.handoffs.has(f.id), false);
+    assert.equal(Boolean(f.bridge.handoff(f.id)), false);
     await assert.rejects(fs.stat(f.session.file), { code: 'ENOENT' });
     const manifest = await restoreManifest(f.config, deleted);
     assert.match(await fs.readFile(manifest.trash_path, 'utf8'), /DELETE_OVERRIDES_LIFECYCLE/);
@@ -184,7 +188,7 @@ test(
     assert.equal(receipt.status, 'unknown');
     assert.equal(receipt.reason, 'ACK_TIMEOUT');
     await until(() => held);
-    assert.equal(f.bridge.locks.has(`stop:${f.id}`), false);
+    assert.equal(f.bridge.lane(f.id, 'stop'), undefined);
     const joined = transfer(f);
     await until(() => rpc.handoffPending);
     await delay(100);
@@ -219,7 +223,7 @@ test(
     assert.equal(rpc.handoffPending, true);
     controller.abort();
     await rejected;
-    await until(() => !f.bridge.handoffs.has(f.id));
+    await until(() => !f.bridge.handoff(f.id));
     assert.equal(await ownerAlive(old.owner), true);
     assert.notEqual((await readClaim(f.config.attachmentDir, f.session)).noColdReacquire, true);
     assert.equal(
@@ -320,14 +324,8 @@ test('an uncertain native switch exception retains its live reservation instead 
 
 test('delete holds exclusion through an opening handoff until the requester exits', async (t) => {
   const f = await fixture(t);
-  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
-  const exited = once(child, 'exit');
-  t.after(async () => {
-    child.kill();
-    await exited;
-  });
-  await once(child, 'spawn');
-  f.request.requester = await processIdentity(child.pid);
+  const { child, exited, owner } = await idleProcess(t);
+  f.request.requester = owner;
   await transfer(f);
   const dir = f.config.attachmentDir;
   const claim = await readClaim(dir, f.session);
@@ -374,7 +372,7 @@ test(
     await until(() => exists(path.join(f.dir, 'settling')));
     const original = (await readClaim(f.config.attachmentDir, f.session)).owner;
     tui.type('/bridge-join ' + f.id + '\r');
-    await until(() => f.bridge.handoffs.has(f.id));
+    await until(() => Boolean(f.bridge.handoff(f.id)));
     assert.equal(await ownerAlive(original), true);
     await f.mark('settle');
     await until(async () => {

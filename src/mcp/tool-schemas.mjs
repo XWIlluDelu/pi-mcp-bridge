@@ -27,6 +27,8 @@ const hasPrompt = (args) => args.text !== undefined || args.images !== undefined
 // Bridge operation methods receive parsed arguments.
 const directory = utf16String(4096).min(1);
 const date = z.string().datetime({ offset: true });
+export const inputOperations = new Set(['send', 'command', 'compact', 'reload']);
+
 export const publicOperationSchemas = {
   list: z
     .object({

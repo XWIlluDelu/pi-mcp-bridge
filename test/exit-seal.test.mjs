@@ -169,6 +169,10 @@ test('owner framing isolates fragmented, malformed, oversized and idle requests'
     assert.equal(await raw((socket) => socket.end(input)), '');
   assert.equal(await raw((socket) => socket.write(request.slice(0, 9))), '');
   assert.equal(f.requests.length, 1);
+  assert.deepEqual(JSON.parse(await raw((socket) => socket.end(request.repeat(2)))).data, {
+    sealed: true,
+  });
+  assert.equal(f.requests.length, 2);
   assert.deepEqual(await f.runtime.seal(), { sealed: true });
 });
 
@@ -217,6 +221,7 @@ test('owned compact keeps its control connection and fence for a matching late r
   await rpc.drainAcks(); // Missing replies are not received ACK tasks.
   response.resolve({ data: compacted });
   assert.deepEqual(await late.promise, { ok: true, data: compacted });
+  await rpc.drainAcks();
   assert.equal(rpc.pending.size, 0);
   assert.equal(rpc.hasPendingCommand('compact'), false);
   assert.equal(f.requests.length, 1);
