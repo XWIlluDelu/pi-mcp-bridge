@@ -1,9 +1,7 @@
 import fs from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import {
@@ -11,7 +9,7 @@ import {
   piLaunchEnvironment,
   loadPiSdk,
 } from '../runtime/pi-installation.mjs';
-import { sessionKey, syncDir, assertNativeDirectory } from '../core/storage.mjs';
+import { sessionKey, syncDir, assertNativeDirectory, writeNewFile } from '../core/storage.mjs';
 import { launchProfile } from '../runtime/rpc.mjs';
 import { traceSessionBranch } from '../core/data.mjs';
 const exec = promisify(execFile);
@@ -65,23 +63,22 @@ export async function prepareSession(config, project, { name, parentSession, cap
 }
 
 export async function persistSession(session, entries) {
-  await assertNativeDirectory(path.dirname(session.file));
+  const directory = path.dirname(session.file);
+  await assertNativeDirectory(directory);
   const temporary = `${session.file}.${randomUUID()}.pending`;
+  function* lines() {
+    yield JSON.stringify(session.header) + '\n';
+    for (const entry of entries) yield JSON.stringify(entry) + '\n';
+  }
+  await writeNewFile(temporary, lines());
   let published = false;
   try {
-    await pipeline(
-      function* () {
-        yield JSON.stringify(session.header) + '\n';
-        for (const entry of entries) yield JSON.stringify(entry) + '\n';
-      },
-      createWriteStream(temporary, { flags: 'wx', mode: 0o600, flush: true }),
-    );
     // Publish a complete immutable prefix without overwriting an existing file.
     // Discovery rejects the brief two-link interval until the temp is unlinked.
     await fs.link(temporary, session.file);
     published = true;
     await fs.unlink(temporary);
-    await syncDir(path.dirname(session.file));
+    await syncDir(directory);
   } catch (error) {
     // Cleanup is best effort after a failed write/publication. A second unlink
     // failure must not replace the original error or erase the published state.

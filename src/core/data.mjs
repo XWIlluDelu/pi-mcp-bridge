@@ -1,8 +1,13 @@
 import fs from 'node:fs/promises';
-import { constants } from 'node:fs';
 import { nativeSdk } from '../runtime/pi-installation.mjs';
 import path from 'node:path';
-import { sessionKey, assertNativeDirectory, NATIVE_TRASH_DIR } from './storage.mjs';
+import {
+  ifMissing,
+  sessionKey,
+  assertNativeDirectory,
+  NATIVE_TRASH_DIR,
+  withReadInode,
+} from './storage.mjs';
 import { scanSavedLines } from './lf-lines.mjs';
 // Cooperative storage boundary: reject aliases instead of changing public IDs.
 // Checks do not exclude concurrent filesystem edits by the same Unix owner.
@@ -11,39 +16,29 @@ function sessionDirectory(file) {
     throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
   return assertNativeDirectory(path.dirname(file));
 }
-function checkSessionStat(stat, { protectedPath }) {
+function checkSessionStat(stat, protectedPath) {
   if (!stat.isFile() || stat.nlink !== 1) throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
   if (stat.uid !== process.getuid() || (!protectedPath && stat.mode & 0o022))
     throw new Error('UNSAFE_NATIVE_SESSION_STORAGE');
 }
 export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
-  const directory = await sessionDirectory(file);
-  let stat;
-  try {
-    stat = await fs.lstat(file);
-  } catch (error) {
-    if (allowMissing && error.code === 'ENOENT') return null;
-    throw error;
-  }
-  checkSessionStat(stat, directory);
+  const protectedPath = await sessionDirectory(file);
+  const stat = await fs.lstat(file).catch(allowMissing ? ifMissing : undefined);
+  if (!stat) return null;
+  checkSessionStat(stat, protectedPath);
   return stat;
 }
 
-export async function withSessionFile(file, read, directory) {
-  directory ??= await sessionDirectory(file);
-  const fd = await fs
-    .open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-    .catch((error) => {
-      if (error.code === 'ELOOP') throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
-      throw error;
-    });
-  try {
-    const stat = await fd.stat();
-    checkSessionStat(stat, directory);
-    return await read(fd, stat);
-  } finally {
-    await fd.close();
-  }
+export async function withSessionFile(file, read, protectedPath) {
+  protectedPath ??= await sessionDirectory(file);
+  return withReadInode(
+    file,
+    (fd, stat) => {
+      checkSessionStat(stat, protectedPath);
+      return read(fd, stat);
+    },
+    'SESSION_FILE_ALIAS_NOT_ALLOWED',
+  );
 }
 function validateHeader(header) {
   if (
@@ -71,7 +66,7 @@ export const servesSession = (reply, session) =>
 export function fileRevision(stat) {
   return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
 }
-export function readSessionIdentity(file, directory) {
+export function readSessionIdentity(file, protectedPath) {
   return withSessionFile(
     file,
     async (fd, stat) => {
@@ -108,7 +103,7 @@ export function readSessionIdentity(file, directory) {
         fileRevision: fileRevision(stat),
       };
     },
-    directory,
+    protectedPath,
   );
 }
 export async function validateExecutionCwd(cwd) {
@@ -124,28 +119,26 @@ export async function validateExecutionCwd(cwd) {
 export async function loadSession(file, { omitImageData = false, config, sdk } = {}) {
   const { parseSessionEntries, migrateSessionEntries, CURRENT_SESSION_VERSION } =
     sdk ?? (await nativeSdk(config));
-  const records = [];
+  const entries = [];
   let skipped = 0;
   const parse = (line) => {
     if (!line.trim()) return;
     const parsed = parseSessionEntries(line);
     if (!parsed.length) skipped++;
-    else
-      for (const entry of parsed) {
-        if (omitImageData) {
-          // Rendering never uses native image bytes. Drop only content-block data,
-          // not business details/arguments; raw fork snapshots keep their default.
-          const content =
-            entry.type === 'message'
-              ? entry.message?.content
-              : entry.type === 'custom_message'
-                ? entry.content
-                : null;
-          for (const block of Array.isArray(content) ? content : [])
-            if (block?.type === 'image') delete block.data;
-        }
-        records.push(entry);
+    for (const entry of parsed) {
+      if (omitImageData) {
+        // Projection drops native image bytes. Raw fork snapshots retain them.
+        const content =
+          entry.type === 'message'
+            ? entry.message?.content
+            : entry.type === 'custom_message'
+              ? entry.content
+              : null;
+        for (const block of Array.isArray(content) ? content : [])
+          if (block?.type === 'image') delete block.data;
       }
+      entries.push(entry);
+    }
   };
   const unterminated = await withSessionFile(file, async (fd, opened) => {
     // Native pure parsing skips malformed records; never call a loader which
@@ -156,12 +149,11 @@ export async function loadSession(file, { omitImageData = false, config, sdk } =
       throw new Error('RUNTIME_SESSION_CHANGED');
     return tail;
   });
-  validateHeader(records[0]);
-  migrateSessionEntries(records);
-  if (records[0].version !== CURRENT_SESSION_VERSION)
-    throw new Error('UNSUPPORTED_SESSION_VERSION');
-  const [header, ...entries] = records,
-    byId = new Map();
+  validateHeader(entries[0]);
+  migrateSessionEntries(entries);
+  const header = entries.shift();
+  if (header.version !== CURRENT_SESSION_VERSION) throw new Error('UNSUPPORTED_SESSION_VERSION');
+  const byId = new Map();
   for (const entry of entries) {
     if (
       !entry ||
@@ -213,9 +205,9 @@ export async function loadSavedSession(session, options) {
 export async function discover(config) {
   const found = [];
   async function walk(dir, nested = false) {
-    let directory;
+    let protectedPath;
     try {
-      directory = await assertNativeDirectory(dir);
+      protectedPath = await assertNativeDirectory(dir);
     } catch (error) {
       if (error.code === 'ENOENT' || (nested && error.message === 'UNSAFE_NATIVE_SESSION_STORAGE'))
         return;
@@ -229,7 +221,7 @@ export async function discover(config) {
       if (ent.isDirectory()) await walk(file, true);
       else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
         try {
-          found.push(await readSessionIdentity(file, directory));
+          found.push(await readSessionIdentity(file, protectedPath));
         } catch {
           /* Invalid or partially written files are not exposed. */
         }

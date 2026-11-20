@@ -6,14 +6,13 @@ import {
   readSessionIdentity,
   sameSessionIdentity,
 } from '../core/data.mjs';
-import { syncDir, NATIVE_TRASH_DIR } from '../core/storage.mjs';
+import { writeNewFile, syncDir, NATIVE_TRASH_DIR, ifMissing } from '../core/storage.mjs';
 
 async function privateTrashDirectory(dir, io) {
   await io.mkdir(dir, { recursive: true, mode: 0o700 });
   const stat = await io.lstat(dir);
   if (
     !stat.isDirectory() ||
-    stat.isSymbolicLink() ||
     stat.uid !== process.getuid() ||
     stat.mode & 0o077 ||
     (await io.realpath(dir)) !== path.resolve(dir)
@@ -40,10 +39,7 @@ export async function prepareTrash(config, session, { io = fs, sync = syncDir } 
   const cancel = async () => {
     if (moved) return;
     cancelled = true;
-    for (const file of created)
-      await io.unlink(file).catch((error) => {
-        if (error.code !== 'ENOENT') throw error;
-      });
+    for (const file of created) await io.unlink(file).catch(ifMissing);
     for (const dir of new Set(created.map((file) => path.dirname(file)))) await sync(dir);
   };
   try {
@@ -62,14 +58,8 @@ export async function prepareTrash(config, session, { io = fs, sync = syncDir } 
       metadata_path: metadataPath,
     });
     for (const file of [metadataPath, indexPath]) {
-      const handle = await io.open(file, 'wx', 0o600);
+      await writeNewFile(file, record, { io });
       created.push(file);
-      try {
-        await handle.writeFile(record);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
       await sync(path.dirname(file));
     }
   } catch (error) {
