@@ -1,7 +1,6 @@
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { ackTimeout } from './fixtures/ack-timeout.mjs';
 import { nativeRpcHost } from './fixtures/native-rpc.mjs';
 
@@ -13,7 +12,6 @@ import path from 'node:path';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
 import { fauxAssistantMessage, fauxProvider } from './fixtures/pi.mjs';
 import { readClaim } from '../src/runtime/attachments.mjs';
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 
 const deferred = () => Promise.withResolvers();
@@ -86,12 +84,7 @@ test('two official SDK sessions in one host PID release independently without sh
   const modelRuntime = await offlineModels(faux);
   const hosts = [];
   for (const saved of [savedA, savedB]) {
-    const controller = await reserveHostSession({
-      buildSessionProjection: hostProjection,
-      attachmentDir: f.config.attachmentDir,
-      session: saved,
-    });
-    f.cleanup.push(() => controller.close());
+    const controller = await f.reserveHost(saved);
     const session = await sdkSession({ ...f, session: saved }, modelRuntime, faux.getModel(), {
       agentDir: path.join(f.dir, saved === savedA ? 'agent-a' : 'agent-b'),
     });

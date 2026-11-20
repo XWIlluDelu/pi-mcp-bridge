@@ -5,16 +5,11 @@ import { sessionKey } from '../core/storage.mjs';
 // CLI class in bundled installations. Importing sdkEntry separately would not.
 import * as sdk from '@earendil-works/pi-coding-agent';
 import { reloadAdmission } from './reload-admission.mjs';
-import { ContextObservation } from '../read/context-observation.mjs';
-import { nativeReadFeatures } from '../read/read-features.mjs';
-import { LiveMessageObserver } from '../read/live-message.mjs';
-import { SettledObserver } from '../events/settled-observer.mjs';
 import {
   ownerServer,
-  closeOwnerServer,
-  listenPrivate,
-  ownerReadFeatures,
   nativeOwnerRead,
+  nativeOwnerObservers,
+  observeNativeOwner,
 } from './attachment-protocol.mjs';
 import { parseCompactInput, compactContext, compactMetadata } from '../ops/compact.mjs';
 import { sameModel, thinkingLevelSchema } from '../ops/models.mjs';
@@ -59,16 +54,6 @@ export default async function rpcObserver(pi) {
   const { socket, generation, ownerControl, resume } = JSON.parse(value);
   const admission = reloadAdmission(sdk.AgentSession);
   let server, context;
-  const connections = new Set();
-  const live = new LiveMessageObserver('rpc_message_events');
-  for (const name of [
-    'agent_start',
-    'agent_settled',
-    'message_start',
-    'message_update',
-    'message_end',
-  ])
-    pi.on(name, (event) => live.update(event));
   // Preserve observation/completion ordering across native extension reload.
   const key = Symbol.for('pi-mcp-bridge.rpc-observer.lifecycle');
   const lifecycle =
@@ -79,21 +64,9 @@ export default async function rpcObserver(pi) {
           captureSequence: 0,
           completionSequence: 0,
         });
-  // Capture the native boundary before the first await. Only local IPC is
-  // acknowledged here; HTTPS delivery never blocks Pi or keeps its writer alive.
-  if (ownerControl) {
-    const settled = new SettledObserver(ownerControl, generation, lifecycle);
-    pi.on('agent_start', (_event, ctx) => settled.start(ctx.sessionManager));
-    pi.on('agent_settled', (event, ctx) => {
-      const occurrence = settled.capture(event, ctx.sessionManager);
-      return settled.send(occurrence);
-    });
-  }
-  // Preserve capture ordering across reload within this same owner generation.
-  const observation = new ContextObservation(generation, lifecycle);
-  // Pi dispatches every context handler before this phase, irrespective of
-  // extension load order. Later full-context hooks can still change it.
-  pi.on('context_with_system', (event, ctx) => observation.capture(event, ctx));
+  const observers = nativeOwnerObservers('rpc_message_events', generation, ownerControl, lifecycle);
+  pi.on('agent_start', (event) => observers.liveMessage.update(event));
+  observeNativeOwner(pi, () => observers);
   // An owned RPC is one file-bound writer. Veto before Pi opens another file;
   // session_shutdown is too late. Native TUI/host owners use their own lifecycle.
   pi.on('session_before_switch', (event, ctx) => {
@@ -125,18 +98,18 @@ export default async function rpcObserver(pi) {
           { signal: AbortSignal.timeout(2000) },
         ).catch(() => {});
     });
-    observation.reset();
+    observers.observation.reset();
     if (server) return;
     server = ownerServer(
-      connections,
       () => ({
         kind: 'rpc',
         generation,
         file: context?.sessionManager.getSessionFile(),
         sessionId: context?.sessionManager.getSessionId(),
       }),
-      async ({ op, body, readAdapters }, connection, _reply, binding) => {
+      async (request, connection, _reply, binding) => {
         if (!context) throw new Error('RUNTIME_SESSION_CHANGED');
+        const { op, body } = request;
         const ctx = context,
           manager = ctx.sessionManager;
         switch (op) {
@@ -169,31 +142,31 @@ export default async function rpcObserver(pi) {
               sealed: admission.sealed(manager),
             };
           case 'read_features':
-            return ownerReadFeatures(
-              binding,
-              nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
-            );
           case 'read':
-            return nativeOwnerRead(binding, body, ctx, observation, live, {
-              buildSessionProjection: sdk.buildSessionProjection,
-              readAdapters,
-            });
+            return nativeOwnerRead(
+              pi,
+              binding,
+              request,
+              ctx,
+              observers,
+              sdk.buildSessionProjection,
+            );
           default:
             throw new Error('INVALID_ATTACHED_OPERATION');
         }
       },
     );
-    await listenPrivate(server, socket);
+    await server.listen(socket);
   });
   pi.on('session_shutdown', async () => {
     if (context) admission.setOnIdle(context.sessionManager, undefined);
     context = null;
-    live.reset();
-    observation.reset();
+    observers.liveMessage.reset();
+    observers.observation.reset();
     // Reload/replacement recreates factories after shutdown handlers finish.
     // Close the owning listener (which unlinks its Unix socket) before rebinding.
     const listener = server;
     server = undefined;
-    await closeOwnerServer(listener, connections);
+    await listener?.close();
   });
 }

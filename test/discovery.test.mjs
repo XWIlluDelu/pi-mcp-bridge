@@ -10,11 +10,7 @@ import { loadSession, readSessionIdentity, discover } from '../src/core/data.mjs
 async function fixture(t) {
   let starts = 0;
   const runtime = ownedRuntime({
-    alive: true,
     command: async () => ({ disposition: 'started' }),
-    stop: async () => {
-      runtime.alive = false;
-    },
     state: async () => ({ isStreaming: false, isCompacting: false }),
   });
   const f = await nativeOwner(t, {

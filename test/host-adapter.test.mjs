@@ -2,13 +2,11 @@ import { nativeOwner } from './fixtures/native-owner.mjs';
 import { message } from './fixtures/native-history.mjs';
 import { readLfLines } from '../src/core/lf-lines.mjs';
 import { ownerEnvelope } from '../src/runtime/attachment-protocol.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 
 import net from 'node:net';
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { READ_CONTRACT } from '../src/read/context-read.mjs';
 import {
   readClaim,
@@ -27,12 +25,7 @@ async function fixture(t) {
     session,
     config: { attachmentDir },
   } = f;
-  const controller = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir,
-    session,
-  });
-  f.cleanup.push(() => controller.close());
+  const controller = await f.reserveHost();
   const state = () => ({
     sessionFile: session.file,
     sessionId: session.header.id,

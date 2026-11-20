@@ -6,6 +6,7 @@ import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
 import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { ownerAlive, readClaim } from '../src/runtime/attachments.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 
 test('native profile discovery leaves an owned RPC claim intact and registers an ordinary RPC', async (t) => {
   const companion = new URL('../src/attach-extension.mjs', import.meta.url).pathname;
@@ -63,4 +64,19 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
   assert.equal((await claim()).generation, external.generation);
   await f.bridge.close();
   assert.equal(await ownerAlive(external.owner), true);
+});
+
+test('a direct spawn failure clears its reservation without binding the Bridge process', async (t) => {
+  const f = await nativeOwner(t, { prefix: 'spawn-failure' });
+  const rpc = new PiRpc(f.config, f.session);
+  const stat = fs.stat;
+  t.mock.method(fs, 'stat', async (file, options) => {
+    const info = await stat(file, options);
+    // Lose the working directory after the final preflight, before spawn.
+    if (file === f.cwd) await fs.rmdir(file);
+    return info;
+  });
+  await assert.rejects(rpc.start(), { code: 'RUNTIME_START_FAILED' });
+  assert.equal(rpc.childIdentity, undefined);
+  assert.equal(await readClaim(f.config.attachmentDir, f.session), null);
 });

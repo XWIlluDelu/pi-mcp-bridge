@@ -69,7 +69,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
     }),
     (e) => e.message === 'ACK_TIMEOUT' && e.uncertain === true,
   );
-  assert.ok(runtime.hasPendingModelSelection());
+  assert.ok(runtime.hasPendingCommand('set_model'));
   await assert.rejects(
     bridge.set_model({ session_id: id, thinking_level: 'low' }),
     /MODEL_SELECTION_PENDING/,
@@ -79,7 +79,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
     'MODEL_SELECTION_PENDING',
   );
   await fs.writeFile(f.gate, 'go');
-  await until(() => !runtime.hasPendingModelSelection());
+  await until(() => !runtime.hasPendingCommand('set_model'));
   assert.equal((await runtime.state()).thinkingLevel, 'off');
   assert.equal((await runtime.entries()).entries.filter((e) => e.message).length, 0);
 });

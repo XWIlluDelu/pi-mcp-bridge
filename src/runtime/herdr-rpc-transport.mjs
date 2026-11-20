@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, randomBytes } from 'node:crypto';
 import { createServer } from 'node:net';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { finished } from 'node:stream/promises';
 import { execFile } from 'node:child_process';
@@ -37,7 +37,6 @@ export class HerdrRpcTransport extends EventEmitter {
     this.scope = 'pi-bridge-rpc-' + randomUUID() + '.scope';
     this.sockets = new Set();
     this.channels = {};
-    this.token = randomBytes(32).toString('hex');
     this.ready = Promise.resolve().then(() => this.start(launch, signal));
   }
   async scopeActive() {
@@ -65,34 +64,31 @@ export class HerdrRpcTransport extends EventEmitter {
     this.directory = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-bridge-herdr-'));
     const address = path.join(this.directory, 'rpc.sock');
     const ticket = path.join(this.directory, 'launch.json');
-    let rejectChannels;
-    const connected = new Promise((resolve, reject) => {
-      rejectChannels = reject;
-      this.server = createServer({ allowHalfOpen: true }, (socket) => {
-        this.sockets.add(socket);
-        socket.on('error', () => {});
-        void (async () => {
-          const hello = await readRecord(socket, signal, 1024);
-          if (
-            hello.token !== this.token ||
-            !['control', 'rpc', 'stderr'].includes(hello.channel) ||
-            this.channels[hello.channel]
-          )
-            throw new Error('HERDR_INVALID_HANDSHAKE');
-          this.channels[hello.channel] = socket;
-          if (Object.keys(this.channels).length === 3) resolve();
-        })().catch(reject);
-      });
+    const token = randomBytes(32).toString('hex');
+    const connected = Promise.withResolvers();
+    this.server = createServer({ allowHalfOpen: true }, async (socket) => {
+      this.sockets.add(socket);
+      socket.on('error', () => {});
+      try {
+        const hello = await readRecord(socket, signal, 1024);
+        if (
+          hello.token !== token ||
+          !['control', 'rpc', 'stderr'].includes(hello.channel) ||
+          this.channels[hello.channel]
+        )
+          throw new Error('HERDR_INVALID_HANDSHAKE');
+        this.channels[hello.channel] = socket;
+        if (Object.keys(this.channels).length === 3) connected.resolve();
+      } catch (error) {
+        connected.reject(error);
+      }
     });
-    connected.catch(() => {});
-    signal.addEventListener('abort', () => rejectChannels(signal.reason), { once: true });
+    connected.promise.catch(() => {});
+    signal.addEventListener('abort', () => connected.reject(signal.reason), { once: true });
     signal.throwIfAborted();
-    this.server.on('error', rejectChannels);
-    await new Promise((resolve, reject) => {
-      this.server.once('error', reject);
-      this.server.listen(address, resolve);
-    });
-    await fs.writeFile(ticket, JSON.stringify({ address, token: this.token }), {
+    this.server.on('error', connected.reject);
+    await once(this.server.listen(address), 'listening');
+    await fs.writeFile(ticket, JSON.stringify({ address, token }), {
       flag: 'wx',
       mode: 0o600,
     });
@@ -130,7 +126,7 @@ export class HerdrRpcTransport extends EventEmitter {
       },
     });
     this.pane = result.layout.root.pane_id;
-    await connected;
+    await connected.promise;
     const { control, rpc, stderr } = this.channels;
     writeRecord(control, {
       ...launch,
@@ -157,7 +153,7 @@ export class HerdrRpcTransport extends EventEmitter {
     drained.catch(() => {});
     // A missing control channel is not an exit. Stop the owned scope and wait
     // for kernel-confirmed death before emitting the child lifecycle events.
-    this.observation = (async () => {
+    void (async () => {
       let result;
       try {
         result = await readRecord(control, undefined, 1024);
@@ -177,8 +173,7 @@ export class HerdrRpcTransport extends EventEmitter {
       this.emit('exit', result.code, result.signal);
       await this.cleanup();
       this.emit('close', result.code, result.signal);
-    })();
-    this.observation.catch((error) => {
+    })().catch((error) => {
       this.emit('error', error);
       this.emit('exitError', error);
     });

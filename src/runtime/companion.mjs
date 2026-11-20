@@ -1,3 +1,4 @@
+import { OwnerFailure } from '../core/errors.mjs';
 // Load once through native Pi settings for ordinary TUI/RPC startup.
 import fs from 'node:fs/promises';
 import { reloadAdmission } from './reload-admission.mjs';
@@ -7,23 +8,22 @@ import { createModelSetter } from '../ops/set-model.mjs';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
 import {
   assertSingleSessionFile,
   readSessionIdentity,
   sameSessionIdentity,
 } from '../core/data.mjs';
-import { atomicJson } from '../core/storage.mjs';
-import { attachedPromptInput, remotePromptRejection } from '../ops/prompt-input.mjs';
+import { ifMissing, atomicJson } from '../core/storage.mjs';
+import { attachedPromptInput, promptOptions, remotePromptRejection } from '../ops/prompt-input.mjs';
 import {
   ownerServer,
-  closeOwnerServer,
-  listenPrivate,
   ownerIdentity,
   ownerProtocol,
-  ownerReadFeatures,
   nativeSnapshot,
   nativeOwnerRead,
+  nativeOwnerObservers,
+  observeNativeOwner,
+  dispatchPromptWithoutAck,
 } from './attachment-protocol.mjs';
 import joinExtension from './join-extension.mjs';
 import {
@@ -31,10 +31,6 @@ import {
   currentCompanionScope,
   companionIncludes,
 } from './companion-profile.mjs';
-import { LiveMessageObserver } from '../read/live-message.mjs';
-import { ContextObservation } from '../read/context-observation.mjs';
-import { nativeReadFeatures } from '../read/read-features.mjs';
-import { SettledObserver } from '../events/settled-observer.mjs';
 import { ownerSocket } from '../owner-runtime.mjs';
 import {
   processIdentity,
@@ -43,10 +39,10 @@ import {
   registryTransaction,
   readClaim,
   claimFile,
+  newOwnerRecord,
   retireClaim,
   updateOwner,
   assertNoOtherLiveOwner,
-  AttachmentFailure,
 } from './attachments.mjs';
 
 // A completed native shutdown authorizes only its paired successor. Keep this
@@ -61,7 +57,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
     throw new Error('INVALID_HOST_PROJECTION');
   const { dir, file } = profile;
   const admission = reloadAdmission(AgentSession);
-  let active, ownership;
+  let active;
   pi.registerCommand('bridge-reload', {
     description: 'Internal Bridge reload dispatch; use /reload for local reloads',
     handler: async (token, ctx) => {
@@ -89,15 +85,8 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       } else {
         // Scope removal does not end an existing writer. Check only the existing
         // registry and target path metadata; do not register or read its history.
-        const registry = await fs.stat(dir).catch((error) => {
-          if (error.code === 'ENOENT') return null;
-          throw error;
-        });
-        if (!registry) return;
-        targetFile = await fs.realpath(targetFile).catch((error) => {
-          if (error.code === 'ENOENT') return targetFile;
-          throw error;
-        });
+        if (!(await fs.stat(dir).catch(ifMissing))) return;
+        targetFile = (await fs.realpath(targetFile).catch(ifMissing)) ?? targetFile;
       }
       // Refuse an already-owned target before SessionManager.open can switch us.
       // This is a read-only admission check, not an atomic open reservation.
@@ -106,7 +95,8 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           dir,
           { file: targetFile },
           {
-            replacing: active?.manager === ctx.sessionManager ? active : undefined,
+            replacing:
+              active?.observation && active.manager === ctx.sessionManager ? active : undefined,
             completeHandoff: true,
           },
         ),
@@ -164,11 +154,11 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           .some((e) => e.type === 'message' && ['user', 'assistant'].includes(e.message?.role))
       ) {
         if (runtime.session.header.version !== 3)
-          throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
+          throw new OwnerFailure('ATTACH_REQUIRES_SAVED_SESSION');
         return;
       }
       if (!sameSessionIdentity(await readSessionIdentity(runtime.session.file), runtime.session))
-        throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+        throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
       runtime.fileObserved = true;
     } catch (error) {
       if (active === runtime) {
@@ -181,52 +171,38 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       throw error; // Retain the claim until exact process death/replacement.
     }
   }
-  for (const event of ['message_start', 'message_update', 'message_end'])
-    pi.on(event, (value) => {
-      active?.liveMessage.update(value);
-    });
-  // All native context transforms have finished before this phase, regardless
-  // of extension load order. Never mutate the observed event.
-  pi.on('context_with_system', (event, ctx) => active?.observation.capture(event, ctx));
-  pi.on('agent_start', (_event, ctx) => {
-    if (active?.ready && active.manager === ctx.sessionManager)
-      active.settled?.start(ctx.sessionManager);
-  });
-  // These events occur after the relevant persistence; every IPC request also
-  // validates, including the first request after a previously absent file appears.
-  pi.on('agent_settled', async (event, ctx) => {
-    const runtime = active;
-    if (!runtime?.ready || runtime.manager !== ctx.sessionManager) return;
-    // Freeze leaf and result at native settlement, before storage/IPC awaits.
-    const occurrence = runtime.settled?.capture(event, ctx.sessionManager);
-    runtime.liveMessage.reset();
-    await validateStorage(runtime);
-    if (occurrence) await runtime.settled.send(occurrence);
-  });
+  observeNativeOwner(
+    pi,
+    (ctx) => {
+      if (active?.observation && (!ctx || (active.ready && active.manager === ctx.sessionManager)))
+        return active;
+    },
+    validateStorage,
+  );
   for (const event of ['session_info_changed', 'session_compact'])
     pi.on(event, async () => {
       if (active?.ready) await validateStorage(active);
     });
   pi.on('session_shutdown', async (event) => {
-    const runtime = active,
-      current = ownership;
-    active = ownership = undefined;
+    const current = active;
+    active = undefined;
     if (!current) return;
-    if (runtime) {
-      runtime.ready = false; // Fence captured callbacks before the first await.
-      runtime.observation.reset();
-    }
+    const { session, record, manager } = current;
+    current.ready = false; // Fence captured callbacks before the first await.
+    current.observation?.reset();
     try {
-      await updateOwner(dir, current.session, current.record, { phase: 'transitioning' });
+      await updateOwner(dir, session, record, { phase: 'transitioning' });
     } finally {
-      if (runtime) {
-        await closeOwnerServer(runtime.server, runtime.connections);
+      if (current.server) {
+        await current.server.close();
         // IPC disconnect does not end admitted native work.
-        await Promise.allSettled(runtime.mutations);
+        await Promise.allSettled(current.mutations.keys());
       }
       if (['reload', 'new', 'resume', 'fork'].includes(event.reason))
-        replacements.set(replacementKey(dir, current.session.file), {
-          ...current,
+        replacements.set(replacementKey(dir, session.file), {
+          session,
+          record,
+          manager,
           reason: event.reason,
           target: event.targetSessionFile,
         });
@@ -246,7 +222,7 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             if (replacement?.session.file === file) {
               // Scope removal disables control, not the still-live native writer.
               // Carry only its ownership forward without inspecting excluded data.
-              ownership = { session: replacement.session, record: replacement.record, manager };
+              active = { session: replacement.session, record: replacement.record, manager };
             } else await retirePreviousClaim(replacement);
             consumeReplacement(replacement);
           });
@@ -254,25 +230,28 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
       }
       const header = ctx.sessionManager.getHeader();
       if (!file || !header || !path.isAbsolute(file))
-        throw new AttachmentFailure('ATTACH_REQUIRES_SAVED_SESSION');
+        throw new OwnerFailure('ATTACH_REQUIRES_SAVED_SESSION');
       const session = { file, header },
         owner = await processIdentity();
       const record = {
-        kind: ctx.mode === 'tui' ? 'tui' : 'extension',
+        ...newOwnerRecord(dir, session, ctx.mode === 'tui' ? 'tui' : 'extension', owner),
         mode: ctx.mode,
-        file,
-        sessionId: header.id,
-        generation: randomUUID(),
-        owner,
-        phase: 'starting',
         ...(profile.ownerControl ? { completionSocket: ownerSocket(profile.ownerControl) } : {}),
       };
-      record.socket = path.join(dir, `${owner.pid}-${record.generation.slice(0, 8)}.sock`);
-      let fileObserved;
-      const registered = await registryTransaction(dir, async () => {
-        const observation = { session, ctx, fileObserved: false };
-        await validateStorage(observation);
-        fileObserved = observation.fileObserved;
+      const runtime = {
+        session,
+        record,
+        ctx,
+        manager,
+        mutations: new Map(),
+        ...nativeOwnerObservers(
+          'extension_message_events',
+          record.generation,
+          profile.ownerControl,
+        ),
+      };
+      await registryTransaction(dir, async () => {
+        await validateStorage(runtime);
         const replacement = replacementFor(event, manager);
         // The same path cannot be reserved under another live native identity,
         // whether first persistence has happened yet or not.
@@ -288,13 +267,13 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           active.manager === manager &&
           old?.generation === active.record.generation
         )
-          return false;
+          return;
         // An installed companion must not replace this writer's existing RPC/host
         // controller. Its endpoint and lifecycle remain with that controller.
         if (sameProcess && ['rpc', 'host'].includes(old.kind)) {
           await retirePreviousClaim(replacement, session);
           consumeReplacement(replacement);
-          return false;
+          return;
         }
         const opening = sameProcess && old.kind === 'handoff' && old.phase === 'opening';
         if (
@@ -302,41 +281,22 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           (await ownerAlive(old.owner)) &&
           !(sameProcess && (opening || replacement?.session.file === file))
         )
-          throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+          throw new OwnerFailure('LIVE_OWNER_UNREACHABLE');
         if (old?.noColdReacquire && !opening) record.noColdReacquire = true;
         await retirePreviousClaim(replacement, session);
         await atomicJson(claimFile(dir, session), record);
-        ownership = { session, record, manager };
+        active = runtime;
         consumeReplacement(replacement);
-        return true;
       });
-      if (!registered) return;
+      if (active !== runtime) return;
       // Publish blocking ownership before socket setup or any later fallible initialization.
-      const connections = new Set();
-      const runtime = {
-        session,
-        record,
-        connections,
-        ready: false,
-        compacting: false,
-        mutations: new Set(),
-        server: null,
-        ctx,
-        manager,
-        fileObserved,
-        liveMessage: new LiveMessageObserver('extension_message_events'),
-        observation: new ContextObservation(record.generation),
-        settled: profile.ownerControl
-          ? new SettledObserver(profile.ownerControl, record.generation)
-          : null,
-      };
-      active = runtime;
       const activity = () => ({
         idle: ctx.isIdle() && runtime.mutations.size === 0 && admission.idle(manager),
         pending_messages: ctx.hasPendingMessages(),
       });
-      async function trackMutation(operation) {
-        runtime.mutations.add(operation);
+      const compacting = () => runtime.mutations.values().some((kind) => kind === 'compact');
+      async function trackMutation(operation, kind) {
+        runtime.mutations.set(operation, kind);
         try {
           return await operation;
         } finally {
@@ -350,14 +310,13 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           ctx.sessionManager.getSessionFile() !== file ||
           ctx.sessionManager.getSessionId() !== header.id
         )
-          throw new AttachmentFailure('RUNTIME_SESSION_CHANGED');
+          throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
       }
       const setModel = createModelSetter({
         state: () => {
           check();
           return {
-            sessionFile: file,
-            sessionId: header.id,
+            ...ownerIdentity(record),
             model: ctx.model,
             thinkingLevel: pi.getThinkingLevel(),
           };
@@ -367,7 +326,6 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
         setThinkingLevel: (level) => pi.setThinkingLevel(level),
       });
       const server = ownerServer(
-        connections,
         () => record,
         async (request, socket, reply) => {
           check();
@@ -379,11 +337,10 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             admission.reloading(manager) &&
             !['state', 'read', 'read_features', 'snapshot'].includes(request.op)
           )
-            throw new AttachmentFailure('RELOAD_IN_PROGRESS');
+            throw new OwnerFailure('RELOAD_IN_PROGRESS');
           if (request.op === 'state')
             data = {
-              sessionFile: file,
-              sessionId: header.id,
+              ...ownerIdentity(record),
               sessionName: ctx.sessionManager.getSessionName() ?? null,
               ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
               isStreaming: !ctx.isIdle(),
@@ -391,20 +348,12 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               activity: activity(),
               reloadComplete: admission.completed(manager),
             };
-          else if (request.op === 'read_features')
-            data = ownerReadFeatures(
-              record,
-              nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
-            );
+          else if (request.op === 'read_features' || request.op === 'read')
+            data = nativeOwnerRead(pi, record, request, ctx, runtime, buildSessionProjection);
           else if (request.op === 'snapshot')
             data = { ...ownerIdentity(record), ...nativeSnapshot(manager) };
-          else if (request.op === 'read')
-            data = nativeOwnerRead(record, args, ctx, runtime.observation, runtime.liveMessage, {
-              buildSessionProjection,
-              readAdapters: request.readAdapters,
-            });
           else if (request.op === 'reload') {
-            if (Object.keys(args).length) throw new AttachmentFailure('INVALID_ARGUMENTS');
+            if (Object.keys(args).length) throw new OwnerFailure('INVALID_ARGUMENTS');
             const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
             runtime.reload = operation;
             // Native reload closes this socket and drains ordinary mutations.
@@ -423,24 +372,18 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               setModel({
                 model: args.model,
                 thinking_level: args.thinking_level,
-                sessionFile: file,
-                sessionId: header.id,
+                ...ownerIdentity(record),
                 beforeDispatch: check,
               }),
             );
             check();
           } else if (request.op === 'compact') {
             const input = parseCompactInput(args);
-            if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
-            const compact = async () => {
+            if (compacting()) throw new OwnerFailure('COMPACTION_PENDING');
+            const compact = () => {
               check();
-              runtime.compacting = true;
               socket.setTimeout(0); // Disconnect only suppresses the receipt.
-              try {
-                return await trackMutation(compactContext(ctx, input.instructions));
-              } finally {
-                runtime.compacting = false;
-              }
+              return trackMutation(compactContext(ctx, input.instructions), 'compact');
             };
             const value = input.interrupt
               ? await compact()
@@ -448,8 +391,8 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
             check();
             data = compactMetadata(value);
           } else if (request.op === 'send') {
-            if (runtime.compacting) throw new AttachmentFailure('COMPACTION_PENDING');
-            if (setModel.pending) throw new AttachmentFailure('MODEL_SELECTION_PENDING');
+            if (compacting()) throw new OwnerFailure('COMPACTION_PENDING');
+            if (setModel.pending) throw new OwnerFailure('MODEL_SELECTION_PENDING');
             const input = attachedPromptInput(args);
             const rejection = remotePromptRejection(input.text),
               currentActivity = activity();
@@ -459,36 +402,29 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               (!currentActivity.idle || currentActivity.pending_messages)
             )
               data = { status: 'skipped', reason: 'busy' };
-            else {
-              const options = { expandPromptTemplates: true };
-              if (input.mode === 'steer') options.deliverAs = 'steer';
-              if (input.mode === 'follow_up') options.deliverAs = 'followUp';
-              try {
+            else
+              data = dispatchPromptWithoutAck(() =>
                 pi.sendUserMessage(
                   input.images ? [{ type: 'text', text: input.text }, ...input.images] : input.text,
-                  options,
-                );
-                // The public API confirms invocation, not native admission or
-                // completion. A later input handler may transform or handle it.
-                data = { status: 'dispatched', admission: 'unobservable' };
-              } catch {
-                // Entering native dispatch can have side effects before a throw.
-                data = { status: 'unknown', reason: 'PI_ACCEPTANCE_UNOBSERVABLE' };
-              }
-            }
+                  {
+                    expandPromptTemplates: true,
+                    deliverAs: promptOptions(input.mode).streamingBehavior,
+                  },
+                ),
+              );
           } else if (request.op === 'bash') {
-            throw new AttachmentFailure('BASH_UNSUPPORTED');
+            throw new OwnerFailure('BASH_UNSUPPORTED');
           } else if (request.op === 'stop') {
             // TUI ctx.abort + getEditorText can recover joined text (including
             // prior draft), but no public context API aborts independent bash.
             // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
-            throw new AttachmentFailure('STOP_UNSUPPORTED');
-          } else throw new AttachmentFailure('INVALID_ATTACHED_OPERATION');
+            throw new OwnerFailure('STOP_UNSUPPORTED');
+          } else throw new OwnerFailure('INVALID_ATTACHED_OPERATION');
           return data;
         },
       );
       runtime.server = server;
-      await listenPrivate(server, record.socket);
+      await server.listen(record.socket);
       runtime.ready = true;
       await updateOwner(dir, session, record, {
         phase: 'ready',

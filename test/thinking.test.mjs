@@ -121,7 +121,7 @@ test(
       'MODEL_SELECTION_PENDING',
     );
     receive(...held);
-    await until(() => !bridge.pool.get(id)?.hasPendingModelSelection());
+    await until(() => !bridge.pool.get(id)?.hasPendingCommand('set_thinking_level'));
     assert.equal(sendReceipt(result).model_selection, undefined);
     assert.equal(
       (await releasedEntries(bridge, id)).filter((e) => e.message?.role === 'user').length,

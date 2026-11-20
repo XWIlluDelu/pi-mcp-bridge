@@ -1,3 +1,4 @@
+import { OwnerFailure } from '../src/core/errors.mjs';
 import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
 import { append, message } from './fixtures/native-history.mjs';
 import { until } from './fixtures/until.mjs';
@@ -14,7 +15,6 @@ import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { Bridge } from '../src/core/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
 import { readClaim, ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
-import { RpcFailure } from '../src/runtime/rpc.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function fixture(t, extraArgs = []) {
@@ -105,7 +105,7 @@ test('failed normal exit retains the owner claim without reporting release succe
     owned = await f.bridge.pool.resolve(f.session),
     exit = owned.gracefulExit;
   owned.gracefulExit = async () => {
-    throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
+    throw new OwnerFailure('RUNTIME_EXIT_ABNORMAL');
   };
   await assert.rejects(
     ownerRequest(f.config, { op: 'release', session_id: f.id }),

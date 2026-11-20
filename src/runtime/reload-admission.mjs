@@ -29,11 +29,7 @@ export function reloadAdmission(AgentSession) {
   const { sessions, scope } = shared;
   function state(manager) {
     let value = sessions.get(manager);
-    if (!value)
-      sessions.set(
-        manager,
-        (value = { pending: 0, operation: null, completed: false, sealed: false }),
-      );
+    if (!value) sessions.set(manager, (value = { pending: 0, operation: null, completed: false }));
     return value;
   }
   const busy = (current, ctx, otherBusy) =>
@@ -46,7 +42,8 @@ export function reloadAdmission(AgentSession) {
   // replaces the implementation they delegate to, preserving other observers.
   shared.invoke = async (session, name, args, original) => {
     const current = state(session.sessionManager);
-    if (current.sealed) {
+    const operation = current.operation;
+    if (operation?.kind === 'seal') {
       // Native shutdown hooks may append their final message synchronously.
       // Preserve only that branch; queued messages and new runs remain closed.
       if (
@@ -60,23 +57,20 @@ export function reloadAdmission(AgentSession) {
     }
     const internal =
       ['prompt', 'sendUserMessage'].includes(name) &&
-      current.operation?.kind === 'reload' &&
-      current.operation.command === args[0];
+      operation?.kind === 'reload' &&
+      operation.command === args[0];
     if (internal) return original.apply(session, args);
     // Input-free model changes remain available during compaction. Their hooks
     // keep the caller's scope, so they cannot start work through this gate.
-    const settings =
-      current.operation?.kind === 'compact' && ['setModel', 'cycleModel'].includes(name);
-    if (current.operation && scope.getStore() !== current.operation && !settings)
-      throw new Error(
-        current.operation.kind === 'reload' ? 'RELOAD_IN_PROGRESS' : 'COMPACTION_PENDING',
-      );
+    const settings = operation?.kind === 'compact' && ['setModel', 'cycleModel'].includes(name);
+    if (operation && scope.getStore() !== operation && !settings)
+      throw new Error(operation.kind === 'reload' ? 'RELOAD_IN_PROGRESS' : 'COMPACTION_PENDING');
     current.pending++;
     try {
       return await original.apply(session, args);
     } finally {
       current.pending--;
-      if (!current.pending && !current.sealed) {
+      if (!current.pending && current.operation?.kind !== 'seal') {
         try {
           current.onIdle?.();
         } catch {} // Maintenance notification cannot change a native result.
@@ -90,71 +84,66 @@ export function reloadAdmission(AgentSession) {
         return shared.invoke(this, name, args, original);
       };
     }
-  const admission = {
-    idle: (manager) =>
-      state(manager).pending === 0 && !state(manager).operation && !state(manager).sealed,
+  function acquire(manager, ctx, otherBusy, kind) {
+    const current = state(manager);
+    if (current.operation?.kind === 'seal') throw new Error('RUNTIME_SHUTTING_DOWN');
+    const reload = kind === 'reload';
+    if (busy(current, ctx, otherBusy)) throw new Error(reload ? 'RELOAD_BUSY' : 'COMPACT_BUSY');
+    let started = false,
+      timer;
+    const operation = {
+      kind,
+      cancel() {
+        clearTimeout(timer);
+        if (current.operation === operation) current.operation = null;
+      },
+      async run(work) {
+        if (started || current.operation !== operation) return;
+        started = true;
+        clearTimeout(timer);
+        try {
+          const result = await scope.run(operation, work);
+          if (reload) current.completed = true;
+          return result;
+        } finally {
+          operation.cancel();
+        }
+      },
+    };
+    if (reload) {
+      current.completed = false;
+      operation.token = randomUUID();
+      operation.command = `/bridge-reload ${operation.token}`;
+      timer = setTimeout(operation.cancel, 5000).unref();
+    }
+    current.operation = operation;
+    return operation;
+  }
+  return {
+    idle(manager) {
+      const current = state(manager);
+      return current.pending === 0 && !current.operation;
+    },
     completed: (manager) => state(manager).completed,
     reloading: (manager) => state(manager).operation?.kind === 'reload',
-    sealed: (manager) => state(manager).sealed,
+    sealed: (manager) => state(manager).operation?.kind === 'seal',
     setOnIdle(manager, callback) {
       state(manager).onIdle = callback;
     },
     seal(manager, ctx, otherBusy = false) {
       const current = state(manager);
-      if (current.sealed) return true;
+      if (current.operation?.kind === 'seal') return true;
       if (busy(current, ctx, otherBusy)) return false;
-      current.sealed = true;
+      current.operation = { kind: 'seal' };
       return true;
     },
     async compact(manager, ctx, run, otherBusy = false) {
-      const current = state(manager);
-      if (current.sealed) throw new Error('RUNTIME_SHUTTING_DOWN');
-      if (busy(current, ctx, otherBusy)) throw new Error('COMPACT_BUSY');
       // Acquire synchronously before Pi's first await, and retain exclusivity
       // until native completion even if the IPC caller disconnects.
-      const operation = { kind: 'compact' };
-      current.operation = operation;
-      try {
-        return await scope.run(operation, run);
-      } finally {
-        if (current.operation === operation) current.operation = null;
-      }
+      return acquire(manager, ctx, otherBusy, 'compact').run(run);
     },
     begin(manager, ctx, otherBusy = false) {
-      const current = state(manager);
-      if (current.sealed) throw new Error('RUNTIME_SHUTTING_DOWN');
-      if (busy(current, ctx, otherBusy)) throw new Error('RELOAD_BUSY');
-      const token = randomUUID();
-      let started = false;
-      const timer = setTimeout(() => {
-        if (!started) operation.cancel();
-      }, 5000);
-      timer.unref();
-      const operation = {
-        kind: 'reload',
-        token,
-        command: `/bridge-reload ${token}`,
-        cancel() {
-          clearTimeout(timer);
-          if (current.operation === operation) current.operation = null;
-        },
-        async run(reload) {
-          if (started || current.operation !== operation) return;
-          started = true;
-          clearTimeout(timer);
-          try {
-            const result = await scope.run(operation, reload);
-            current.completed = true;
-            return result;
-          } finally {
-            operation.cancel();
-          }
-        },
-      };
-      current.completed = false;
-      current.operation = operation;
-      return operation;
+      return acquire(manager, ctx, otherBusy, 'reload');
     },
   };
-  return admission;
 }

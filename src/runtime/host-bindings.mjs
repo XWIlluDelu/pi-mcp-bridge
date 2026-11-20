@@ -8,31 +8,40 @@ import { modelState } from '../ops/models.mjs';
 import { createModelSetter } from '../ops/set-model.mjs';
 import { requestStop } from '../ops/stop-execution.mjs';
 import { reloadAdmission } from './reload-admission.mjs';
-import { nativeSnapshot } from './attachment-protocol.mjs';
-const unknown = () => ({
-  status: 'unknown',
-  reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-});
+import {
+  dispatchPromptWithoutAck,
+  nativeSnapshot,
+  unconfirmedPrompt,
+} from './attachment-protocol.mjs';
 const identity = (state) => ({ sessionFile: state.sessionFile, sessionId: state.sessionId });
+const hostState = (value) => ({
+  ...identity(value),
+  ...modelState(value),
+  sessionName: value.sessionName ?? null,
+  isStreaming: value.isStreaming,
+  isCompacting: value.isCompacting,
+  pendingMessageCount: value.pendingMessageCount,
+});
 function assertIdentity(before, after) {
   if (before.sessionFile !== after.sessionFile || before.sessionId !== after.sessionId)
     throw new Error('RUNTIME_SESSION_CHANGED');
 }
 async function bound(state, expected, run) {
   const before = await state();
-  assertIdentity(expected ?? before, before);
+  if (expected) assertIdentity(expected, before);
   const verify = async () => assertIdentity(before, await state());
   const result = await run(before, verify);
   await verify();
   return result;
 }
 
-function bashReceipt(result, onResult) {
+async function bashReceipt(result, onResult) {
   const output = nativeBashResult(result);
-  return Promise.resolve(onResult(output)).then(() => output);
+  await onResult(output);
+  return output;
 }
 
-function tracker(release, onError) {
+function tracker({ release, cancel, onError }) {
   const pending = new Set();
   function track(work) {
     const promise = Promise.resolve(work);
@@ -51,23 +60,31 @@ function tracker(release, onError) {
   }
   return {
     track,
-    ...(release
-      ? {
-          release: async () => {
-            // The host must stop admission, abort/drain ALL its session work and close
-            // the writer. Waiting only our dispatched promises cannot prove release.
-            const outcome = await release();
-            if (outcome?.released !== true) throw new Error('HOST_RELEASE_UNCONFIRMED');
-            await Promise.allSettled(pending);
-            return { released: true };
-          },
-        }
-      : {}),
+    lifecycle: release && {
+      cancel,
+      async release() {
+        // The host must stop admission, abort/drain ALL its session work and close
+        // the writer. Waiting only our dispatched promises cannot prove release.
+        const outcome = await release();
+        if (outcome?.released !== true) throw new Error('HOST_RELEASE_UNCONFIRMED');
+        await Promise.allSettled(pending);
+        return { released: true };
+      },
+    },
   };
 }
 
 export function createSdkHostBinding(session, { release, onError } = {}) {
-  const tracked = tracker(release, onError);
+  const tracked = tracker({
+    release,
+    onError,
+    async cancel() {
+      session.clearQueue();
+      const cancellation = session.abort();
+      session.abortBash();
+      await cancellation;
+    },
+  });
   let pendingBashes = 0;
   // Pi's AgentSession methods live on its class prototype. Install the
   // admission observer there before the host admits local work: operation
@@ -75,6 +92,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   if (Object.getPrototypeOf(session) === Object.prototype || !session.sessionManager)
     throw new Error('INVALID_HOST_SESSION');
   const admission = reloadAdmission(session.constructor);
+  const verify = (expected) => assertIdentity(expected, session);
   const nativeActivity = {
     isIdle: () => session.isIdle && !session.isBashRunning,
     hasPendingMessages: () => session.pendingMessageCount > 0,
@@ -82,14 +100,9 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
   const isIdle = () =>
     nativeActivity.isIdle() && !pendingBashes && admission.idle(session.sessionManager);
   const state = async () => ({
-    ...identity(session),
-    ...modelState(session),
-    sessionName: session.sessionName ?? null,
+    ...hostState(session),
     isIdle: isIdle(),
-    isStreaming: session.isStreaming,
-    isCompacting: session.isCompacting,
     isBashRunning: session.isBashRunning,
-    pendingMessageCount: session.pendingMessageCount,
   });
   return {
     state,
@@ -102,19 +115,18 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     snapshot: async () => {
       const before = identity(session);
       const snapshot = nativeSnapshot(session.sessionManager);
-      assertIdentity(before, identity(session));
+      verify(before);
       return { ...before, ...snapshot };
     },
     supportsImages: true,
     supportsIdleOnly: true,
     reload: async ({ beforeDispatch, ...expected }) => {
-      const before = identity(session);
-      assertIdentity(expected, before);
+      verify(expected);
       const operation = admission.begin(session.sessionManager, nativeActivity, pendingBashes > 0);
       try {
         beforeDispatch?.();
         await operation.run(() => tracked.track(session.reload()));
-        assertIdentity(before, identity(session));
+        verify(expected);
         return { reloaded: true };
       } finally {
         operation.cancel();
@@ -124,7 +136,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       bound(state, expected, (before) => {
         const compact = async () => {
           beforeDispatch?.();
-          assertIdentity(before, identity(session));
+          verify(before);
           try {
             return await tracked.track(session.compact(instructions));
           } catch {
@@ -147,21 +159,14 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
       beforeDispatch?.();
       if (mode === 'idle_only' && (!isIdle() || session.pendingMessageCount > 0))
         return { status: 'skipped', reason: 'busy' };
-      // Public prompt() returns the input call's Promise, not an admission
-      // receipt. A synchronous throw after entry cannot prove no side effect.
-      try {
-        tracked.track(session.prompt(text, { ...options(mode), ...(images ? { images } : {}) }));
-      } catch (error) {
-        try {
-          onError?.(error);
-        } catch {}
-        return unknown();
-      }
-      return { status: 'dispatched', admission: 'unobservable' };
+      return dispatchPromptWithoutAck(
+        () =>
+          tracked.track(session.prompt(text, { ...options(mode), ...(images ? { images } : {}) })),
+        onError,
+      );
     },
     bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
-      const before = identity(session);
-      assertIdentity(expected, before);
+      verify(expected);
       beforeDispatch?.();
       // Native executeBash observation excludes the user_bash hook and result
       // delivery. Keep idle admission fenced across the entire host operation.
@@ -173,7 +178,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
           excludeFromContext: false,
           cwd: session.sessionManager.getCwd(),
         });
-        assertIdentity(before, identity(session));
+        verify(expected);
         let result;
         if (handled?.result) {
           result = handled.result;
@@ -187,40 +192,15 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
             }),
           );
         }
-        assertIdentity(before, identity(session));
+        verify(expected);
         return await bashReceipt(result, onResult);
       } finally {
         pendingBashes--;
       }
     },
-    stop: async ({ onWithdraw, ...expected }) => {
-      const before = identity(session);
-      assertIdentity(expected, before);
-      return tracked.track(
-        requestStop(
-          {
-            clearQueue: () => {
-              assertIdentity(before, identity(session));
-              return session.clearQueue();
-            },
-            abort: () => session.abort(),
-            abortBash: async () => session.abortBash(),
-          },
-          onWithdraw,
-        ),
-      );
-    },
-    ...(tracked.release
-      ? {
-          cancel: async () => {
-            session.clearQueue();
-            const cancellation = session.abort();
-            session.abortBash();
-            await cancellation;
-          },
-          release: tracked.release,
-        }
-      : {}),
+    stop: ({ onWithdraw, ...expected }) =>
+      tracked.track(requestStop(session, onWithdraw, () => verify(expected))),
+    ...tracked.lifecycle,
   };
 }
 
@@ -231,18 +211,12 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
     )
   )
     throw new Error('INVALID_HOST_CALLBACKS');
-  const tracked = tracker(release, onError);
-  const state = async () => {
-    const value = await client.getState();
-    return {
-      ...identity(value),
-      ...modelState(value),
-      sessionName: value.sessionName ?? null,
-      isStreaming: value.isStreaming,
-      isCompacting: value.isCompacting,
-      pendingMessageCount: value.pendingMessageCount,
-    };
-  };
+  const tracked = tracker({
+    release,
+    onError,
+    cancel: () => requestStop(client, () => {}),
+  });
+  const state = async () => hostState(await client.getState());
   return {
     state,
     readFeatures: () =>
@@ -299,12 +273,12 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
         const disposition = await tracked.track(
           client.prompt(text, images, options(mode).streamingBehavior),
         );
-        if (!['started', 'queued', 'handled'].includes(disposition)) return unknown();
+        if (!['started', 'queued', 'handled'].includes(disposition)) return unconfirmedPrompt();
         return { status: 'accepted', disposition };
       } catch {
         // Official RpcClient exposes both negative ACKs and transport failures
         // as plain Errors. Never infer rejection by parsing a raw error string.
-        return unknown();
+        return unconfirmedPrompt();
       }
     },
     bash: ({ command, onResult, beforeDispatch, ...expected }) =>
@@ -323,13 +297,6 @@ export function createRpcHostBinding(client, { release, reload, onError } = {}) 
           }),
         ),
       ),
-    ...(tracked.release
-      ? {
-          cancel: async () => {
-            await requestStop(client, async () => {});
-          },
-          release: tracked.release,
-        }
-      : {}),
+    ...tracked.lifecycle,
   };
 }

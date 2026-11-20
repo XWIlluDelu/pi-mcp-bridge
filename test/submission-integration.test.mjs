@@ -21,9 +21,6 @@ async function fixture(t) {
       calls.push(command);
       return { disposition: 'handled' };
     },
-    stop: async () => {
-      runtime.alive = false;
-    },
   });
   const f = await nativeOwner(t, {
     prefix: 'submission',

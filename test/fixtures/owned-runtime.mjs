@@ -5,8 +5,11 @@ import { nativeBusy, pendingMessages } from '../../src/runtime/attachment-protoc
 export function ownedRuntime(members) {
   return {
     alive: true,
+    async stop() {
+      this.alive = false;
+    },
     submitPrompt: PiRpc.prototype.submitPrompt,
-    hasPendingAdmission: () => false,
+    hasPendingCommand: () => false,
     hasUnsettledWork: () => false,
     async idleSnapshot() {
       const state = await this.state();

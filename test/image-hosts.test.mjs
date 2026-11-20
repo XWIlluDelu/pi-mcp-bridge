@@ -1,6 +1,5 @@
 import { nativeOwner, launchNativeTui } from './fixtures/native-owner.mjs';
 import { until } from './fixtures/until.mjs';
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import { nativeRpc, nativeRpcHost } from './fixtures/native-rpc.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -11,7 +10,6 @@ import { loadSavedSession } from '../src/core/data.mjs';
 import { offlineModels, sdkSession } from './fixtures/native-sdk.mjs';
 import { fauxProvider } from './fixtures/pi.mjs';
 import { readClaim } from '../src/runtime/attachments.mjs';
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 import { createRpcHostBinding, createSdkHostBinding } from '../src/runtime/host-bindings.mjs';
 import { pngImage, imageEvidence } from './fixtures/image-input.mjs';
 import { imageReply, imageInputExtension } from './fixtures/image-provider.mjs';
@@ -39,12 +37,7 @@ for (const route of ['rpc-host', 'companion', 'tui-companion', 'sdk-host'])
       const { config, bridge, session: saved } = f;
       let native, sdk;
       if (route === 'sdk-host') {
-        const controller = await reserveHostSession({
-          buildSessionProjection: hostProjection,
-          attachmentDir: config.attachmentDir,
-          session: saved,
-        });
-        f.cleanup.push(() => controller.close());
+        const controller = await f.reserveHost();
         const faux = fauxProvider({
           provider: 'image-sdk',
           models: [{ id: 'vision', input: ['text', 'image'] }],

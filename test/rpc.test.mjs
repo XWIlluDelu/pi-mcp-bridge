@@ -1,7 +1,8 @@
+import { OwnerFailure } from '../src/core/errors.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { PiRpc, RpcFailure } from '../src/runtime/rpc.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 import { RuntimePool } from '../src/runtime/runtime-pool.mjs';
 
 const session = { file: '/isolated/session.jsonl', header: { id: 'native' } };
@@ -174,7 +175,7 @@ test('post-ACK identity failures preserve already observed UI facts and uncertai
   rpc.dispatch = async (command) => {
     if (command.type === 'get_state') {
       if (++states === 1) return { sessionFile: rpc.session.file, sessionId: 'a' };
-      throw new RpcFailure('RUNTIME_DISCONNECTED');
+      throw new OwnerFailure('RUNTIME_DISCONNECTED');
     }
     return { disposition: 'handled', ui };
   };
@@ -195,7 +196,7 @@ test('stop tolerates exact natural exit during identity validation, but never si
     };
     rpc.assertProcessIdentity = async () => {
       if (exited) child.emit('exit', 0, null);
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
     };
     if (exited) await rpc.stop();
     else await assert.rejects(rpc.stop(), /RUNTIME_SESSION_CHANGED/);
@@ -304,7 +305,7 @@ test('late clear_queue ACK validates identity without cancellation replay, stora
     }
     if (command.type === 'clear_queue') {
       late = onLate;
-      throw new RpcFailure('ACK_TIMEOUT', true);
+      throw new OwnerFailure('ACK_TIMEOUT', true);
     }
     cancellations++;
   };
@@ -331,7 +332,7 @@ test('known withdrawal precedes uncertain cancellation and remains bounded insid
       return { sessionFile: session.file, sessionId: session.header.id };
     if (command.type === 'clear_queue')
       return { steering: ['keep 😀 '.repeat(1000)], followUp: ['tail'] };
-    if (command.type === 'abort') throw new RpcFailure('ACK_TIMEOUT', true);
+    if (command.type === 'abort') throw new OwnerFailure('ACK_TIMEOUT', true);
   };
   await assert.rejects(rpc.stopExecution({ max_chars: 256 }), (error) => {
     assert.equal(error.uncertain, true);

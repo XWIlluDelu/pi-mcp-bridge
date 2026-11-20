@@ -1,10 +1,7 @@
-import { buildSessionProjection as hostProjection } from './fixtures/pi.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-
-import { reserveHostSession } from '../src/runtime/host-adapter.mjs';
 
 import { idleProcess, nativeOwner } from './fixtures/native-owner.mjs';
 import { restoreManifest } from './fixtures/saved-session.mjs';
@@ -77,13 +74,7 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
 
 async function hostWriter(f, owner) {
   const { session } = f;
-  const host = await reserveHostSession({
-    buildSessionProjection: hostProjection,
-    attachmentDir: f.config.attachmentDir,
-    session,
-    owner,
-  });
-  f.cleanup.push(() => host.close());
+  const host = await f.reserveHost(session, owner);
   const ready = (callbacks) =>
     host.ready({
       state: async () => ({ sessionFile: session.file, sessionId: session.header.id }),

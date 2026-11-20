@@ -15,12 +15,14 @@ async function run() {
   await fs.unlink(file);
   const sockets = {};
   let child,
+    closed,
     launch,
     stopping = false;
+  const running = () => child && child.exitCode === null && child.signalCode === null;
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    if (running()) child.kill('SIGTERM');
   };
   process.on('SIGTERM', () => {
     // Bridge sends SIGTERM to the entire scope. Pi receives it directly;
@@ -48,7 +50,7 @@ async function run() {
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const closed = new Promise((resolve) =>
+    closed = new Promise((resolve) =>
       child.once('close', (code, signal) => resolve({ code, signal })),
     );
     child.on('error', stop);
@@ -75,14 +77,13 @@ async function run() {
     for (const socket of Object.values(sockets)) socket.destroy();
     // Host loss still removes only this allocated pane, after Pi really exits.
     // Normal cleanup is performed by the host after this scope becomes empty.
-    if (stopping && child && child.exitCode === null && child.signalCode === null)
-      await once(child, 'close');
+    if (running()) await closed;
     // Remove only the ticket's own empty IPC directory, including after host loss.
     if (path.dirname(ticket.address) === path.dirname(file)) {
       await fs.unlink(ticket.address).catch(() => {});
       await fs.rmdir(path.dirname(file)).catch(() => {});
     }
-    if (launch?.pane && sockets.control.destroyed && !sockets.control.writableFinished) {
+    if (launch?.pane && !sockets.control.writableFinished) {
       const control = new HerdrControl(launch.pane.address, launch.pane.identity);
       await control.request('pane.close', { pane_id: launch.pane.id }).catch(() => {});
     }

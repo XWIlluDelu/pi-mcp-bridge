@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 
-import { knownErrorCode } from './errors.mjs';
+import { isOwnerMutation, knownErrorCode } from './errors.mjs';
 
 const enums = {
   method: [
@@ -48,24 +48,17 @@ const enums = {
   op: [
     'state',
     'models',
-    'set_model',
     'set_thinking_level',
     'get_available_models',
-    'compact',
-    'reload',
     'health',
     'list',
     'read',
     'search',
-    'send',
     'submission',
-    'stop',
-    'bash',
     'command',
     'create',
     'delete',
     'batch',
-    'seal',
     'read_features',
     'snapshot',
     'get_state',
@@ -74,7 +67,6 @@ const enums = {
     'abort',
     'abort_bash',
     'clear_queue',
-    'release',
   ],
   status: [
     'ok',
@@ -95,7 +87,26 @@ const enums = {
   disposition: ['started', 'queued', 'handled'],
   mode: ['steer', 'follow_up', 'idle_only'],
 };
-const refs = new Set(['mcp_id_ref', 'session_ref']);
+const reference = /^[a-f0-9]{24}$/;
+const refs = ['mcp_id_ref', 'session_ref'];
+const formats = {
+  mcp_id_ref: reference,
+  session_ref: reference,
+  callback_hostname: /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?[.]?$/,
+  generation: /^[a-f0-9-]{36}$/,
+};
+const numbers = ['duration_ms', 'http_status', 'index'];
+const flags = ['uncertain', 'late', 'allowed', 'response_finished'];
+
+function approvedField(key, value) {
+  if (key === 'op' && isOwnerMutation(value)) return true;
+  if (Object.hasOwn(enums, key)) return enums[key].includes(value);
+  if (numbers.includes(key)) return Number.isFinite(value);
+  if (flags.includes(key)) return typeof value === 'boolean';
+  if (key === 'rpc_code') return Number.isInteger(value) && value >= -32768 && value <= -32000;
+  return typeof value === 'string' && Object.hasOwn(formats, key) && formats[key].test(value);
+}
+
 export const diagnosticRef = (value) =>
   value === undefined
     ? undefined
@@ -113,27 +124,9 @@ export function createDiagnostics({ enabled = false, write = () => {} } = {}) {
       ...context.getStore(),
     };
     for (const [key, value] of Object.entries(fields)) {
-      if (enums[key]?.includes(value) || (refs.has(key) && /^[a-f0-9]{24}$/.test(value)))
-        record[key] = value;
-      else if (
-        key === 'callback_hostname' &&
-        typeof value === 'string' &&
-        /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?[.]?$/.test(value)
-      )
-        record[key] = value;
-      else if (key === 'rpc_code' && Number.isInteger(value) && value >= -32768 && value <= -32000)
-        record[key] = value;
-      else if (['duration_ms', 'http_status', 'index'].includes(key) && Number.isFinite(value))
-        record[key] = value;
-      else if (
-        ['uncertain', 'late', 'allowed', 'response_finished'].includes(key) &&
-        typeof value === 'boolean'
-      )
-        record[key] = value;
-      else if (key === 'generation' && typeof value === 'string' && /^[a-f0-9-]{36}$/.test(value))
-        record[key] = value;
-      else if (key === 'code' && value !== undefined)
+      if (key === 'code' && value !== undefined)
         record.code = value === 'busy' ? value : knownErrorCode(value, 'OTHER_ERROR');
+      else if (approvedField(key, value)) record[key] = value;
     }
     try {
       write(JSON.stringify(record) + '\n');
@@ -145,7 +138,7 @@ export function createDiagnostics({ enabled = false, write = () => {} } = {}) {
     if (!enabled) return fn();
     // Only internal trace/correlation fields enter ambient context.
     const next = { ...context.getStore(), trace_id: context.getStore()?.trace_id ?? randomUUID() };
-    for (const key of refs) if (/^[a-f0-9]{24}$/.test(fields[key] ?? '')) next[key] = fields[key];
+    for (const key of refs) if (approvedField(key, fields[key])) next[key] = fields[key];
     return context.run(next, fn);
   }
   async function measure(stage, fields, fn) {
@@ -153,37 +146,32 @@ export function createDiagnostics({ enabled = false, write = () => {} } = {}) {
     return withContext(fields, async () => {
       const started = performance.now();
       emit(stage + '.start', fields);
+      let outcome;
       try {
         const result = await fn();
-        emit(stage + '.end', {
-          ...fields,
-          duration_ms: performance.now() - started,
+        outcome = {
           status: result?.status ?? 'ok',
           disposition: result?.disposition,
           code: result?.reason,
-        });
+        };
         return result;
       } catch (error) {
-        emit(stage + '.end', {
-          ...fields,
-          duration_ms: performance.now() - started,
+        outcome = {
           status: 'error',
           code: error.code ?? error.message,
           uncertain: error.uncertain === true,
-        });
+        };
         throw error;
+      } finally {
+        emit(stage + '.end', { ...fields, ...outcome, duration_ms: performance.now() - started });
       }
     });
-  }
-  function capture() {
-    const captured = context.getStore();
-    return (event, fields) => context.run(captured, () => emit(event, fields));
   }
   function bind(fn) {
     const captured = context.getStore();
     return (...args) => context.run(captured, () => fn(...args));
   }
-  return { emit, measure, withContext, capture, bind };
+  return { emit, measure, withContext, capture: () => bind(emit), bind };
 }
 const enabled = process.env.PI_MCP_LOG === '1';
 if (enabled) process.stderr.on('error', () => {});

@@ -26,9 +26,6 @@ async function fixture(t) {
       model: model ?? { provider: 'fixture', id: 'native' },
       thinking_level: options.thinkingLevel ?? 'off',
     }),
-    stop: async () => {
-      runtime.alive = false;
-    },
   });
   const f = await nativeOwner(t, {
     prefix: 'mutation',

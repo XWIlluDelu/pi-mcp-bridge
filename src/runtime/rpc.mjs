@@ -1,11 +1,7 @@
+import { OwnerFailure } from '../core/errors.mjs';
+import { ifMissing } from '../core/storage.mjs';
 import fs from 'node:fs/promises';
-import {
-  resolvePiInstallation,
-  piLaunchEnvironment,
-  launchProfile,
-  loadPiSdk,
-  loadPiAi,
-} from './pi-installation.mjs';
+import { resolvePiLaunch, loadPiSdk, loadPiAi } from './pi-installation.mjs';
 import { spawn } from 'node:child_process';
 import { findHerdr } from './herdr-control.mjs';
 import { HerdrRpcTransport, prepareHerdr } from './herdr-rpc-transport.mjs';
@@ -48,13 +44,6 @@ import {
 const READ_COMMANDS = new Set(['get_state', 'get_entries', 'get_available_models']);
 const MODEL_COMMANDS = new Set(['set_model', 'set_thinking_level']);
 const ADMISSION_COMMANDS = new Set(['prompt', 'compact', ...MODEL_COMMANDS]);
-export class RpcFailure extends Error {
-  constructor(code, uncertain = false) {
-    super(code);
-    this.code = code;
-    this.uncertain = uncertain;
-  }
-}
 export class PiRpc {
   constructor(config, session, { completionControl, compatibility } = {}) {
     this.compatibility = compatibility;
@@ -76,28 +65,19 @@ export class PiRpc {
   }
   async start(signal) {
     try {
-      return await this.startRuntime(signal);
-    } finally {
-      this.launchSettled.resolve();
-    }
-  }
-  async startRuntime(signal) {
-    signal?.throwIfAborted();
-    const { env: baseEnv, toolArgs } = launchProfile(this.config);
-    const executable = await resolvePiInstallation(this.config, baseEnv);
-    this.installation = executable;
-    await validateLaunchArgs(executable, this.config.piArgs, 'rpc');
-    this.config = { ...this.config, attachmentDir: registryDirectory(this.config) };
-    if (this.config.piRuntime?.agentDir)
-      await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
-    const env = await piLaunchEnvironment(executable, baseEnv, this.session.cwd);
-    signal?.throwIfAborted();
-    try {
+      signal?.throwIfAborted();
+      const { installation, env, toolArgs } = await resolvePiLaunch(this.config, this.session.cwd);
+      this.installation = installation;
+      await validateLaunchArgs(installation, this.config.piArgs, 'rpc');
+      this.config = { ...this.config, attachmentDir: registryDirectory(this.config) };
+      if (this.config.piRuntime?.agentDir)
+        await fs.mkdir(this.config.piRuntime.agentDir, { recursive: true, mode: 0o700 });
+      signal?.throwIfAborted();
       this.ownerRecord = await reserveOwner(this.config.attachmentDir, this.session, 'rpc');
       // Capture the committed leaf before native startup can append its defaults.
       const { entries, leafId, byId } = await loadSavedSession(this.session, {
         omitImageData: true,
-        sdk: await loadPiSdk(executable),
+        sdk: await loadPiSdk(installation),
       });
       traceSessionBranch(entries, leafId, byId);
       // An installed daily companion must use this writer's actual registry,
@@ -114,7 +94,7 @@ export class PiRpc {
       await validateExecutionCwd(this.session.cwd);
       // Native environment/settings by default; only owner-selected overrides apply.
       const launch = {
-        command: executable.command,
+        command: installation.command,
         args: [
           '-e',
           fileURLToPath(new URL('./rpc-observer.mjs', import.meta.url)),
@@ -152,45 +132,33 @@ export class PiRpc {
             env: launch.env,
             stdio: ['pipe', 'pipe', 'pipe'],
           });
-    } catch (error) {
-      await this.#releaseClaim();
-      throw error;
-    }
-    this.alive = true;
-    this.observeExit(); // Install before the first asynchronous owner/readiness check.
-    const runtimeLog = diagnostics.capture();
-    this.child.once('spawn', () =>
-      runtimeLog('runtime.spawned', { kind: 'rpc', generation: this.generation }),
-    );
-    this.child.stderr.resume(); // Drain diagnostics without retaining provider output.
-    const fail = () => {
-      this.alive = false;
-      this.clearPending();
-    };
-    this.child.once('error', () => {
-      if (!this.child.pid && !this.child.ready) this.exited = true;
-      fail();
-    });
-    this.child.once('exit', () => {
-      runtimeLog('runtime.exited', { kind: 'rpc', generation: this.generation });
-      fail();
-    });
-    this.child.stdin.on('error', fail);
-    const generation = this.generation;
-    this.lines = readLfLines(this.child.stdout, (line) => {
-      let event;
-      try {
-        event = JSON.parse(line);
-      } catch {
-        return;
-      }
-      this.receiveResponse(event, generation);
-    });
-    try {
+      this.alive = true;
+      const runtimeLog = diagnostics.capture();
+      this.observeExit(runtimeLog); // Install before the first asynchronous owner/readiness check.
+      this.child.once('spawn', () =>
+        runtimeLog('runtime.spawned', { kind: 'rpc', generation: this.generation }),
+      );
+      this.child.stderr.resume(); // Drain diagnostics without retaining provider output.
+      const fail = () => {
+        this.alive = false;
+        this.clearPending();
+      };
+      this.child.once('error', fail);
+      this.child.stdin.on('error', fail);
+      const generation = this.generation;
+      this.lines = readLfLines(this.child.stdout, (line) => {
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          return;
+        }
+        this.receiveResponse(event, generation);
+      });
       await this.child.ready;
-      this.childIdentity = await processIdentity(this.child.pid);
+      if (this.child.pid) this.childIdentity = await processIdentity(this.child.pid);
       const owner = this.childIdentity;
-      if (!owner) throw new RpcFailure('RUNTIME_START_FAILED');
+      if (!owner) throw new OwnerFailure('RUNTIME_START_FAILED');
       await updateOwner(this.config.attachmentDir, this.session, this.ownerRecord, {
         owner,
         phase: 'ready',
@@ -204,16 +172,25 @@ export class PiRpc {
       this.phase = 'running';
       return this;
     } catch (error) {
+      if (!this.child) {
+        await this.#releaseClaim();
+        throw error;
+      }
       this.launchSettled.resolve();
-      if (this.child.abortStartup && !this.childIdentity) {
-        await this.child.abortStartup();
+      if (!this.child.pid || (this.child.abortStartup && !this.childIdentity)) {
+        if (this.child.abortStartup) await this.child.abortStartup();
+        this.alive = false;
         this.exited = true;
       }
       await this.stop();
       throw (
         this.startFailure ??
-        new RpcFailure(error.message?.startsWith('HERDR_') ? error.message : 'RUNTIME_START_FAILED')
+        new OwnerFailure(
+          error.message?.startsWith('HERDR_') ? error.message : 'RUNTIME_START_FAILED',
+        )
       );
+    } finally {
+      this.launchSettled.resolve();
     }
   }
   clearPending() {
@@ -261,7 +238,7 @@ export class PiRpc {
           JSON.stringify({ type: 'extension_ui_response', id: event.id, cancelled: true }) + '\n',
         );
       } else if (phase === 'startup') {
-        this.startFailure = Object.assign(new RpcFailure(code), uiSnapshot(this.uiFacts));
+        this.startFailure = Object.assign(new OwnerFailure(code), uiSnapshot(this.uiFacts));
         this.clearPending();
       }
       return;
@@ -306,7 +283,7 @@ export class PiRpc {
     clearTimeout(req.timer);
   }
   #failure(req, code, written = false, native_reason) {
-    return Object.assign(new RpcFailure(code, written && !req.read), uiSnapshot(req.uiFacts), {
+    return Object.assign(new OwnerFailure(code, written && !req.read), uiSnapshot(req.uiFacts), {
       native_reason,
     });
   }
@@ -324,7 +301,6 @@ export class PiRpc {
   }
   #receive(req, result) {
     if (this.pending.get(req.id) !== req || req.ack) return;
-    clearTimeout(req.timer);
     // A started/queued ACK is admission, never completion. In the supported
     // owned RPC path its run must subsequently settle, including queued work.
     if (
@@ -356,7 +332,7 @@ export class PiRpc {
             await req.onLate(result);
           } catch (error) {
             diagnostics.emit('operation.failure', {
-              code: error.code ?? 'OTHER_ERROR',
+              code: error?.code ?? 'OTHER_ERROR',
               uncertain: true,
             });
           } finally {
@@ -382,7 +358,7 @@ export class PiRpc {
     }
   }
   async command(command, { onLate, beforeDispatch, ...options } = {}) {
-    await this.state();
+    const before = await this.state();
     const bash = command.type === 'bash';
     const recheck = bash || ADMISSION_COMMANDS.has(command.type);
     const late =
@@ -391,26 +367,26 @@ export class PiRpc {
         await this.state();
         await onLate?.(result);
       });
-    await beforeDispatch?.();
+    await beforeDispatch?.(before);
     let result, rejection;
     try {
       result = await this.dispatch(command, { ...options, onLate: late, beforeDispatch });
     } catch (error) {
-      if (bash && error.code === 'PI_REJECTED') error.uncertain = true;
-      if (bash) throw error;
       if (error.code !== 'PI_REJECTED') throw error;
+      if (bash) throw Object.assign(error, { uncertain: true });
       rejection = error;
     }
     try {
-      await this.state();
+      const current = await this.state();
+      // The thinking setter ACK carries no value. Reuse the verified state.
+      if (!rejection) return command.type === 'set_thinking_level' ? current : result;
     } catch (error) {
       if (recheck) error.uncertain = true;
       const observedUI = result?.ui ?? rejection?.ui;
       if (observedUI && !error.ui) error.ui = observedUI;
       throw error;
     }
-    if (rejection) throw rejection;
-    return result;
+    throw rejection;
   }
   // Write one native RPC command and await its matching ACK. A timed-out
   // mutation keeps its fence for a late matching ACK. allowBusySelection lets
@@ -427,23 +403,24 @@ export class PiRpc {
     { timeout = 5000, onLate, beforeDispatch, allowBusySelection = false },
   ) {
     if (this.startFailure) throw this.startFailure;
-    if (!this.alive) throw new RpcFailure('RUNTIME_DISCONNECTED');
+    if (!this.alive) throw new OwnerFailure('RUNTIME_DISCONNECTED');
     if (this.handoffPending && type !== 'get_state' && type !== 'get_entries')
-      throw new RpcFailure('HANDOFF_PENDING');
-    if (this.gracefulExitPromise) throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+      throw new OwnerFailure('HANDOFF_PENDING');
+    if (this.gracefulExitPromise) throw new OwnerFailure('RUNTIME_SHUTTING_DOWN');
     if (ADMISSION_COMMANDS.has(type)) {
       if (this.hasPendingCommand('compact') && !(allowBusySelection && MODEL_COMMANDS.has(type)))
-        throw new RpcFailure('COMPACTION_PENDING');
-      if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
+        throw new OwnerFailure('COMPACTION_PENDING');
+      if (this.hasPendingCommand(...MODEL_COMMANDS))
+        throw new OwnerFailure('MODEL_SELECTION_PENDING');
       if ((type === 'prompt' || type === 'compact') && this.hasPendingCommand('prompt'))
-        throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+        throw new OwnerFailure('PROMPT_ADMISSION_PENDING');
     }
     const id = requestId ?? randomUUID();
     if (typeof id !== 'string' || !id.length || id.length > 128 || this.pending.has(id))
-      throw new RpcFailure('INVALID_ARGUMENTS');
+      throw new OwnerFailure('INVALID_ARGUMENTS');
     const guardedCompact = type === 'compact' && idleOnly === true;
     if (guardedCompact && !this.ownerRecord)
-      throw new RpcFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
+      throw new OwnerFailure('OWNER_COMPONENT_UPDATE_REQUIRED');
     const frame = guardedCompact ? null : `${JSON.stringify({ type, ...body, id })}\n`;
     const waiter = Promise.withResolvers();
     const req = {
@@ -473,9 +450,8 @@ export class PiRpc {
     return waiter.promise;
   }
   async #writeCompact(req, instructions, beforeDispatch) {
-    const transport = new AttachedRuntime(this.config, this.session, this.ownerRecord);
     try {
-      const data = await transport.request(
+      const data = await this.#attachment().request(
         'compact',
         { instructions },
         {
@@ -485,7 +461,7 @@ export class PiRpc {
             // No await between Bridge's final Stop/lifecycle fence and socket write.
             beforeDispatch?.();
             if (!this.alive || this.handoffPending || this.gracefulExitPromise)
-              throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+              throw new OwnerFailure('RUNTIME_SHUTTING_DOWN');
             req.written = true;
           },
         },
@@ -504,7 +480,7 @@ export class PiRpc {
   assertSessionIdentity(state) {
     if (!servesSession(state, this.session)) {
       this.runtimeEvents.invalidate();
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
     }
   }
   async state(timeout = 5000) {
@@ -513,7 +489,8 @@ export class PiRpc {
     return state;
   }
   async observeRead(read) {
-    if (this.sealPending || this.gracefulExitPromise) throw new RpcFailure('RUNTIME_SHUTTING_DOWN');
+    if (this.sealPending || this.gracefulExitPromise)
+      throw new OwnerFailure('RUNTIME_SHUTTING_DOWN');
     this.activeReads = (this.activeReads ?? 0) + 1;
     try {
       return await read();
@@ -522,29 +499,22 @@ export class PiRpc {
       this.onIdleCandidate?.();
     }
   }
+  #attachment(record = this.ownerRecord) {
+    return new AttachedRuntime(this.config, this.session, record, {
+      compatibility: this.compatibility,
+    });
+  }
   readFeatures() {
-    return this.observeRead(() =>
-      new AttachedRuntime(this.config, this.session, this.ownerRecord).readFeatures(),
-    );
+    return this.observeRead(() => this.#attachment().readFeatures());
   }
   read(args) {
-    return this.observeRead(() =>
-      new AttachedRuntime(this.config, this.session, this.ownerRecord, {
-        compatibility: this.compatibility,
-      }).read(args),
-    );
+    return this.observeRead(() => this.#attachment().read(args));
   }
   entries() {
     return this.observeRead(() => this.command({ type: 'get_entries' }));
   }
-  hasPendingCommand(type) {
-    return this.pending.values().some((req) => !req.ack && req.type === type);
-  }
-  hasPendingModelSelection() {
-    return this.pending.values().some((req) => !req.ack && MODEL_COMMANDS.has(req.type));
-  }
-  hasPendingAdmission() {
-    return this.pending.values().some((req) => !req.ack && ADMISSION_COMMANDS.has(req.type));
+  hasPendingCommand(...types) {
+    return this.pending.values().some((req) => !req.ack && types.includes(req.type));
   }
   hasUnsettledWork() {
     return Boolean(
@@ -565,7 +535,7 @@ export class PiRpc {
       !this.ownerRecord?.socket
     )
       return result('unknown');
-    const observed = await new AttachedRuntime(this.config, this.session, this.ownerRecord).state();
+    const observed = await this.#attachment().state();
     if (nativeBusy(observed) || this.hasUnsettledWork()) return result('busy');
     if (observed.isIdle !== true || observed.hasPendingMessages !== false) return result('unknown');
     return result('idle');
@@ -574,10 +544,11 @@ export class PiRpc {
     busy = 'MODEL_SELECTION_BUSY',
     unconfirmed = 'MODEL_SELECTION_IDLE_UNCONFIRMED',
   } = {}) {
-    if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
+    if (this.hasPendingCommand(...MODEL_COMMANDS))
+      throw new OwnerFailure('MODEL_SELECTION_PENDING');
     const result = await this.idleSnapshot();
     if (result.status !== 'idle')
-      throw new RpcFailure(result.status === 'busy' ? busy : unconfirmed);
+      throw new OwnerFailure(result.status === 'busy' ? busy : unconfirmed);
     return result.state;
   }
   // Native selection is persistent session state, NOT a per-prompt binding.
@@ -588,17 +559,19 @@ export class PiRpc {
     model,
     { thinkingLevel, idle = false, nativeThinking = false, beforeDispatch } = {},
   ) {
-    if (this.hasPendingModelSelection()) throw new RpcFailure('MODEL_SELECTION_PENDING');
-    if (idle && this.hasPendingCommand('prompt')) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+    if (this.hasPendingCommand(...MODEL_COMMANDS))
+      throw new OwnerFailure('MODEL_SELECTION_PENDING');
+    if (idle && this.hasPendingCommand('prompt'))
+      throw new OwnerFailure('PROMPT_ADMISSION_PENDING');
     const models = model ? (await this.command({ type: 'get_available_models' })).models : null;
     const requested = models?.find((entry) => sameModel(entry, model));
-    if (model && !requested) throw new RpcFailure('MODEL_UNAVAILABLE');
+    if (model && !requested) throw new OwnerFailure('MODEL_UNAVAILABLE');
     const ai =
       !nativeThinking && thinkingLevel !== undefined ? await loadPiAi(this.installation) : null;
     if (requested) assertThinkingLevel(requested, thinkingLevel, ai);
     const selected = () => (idle ? this.assertIdle() : this.state());
     const first = await selected();
-    if (!requested && !first.model) throw new RpcFailure('MODEL_UNAVAILABLE');
+    if (!requested && !first.model) throw new OwnerFailure('MODEL_UNAVAILABLE');
     await beforeDispatch?.();
     if (!requested) assertThinkingLevel(first.model, thinkingLevel, ai);
     const options = { beforeDispatch, allowBusySelection: !idle };
@@ -615,8 +588,7 @@ export class PiRpc {
           return selected();
         },
         setThinkingLevel: async (level) => {
-          await this.command({ type: 'set_thinking_level', level }, options);
-          const actual = await this.state();
+          const actual = await this.command({ type: 'set_thinking_level', level }, options);
           if (ai && actual.thinkingLevel !== thinkingLevel)
             throw new Error('MODEL_SELECTION_CHANGED');
           return actual;
@@ -624,7 +596,7 @@ export class PiRpc {
       });
     } catch (error) {
       if (error.message === 'MODEL_SELECTION_CHANGED')
-        throw new RpcFailure('MODEL_SELECTION_CHANGED', true);
+        throw new OwnerFailure('MODEL_SELECTION_CHANGED', true);
       throw error;
     }
   }
@@ -633,7 +605,7 @@ export class PiRpc {
     const checkIdle = async (code) => {
       const { status } = await this.idleSnapshot();
       if (status === 'busy') return false;
-      if (status !== 'idle') throw new RpcFailure(code);
+      if (status !== 'idle') throw new OwnerFailure(code);
       return true;
     };
     if (settings) {
@@ -649,7 +621,7 @@ export class PiRpc {
     if (input.mode === 'idle_only' && !(await checkIdle('RUNTIME_IDLE_UNCONFIRMED')))
       return { status: 'skipped', reason: 'busy' };
     await authorize();
-    if (!this.hasPendingAdmission()) onAdmitted?.();
+    if (!this.hasPendingCommand(...ADMISSION_COMMANDS)) onAdmitted?.();
     const result = await this.command(
       {
         id: submissionId,
@@ -660,9 +632,8 @@ export class PiRpc {
       },
       {
         onLate: onLate && ((result) => onLate(promptResult(result))),
-        beforeDispatch: async () => {
+        beforeDispatch: async (state) => {
           if (settings) {
-            const state = await this.state();
             assertPromptSelection(input, state);
             selection.model_selection = modelSettings({
               model: state.model,
@@ -737,7 +708,7 @@ export class PiRpc {
       }
       if (!this.exitSeal && mode === 'wait_idle') await this.waitForHandoff(signal);
       else if (!this.exitSeal && mode === 'idle') {
-        if (this.hasPendingCommand('prompt')) throw new RpcFailure('PROMPT_ADMISSION_PENDING');
+        if (this.hasPendingCommand('prompt')) throw new OwnerFailure('PROMPT_ADMISSION_PENDING');
         await this.assertIdle({ busy: 'RUNTIME_BUSY', unconfirmed: 'RUNTIME_IDLE_UNCONFIRMED' });
       }
       await beforeExit?.();
@@ -750,10 +721,10 @@ export class PiRpc {
   async waitForHandoff(signal) {
     for (;;) {
       signal?.throwIfAborted();
-      if (!this.alive) throw new RpcFailure('RUNTIME_DISCONNECTED');
+      if (!this.alive) throw new OwnerFailure('RUNTIME_DISCONNECTED');
       if (!this.hasUnsettledWork()) {
         const { status } = await this.idleSnapshot();
-        if (status === 'unknown') throw new RpcFailure('RUNTIME_IDLE_UNCONFIRMED');
+        if (status === 'unknown') throw new OwnerFailure('RUNTIME_IDLE_UNCONFIRMED');
         if (status === 'idle') {
           signal?.throwIfAborted();
           return;
@@ -762,16 +733,17 @@ export class PiRpc {
       await delay(25, undefined, { signal });
     }
   }
-  observeExit() {
+  observeExit(log = diagnostics.capture()) {
     if (this.exitObservation?.child === this.child) return this.exitObservation;
-    const observation = { child: this.child, result: null };
+    const observation = { child: this.child };
     observation.promise = new Promise((resolve, reject) => {
       this.child.once('exitError', reject);
       this.child.once('exit', (code, signal) => {
-        observation.result = { code, signal };
         this.exited = true;
         this.alive = false;
-        resolve(observation.result);
+        log('runtime.exited', { kind: 'rpc', generation: this.generation });
+        this.clearPending();
+        resolve({ code, signal });
       });
     });
     observation.promise.catch(() => {});
@@ -787,7 +759,7 @@ export class PiRpc {
   }
   async gracefulExit(signal) {
     if (this.gracefulExitPromise) return this.gracefulExitPromise;
-    if (!this.child || this.exited || !this.alive) throw new RpcFailure('RUNTIME_DISCONNECTED');
+    if (!this.child || this.exited || !this.alive) throw new OwnerFailure('RUNTIME_DISCONNECTED');
     const child = this.child,
       record = this.ownerRecord,
       exit = this.observeExit();
@@ -799,14 +771,13 @@ export class PiRpc {
       await this.retainObservation?.();
       await this.drainAcks();
       signal?.throwIfAborted();
-      if (exit.result || this.exited || !this.alive)
-        throw new RpcFailure('RUNTIME_EXIT_BEFORE_EOF');
+      if (this.exited || !this.alive) throw new OwnerFailure('RUNTIME_EXIT_BEFORE_EOF');
       // Parent observations reject known work early. The child's atomic seal
       // also excludes native work started since the last idle observation.
-      if (this.hasUnsettledWork() || this.activeReads) throw new RpcFailure('RUNTIME_BUSY');
-      const sealed = await new AttachedRuntime(this.config, this.session, record).seal(() => {
+      if (this.hasUnsettledWork() || this.activeReads) throw new OwnerFailure('RUNTIME_BUSY');
+      const sealed = await this.#attachment(record).seal(() => {
         signal?.throwIfAborted();
-        if (this.hasUnsettledWork() || this.activeReads) throw new RpcFailure('RUNTIME_BUSY');
+        if (this.hasUnsettledWork() || this.activeReads) throw new OwnerFailure('RUNTIME_BUSY');
         // Close read admission across the control request's await. A read
         // already admitted above keeps this attempt from sealing the writer.
         this.sealPending = true;
@@ -816,7 +787,7 @@ export class PiRpc {
       });
       if (!sealed.sealed) {
         if (!previousSeal) this.exitSeal = null;
-        throw new RpcFailure('RUNTIME_BUSY', Boolean(previousSeal));
+        throw new OwnerFailure('RUNTIME_BUSY', Boolean(previousSeal));
       }
       this.exitSeal = 'sealed';
       this.gracefulExitPromise = (async () => {
@@ -827,10 +798,10 @@ export class PiRpc {
         if (this.interruptShutdown) await this.stop();
         const result = await exit.promise;
         await exit.closed; // Drain final UI diagnostics as well as observing exact death.
-        if (await ownerAlive(record.owner)) throw new RpcFailure('OWNER_STILL_ALIVE');
+        if (await ownerAlive(record.owner)) throw new OwnerFailure('OWNER_STILL_ALIVE');
         this.lines?.close();
         await this.#releaseClaim(record);
-        if (result.code !== 0 || result.signal) throw new RpcFailure('RUNTIME_EXIT_ABNORMAL');
+        if (result.code !== 0 || result.signal) throw new OwnerFailure('RUNTIME_EXIT_ABNORMAL');
         // UI availability is a shutdown diagnostic, not another writer claim.
         return this.uiFacts.shutdown.size ? uiSnapshot(this.uiFacts) : {};
       })();
@@ -846,15 +817,15 @@ export class PiRpc {
   async assertProcessIdentity(child = this.child, record = this.ownerRecord) {
     if (!child || this.exited) return;
     if (child !== this.child || record !== this.ownerRecord)
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
     const identity = record?.owner ?? this.childIdentity;
     if (record) {
       const current = await readClaim(this.config.attachmentDir, this.session);
       if (current?.generation !== record.generation || !sameOwner(current.owner, identity))
-        throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+        throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
     }
     if (!identity || identity.pid !== child.pid || !(await ownerAlive(identity)))
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
   }
   async #releaseClaim(record = this.ownerRecord) {
     if (!record) return;
@@ -871,34 +842,31 @@ export class PiRpc {
     if (this.stopPromise) return this.stopPromise;
     const child = this.child,
       record = this.ownerRecord,
+      owner = record?.owner ?? this.childIdentity,
       exit = this.observeExit();
     this.stopPromise = (async () => {
-      if (!exit.result) {
-        try {
-          await this.assertProcessIdentity(child, record);
-        } catch (error) {
-          const owner = record?.owner ?? this.childIdentity;
-          // Natural EOF can finish during /proc/claim checks. Only exact death
-          // makes that failure harmless; a live or unknown owner still fails.
-          if (!exit.result && (!owner || (await ownerAlive(owner)))) throw error;
-          await exit.promise;
-        }
-        if (!exit.result && child.terminate) await child.terminate();
-        if (!exit.result && !child.terminate && child.kill('SIGTERM') === false) {
-          const owner = record?.owner ?? this.childIdentity;
-          if (!exit.result && (!owner || (await ownerAlive(owner))))
-            throw new RpcFailure('RUNTIME_STOP_FAILED');
-        }
-        // Explicit shutdown may interrupt work; elapsed time never authorizes force-kill.
+      try {
+        await this.assertProcessIdentity(child, record);
+      } catch (error) {
+        // Natural EOF can finish during /proc/claim checks. Only exact death
+        // makes that failure harmless; a live or unknown owner still fails.
+        if (!this.exited && (!owner || (await ownerAlive(owner)))) throw error;
         await exit.promise;
       }
+      if (!this.exited) {
+        if (child.terminate) await child.terminate();
+        else if (
+          child.kill('SIGTERM') === false &&
+          !this.exited &&
+          (!owner || (await ownerAlive(owner)))
+        )
+          throw new OwnerFailure('RUNTIME_STOP_FAILED');
+      }
+      // Explicit shutdown may interrupt work; elapsed time never authorizes force-kill.
+      await exit.promise;
       await exit.closed;
-      this.clearPending();
       this.lines?.close();
-      if (this.ownerRecord?.socket)
-        await fs.unlink(this.ownerRecord.socket).catch((error) => {
-          if (error.code !== 'ENOENT') throw error;
-        });
+      if (this.ownerRecord?.socket) await fs.unlink(this.ownerRecord.socket).catch(ifMissing);
       await this.#releaseClaim();
     })();
     try {

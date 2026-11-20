@@ -12,6 +12,7 @@ import net from 'node:net';
 
 import { AttachedRuntime, claimFile, processIdentity } from '../src/runtime/attachments.mjs';
 import { PiRpc } from '../src/runtime/rpc.mjs';
+import { until } from './fixtures/until.mjs';
 
 async function fixture(t) {
   const dir = await fs.mkdtemp('/tmp/pi-seal-'),
@@ -32,9 +33,9 @@ async function fixture(t) {
   const server = attachmentServer(connections, async (frame, socket) => {
     const request = JSON.parse(frame);
     requests.push(request);
-    const result = await respond(request);
+    const result = await respond(request, socket);
     if (result === null) socket.destroy();
-    else socket.end(ownerEnvelope(record, result));
+    else if (result !== undefined) socket.end(ownerEnvelope(record, result));
   });
   await listenPrivate(server, record.socket);
   await fs.writeFile(claimFile(dir, session), JSON.stringify(record), { mode: 0o600 });
@@ -115,6 +116,58 @@ test('seal rejects unsupported owners and cancellation before writing without se
   });
   assert.equal(f.requests.length, 0);
 });
+
+test(
+  'an owner disconnect settles before slow authorization can dispatch',
+  { timeout: 2000 },
+  async (t) => {
+    const f = await fixture(t);
+    const entered = Promise.withResolvers(),
+      proceed = Promise.withResolvers();
+    t.after(() => proceed.resolve());
+    const pending = f.runtime.seal(() => {
+      entered.resolve();
+      return proceed.promise;
+    });
+    const rejected = assert.rejects(pending, { code: 'LIVE_OWNER_UNREACHABLE', uncertain: false });
+    await entered.promise;
+    await until(() => f.connections.size > 0);
+    for (const connection of f.connections) connection.end();
+    await rejected;
+    proceed.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(f.requests.length, 0);
+  },
+);
+
+test(
+  'a complete owner reply resolves before the peer closes its write side',
+  { timeout: 2000 },
+  async (t) => {
+    const f = await fixture(t);
+    f.respond((_request, connection) => {
+      connection.write(ownerEnvelope(f.runtime.record, { data: { sealed: true } }));
+    });
+    assert.deepEqual(await f.runtime.seal(), { sealed: true });
+  },
+);
+
+test(
+  'a partial owner reply preserves its evidence through the client deadline',
+  { timeout: 3000 },
+  async (t) => {
+    const f = await fixture(t);
+    const withdrawal = { text: 'queued', includesEditorDraft: false, complete: false };
+    f.respond((_request, connection) => {
+      connection.write(ownerEnvelope(f.runtime.record, { partial: true, data: { withdrawal } }));
+    });
+    await assert.rejects(f.runtime.request('stop', {}, { timeout: 1000 }), {
+      code: 'ACK_TIMEOUT',
+      uncertain: true,
+      result: { withdrawal },
+    });
+  },
+);
 
 const ownedRpc = (f) => {
   const rpc = new PiRpc(f.runtime.config, f.runtime.session);

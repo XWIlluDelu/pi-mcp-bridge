@@ -40,7 +40,8 @@ export async function findHerdr(env = process.env) {
 // Startup/control records only. Native RPC bytes never pass through this decoder.
 export function readRecord(socket, signal, limit = 65536) {
   return new Promise((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
+    const parts = [];
+    let length = 0;
     const finish = (error, value) => {
       socket.pause();
       socket.off('data', data);
@@ -54,14 +55,17 @@ export function readRecord(socket, signal, limit = 65536) {
     const ended = () => fail(new Error('HERDR_DISCONNECTED'));
     const aborted = () => fail(signal.reason);
     const data = (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      const end = buffer.indexOf(10);
-      if (end < 0 && buffer.length <= limit) return;
-      if (end < 0 || end > limit) return fail(new Error('HERDR_INVALID_RECORD'));
+      const end = chunk.indexOf(10);
+      const part = end < 0 ? chunk : chunk.subarray(0, end);
+      length += part.length;
+      if (length > limit) return fail(new Error('HERDR_INVALID_RECORD'));
+      parts.push(part);
+      if (end < 0) return;
       socket.pause();
-      if (end + 1 < buffer.length) socket.unshift(buffer.subarray(end + 1));
+      if (end + 1 < chunk.length) socket.unshift(chunk.subarray(end + 1));
       try {
-        finish(null, JSON.parse(buffer.subarray(0, end).toString('utf8')));
+        const frame = parts.length === 1 ? part : Buffer.concat(parts, length);
+        finish(null, JSON.parse(frame.toString('utf8')));
       } catch {
         fail(new Error('HERDR_INVALID_RECORD'));
       }

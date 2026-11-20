@@ -12,9 +12,6 @@ async function fixture(t) {
   const runtime = ownedRuntime({
     state: async () => ({ isIdle: true }),
     command: async () => ({ disposition: 'started' }),
-    async stop() {
-      this.alive = false;
-    },
   });
   const f = await nativeOwner(t, { prefix: 'session-list', factory: async () => runtime });
   return { ...f, runtime };

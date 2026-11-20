@@ -11,18 +11,20 @@ test('diagnostics isolate concurrent contexts and exclude unapproved fields and 
     log = createDiagnostics({ enabled: true, write: (line) => rows.push(JSON.parse(line)) });
   await Promise.all(
     ['a', 'b'].map(async (id) =>
-      log.measure('tool', { op: 'read', mcp_id_ref: diagnosticRef(id) }, async () => {
+      log.measure('tool', { op: 'send', mcp_id_ref: diagnosticRef(id) }, async () => {
         await new Promise((resolve) => setTimeout(resolve, id === 'a' ? 5 : 1));
         log.emit('fixture', {
           body: 'SECRET_BODY',
           token: 'SECRET_TOKEN',
           code: 'SECRET_ERROR',
-          op: 'SECRET_OP',
+          op: { private: 'SECRET_OP', toString: () => 'send' },
+          session_ref: { private: 'SECRET_RECORD', toString: () => diagnosticRef(id) },
         });
       }),
     ),
   );
   const starts = rows.filter((r) => r.event === 'tool.start');
+  assert.ok(starts.every((r) => r.op === 'send'));
   assert.equal(new Set(starts.map((r) => r.trace_id)).size, 2);
   assert.equal(new Set(starts.map((r) => r.mcp_id_ref)).size, 2);
   for (const start of starts)

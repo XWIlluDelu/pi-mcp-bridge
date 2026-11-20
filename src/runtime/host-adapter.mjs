@@ -1,9 +1,10 @@
+import { OwnerFailure } from '../core/errors.mjs';
 // Cooperative host integration. Reserve the actual writer before it opens the
 // saved target; this adapter never starts, stops or takes over a Pi process.
 import { readSessionIdentity, sameSessionIdentity, servesSession } from '../core/data.mjs';
 
 import { parseCompactInput, compactMetadata } from '../ops/compact.mjs';
-import { assertReadFeatures } from '../read/read-features.mjs';
+import { assertReadFeatures, nativeReadFeatures } from '../read/read-features.mjs';
 import { unavailableObservation } from '../read/context-observation.mjs';
 import { attachedPromptInput, remotePromptRejection } from '../ops/prompt-input.mjs';
 import { modelState, sameModel } from '../ops/models.mjs';
@@ -13,9 +14,7 @@ import { stopReceipt, withdrawalCollector } from '../ops/stop-execution.mjs';
 import { ownerControlSchemas } from '../mcp/tool-schemas.mjs';
 import {
   ownerServer,
-  closeOwnerServer,
   ownerProtocol,
-  listenPrivate,
   ownerEnvelope,
   ownerIdentity,
   ownerReadFeatures,
@@ -23,6 +22,7 @@ import {
   validNativeSnapshot,
   nativeBusy,
   pendingMessages,
+  unconfirmedPrompt,
 } from './attachment-protocol.mjs';
 import {
   reserveOwner,
@@ -32,10 +32,9 @@ import {
   processIdentity,
   ownerAlive,
   isReleasedOwner,
-  AttachmentFailure,
 } from './attachments.mjs';
 const fail = (code) => {
-  throw new AttachmentFailure(code);
+  throw new OwnerFailure(code);
 };
 function receipt(value) {
   if (value?.status === 'dispatched' && value.admission === 'unobservable')
@@ -44,11 +43,7 @@ function receipt(value) {
     return { status: 'accepted', disposition: value.disposition };
   if (value?.status === 'skipped' && value.reason === 'busy')
     return { status: 'skipped', reason: 'busy' };
-  if (value?.status === 'unknown')
-    return {
-      status: 'unknown',
-      reason: 'PI_ACCEPTANCE_UNOBSERVABLE',
-    };
+  if (value?.status === 'unknown') return unconfirmedPrompt();
   if (
     value?.status === 'rejected' &&
     ['PI_REJECTED', 'PROMPT_ADMISSION_PENDING', 'HOST_ADMISSION_UNSUPPORTED'].includes(value.reason)
@@ -70,15 +65,12 @@ export async function reserveHostSession({
   const identity = ownerIdentity(record);
   let callbacks,
     server,
-    ready = false,
-    closed = false,
+    phase = 'reserved',
     stopSequence = 0,
-    releasing = false,
     writerReleased = false,
     releasePromise,
     closePromise;
-  const sockets = new Set(),
-    operations = new Set();
+  const operations = new Set();
   const active = (op) =>
     operations.values().some((job) => job.lane && (op === undefined || job.lane === op));
   const drain = () => Promise.allSettled(operations.values().map((job) => job.task));
@@ -103,15 +95,13 @@ export async function reserveHostSession({
     return value;
   }
   async function retire() {
-    ready = false;
     if ((await readClaim(attachmentDir, target))?.generation === record.generation)
       await updateOwner(attachmentDir, target, record, { phase: 'transitioning' });
   }
   async function release() {
     if (!callbacks?.release) fail('HOST_RELEASE_UNSUPPORTED');
     if (releasePromise) return releasePromise;
-    releasing = true;
-    ready = false; // A failed close never reopens business admission.
+    if (phase !== 'closed') phase = 'releasing'; // A failed release cannot reopen admission.
     releasePromise = (async () => {
       if (!writerReleased) {
         await retire();
@@ -135,8 +125,7 @@ export async function reserveHostSession({
       const current = await readClaim(attachmentDir, target);
       if (current && current.generation !== record.generation) fail('RUNTIME_SESSION_CHANGED');
       if (current && !isReleasedOwner(current)) await releaseOwner(attachmentDir, target, record);
-      // Let the current release socket flush its acknowledgment.
-      server?.close(() => {});
+      server?.stopAccepting();
       return { released: true, generation: record.generation };
     })();
     try {
@@ -152,15 +141,6 @@ export async function reserveHostSession({
   async function operate(request, job, partial) {
     const { op } = request;
     const args = request.body ?? {};
-    // Native work retains its lane even when the requesting socket goes away.
-    const runActive = async (run) => {
-      job.lane = op;
-      try {
-        return await run();
-      } finally {
-        job.lane = null;
-      }
-    };
     if (op === 'snapshot' || (op === 'read' && args.view !== 'runtime')) {
       // A snapshot callback binds its capture to the actual native session.
       // The RPC binding already samples native identity on each side of getEntries.
@@ -191,7 +171,7 @@ export async function reserveHostSession({
     const beforeDispatch = () => {
       if (stoppingAtEntry || active('stop') || entryStopSequence !== stopSequence)
         fail('STOP_IN_PROGRESS');
-      if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
+      if (phase !== 'ready') fail('RUNTIME_SESSION_CHANGED');
     };
     if (op === 'state')
       return {
@@ -215,7 +195,7 @@ export async function reserveHostSession({
     if (op === 'read_features') {
       const features = callbacks.readFeatures
         ? assertReadFeatures(await callbacks.readFeatures())
-        : { available: false, tools: [], commands: [], leaf_id: null };
+        : nativeReadFeatures();
       data = ownerReadFeatures(record, features);
     } else if (op === 'read')
       data = {
@@ -227,53 +207,50 @@ export async function reserveHostSession({
       if (Object.keys(args).length) fail('INVALID_ARGUMENTS');
       if (active() || nativeBusy(observed)) fail('RELOAD_BUSY');
       beforeDispatch();
-      data = await runActive(async () => {
-        let dispatched = false;
-        try {
-          const result = await callbacks.reload({
-            ...identity,
-            beforeDispatch: () => {
-              beforeDispatch();
-              dispatched = true;
-            },
-          });
-          if (dispatched && result?.reloaded === true) return { reloaded: true };
-        } catch (error) {
-          if (!dispatched) throw error;
-        }
-        fail('RELOAD_UNCONFIRMED');
-      });
+      job.lane = op;
+      let dispatched = false;
+      try {
+        const result = await callbacks.reload({
+          ...identity,
+          beforeDispatch: () => {
+            beforeDispatch();
+            dispatched = true;
+          },
+        });
+        if (dispatched && result?.reloaded === true) data = { reloaded: true };
+      } catch (error) {
+        if (!dispatched) throw error;
+      }
+      if (!data) fail('RELOAD_UNCONFIRMED');
     } else if (op === 'set_model') {
       if (typeof callbacks.setModel !== 'function') fail('MODEL_SELECTION_UNSUPPORTED');
       const input = modelSettingsSchema.safeParse(args);
       if (!input.success) fail('INVALID_ARGUMENTS');
       if (active('set_model')) fail('MODEL_SELECTION_PENDING');
       const beforeModelDispatch = () => {
-        if (!ready || closed) fail('RUNTIME_SESSION_CHANGED');
+        if (phase !== 'ready') fail('RUNTIME_SESSION_CHANGED');
         if (active('reload')) fail('RELOAD_IN_PROGRESS');
       };
       beforeModelDispatch();
-      return runActive(async () => {
-        const value = modelSettings(
-          await callbacks.setModel({
-            ...input.data,
-            ...identity,
-            beforeDispatch: beforeModelDispatch,
-          }),
-        );
-        const actual = await state();
-        if (!sameModel(value.model, actual.model) || value.thinking_level !== actual.thinkingLevel)
-          fail('MODEL_SELECTION_CHANGED');
-        return value;
-      });
+      job.lane = op;
+      const value = modelSettings(
+        await callbacks.setModel({
+          ...input.data,
+          ...identity,
+          beforeDispatch: beforeModelDispatch,
+        }),
+      );
+      const actual = await state();
+      if (!sameModel(value.model, actual.model) || value.thinking_level !== actual.thinkingLevel)
+        fail('MODEL_SELECTION_CHANGED');
+      return value;
     } else if (op === 'compact') {
       if (typeof callbacks.compact !== 'function') fail('COMPACT_UNSUPPORTED');
       const input = parseCompactInput(args);
       if (active('compact')) fail('COMPACTION_PENDING');
       beforeDispatch();
-      data = await runActive(async () =>
-        compactMetadata(await callbacks.compact({ ...input, ...identity, beforeDispatch })),
-      );
+      job.lane = op;
+      data = compactMetadata(await callbacks.compact({ ...input, ...identity, beforeDispatch }));
     } else if (op === 'send') {
       if (active('compact')) fail('COMPACTION_PENDING');
       if (active('set_model')) fail('MODEL_SELECTION_PENDING');
@@ -282,59 +259,59 @@ export async function reserveHostSession({
       if (input.images && callbacks.supportsImages !== true) fail('IMAGE_INPUT_UNSUPPORTED');
       // The host owns admission and idle observation. A transport-level idle
       // check cannot replace its input/preparation coordination.
-      data =
-        remotePromptRejection(input.text) ??
-        (await runActive(async () =>
-          receipt(await callbacks.submit({ ...input, beforeDispatch })),
-        ));
+      data = remotePromptRejection(input.text);
+      if (!data) {
+        job.lane = op;
+        data = receipt(await callbacks.submit({ ...input, beforeDispatch }));
+      }
     } else if (op === 'bash') {
       if (!supportsBash()) fail('BASH_UNSUPPORTED');
       beforeDispatch();
       if (active('bash')) fail('BASH_IN_PROGRESS');
-      data = await runActive(async () => {
-        const result = await callbacks.bash({
-          command: args.command,
-          ...identity,
-          beforeDispatch,
-          onResult: async (value) => {
-            await state();
-            partial(limitBashResult(value, args.max_chars));
-          },
-        });
-        return limitBashResult(result, args.max_chars);
+      job.lane = op;
+      const result = await callbacks.bash({
+        command: args.command,
+        ...identity,
+        beforeDispatch,
+        onResult: async (value) => {
+          await state();
+          partial(limitBashResult(value, args.max_chars));
+        },
       });
+      data = limitBashResult(result, args.max_chars);
     } else if (op === 'stop') {
       if (typeof callbacks.stop !== 'function') fail('STOP_UNSUPPORTED');
       if (active('stop')) fail('STOP_IN_PROGRESS');
       const withdrawn = withdrawalCollector(args.max_chars);
       stopSequence++;
-      data = await runActive(async () => {
-        const receipt = stopReceipt(
-          await callbacks.stop({
-            ...identity,
-            onWithdraw: async (value) => {
-              await state();
-              partial({ withdrawal: { ...withdrawn.add(value), complete: false } });
-            },
-          }),
-        );
-        if (!withdrawn.value) fail('INVALID_STOP_RECEIPT');
-        return { ...receipt, withdrawal: withdrawn.value };
-      });
+      job.lane = op;
+      const receipt = stopReceipt(
+        await callbacks.stop({
+          ...identity,
+          onWithdraw: async (value) => {
+            await state();
+            partial({ withdrawal: { ...withdrawn.add(value), complete: false } });
+          },
+        }),
+      );
+      if (!withdrawn.value) fail('INVALID_STOP_RECEIPT');
+      data = { ...receipt, withdrawal: withdrawn.value };
     } else fail('INVALID_ATTACHED_OPERATION');
+    // Release the native lane before checking the receipt. Failed operations
+    // leave the ledger in the request handler's finally, including on disconnect.
+    job.lane = null;
     await state();
     return data;
   }
   async function close() {
     if (closePromise) return closePromise;
-    closed = true;
-    ready = false;
+    phase = 'closed';
     closePromise = (async () => {
       try {
         await retire();
       } finally {
         await drain();
-        await closeOwnerServer(server, sockets);
+        await server?.close();
       }
       // Controller disconnect is not proof the actual writer has exited.
       if (!(await ownerAlive(record.owner))) await releaseOwner(attachmentDir, target, record);
@@ -342,7 +319,7 @@ export async function reserveHostSession({
     return closePromise;
   }
   async function publish(value) {
-    if (callbacks || closed) fail('HOST_ADAPTER_ALREADY_STARTED');
+    if (callbacks || phase === 'closed') fail('HOST_ADAPTER_ALREADY_STARTED');
     if (
       !value ||
       (value.supportsImages !== undefined && typeof value.supportsImages !== 'boolean') ||
@@ -356,12 +333,11 @@ export async function reserveHostSession({
     callbacks = value;
     try {
       await state();
-      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
+      if (phase !== 'reserved') fail('RUNTIME_SESSION_CHANGED');
       server = ownerServer(
-        sockets,
         () => record,
         async (request, socket) => {
-          if (closed || (!ready && !(releasing && request.op === 'release')))
+          if (phase !== 'ready' && !(phase === 'releasing' && request.op === 'release'))
             fail('RUNTIME_SESSION_CHANGED');
           if (request.op === 'release') return release();
           if (['compact', 'reload'].includes(request.op)) socket.setTimeout(0);
@@ -382,9 +358,9 @@ export async function reserveHostSession({
         },
         'HOST_OPERATION_FAILED',
       );
-      await listenPrivate(server, record.socket);
+      await server.listen(record.socket);
       await state();
-      if (closed || releasing) fail('RUNTIME_SESSION_CHANGED');
+      if (phase !== 'reserved') fail('RUNTIME_SESSION_CHANGED');
       await updateOwner(attachmentDir, target, record, {
         phase: 'ready',
         imagesSupported: callbacks.supportsImages === true,
@@ -392,15 +368,14 @@ export async function reserveHostSession({
         ...ownerProtocol,
         reloadSupported: typeof callbacks.reload === 'function',
       });
-      if (closed || releasing) {
+      if (phase !== 'reserved') {
         await retire();
         fail('RUNTIME_SESSION_CHANGED');
       }
-      ready = true;
+      phase = 'ready';
       return controller;
     } catch (error) {
-      ready = false;
-      await closeOwnerServer(server, sockets);
+      await server?.close();
       // Retain the blocking claim even when endpoint publication fails.
       throw error;
     }

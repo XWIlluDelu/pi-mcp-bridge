@@ -1,16 +1,11 @@
+import { OwnerFailure } from '../core/errors.mjs';
 import { HerdrRpcTransport } from './herdr-rpc-transport.mjs';
 import { RetainedObservations } from '../read/context-observation.mjs';
 import { sameSessionIdentity, validateExecutionCwd } from '../core/data.mjs';
 import { diagnostics } from '../core/diagnostics.mjs';
 import { readOwnerConfig, registryDirectory } from '../core/owner-config.mjs';
-import {
-  acquireDeletion,
-  readClaim,
-  ownerAlive,
-  AttachedRuntime,
-  AttachmentFailure,
-} from './attachments.mjs';
-import { PiRpc, RpcFailure } from './rpc.mjs';
+import { acquireDeletion, readClaim, ownerAlive, AttachedRuntime } from './attachments.mjs';
+import { PiRpc } from './rpc.mjs';
 
 export class RuntimePool {
   constructor(config, factory, { configFile, completionControl, compatibility } = {}) {
@@ -26,7 +21,7 @@ export class RuntimePool {
         // A different namespace cannot prove this target has no writer. This
         // affects only acquisition, not reads or reuse of an existing owner.
         if (registryDirectory(desired) !== this.attachmentDir)
-          throw new RpcFailure('CONFIG_RESTART_REQUIRED');
+          throw new OwnerFailure('CONFIG_RESTART_REQUIRED');
         const herdr = desired.herdr;
         const start = this.starting.get(session.id);
         start.controller.signal.throwIfAborted();
@@ -47,37 +42,29 @@ export class RuntimePool {
     this.observations = new RetainedObservations();
     this.starting = new Map();
   }
+  #attachment(session, claim, config = this.config) {
+    return new AttachedRuntime({ ...config, attachmentDir: this.attachmentDir }, session, claim, {
+      compatibility: this.compatibility,
+    });
+  }
   watchRuntime(runtime) {
-    if (runtime instanceof PiRpc) {
-      runtime.interruptShutdown = this.closing === true;
-      this.runtimeEvents.delete(runtime.session.id);
-      this.runtimeEvents.set(runtime.session.id, runtime.runtimeEvents);
-      if (this.runtimeEvents.size > 16)
-        this.runtimeEvents.delete(this.runtimeEvents.keys().next().value);
-      runtime.onIdleCandidate = () => this.onIdleCandidate?.(runtime);
-      runtime.retainObservation = async () => {
-        let snapshot;
-        try {
-          // This close attempt already awaits its own capture. Do not report
-          // it as a public read completion and schedule another close attempt.
-          snapshot = await new AttachedRuntime(
-            runtime.config,
-            runtime.session,
-            runtime.ownerRecord,
-            {
-              compatibility: runtime.compatibility,
-            },
-          ).read({ session_id: runtime.session.id, view: 'runtime' });
-        } catch {
-          // An unavailable observer does not erase a dated request snapshot.
-          // Late public reads remain fenced by handoff and the runtime identity.
-          return;
-        }
-        if (this.instances.get(runtime.session.id) === runtime)
-          this.observations.put(runtime.session, snapshot, runtime);
-      };
-    }
-    return runtime;
+    if (!(runtime instanceof PiRpc)) return;
+    const { session } = runtime;
+    runtime.interruptShutdown = this.closing === true;
+    this.runtimeEvents.delete(session.id);
+    this.runtimeEvents.set(session.id, runtime.runtimeEvents);
+    if (this.runtimeEvents.size > 16)
+      this.runtimeEvents.delete(this.runtimeEvents.keys().next().value);
+    runtime.onIdleCandidate = () => this.onIdleCandidate?.(runtime);
+    runtime.retainObservation = async () => {
+      // Observe directly without scheduling another close. An unavailable
+      // observer does not erase a dated request snapshot.
+      const snapshot = await this.#attachment(session, runtime.ownerRecord, runtime.config)
+        .read({ session_id: session.id, view: 'runtime' })
+        .catch(() => null);
+      if (snapshot && this.instances.get(session.id) === runtime)
+        this.observations.put(session, snapshot, runtime);
+    };
   }
   async forRead(session, claim) {
     if (claim === undefined) claim = await readClaim(this.attachmentDir, session);
@@ -87,18 +74,13 @@ export class RuntimePool {
       if (claim.kind === 'rpc') {
         if (existing?.alive && existing.ownerRecord?.generation === claim.generation)
           return this.boundRuntime(existing, session);
-        throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+        throw new OwnerFailure('LIVE_OWNER_UNREACHABLE');
       }
-      if (claim.phase !== 'ready') throw new AttachmentFailure('LIVE_OWNER_UNREACHABLE');
+      if (claim.phase !== 'ready') throw new OwnerFailure('LIVE_OWNER_UNREACHABLE');
       if (existing?.attached && existing.record.generation === claim.generation)
         return this.boundRuntime(existing, session);
       if (existing && !existing.attached) await existing.stop();
-      const attached = new AttachedRuntime(
-        { ...this.config, attachmentDir: this.attachmentDir },
-        session,
-        claim,
-        { compatibility: this.compatibility },
-      );
+      const attached = this.#attachment(session, claim);
       diagnostics.emit('runtime.attach', { kind: 'attached', generation: claim.generation });
       this.instances.set(session.id, attached);
       return attached;
@@ -115,7 +97,7 @@ export class RuntimePool {
   }
   boundRuntime(runtime, session) {
     if (runtime.session && !sameSessionIdentity(runtime.session, session))
-      throw new RpcFailure('RUNTIME_SESSION_CHANGED');
+      throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
     return runtime;
   }
   async resolve(session, { beforeStart, onStart } = {}) {
@@ -133,7 +115,7 @@ export class RuntimePool {
         return runtime;
       }
       if (beforeStart) await validateExecutionCwd(session.cwd);
-      if (claim?.noColdReacquire) throw new AttachmentFailure('COLD_REACQUIRE_BLOCKED');
+      if (claim?.noColdReacquire) throw new OwnerFailure('COLD_REACQUIRE_BLOCKED');
       const previous = this.instances.get(id);
       if (previous && !previous.alive) await previous.stop?.();
       await beforeStart?.();
@@ -164,7 +146,7 @@ export class RuntimePool {
   }
   async stopForDelete(session) {
     const pending = this.starting.get(session.id);
-    pending?.controller.abort(new RpcFailure('RUNTIME_START_CANCELLED'));
+    pending?.controller.abort(new OwnerFailure('RUNTIME_START_CANCELLED'));
     // Stop before launch, or obtain the actual launched process identity. Never
     // wait for native readiness/failure cleanup before exercising delete authority.
     await pending?.runtime?.launchSettled.promise;
@@ -181,14 +163,8 @@ export class RuntimePool {
       // not a writer to signal. A successor claim still belongs to this deletion.
       const startingOwner =
         herdr && !owned.childIdentity && claim?.generation === owned.ownerRecord?.generation;
-      if (claim && !startingOwner && (await ownerAlive(claim.owner))) {
-        const attached = new AttachedRuntime(
-          { ...this.config, attachmentDir: this.attachmentDir },
-          session,
-          claim,
-        );
-        await attached.stopForDelete();
-      }
+      if (claim && !startingOwner && (await ownerAlive(claim.owner)))
+        await this.#attachment(session, claim).stopForDelete();
       // Close the owned scope once: either startup never reported a Pi identity,
       // or the verified writer is now gone and only descendants may remain.
       if (herdr && (!owned.childIdentity || !(await ownerAlive(owned.childIdentity))))

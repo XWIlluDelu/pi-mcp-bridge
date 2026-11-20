@@ -5,6 +5,14 @@ import path from 'node:path';
 import { readOwnerConfig, registryDirectory } from '../core/owner-config.mjs';
 import { inside } from '../core/permissions.mjs';
 
+export async function readCompanionConfig(file, expectedDir) {
+  const { config } = await readOwnerConfig(file);
+  const dir = registryDirectory(config);
+  if (expectedDir !== undefined && expectedDir !== dir)
+    throw new Error('HANDOFF_DIRECTORY_MISMATCH');
+  return { config, dir };
+}
+
 export async function companionProfile(env = process.env) {
   const explicitFile = env.PI_MCP_OWNER_CONFIG;
   if (env.PI_MCP_ATTACH_DIR && !explicitFile)
@@ -16,16 +24,13 @@ export async function companionProfile(env = process.env) {
       'pi-mcp-bridge',
       'owner.json',
     );
-  let config;
+  let config, dir;
   try {
-    ({ config } = await readOwnerConfig(file));
+    ({ config, dir } = await readCompanionConfig(file, env.PI_MCP_ATTACH_DIR || undefined));
   } catch (error) {
     if (!explicitFile && error.code === 'ENOENT') return null;
     throw error;
   }
-  const dir = registryDirectory(config);
-  if (env.PI_MCP_ATTACH_DIR && env.PI_MCP_ATTACH_DIR !== dir)
-    throw new Error('HANDOFF_DIRECTORY_MISMATCH');
   return {
     file,
     dir,
@@ -38,8 +43,7 @@ export async function companionProfile(env = process.env) {
 // already-running Pi installation remain fixed for this companion instance.
 export async function currentCompanionScope(profile) {
   if (!profile.file) return profile;
-  const { config } = await readOwnerConfig(profile.file);
-  if (registryDirectory(config) !== profile.dir) throw new Error('HANDOFF_DIRECTORY_MISMATCH');
+  const { config } = await readCompanionConfig(profile.file, profile.dir);
   return { ...profile, roots: config.sessionRoots };
 }
 
