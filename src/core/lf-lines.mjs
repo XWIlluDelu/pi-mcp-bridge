@@ -1,54 +1,86 @@
-import { StringDecoder } from 'node:string_decoder';
+const EMPTY = Buffer.alloc(0);
 
-// Saved JSONL can have a valid final record without LF. Report that boundary
-// to the history reader while processing the last record in the usual way.
-export async function scanSavedLines(stream, consume) {
-  let fragments = [];
-  for await (const chunk of stream) {
-    let start = 0,
-      end;
-    while ((end = chunk.indexOf('\n', start)) !== -1) {
-      const part = chunk.slice(start, end);
-      if (fragments.length) {
-        fragments.push(part);
-        consume(fragments.join(''));
-        fragments = [];
-      } else consume(part);
-      start = end + 1;
-    }
-    if (start < chunk.length) fragments.push(chunk.slice(start));
+// Scan bytes before decoding. A fragmented frame grows geometrically and an
+// oversized line can be discarded without affecting the next frame.
+function framer(onFrame, { maxBytes = Infinity, onOverflow } = {}) {
+  let buffer = EMPTY,
+    length = 0,
+    discarding = false,
+    closed = false;
+  function reset() {
+    buffer = EMPTY;
+    length = 0;
   }
-  if (fragments.length) consume(fragments.join(''));
-  return fragments.length > 0;
+  return {
+    push(chunk) {
+      if (typeof chunk === 'string') chunk = Buffer.from(chunk);
+      for (let start = 0; !closed && start < chunk.length;) {
+        const newline = chunk.indexOf(10, start);
+        const part = chunk.subarray(start, newline < 0 ? chunk.length : newline);
+        if (!discarding) {
+          const size = length + part.length;
+          if (size > maxBytes) {
+            reset();
+            discarding = true;
+            onOverflow();
+          } else if (newline >= 0 && !length) onFrame(part);
+          else {
+            if (size > buffer.length) {
+              const next = Buffer.allocUnsafe(
+                Math.min(maxBytes, Math.max(size, buffer.length * 2, 4096)),
+              );
+              buffer.copy(next, 0, 0, length);
+              buffer = next;
+            }
+            part.copy(buffer, length);
+            length = size;
+            if (newline >= 0) {
+              const frame = buffer.subarray(0, length);
+              reset();
+              onFrame(frame);
+            }
+          }
+        }
+        if (newline < 0) return;
+        discarding = false;
+        start = newline + 1;
+      }
+    },
+    tail: () => buffer.subarray(0, length),
+    close() {
+      closed = true;
+      reset();
+    },
+  };
 }
 
-// Pi frames JSON with LF. Unicode line separators inside JSON strings are data.
-export function readLfLines(input, onLine) {
-  const decoder = new StringDecoder('utf8');
-  let fragments = [],
-    closed = false;
-  const data = (chunk) => {
-    const text = decoder.write(chunk);
-    let start = 0,
-      end;
-    // Scan each decoded chunk once; join a fragmented frame only at its LF.
-    while (!closed && (end = text.indexOf('\n', start)) !== -1) {
-      const part = text.slice(start, end);
-      const line = fragments.length ? [...fragments, part].join('') : part;
-      fragments = [];
-      start = end + 1;
-      onLine(line.endsWith('\r') ? line.slice(0, -1) : line);
-    }
-    if (!closed && start < text.length) fragments.push(text.slice(start));
-  };
-  // An unfinished frame at EOF is not a protocol response.
+// Saved JSONL can have a valid final record without LF.
+export async function scanSavedLines(stream, consume) {
+  const frames = framer((frame) => consume(frame.toString('utf8')));
+  for await (const chunk of stream) frames.push(chunk);
+  const tail = frames.tail();
+  if (tail.length) consume(tail.toString('utf8'));
+  return tail.length > 0;
+}
+
+// An unfinished frame at EOF is not a protocol response.
+export function readLfFrames(input, onFrame, options) {
+  const frames = framer(onFrame, options);
   const close = () => {
-    closed = true;
-    input.off('data', data);
+    frames.close();
+    input.off('data', frames.push);
     input.off('end', close);
-    fragments = [];
   };
-  input.on('data', data);
+  input.on('data', frames.push);
   input.once('end', close);
   return { close };
+}
+
+export function readLfLines(input, onLine, options) {
+  return readLfFrames(
+    input,
+    (frame) =>
+      onLine(frame.toString('utf8', 0, frame.at(-1) === 13 ? frame.length - 1 : frame.length)),
+    options,
+  );
 }

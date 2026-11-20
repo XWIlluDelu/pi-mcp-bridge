@@ -11,7 +11,7 @@ export async function savedSessionName(session, cache) {
     // Bind the title to the same inode and revision as the authorized list row.
     if (fileRevision(stat) !== session.fileRevision) return null;
     let name = null;
-    const stream = fd.createReadStream({ encoding: 'utf8', autoClose: false, end: stat.size - 1 });
+    const stream = fd.createReadStream({ autoClose: false, end: stat.size - 1 });
     await scanSavedLines(stream, (line) => {
       if (!line.includes('"session_info"')) return;
       try {

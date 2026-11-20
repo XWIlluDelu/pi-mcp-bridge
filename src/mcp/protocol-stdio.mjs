@@ -1,6 +1,6 @@
 import { isRpcRequest, parseJson, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
-const EMPTY = Buffer.alloc(0);
+import { readLfFrames } from '../core/lf-lines.mjs';
 
 // Bound each newline-delimited request before decoding UTF-8.
 export class StdioTransport {
@@ -9,15 +9,19 @@ export class StdioTransport {
     this.capacity = capacity;
     this.input = input;
     this.output = output;
-    this.buffer = EMPTY;
-    this.bufferLength = 0;
-    this.discarding = false;
-    this.tasks = new Set();
     this.requests = new Map();
-    this.data = (chunk) => this.read(chunk);
   }
   start() {
-    this.input.on('data', this.data);
+    this.reader = readLfFrames(
+      this.input,
+      (frame) => {
+        if (frame.length) this.line(frame);
+      },
+      {
+        maxBytes: MCP_INPUT_LIMIT,
+        onOverflow: () => this.reject(null, -32600, 'INPUT_TOO_LARGE'),
+      },
+    );
     this.input.resume();
   }
   async write(message) {
@@ -29,88 +33,50 @@ export class StdioTransport {
     );
   }
   close() {
-    this.input.off('data', this.data);
-    for (const request of this.requests.values()) request.abort();
+    this.reader?.close();
+    for (const { controller } of this.requests.values()) controller?.abort();
   }
   async drain() {
-    await Promise.allSettled([...this.tasks]);
+    await Promise.allSettled(this.requests.values().map(({ task }) => task));
   }
-  track(task) {
-    this.tasks.add(task);
-    void task.finally(() => this.tasks.delete(task)).catch((error) => this.onerror?.(error));
+  track(run, id = Symbol(), controller) {
+    const request = { controller };
+    this.requests.set(id, request);
+    request.task = run();
+    void request.task
+      .finally(() => this.requests.delete(id))
+      .catch((error) => this.onerror?.(error));
   }
-  read(chunk) {
-    // Split before concatenation, so an oversized line never grows the buffer
-    // without bound, even if the peer keeps writing without a newline.
-    let start = 0;
-    while (start < chunk.length) {
-      const newline = chunk.indexOf(10, start);
-      const part = chunk.subarray(start, newline < 0 ? chunk.length : newline);
-      if (!this.discarding) {
-        const size = this.bufferLength + part.length;
-        if (size > MCP_INPUT_LIMIT) {
-          this.buffer = EMPTY;
-          this.bufferLength = 0;
-          this.discarding = true;
-          this.track(this.write(rpcError(null, -32600, 'INPUT_TOO_LARGE')));
-        } else if (newline >= 0 && !this.bufferLength) {
-          if (part.length) this.line(part);
-        } else if (part.length) {
-          // Geometric growth bounds total copying, even for tiny input chunks.
-          // Only the initialized prefix is parsed; capacity never exceeds the frame limit.
-          if (size > this.buffer.length) {
-            const capacity = Math.min(
-              MCP_INPUT_LIMIT,
-              Math.max(size, this.buffer.length * 2, 4096),
-            );
-            const next = Buffer.allocUnsafe(capacity);
-            this.buffer.copy(next, 0, 0, this.bufferLength);
-            this.buffer = next;
-          }
-          part.copy(this.buffer, this.bufferLength);
-          this.bufferLength = size;
-        }
-      }
-      if (newline < 0) return;
-      if (!this.discarding && this.bufferLength)
-        this.line(this.buffer.subarray(0, this.bufferLength));
-      this.buffer = EMPTY;
-      this.bufferLength = 0;
-      this.discarding = false;
-      start = newline + 1;
-    }
+  reject(id, code, message, data) {
+    this.track(() => this.write(rpcError(id, code, message, data)));
   }
   line(bytes) {
     let body;
     try {
       body = parseJson(bytes);
     } catch {
-      this.track(this.write(rpcError(null, -32700, 'Parse error')));
-      return;
+      return this.reject(null, -32700, 'Parse error');
     }
-    if (!isRpcRequest(body)) {
-      this.track(this.write(rpcError(null, -32600, 'Invalid request')));
-      return;
-    }
+    if (!isRpcRequest(body)) return this.reject(null, -32600, 'Invalid request');
     if (body.id === undefined) {
       if (body.method === 'notifications/cancelled')
-        this.requests.get(body.params?.requestId)?.abort();
+        this.requests.get(body.params?.requestId)?.controller?.abort();
       return;
     }
-    if (this.requests.has(body.id)) {
-      this.track(this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID')));
-      return;
-    }
-    if (this.capacity && this.requests.size >= this.capacity.limit) {
-      this.track(
-        this.write(rpcError(body.id, -32000, this.capacity.code, { recovery: 'NOT_FORWARDED' })),
-      );
-      return;
+    if (this.requests.has(body.id))
+      return this.reject(body.id, -32600, 'Duplicate in-flight request ID');
+    if (
+      this.capacity &&
+      this.requests
+        .values()
+        .filter(({ controller }) => controller)
+        .reduce((count) => count + 1, 0) >= this.capacity.limit
+    ) {
+      return this.reject(body.id, -32000, this.capacity.code, { recovery: 'NOT_FORWARDED' });
     }
     const controller = new AbortController();
-    this.requests.set(body.id, controller);
-    const task = (async () => {
-      try {
+    this.track(
+      async () => {
         let reply;
         try {
           reply = await this.dispatch(body, controller.signal);
@@ -118,10 +84,9 @@ export class StdioTransport {
           reply = rpcError(body.id, -32603, 'REQUEST_FAILED');
         }
         if (!controller.signal.aborted) await this.write(reply);
-      } finally {
-        this.requests.delete(body.id);
-      }
-    })();
-    this.track(task);
+      },
+      body.id,
+      controller,
+    );
   }
 }

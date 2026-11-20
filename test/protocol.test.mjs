@@ -222,13 +222,15 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
   release.resolve();
   await transport.drain();
   assert.equal(lines.length, 0);
-  input.write('x'.repeat(MCP_INPUT_LIMIT + 1) + '\n');
-  input.write('{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}\n');
-  input.write(JSON.stringify(message('ping', {}, 43)));
-  input.write('\n');
+  input.write(Buffer.alloc(MCP_INPUT_LIMIT - 7, 120));
+  input.write(Buffer.alloc(8, 120));
+  input.write('\n{"jsonrpc":"2.0","id":44,"method":"initialize","params":{}}\r\n');
+  const id = 'Before\u2028between\u2029after 😀 汉字';
+  for (const byte of Buffer.from(JSON.stringify(message('ping', {}, id)) + '\r\n'))
+    input.write(Buffer.of(byte));
   await transport.drain();
   assert.equal(lines[0].error.message, 'INPUT_TOO_LARGE');
   assert.equal(lines.find((line) => line.id === 44).error.code, -32602);
-  assert.ok(lines.find((line) => line.id === 43).result);
+  assert.ok(lines.find((line) => line.id === id).result);
   await transport.close();
 });

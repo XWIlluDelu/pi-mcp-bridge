@@ -3,6 +3,7 @@ import { publicError } from './core/errors.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { Bridge } from './core/bridge.mjs';
+import { runService } from './server.mjs';
 import { diagnostics } from './core/diagnostics.mjs';
 import {
   isRpcRequest,
@@ -200,41 +201,9 @@ async function main() {
   if (!configFile) throw new Error('OWNER_CONFIG_REQUIRED');
   const { config, token, port } = await loadHttpConfig(configFile);
   const bridge = new Bridge(config, undefined, { configFile });
-  let service,
-    initializing,
-    closing,
-    exitCode = 0;
-  const close = (code = 0) => {
-    exitCode = Math.max(exitCode, code);
-    if (closing) return closing;
-    closing = (async () => {
-      await initializing?.catch(() => {});
-      try {
-        if (service) await service.close();
-        else await bridge.close();
-      } catch {
-        exitCode = 1;
-        console.error('SHUTDOWN_FAILED');
-      }
-      process.exit(exitCode);
-    })();
-    return closing;
-  };
-  const stop = () => void close();
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-  try {
-    initializing = (async () => {
-      await bridge.init();
-      if (closing) return;
-      service = createHttpService(bridge, { token, port });
-      await service.listen();
-    })();
-    await initializing;
-  } catch (error) {
-    console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
-    await close(1);
-  }
+  return runService(bridge, () => createHttpService(bridge, { token, port }), {
+    failureCode: 'HTTP_SERVICE_FAILED',
+  });
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   main().catch((error) => {
