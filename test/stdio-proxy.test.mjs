@@ -1,9 +1,10 @@
+import { mcpRequest } from './fixtures/tool-call.mjs';
 import { readLfLines } from '../src/core/lf-lines.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createStdioProxy } from '../src/stdio-proxy.mjs';
-import { META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
+import { MODERN_VERSION } from '../src/mcp/protocol.mjs';
 
 const token = 'synthetic-proxy-token-never-a-real-credential';
 function fixture(fetchImpl, port = 43123) {
@@ -19,17 +20,7 @@ function fixture(fetchImpl, port = 43123) {
     fetchImpl,
   });
   const send = (id, method, params) =>
-    input.write(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id,
-        method,
-        params: {
-          ...params,
-          _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-        },
-      }) + '\n',
-    );
+    input.write(JSON.stringify(mcpRequest(method, params, id)) + '\n');
   return { input, lines, proxy, send };
 }
 test('stdio proxy forwards per-request metadata and encodes the mirrored tool name', async () => {

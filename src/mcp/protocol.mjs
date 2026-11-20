@@ -4,6 +4,7 @@ import { publicSchemas, publicAnnotations } from './tool-schemas.mjs';
 import { executeBatch } from './batch.mjs';
 import { diagnostics, diagnosticRef } from '../core/diagnostics.mjs';
 import { toolFailure } from '../core/errors.mjs';
+import { readBoundedBytes } from '../core/storage.mjs';
 import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 import { EventError } from '../events/events.mjs';
 
@@ -15,14 +16,7 @@ export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const parseJson = (bytes) => JSON.parse(decoder.decode(bytes));
 export async function readJson(stream, limit, tooLarge) {
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of stream) {
-    bytes += chunk.length;
-    if (bytes > limit) throw new Error(tooLarge);
-    chunks.push(chunk);
-  }
-  return parseJson(Buffer.concat(chunks, bytes));
+  return parseJson(await readBoundedBytes(stream, limit, () => new Error(tooLarge)));
 }
 // Keep descriptions concise to minimize per-conversation token overhead.
 // Detailed semantics live in docs/api.md and error recovery hints.
@@ -146,113 +140,95 @@ export function rpcError(id, code, message, data) {
     error: { code, message, ...(data === undefined ? {} : { data }) },
   };
 }
-function complete(result) {
-  return {
-    resultType: 'complete',
-    ...result,
-    _meta: { ...result._meta, [META + 'serverInfo']: SERVER_INFO },
-  };
-}
-function unsupportedVersion(id, requested) {
-  return rpcError(id, -32022, 'Unsupported protocol version', {
-    supported: SUPPORTED_VERSIONS,
-    // A malformed version must still fit the MCP response budget.
-    requested: requested.slice(0, 64),
+// The budget covers the full JSON-RPC envelope, including the duplicated text
+// and the request ID. Keep the fallback within the same response contract.
+function success(id, result) {
+  const envelope = (value) => ({
+    jsonrpc: '2.0',
+    id,
+    result: {
+      resultType: 'complete',
+      ...value,
+      _meta: { ...value._meta, [META + 'serverInfo']: SERVER_INFO },
+    },
   });
-}
-// Applies to the entire serialized JSON-RPC envelope, including escaped text
-// duplication, metadata and request ID. Never truncates JSON.
-function boundedResult(id, result) {
-  const message = { jsonrpc: '2.0', id, result: complete(result) };
-  if (Buffer.byteLength(JSON.stringify(message), 'utf8') <= MCP_RESPONSE_LIMIT) return message;
-  return {
-    ...message,
-    result: complete(
+  let message = envelope(result);
+  if (Buffer.byteLength(JSON.stringify(message)) > MCP_RESPONSE_LIMIT)
+    message = envelope(
       toolError('RESPONSE_TOO_LARGE', {
         recovery:
           'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
       }),
-    ),
-  };
+    );
+  return { status: 200, message };
 }
+
 export async function dispatchModern(bridge, body, options = {}) {
-  const id = body?.id;
-  if (!isRpcRequest(body) || id === undefined)
+  if (!isRpcRequest(body) || body.id === undefined)
     return { status: 400, message: rpcError(null, -32600, 'Invalid request') };
-  const meta = body.params?._meta;
+  const { id, params, method } = body;
+  const reject = (code, reason, data, status = 400) => ({
+    status,
+    message: rpcError(id, code, reason, data),
+  });
+  if (options.headers && !validModernHeaders(body, options.headers))
+    return reject(-32020, 'Header mismatch');
+  const meta = params?._meta;
+  const version = meta?.[META + 'protocolVersion'];
+  const client = meta?.[META + 'clientInfo'];
   if (
     !object(meta) ||
-    typeof meta[META + 'protocolVersion'] !== 'string' ||
+    typeof version !== 'string' ||
     !object(meta[META + 'clientCapabilities']) ||
-    (meta[META + 'clientInfo'] !== undefined &&
-      (!object(meta[META + 'clientInfo']) ||
-        typeof meta[META + 'clientInfo'].name !== 'string' ||
-        typeof meta[META + 'clientInfo'].version !== 'string'))
+    (client !== undefined &&
+      (!object(client) || typeof client.name !== 'string' || typeof client.version !== 'string'))
   )
-    return {
-      status: 400,
-      message: rpcError(
-        id,
-        -32602,
-        'Required per-request protocol metadata is missing or malformed',
-      ),
-    };
-  if (meta[META + 'protocolVersion'] !== MODERN_VERSION)
-    return { status: 400, message: unsupportedVersion(id, meta[META + 'protocolVersion']) };
-  let result;
-  switch (body.method) {
+    return reject(-32602, 'Required per-request protocol metadata is missing or malformed');
+  if (version !== MODERN_VERSION)
+    return reject(-32022, 'Unsupported protocol version', {
+      supported: SUPPORTED_VERSIONS,
+      requested: version.slice(0, 64),
+    });
+  switch (method) {
     case 'server/discover':
-      result = {
+      return success(id, {
         supportedVersions: SUPPORTED_VERSIONS,
         capabilities: { tools: {}, events: {} },
         ttlMs: 0,
         cacheScope: 'private',
-      };
-      break;
+      });
     case 'events/list':
     case 'events/subscribe':
-    case 'events/unsubscribe': {
+    case 'events/unsubscribe':
       try {
-        result = await bridge.events.handle(body.method, body.params, options);
+        return success(id, await bridge.events.handle(method, params, options));
       } catch (error) {
-        return {
-          status: error instanceof EventError && error.code !== -32603 ? 400 : 500,
-          message:
-            error instanceof EventError
-              ? rpcError(id, error.code, error.message, error.data)
-              : rpcError(id, -32603, 'REQUEST_FAILED'),
-        };
+        if (error instanceof EventError)
+          return reject(error.code, error.message, error.data, error.code === -32603 ? 500 : 400);
+        return reject(-32603, 'REQUEST_FAILED', undefined, 500);
       }
-      break;
-    }
     case 'ping':
-      result = {};
-      break;
+      return success(id, {});
     case 'tools/list':
-      if (body.params.cursor !== undefined)
-        return { status: 400, message: rpcError(id, -32602, 'Invalid cursor') };
-      result = { tools: toolDefinitions(), ttlMs: 0, cacheScope: 'private' };
-      break;
+      if (params.cursor !== undefined) return reject(-32602, 'Invalid cursor');
+      return success(id, { tools: toolDefinitions(), ttlMs: 0, cacheScope: 'private' });
     case 'tools/call':
       if (
-        typeof body.params.name !== 'string' ||
-        (body.params.arguments !== undefined && !object(body.params.arguments))
+        typeof params.name !== 'string' ||
+        (params.arguments !== undefined && !object(params.arguments))
       )
-        return { status: 400, message: rpcError(id, -32602, 'Malformed tool call') };
-      if (!toolNames.includes(body.params.name))
-        return { status: 400, message: rpcError(id, -32602, 'Unknown tool') };
-      result = await callBridgeTool(bridge, body.params.name, body.params.arguments, {
-        ...options,
-        requestId: id,
-      });
-      break;
+        return reject(-32602, 'Malformed tool call');
+      if (!toolNames.includes(params.name)) return reject(-32602, 'Unknown tool');
+      return success(
+        id,
+        await callBridgeTool(bridge, params.name, params.arguments, { ...options, requestId: id }),
+      );
     default:
-      return { status: 404, message: rpcError(id, -32601, 'Method not found') };
+      return reject(-32601, 'Method not found', undefined, 404);
   }
-  return { status: 200, message: boundedResult(id, result) };
 }
 
-export function modernHeaderFields(body) {
+function modernHeaderFields(body) {
   const expected = {
     'mcp-protocol-version': body?.params?._meta?.[META + 'protocolVersion'],
     'mcp-method': body?.method,
@@ -262,26 +238,32 @@ export function modernHeaderFields(body) {
   return expected;
 }
 
-// Modern HTTP bindings require mirrored fields and reject duplicate headers.
-export function validateModernHeaders(body, getHeaders) {
-  for (const [name, value] of Object.entries(modernHeaderFields(body))) {
-    const values = getHeaders(name);
-    if (values.length !== 1 || typeof value !== 'string')
-      return rpcError(body?.id, -32020, 'Header mismatch');
-    let actual = values[0];
-    if (name === 'mcp-name' && actual.startsWith('=?base64?') && actual.endsWith('?=')) {
-      const encoded = actual.slice(9, -2);
-      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded))
-        return rpcError(body?.id, -32020, 'Header mismatch');
-      const bytes = Buffer.from(encoded, 'base64');
-      try {
-        actual = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      } catch {
-        return rpcError(body?.id, -32020, 'Header mismatch');
-      }
-    } else if (!/^[\x20-\x7e]+$/.test(actual) || actual.trim() !== actual)
-      return rpcError(body?.id, -32020, 'Header mismatch');
-    if (actual !== value) return rpcError(body?.id, -32020, 'Header mismatch');
+const plainHeader = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/;
+const encodedPrefix = '=?base64?';
+export function forwardedMcpHeaders(body) {
+  const headers = modernHeaderFields(body);
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value !== 'string') delete headers[name];
+    else if (name === 'mcp-name' && (!plainHeader.test(value) || value.startsWith(encodedPrefix)))
+      headers[name] = encodedPrefix + Buffer.from(value).toString('base64') + '?=';
   }
-  return null;
+  return headers;
+}
+
+// Modern HTTP bindings require mirrored fields and reject duplicate headers.
+function validModernHeaders(body, headers) {
+  return Object.entries(modernHeaderFields(body)).every(([name, value]) => {
+    const actual = headers[name]?.[0];
+    if (headers[name]?.length !== 1 || typeof value !== 'string') return false;
+    if (name !== 'mcp-name' || !actual.startsWith(encodedPrefix) || !actual.endsWith('?='))
+      return plainHeader.test(actual) && actual === value;
+    const encoded = actual.slice(encodedPrefix.length, -2);
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded))
+      return false;
+    try {
+      return decoder.decode(Buffer.from(encoded, 'base64')) === value;
+    } catch {
+      return false;
+    }
+  });
 }

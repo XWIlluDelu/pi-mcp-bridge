@@ -1,3 +1,4 @@
+import { mcpRequest as modern } from './fixtures/tool-call.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
@@ -11,7 +12,7 @@ import path from 'node:path';
 import { createHttpService } from '../src/http-server.mjs';
 import { loadHttpConfig, TOKEN_HEADER } from '../src/mcp/http-config.mjs';
 
-import { META, MODERN_VERSION, MCP_INPUT_LIMIT } from '../src/mcp/protocol.mjs';
+import { META, MCP_INPUT_LIMIT } from '../src/mcp/protocol.mjs';
 
 const token = 'synthetic-http-test-token-never-a-real-credential';
 const rpc = (name, args = {}) => modern('tools/call', { name, arguments: args });
@@ -57,15 +58,11 @@ function request(url, message, options = {}) {
 }
 async function fixture(t, serviceOptions = {}) {
   const runtime = ownedRuntime({
-    alive: true,
     calls: [],
     state: async () => ({ isStreaming: false }),
     command: async function (c) {
       this.calls.push(c);
       return { disposition: 'started' };
-    },
-    stop: async function () {
-      this.alive = false;
     },
   });
   const f = await nativeOwner(t, { prefix: 'http', factory: async () => runtime });
@@ -82,15 +79,6 @@ async function fixture(t, serviceOptions = {}) {
 }
 const deferred = () => Promise.withResolvers();
 
-const modern = (method, params = {}, id = 1) => ({
-  jsonrpc: '2.0',
-  id,
-  method,
-  params: {
-    ...params,
-    _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-  },
-});
 const modernHeaders = (body) => ({
   'MCP-Protocol-Version': body.params._meta[META + 'protocolVersion'],
   'Mcp-Method': body.method,

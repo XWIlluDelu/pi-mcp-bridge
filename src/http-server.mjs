@@ -1,18 +1,11 @@
 import http from 'node:http';
+import { once } from 'node:events';
 import { publicError } from './core/errors.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
 import { Bridge } from './core/bridge.mjs';
 import { runService } from './server.mjs';
 import { diagnostics } from './core/diagnostics.mjs';
-import {
-  isRpcRequest,
-  dispatchModern,
-  validateModernHeaders,
-  readJson,
-  rpcError,
-  MCP_INPUT_LIMIT,
-} from './mcp/protocol.mjs';
+import { dispatchModern, readJson, rpcError, MCP_INPUT_LIMIT } from './mcp/protocol.mjs';
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 
 const digest = (value) => createHash('sha256').update(value).digest();
@@ -35,28 +28,12 @@ function respond(res, status, message, close = false) {
   });
   res.end(JSON.stringify(message));
 }
-async function parseBody(req) {
-  try {
-    // Preserve the socket long enough to send 413 after abandoning an upload.
-    const value = await readJson(
-      req.iterator({ destroyOnReturn: false }),
-      MCP_INPUT_LIMIT,
-      'BODY_TOO_LARGE',
-    );
-    // The MCP batch tool is supported; JSON-RPC envelope arrays are not.
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
-    return value;
-  } catch (error) {
-    if (error.message === 'BODY_TOO_LARGE') throw error;
-    throw new Error('INVALID_JSON_OBJECT');
-  }
-}
-
 // The token and port come from loadHttpConfig, which validates them.
 export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
   const tokenDigest = digest(token),
     requests = new Map();
   let stopping = false,
+    listening,
     closing,
     allowedHosts;
   const listener = http.createServer(
@@ -103,39 +80,42 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       return refuse(res, 'BODY_TOO_LARGE');
     requests.set(res, null);
     let deadline;
-    res.once('close', () => {
-      clearTimeout(deadline);
-      if (!requests.get(res)) requests.delete(res);
-    });
-    let body;
     try {
-      body = await parseBody(req);
-    } catch (error) {
-      // Upload/parse failures happen before admission; others stay unknown.
-      if (Object.hasOwn(NOT_ADMITTED, error.message)) return refuse(res, error.message);
-      throw error;
-    }
-    try {
+      let body;
+      try {
+        // Leave the socket open long enough to reject an oversized upload.
+        body = await readJson(
+          req.iterator({ destroyOnReturn: false }),
+          MCP_INPUT_LIMIT,
+          'BODY_TOO_LARGE',
+        );
+      } catch (error) {
+        return refuse(
+          res,
+          error.message === 'BODY_TOO_LARGE' ? error.message : 'INVALID_JSON_OBJECT',
+        );
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body))
+        return refuse(res, 'INVALID_JSON_OBJECT');
       if (res.destroyed) return;
       if (stopping) return refuse(res, 'SERVICE_STOPPING');
       diagnostics.emit('http.request', { method: body.method });
-      if (!isRpcRequest(body) || body.id === undefined)
-        return respond(res, 400, rpcError(null, -32600, 'Invalid request'));
-      const mismatch = validateModernHeaders(body, (name) => headers[name] ?? []);
-      if (mismatch) return respond(res, 400, mismatch);
-      deadline = setTimeout(() => {
-        respond(
-          res,
-          504,
-          rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
-            recovery:
-              'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
-          }),
-        );
-      }, waitTimeoutMs);
-      deadline.unref();
       const response = await dispatchModern(bridge, body, {
+        headers,
         execute(run) {
+          deadline = setTimeout(
+            () =>
+              respond(
+                res,
+                504,
+                rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
+                  recovery:
+                    'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
+                }),
+              ),
+            waitTimeoutMs,
+          );
+          deadline.unref();
           // Keep admitted work in the request map after the response closes.
           const task = Promise.resolve().then(run);
           requests.set(res, task);
@@ -146,18 +126,14 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     } finally {
       clearTimeout(deadline);
       if (res.destroyed) requests.delete(res);
-      else requests.set(res, null);
+      else res.once('close', () => requests.delete(res));
     }
   }
   return {
     async listen() {
-      await new Promise((resolve, reject) => {
-        listener.once('error', reject);
-        listener.listen(port, '127.0.0.1', () => {
-          listener.off('error', reject);
-          resolve();
-        });
-      });
+      if (stopping) throw new Error('SERVICE_STOPPING');
+      listening = once(listener.listen(port, '127.0.0.1'), 'listening');
+      await listening;
       const authority = `127.0.0.1:${listener.address().port}`;
       const endpoint = new URL(`http://${authority}/mcp`);
       // HTTP clients normally omit the default port from Host.
@@ -170,20 +146,16 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       stopping = true;
       diagnostics.emit('service.stopping', { transport: 'http' });
       closing = (async () => {
-        const stopped = new Promise((resolve, reject) =>
-          listener.close((error) =>
-            error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve(),
-          ),
+        const stopped = listening?.then(
+          () => listener[Symbol.asyncDispose](),
+          () => {},
         );
-        // Stop incomplete uploads/validation; admitted tools remain alive.
-        const admitted = [];
-        for (const [res, task] of requests) {
-          if (task) admitted.push(task);
-          else res.destroy();
-        }
+        // Disconnect unfinished uploads. A detached, admitted request stays in
+        // the map until dispatch finishes, even after its HTTP deadline.
+        for (const [res, task] of requests) if (!task) res.destroy();
         try {
           await bridge.prepareClose();
-          await Promise.allSettled(admitted);
+          await Promise.allSettled(requests.values());
           await bridge.close();
         } finally {
           for (const res of requests.keys()) res.destroy();
@@ -205,7 +177,7 @@ async function main() {
     failureCode: 'HTTP_SERVICE_FAILED',
   });
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch((error) => {
     console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
     process.exitCode = 1;

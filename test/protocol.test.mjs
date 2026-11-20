@@ -1,3 +1,4 @@
+import { mcpRequest as message } from './fixtures/tool-call.mjs';
 import { test } from 'node:test';
 import packageInfo from '../package.json' with { type: 'json' };
 import assert from 'node:assert/strict';
@@ -16,13 +17,6 @@ import { publicSchemas } from '../src/mcp/tool-schemas.mjs';
 import { CONTENT_KINDS } from '../src/read/read-schema.mjs';
 import { MAX_IMAGES } from '../src/ops/prompt-input.mjs';
 
-const meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
-const message = (method, params = {}, id = 1) => ({
-  jsonrpc: '2.0',
-  id,
-  method,
-  params: { ...params, _meta: { ...meta } },
-});
 // Every tool call captures its receive-time policy before execution.
 const captureRequestContext = async () => ({});
 const stub = { captureRequestContext, list: async (args) => ({ sessions: [], args }) };
@@ -40,14 +34,15 @@ test('oversized input collections reject before inspecting elements or admitting
     Object.defineProperty(values, 0, {
       get: () => assert.fail(`${name} inspected an element of an oversized collection`),
     });
-    const args = { ...identity, [field]: values };
-    const parsed = publicSchemas[name].safeParse(args);
-    assert.equal(parsed.success, false);
-    assert.equal(parsed.error.issues.length, 1);
-    assert.equal(parsed.error.issues[0].code, 'too_big');
-    assert.deepEqual(parsed.error.issues[0].path, [field]);
-    const result = await callBridgeTool(bridge, name, args);
-    assert.equal(result.structuredContent.error.code, 'INVALID_ARGUMENTS');
+    const { structuredContent } = await callBridgeTool(bridge, name, {
+      ...identity,
+      [field]: values,
+    });
+    assert.equal(structuredContent.error.code, 'INVALID_ARGUMENTS');
+    assert.deepEqual(
+      structuredContent.error.issues.map(({ path }) => path),
+      [[field]],
+    );
   }
 });
 

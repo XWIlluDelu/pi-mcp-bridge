@@ -2,11 +2,10 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { META, MODERN_VERSION } from '../../src/mcp/protocol.mjs';
+import { mcpRequest } from './tool-call.mjs';
 
 const base = fileURLToPath(new URL('../..', import.meta.url));
 const server = fileURLToPath(new URL('../../src/server.mjs', import.meta.url));
-const meta = { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} };
 
 export function launchStdio(f, nodeArgs = []) {
   const child = spawn(process.execPath, [...nodeArgs, server, f.configFile], {
@@ -43,7 +42,7 @@ export function launchStdio(f, nodeArgs = []) {
     new Promise((resolve) => {
       const id = ++next;
       pending.set(id, resolve);
-      write({ jsonrpc: '2.0', id, method, params: { ...params, _meta: meta } });
+      write(mcpRequest(method, params, id));
     });
   return {
     child,

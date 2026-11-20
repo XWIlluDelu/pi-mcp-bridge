@@ -1,5 +1,4 @@
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { StdioTransport } from './mcp/protocol-stdio.mjs';
 import { dispatchModern } from './mcp/protocol.mjs';
 import { Bridge } from './core/bridge.mjs';
@@ -86,7 +85,7 @@ async function main() {
     { stdio: true },
   );
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch((e) => {
     console.error(publicError(e));
     process.exitCode = 1;

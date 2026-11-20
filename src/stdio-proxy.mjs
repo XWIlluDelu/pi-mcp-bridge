@@ -1,7 +1,6 @@
-import { pathToFileURL } from 'node:url';
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 import { StdioTransport } from './mcp/protocol-stdio.mjs';
-import { modernHeaderFields, readJson, rpcError } from './mcp/protocol.mjs';
+import { forwardedMcpHeaders, readJson, rpcError } from './mcp/protocol.mjs';
 import { MCP_RESPONSE_LIMIT } from './mcp/response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
@@ -15,25 +14,18 @@ export function createStdioProxy({
 }) {
   // The token and port come from loadHttpConfig, which validates them.
   const target = new URL(`http://127.0.0.1:${port}/mcp`);
-  const encode = (value) =>
-    /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && !value.startsWith('=?base64?')
-      ? value
-      : '=?base64?' + Buffer.from(value).toString('base64') + '?=';
   return new StdioTransport(
     async (body, signal) => {
       const { id } = body;
       try {
-        const headers = {
-          'content-type': 'application/json',
-          accept: 'application/json',
-          [TOKEN_HEADER]: token,
-        };
-        for (const [name, value] of Object.entries(modernHeaderFields(body)))
-          if (typeof value === 'string')
-            headers[name] = name === 'mcp-name' ? encode(value) : value;
         const response = await fetchImpl(target, {
           method: 'POST',
-          headers,
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            [TOKEN_HEADER]: token,
+            ...forwardedMcpHeaders(body),
+          },
           body: JSON.stringify(body),
           redirect: 'error',
           signal: AbortSignal.any([signal, AbortSignal.timeout(40000)]),
@@ -88,7 +80,7 @@ async function main() {
   proxy.onerror = close;
   proxy.start();
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch(() => {
     console.error('STDIO_PROXY_FAILED');
     process.exitCode = 1;

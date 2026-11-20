@@ -1,3 +1,4 @@
+import { promisify } from 'node:util';
 import { isRpcRequest, parseJson, rpcError, MCP_INPUT_LIMIT } from './protocol.mjs';
 
 import { readLfFrames } from '../core/lf-lines.mjs';
@@ -9,6 +10,7 @@ export class StdioTransport {
     this.capacity = capacity;
     this.input = input;
     this.output = output;
+    this.writeLine = promisify(output.write.bind(output));
     this.requests = new Map();
   }
   start() {
@@ -24,31 +26,24 @@ export class StdioTransport {
     );
     this.input.resume();
   }
-  async write(message) {
+  write(message) {
     if (this.output.destroyed || this.output.writableEnded) return;
-    await new Promise((resolve, reject) =>
-      this.output.write(JSON.stringify(message) + '\n', (error) =>
-        error ? reject(error) : resolve(),
-      ),
-    );
+    // Writable callbacks complete in order, including replies that never
+    // admitted a request. Only the tail is needed to flush those rejections.
+    return (this.lastWrite = this.writeLine(JSON.stringify(message) + '\n').catch((error) =>
+      this.onerror?.(error),
+    ));
   }
   close() {
     this.reader?.close();
-    for (const { controller } of this.requests.values()) controller?.abort();
+    for (const { controller } of this.requests.values()) controller.abort();
   }
   async drain() {
     await Promise.allSettled(this.requests.values().map(({ task }) => task));
-  }
-  track(run, id = Symbol(), controller) {
-    const request = { controller };
-    this.requests.set(id, request);
-    request.task = run();
-    void request.task
-      .finally(() => this.requests.delete(id))
-      .catch((error) => this.onerror?.(error));
+    await this.lastWrite;
   }
   reject(id, code, message, data) {
-    this.track(() => this.write(rpcError(id, code, message, data)));
+    this.write(rpcError(id, code, message, data));
   }
   line(bytes) {
     let body;
@@ -65,28 +60,22 @@ export class StdioTransport {
     }
     if (this.requests.has(body.id))
       return this.reject(body.id, -32600, 'Duplicate in-flight request ID');
-    if (
-      this.capacity &&
-      this.requests
-        .values()
-        .filter(({ controller }) => controller)
-        .reduce((count) => count + 1, 0) >= this.capacity.limit
-    ) {
+    if (this.capacity && this.requests.size >= this.capacity.limit)
       return this.reject(body.id, -32000, this.capacity.code, { recovery: 'NOT_FORWARDED' });
-    }
     const controller = new AbortController();
-    this.track(
-      async () => {
-        let reply;
-        try {
-          reply = await this.dispatch(body, controller.signal);
-        } catch {
-          reply = rpcError(body.id, -32603, 'REQUEST_FAILED');
-        }
-        if (!controller.signal.aborted) await this.write(reply);
-      },
-      body.id,
-      controller,
-    );
+    const request = { controller };
+    this.requests.set(body.id, request);
+    request.task = this.reply(body, controller.signal)
+      .catch((error) => this.onerror?.(error))
+      .finally(() => this.requests.delete(body.id));
+  }
+  async reply(body, signal) {
+    let message;
+    try {
+      message = await this.dispatch(body, signal);
+    } catch {
+      message = rpcError(body.id, -32603, 'REQUEST_FAILED');
+    }
+    if (!signal.aborted) await this.write(message);
   }
 }
