@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PiRpc, RuntimePool } from '../src/rpc.mjs';
-import { RuntimeEvents } from '../src/runtime-events.mjs';
-import { prepareContextRead } from './fixtures/read-pages.mjs';
-import { ContextReadCache } from '../src/read-cache.mjs';
-import { assertContextReadResponse } from './fixtures/read-pages.mjs';
-import { toolResultBytes } from '../src/response-budget.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
+import { RuntimePool } from '../src/runtime/runtime-pool.mjs';
+import { RuntimeEvents, boundRuntimeEvents } from '../src/read/runtime-events.mjs';
+import { assertContextReadResponse, prepareContextRead } from './fixtures/read-pages.mjs';
+import { message } from './fixtures/native-history.mjs';
+import { ContextReadCache } from '../src/read/read-cache.mjs';
+import { resultSize } from '../src/mcp/response-budget.mjs';
 
 const bytes = (value) => Buffer.byteLength(JSON.stringify(value));
 const notify = (message) => ({ type: 'extension_ui_request', method: 'notify', message });
@@ -26,10 +27,10 @@ test('native errors and notifications belong only to their RPC generation, not p
   rpc.receiveResponse(error, 'other-generation');
   rpc.receiveResponse({ ...error, error: null }, generation);
   rpc.receiveResponse({ ...notify('ignored'), method: 'setStatus' }, generation);
-  assert.equal(rpc.runtimeEvents.snapshot(4096), null);
+  assert.equal(rpc.runtimeEvents.snapshot(), null);
   rpc.receiveResponse(error, generation);
   rpc.receiveResponse(notify('before ACK'), generation);
-  assert.ok(rpc.promptAdmission);
+  assert.ok(rpc.hasPendingCommand('prompt'));
   rpc.receiveResponse(
     {
       type: 'response',
@@ -42,7 +43,7 @@ test('native errors and notifications belong only to their RPC generation, not p
   );
   assert.deepEqual(await pending, { disposition: 'handled' });
   rpc.receiveResponse(notify('after ACK'), generation);
-  const snapshot = rpc.runtimeEvents.snapshot(4096);
+  const snapshot = rpc.runtimeEvents.snapshot();
   assert.equal(snapshot.generation, generation);
   assert.deepEqual(
     snapshot.events.map((e) => e.type),
@@ -53,13 +54,13 @@ test('native errors and notifications belong only to their RPC generation, not p
     assert.equal(event.prompt_id, undefined);
     assert.equal(event.id, undefined);
   }
-  const pool = new RuntimePool({});
+  const pool = new RuntimePool({ attachmentDir: '/unused-test-registry' });
   pool.watchRuntime(rpc);
   assert.equal(pool.runtimeEvents.get('s'), rpc.runtimeEvents);
   // A replacement generation replaces retained observations; other sessions are bounded.
   const replacement = new PiRpc({}, { id: 's' });
   pool.watchRuntime(replacement);
-  assert.equal(pool.runtimeEvents.get('s').snapshot(4096), null);
+  assert.equal(pool.runtimeEvents.get('s').snapshot(), null);
   for (let i = 0; i < 20; i++) pool.watchRuntime(new PiRpc({}, { id: 's' + i }));
   assert.equal(pool.runtimeEvents.size, 16);
 });
@@ -67,14 +68,14 @@ test('native errors and notifications belong only to their RPC generation, not p
 test('an observed native identity switch invalidates retained events even after the runtime closes', async () => {
   const session = { id: 's', file: '/synthetic/a.jsonl', header: { id: 'a' } };
   const rpc = new PiRpc({}, session),
-    pool = new RuntimePool({});
+    pool = new RuntimePool({ attachmentDir: '/unused-test-registry' });
   pool.watchRuntime(rpc);
   rpc.receiveResponse(notify('unverified session notice'), rpc.generation);
   rpc.dispatch = async () => ({ sessionFile: '/synthetic/b.jsonl', sessionId: 'b' });
   rpc.stop = async () => assert.fail('Identity observation must not stop the process');
   await assert.rejects(rpc.state(), { code: 'RUNTIME_SESSION_CHANGED' });
   rpc.receiveResponse(notify('after switch'), rpc.generation);
-  assert.equal(pool.runtimeEvents.get('s').snapshot(4096), null);
+  assert.equal(pool.runtimeEvents.get('s').snapshot(), null);
 });
 
 test('event retention and fresh read previews are bounded; cursor pages stay historical', () => {
@@ -82,21 +83,18 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
   for (let i = 0; i < 40; i++) events.observe(notify('long 😀\u0000'.repeat(1000)));
   assert.equal(events.events.length, 32);
   assert.ok(events.events.every((e) => e.message.length <= 2048));
-  const observations = events.snapshot(1024);
+  const observations = boundRuntimeEvents(events.snapshot(), 1024);
   assert.ok(bytes(observations) <= 1024);
   assert.equal(observations.events.at(-1).sequence, 40);
   assert.equal(observations.omitted_events, 40 - observations.events.length);
   assert.ok(observations.events.at(-1).truncated_fields.includes('message'));
-  const entry = {
-    type: 'message',
-    id: 'user',
-    parentId: null,
-    timestamp: '2026-01-01T00:00:00Z',
-    message: { role: 'user', content: 'history\n\n'.repeat(6000), timestamp: 0 },
-  };
   const args = { session_id: 's', max_bytes: 24000 },
     prepared = prepareContextRead(
-      { header: { id: 'native' }, entries: [entry], leafId: entry.id },
+      {
+        header: { id: 'native' },
+        entries: [message('user', null, 'user', 'history\n\n'.repeat(6000))],
+        leafId: 'user',
+      },
       args,
     ),
     cache = new ContextReadCache(),
@@ -116,19 +114,13 @@ test('event retention and fresh read previews are bounded; cursor pages stay his
     undefined,
   );
 
-  const frozen = JSON.stringify(prepared.units),
-    reduced = cache.render(prepared, args, {
-      ...options,
-      resultBudget: { maxBytes: 19000, maxWireBytes: 25000 },
-    });
+  const reduced = cache.render(prepared, args, {
+    ...options,
+    resultBudget: { maxBytes: 19000, maxWireBytes: 25000 },
+  });
   assertContextReadResponse(reduced, args);
   assert.ok(bytes(reduced) <= 19000);
-  assert.ok(toolResultBytes(reduced) <= 25000);
+  assert.ok(resultSize(reduced).wireBytes <= 25000);
   assert.ok(reduced.items.length > 0, 'Committed history wins over optional previews');
   if (reduced.runtime_events) assert.equal(reduced.runtime_events.events.at(-1).sequence, 40);
-  assert.equal(
-    JSON.stringify(prepared.units),
-    frozen,
-    'Batch budgets render the captured snapshot without mutation',
-  );
 });

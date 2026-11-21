@@ -5,3 +5,4 @@ node_modules/
 /.local/
 /owner.json
 /owner-config.json
+/docdoki/private/

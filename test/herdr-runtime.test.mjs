@@ -4,18 +4,44 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { Bridge } from '../src/bridge.mjs';
-import { PiRpc, launchProfile } from '../src/rpc.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+import { launchProfile } from '../src/runtime/pi-installation.mjs';
 import { fileURLToPath } from 'node:url';
-import { scheduleAutoRelease } from '../src/auto-release.mjs';
-import { findHerdr, HerdrControl } from '../src/herdr-control.mjs';
-import { HerdrRpcTransport } from '../src/herdr-rpc-transport.mjs';
-import { ownerAlive, readClaim, processIdentity } from '../src/attachments.mjs';
+import { findHerdr, HerdrControl } from '../src/runtime/herdr-control.mjs';
+import { HerdrRpcTransport, prepareHerdr } from '../src/runtime/herdr-rpc-transport.mjs';
+import { ownerAlive, readClaim, processIdentity } from '../src/runtime/attachments.mjs';
 import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+import { restoreManifest, savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { nativeOwner } from './fixtures/native-owner.mjs';
+import { until } from './fixtures/until.mjs';
 
 const exec = promisify(execFile);
+
+async function fixture(t, compatibilityModules = []) {
+  return nativeOwner(t, {
+    prefix: 'herdr',
+    async configure({ dir, config, cleanup }) {
+      const bin = path.join(dir, 'bin');
+      await fs.mkdir(bin);
+      await fs.symlink(process.execPath, path.join(bin, 'node'));
+      const { PATH, HOME, PI_INTERCOM_TEST_SESSION } = process.env;
+      cleanup.push(() => {
+        for (const [key, value] of Object.entries({ PATH, HOME, PI_INTERCOM_TEST_SESSION })) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      });
+      Object.assign(process.env, {
+        PATH: bin,
+        HOME: dir,
+        PI_INTERCOM_TEST_SESSION: 'synthetic-session',
+      });
+      Object.assign(config, { herdr: true, compatibilityModules });
+    },
+  });
+}
+
 test('Herdr discovery uses executable PATH/local installation, not a cached availability flag', async (t) => {
   const dir = await fs.mkdtemp('/tmp/bridge-herdr-discovery-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -32,96 +58,66 @@ test('Herdr discovery uses executable PATH/local installation, not a cached avai
   assert.equal(await findHerdr(env), null);
 });
 
-test('missing Herdr starts directly; an installed Herdr failure cleans reservation without fallback', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/bridge-herdr-selection-');
-  const bin = path.join(dir, 'bin');
-  await fs.mkdir(bin);
-  await fs.symlink(process.execPath, path.join(bin, 'node'));
-  const environment = { PATH: process.env.PATH, HOME: process.env.HOME },
-    intercomSession = process.env.PI_INTERCOM_TEST_SESSION;
-  process.env.PATH = bin;
-  process.env.HOME = dir;
-  process.env.PI_INTERCOM_TEST_SESSION = 'synthetic-session';
-  const config = {
-    ...isolatedRuntime(dir),
-    compatibilityModules: [
-      { module: fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url)) },
-    ],
-    herdr: true,
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: dir }],
-    defaults: denyAllPermissions(),
-  };
-  const bridge = await new Bridge(config).init();
-  t.after(async () => {
-    Object.assign(process.env, environment);
-    if (intercomSession === undefined) delete process.env.PI_INTERCOM_TEST_SESSION;
-    else process.env.PI_INTERCOM_TEST_SESSION = intercomSession;
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
+test('unavailable Herdr preflight silently falls back to direct startup; post-launch failures clean up without fallback', async (t) => {
+  const { dir, bridge, config, session } = await fixture(t, [
+    { module: fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url)) },
+  ]);
   bridge.pool.onIdleCandidate = undefined;
-  const seed = await savedSession(bridge),
-    session = await bridge.session(seed.session_id);
   const direct = await bridge.pool.resolve(session);
   assert.equal(direct.child instanceof HerdrRpcTransport, false);
   await direct.stop();
-  await fs.writeFile(path.join(bin, 'herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  await fs.writeFile(path.join(dir, 'bin/herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
+  let sawFilteredEnv = false;
   t.mock.method(HerdrControl, 'open', async (_binary, daemonEnvironment) => {
     assert.equal(daemonEnvironment.PI_INTERCOM_TEST_SESSION, undefined);
     assert.equal(process.env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
     assert.equal(launchProfile({}).env.PI_INTERCOM_TEST_SESSION, 'synthetic-session');
+    sawFilteredEnv = true;
     throw new Error('HERDR_UNAVAILABLE');
   });
-  const rejected = new PiRpc({ ...config, attachmentDir: bridge.pool.attachmentDir }, session, {
-    compatibility: bridge.compatibilityServices,
-  });
-  await assert.rejects(rejected.start(), /HERDR_UNAVAILABLE/);
-  assert.ok(rejected.child instanceof HerdrRpcTransport);
-  assert.equal(rejected.child.pid, undefined);
+  const fallback = await bridge.pool.resolve(session);
+  assert.equal(sawFilteredEnv, true);
+  assert.equal(fallback.child instanceof HerdrRpcTransport, false);
+  assert.equal(fallback.alive, true);
+  await fallback.stop();
+  // Once a Herdr worker launch is underway (after preflight), failure must NOT spawn a second Pi.
+  const fakeControl = {
+    address: path.join(dir, 'herdr.sock'),
+    identity: '0:0:0',
+    async request(method) {
+      if (method === 'workspace.create')
+        return { tab: { tab_id: 't1' }, root_pane: { pane_id: 'p1' } };
+      if (method === 'layout.apply') throw new Error('HERDR_DISCONNECTED');
+      return {};
+    },
+  };
+  const failing = new HerdrRpcTransport(fakeControl, { cwd: dir });
+  failing.scopeActive = async () => false;
+  await assert.rejects(failing.ready, /HERDR_DISCONNECTED/);
+  await failing.abortStartup();
+  assert.equal(failing.pid, undefined);
   assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
-  await assert.rejects(fs.stat(rejected.child.directory), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(failing.directory), { code: 'ENOENT' });
 });
 
 test(
   'delete completes when Herdr startup fails before reporting a Pi PID',
   { timeout: 10000 },
   async (t) => {
-    const dir = await fs.mkdtemp('/tmp/bridge-herdr-start-delete-'),
-      bin = path.join(dir, 'bin'),
+    const { dir, bridge, config, session, cleanup } = await fixture(t),
       entered = Promise.withResolvers(),
-      failStartup = Promise.withResolvers(),
-      environment = { PATH: process.env.PATH, HOME: process.env.HOME };
-    let bridge, sent;
-    t.after(async () => {
-      failStartup.resolve();
-      Object.assign(process.env, environment);
-      await sent;
-      await bridge?.close();
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-    await fs.mkdir(bin);
-    await fs.writeFile(path.join(bin, 'herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
-    process.env.PATH = bin;
-    process.env.HOME = dir;
-    const config = {
-      ...isolatedRuntime(dir),
-      herdr: true,
-      stateDir: path.join(dir, 'state'),
-      sessionRoots: [path.join(dir, 'sessions')],
-      folders: [{ path: dir }],
-      defaults: denyAllPermissions(),
-      grants: [{ folder: dir, send: true, delete: true }],
-    };
-    bridge = await new Bridge(config).init();
-    const session = await bridge.session((await savedSession(bridge)).session_id);
+      failStartup = Promise.withResolvers();
+    await fs.writeFile(path.join(dir, 'bin/herdr'), '#!/bin/sh\nexit 1\n', { mode: 0o700 });
     t.mock.method(HerdrControl, 'open', async () => {
       entered.resolve();
       await failStartup.promise;
       throw new Error('HERDR_UNAVAILABLE');
     });
-    sent = bridge.send({ session_id: session.id, text: 'MUST_NOT_REACH_PI' });
+    const sent = bridge.send({ session_id: session.id, text: 'MUST_NOT_REACH_PI' });
+    cleanup.unshift(() => {
+      failStartup.resolve();
+      return sent;
+    });
     await entered.promise;
     const start = bridge.pool.starting.get(session.id);
     assert.equal(start.runtime.childIdentity, undefined);
@@ -129,7 +125,7 @@ test(
     const cancelled = new Promise((resolve) =>
       start.controller.signal.addEventListener('abort', resolve, { once: true }),
     );
-    const deleting = bridge.delete({ session_id: session.id });
+    const deleting = bridge.delete_session({ session_id: session.id });
     await cancelled;
     failStartup.resolve();
     const result = await deleting;
@@ -138,12 +134,7 @@ test(
     assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
     assert.equal(bridge.pool.starting.has(session.id), false);
     await assert.rejects(fs.stat(session.file), { code: 'ENOENT' });
-    const manifest = JSON.parse(
-      await fs.readFile(
-        path.join(config.stateDir, 'trash', result.restore_token + '.restore.json'),
-        'utf8',
-      ),
-    );
+    const manifest = await restoreManifest(config, result);
     assert.equal(manifest.native_session_id, session.header.id);
     assert.equal(manifest.original_path, session.file);
     assert.doesNotMatch(await fs.readFile(manifest.trash_path, 'utf8'), /MUST_NOT_REACH_PI/);
@@ -264,10 +255,13 @@ test(
     assert.equal(daemonEnvironment.includes('INVOCATION_ID=bridge-parent-invocation'), false);
     assert.equal(daemonEnvironment.includes('LISTEN_FDS=17'), false);
     assert.equal((await runtime.state()).sessionId, session.header.id);
-    const identity = runtime.childIdentity,
-      directory = child.directory,
-      pane = child.pane;
-    assert.ok(await ownerAlive(identity));
+    const pane = child.pane;
+    const assertReaped = async (rpc) => {
+      assert.equal(await ownerAlive(rpc.childIdentity), false);
+      assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
+      await assert.rejects(fs.stat(rpc.child.directory), { code: 'ENOENT' });
+    };
+    assert.ok(await ownerAlive(runtime.childIdentity));
     const info = await child.control.request('pane.process_info', { pane_id: pane });
     assert.equal(info.process_info.pane_id, pane);
     const shell = await runtime.command({ type: 'bash', command: 'printf "%s" "$HERDR_PANE_ID"' });
@@ -276,9 +270,7 @@ test(
     await bridge.captureRequestContext();
     assert.equal(await bridge.pool.resolve(session), runtime);
     await runtime.gracefulExit();
-    assert.equal(await ownerAlive(identity), false);
-    assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
-    await assert.rejects(fs.stat(directory), { code: 'ENOENT' });
+    await assertReaped(runtime);
     await assert.rejects(child.control.request('pane.process_info', { pane_id: pane }));
     const next = await bridge.pool.resolve(session);
     assert.equal(next.child instanceof HerdrRpcTransport, false);
@@ -299,21 +291,16 @@ test(
       return scopeActive();
     });
     await finalChild.terminateScope();
-    assert.equal(await ownerAlive(final.childIdentity), false);
-    assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
-    await assert.rejects(fs.stat(finalChild.directory), { code: 'ENOENT' });
+    await assertReaped(final);
     // Losing the private transport must terminate the actual writer, not merely
     // forget its PID and release a live claim.
-    const disconnected = await bridge.pool.resolve(session),
-      lost = disconnected.child;
-    const lostDirectory = lost.directory;
-    lost.channels.control.destroy();
-    await disconnected.observeExit().promise;
-    await disconnected.observeExit().closed;
+    const disconnected = await bridge.pool.resolve(session);
+    disconnected.child.channels.control.destroy();
+    const exit = disconnected.observeExit();
+    await exit.promise;
+    await exit.closed;
     await disconnected.stop();
-    assert.equal(await ownerAlive(disconnected.childIdentity), false);
-    assert.equal(await readClaim(bridge.pool.attachmentDir, session), null);
-    await assert.rejects(fs.stat(lostDirectory), { code: 'ENOENT' });
+    await assertReaped(disconnected);
     // Delete must also reap a stubborn native tool descendant, without turning
     // ordinary EOF or service shutdown into force-kill policies.
     const deleting = await bridge.pool.resolve(session);
@@ -323,42 +310,44 @@ test(
       type: 'bash',
       command: `${JSON.stringify(process.execPath)} -e '${script.replaceAll("'", "'\\''")}' >/dev/null 2>&1 &`,
     });
-    while (!(await fs.stat(marker).catch(() => null)))
-      await new Promise((resolve) => setTimeout(resolve, 25));
+    await until(() => fs.stat(marker).catch(() => null));
     const toolOwner = await processIdentity(Number(await fs.readFile(marker, 'utf8')));
     assert.equal(await ownerAlive(toolOwner), true);
     try {
       // Pi's normal EOF has completed, but auto-release still holds the lane
       // while the Herdr scope waits for its stubborn tool descendant.
       deleting.autoReleaseWanted = true;
-      scheduleAutoRelease(bridge, deleting);
-      const deadline = Date.now() + 5000;
-      while (await ownerAlive(deleting.childIdentity)) {
-        assert.ok(Date.now() < deadline, 'native EOF did not finish');
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-      assert.equal(bridge.handoffs.get(session.id)?.kind, 'auto_release');
+      bridge.scheduleAutoRelease(deleting);
+      await until(async () => !(await ownerAlive(deleting.childIdentity)), 'native EOF', 5000);
+      assert.equal(bridge.handoff(session.id)?.kind, 'auto_release');
       assert.equal(await ownerAlive(toolOwner), true);
-      const deleted = await bridge.delete({ session_id: session.id });
+      const deleted = await bridge.delete_session({ session_id: session.id });
       assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
     } finally {
       if (await ownerAlive(toolOwner)) process.kill(toolOwner.pid, 'SIGKILL');
     }
     assert.equal(await ownerAlive(toolOwner), false);
-    assert.equal(await ownerAlive(deleting.childIdentity), false);
+    await assertReaped(deleting);
     assert.equal(await deleting.child.scopeActive(), false);
-    await assert.rejects(fs.stat(deleting.child.directory), { code: 'ENOENT' });
-    // Final stdout/stderr can exceed socket buffers and arrive after the exit
-    // record on another channel. close must mean both streams were drained.
+    // Scope shutdown lets the native handler finish once. Its final output
+    // exceeds socket buffers and must arrive before close.
     const bytes = 256 * 1024;
-    const drain = new HerdrRpcTransport(wrapper, {
+    const drain = new HerdrRpcTransport(await prepareHerdr(wrapper), {
       command: process.execPath,
       args: [
         '-e',
-        `process.stdin.resume(); process.stdin.on('end', () => {
-        process.stdout.write('o'.repeat(${bytes}));
-        process.stderr.write('e'.repeat(${bytes}));
-      });`,
+        `let stopping = false;
+        process.stdin.resume();
+        process.on('SIGTERM', () => {
+          if (stopping) process.exit(3);
+          stopping = true;
+          setTimeout(() => {
+            process.stdout.write('o'.repeat(${bytes}));
+            process.stderr.write('e'.repeat(${bytes}));
+            process.stdin.pause();
+          }, 100);
+        });
+        process.stdout.write('!');`,
       ],
       cwd: dir,
       env: { PATH: oldPath },
@@ -378,10 +367,11 @@ test(
       drain.once('exitError', reject);
     });
     await drain.ready;
-    drain.stdin.end();
-    await closed;
+    await until(() => outputBytes > 0);
+    await drain.terminate();
+    assert.equal(await closed, 0);
     assert.deepEqual(failures, []);
-    assert.equal(outputBytes, bytes);
+    assert.equal(outputBytes, bytes + 1);
     assert.equal(errorBytes, bytes);
     const snapshot = await finalChild.control.request('session.snapshot');
     assert.equal(snapshot.snapshot.panes.length, 0);

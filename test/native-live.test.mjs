@@ -1,57 +1,27 @@
-import { denyAllPermissions } from './fixtures/permissions.mjs';
+import { nativeOwner, fauxArgs } from './fixtures/native-owner.mjs';
+import { until } from './fixtures/until.mjs';
+
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { Bridge } from '../src/bridge.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
-import { isolatedRuntime } from './fixtures/isolated-runtime.mjs';
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-async function until(fn) {
-  const end = Date.now() + 8000;
-  while (Date.now() < end) {
-    const result = await fn();
-    if (result) return result;
-    await delay(10);
-  }
-  throw new Error('NATIVE_LIVE_TIMEOUT');
-}
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-native-live-'),
-    cwd = path.join(dir, 'project');
-  await fs.mkdir(cwd);
-  const config = {
-    ...isolatedRuntime(dir),
-    defaults: denyAllPermissions(),
-    stateDir: path.join(dir, 'state'),
-    sessionRoots: [path.join(dir, 'sessions')],
-    folders: [{ path: cwd }],
-    grants: [{ folder: cwd, list: true, read: true, send: true }],
-  };
-  config.piArgs.push(
-    '-e',
-    path.resolve('test/fixtures/faux-extension.mjs'),
-    '-e',
-    path.resolve('test/fixtures/live-stream-gate.mjs'),
-    '--provider',
-    'bridge-fixture',
-    '--model',
-    'deterministic',
-    '--thinking',
-    'off',
-  );
-  const bridge = await new Bridge(config).init(),
-    made = await savedSession(bridge),
-    session = await bridge.session(made.session_id);
-  const finish = (run) => fs.writeFile(path.join(dir, 'finish-live-stream-' + run), 'go');
-  t.after(async () => {
-    await Promise.all([finish(1), finish(2)]);
-    await bridge.close();
-    await fs.rm(dir, { recursive: true, force: true });
+  const finish = (dir, run) => fs.writeFile(path.join(dir, 'finish-live-stream-' + run), 'go');
+  const f = await nativeOwner(t, {
+    prefix: 'native-live',
+    configure({ config, dir, cleanup }) {
+      config.piArgs.push(
+        ...fauxArgs,
+        '-e',
+        path.resolve('test/fixtures/live-stream-gate.mjs'),
+        '--thinking',
+        'off',
+      );
+      cleanup.push(() => Promise.all([finish(dir, 1), finish(dir, 2)]));
+    },
   });
-
-  return { bridge, session, finish };
+  return { ...f, finish: (run) => finish(f.dir, run) };
 }
 
 test(
@@ -59,7 +29,8 @@ test(
   { timeout: 15000 },
   async (t) => {
     const { bridge, session, finish } = await fixture(t);
-    const status = async () => (await bridge.list({ session_id: session.id })).sessions[0].status;
+    const status = async () =>
+      (await bridge.list_sessions({ session_id: session.id })).sessions[0].status;
     const saved = await status();
     assert.equal(saved.state, 'saved');
     assert.equal(Object.hasOwn(saved, 'capabilities'), false);
@@ -84,7 +55,7 @@ test(
     });
     assert.equal(historical.live, null);
     await finish(1);
-    await until(() => !bridge.pool.get(session.id) && !bridge.autoReleases.size);
+    await until(() => !bridge.pool.get(session.id) && !bridge.lane(session.id));
     assert.equal((await status()).state, 'saved');
     assert.equal(Object.hasOwn(await status(), 'capabilities'), false);
     const final = await bridge.read({ session_id: session.id, max_bytes: 4096 });

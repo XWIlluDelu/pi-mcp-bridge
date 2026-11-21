@@ -1,11 +1,10 @@
 // Owner-local native TUI launcher. Never open the target before its handoff.
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readOwnerConfig, validateLaunchArgs } from './owner-config.mjs';
-import { discover, validateExecutionCwd } from './data.mjs';
-import { launchProfile } from './rpc.mjs';
-import { resolvePiInstallation } from './pi-installation.mjs';
+import { fileURLToPath } from 'node:url';
+import { readOwnerConfig, registryDirectory, validateLaunchArgs } from './core/owner-config.mjs';
+import { discover, validateExecutionCwd } from './core/data.mjs';
+import { resolvePiLaunch } from './runtime/pi-installation.mjs';
 
 export async function openProfile(configFile, sessionId, hostEnv = process.env) {
   if (!/^ps_[a-f0-9]{32}$/.test(sessionId ?? '')) throw new Error('INVALID_SESSION_ID');
@@ -14,24 +13,21 @@ export async function openProfile(configFile, sessionId, hostEnv = process.env) 
   const session = (await discover(config)).find((item) => item.id === sessionId);
   if (!session) throw new Error('SESSION_NOT_FOUND');
   await validateExecutionCwd(session.cwd);
-  const { env, toolArgs } = launchProfile(config, hostEnv);
+  const { installation, env, toolArgs } = await resolvePiLaunch(config, session.cwd, hostEnv);
   env.PI_MCP_OWNER_CONFIG = configFile;
-  env.PI_MCP_ATTACH_DIR = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  const executable = await resolvePiInstallation(config, env);
-  // --session-dir only chooses storage for the fresh session. Owner piArgs
-  // may set that directory, a provider or resources, but may not select or
-  // fork any saved session before the safe /bridge-join reservation.
+  env.PI_MCP_ATTACH_DIR = registryDirectory(config);
   const extra = config.piArgs ?? [];
-  validateLaunchArgs(extra, 'UNSAFE_OPEN_PI_ARGS');
-  // No --session TARGET: Pi migrates/opens it before loading extensions.
+  await validateLaunchArgs(installation, extra, 'text');
+  // The companion and join must reach Pi before owner flags can consume
+  // a positional argument or end option parsing.
   return {
-    command: executable.command,
+    command: installation.command,
     args: [
-      ...toolArgs,
-      ...extra,
       '-e',
       fileURLToPath(new URL('./attach-extension.mjs', import.meta.url)),
       `/bridge-join ${sessionId}`,
+      ...toolArgs,
+      ...extra,
     ],
     cwd: session.cwd,
     env,
@@ -65,7 +61,7 @@ async function main() {
     process.exitCode = code ?? (signal ? 1 : 0);
   });
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch((error) => {
     console.error(error.code ?? error.message);
     process.exitCode = 1;

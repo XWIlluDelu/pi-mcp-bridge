@@ -1,23 +1,21 @@
 // Exercise late acknowledgements without exposing a public timeout parameter.
-import { PiRpc } from '../../src/rpc.mjs';
-import { AttachedRuntime } from '../../src/attachments.mjs';
+import { PiRpc } from '../../src/runtime/rpc.mjs';
+import { AttachedRuntime } from '../../src/runtime/attachments.mjs';
 
 export function ackTimeout(t, operations, timeout = 50) {
+  // A null timeout is an owned compact transport that waits on its caller's signal.
+  const shorten = (type, options = {}) =>
+    operations.includes(type) && options.timeout !== null ? { ...options, timeout } : options;
   const dispatch = PiRpc.prototype.dispatch;
-  const rpc = t.mock.method(PiRpc.prototype, 'dispatch', function (command, wait, ...rest) {
-    return dispatch.call(
-      this,
-      command,
-      operations.includes(command.type) ? timeout : wait,
-      ...rest,
-    );
+  const rpc = t.mock.method(PiRpc.prototype, 'dispatch', function (command, options) {
+    return dispatch.call(this, command, shorten(command.type, options));
   });
   const request = AttachedRuntime.prototype.request;
   const attached = t.mock.method(
     AttachedRuntime.prototype,
     'request',
-    function (op, body, wait, ...rest) {
-      return request.call(this, op, body, operations.includes(op) ? timeout : wait, ...rest);
+    function (op, body, options) {
+      return request.call(this, op, body, shorten(op, options));
     },
   );
   return () => {

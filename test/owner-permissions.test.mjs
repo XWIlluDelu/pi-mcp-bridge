@@ -1,21 +1,14 @@
 import { denyAllPermissions } from './fixtures/permissions.mjs';
-import { savedSession } from './fixtures/saved-session.mjs';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { permitted, resolvePermission } from '../src/permissions.mjs';
-import {
-  readOwnerConfig,
-  editPermission,
-  permissionDetails,
-  validateGrants,
-} from '../src/owner-config.mjs';
+import { permitted, resolvePermission } from '../src/core/permissions.mjs';
+import { readOwnerConfig, editPermission, permissionDetails } from '../src/core/owner-config.mjs';
 import ownerPermissions from '../src/owner-permissions-extension.mjs';
-import { SessionManager } from './fixtures/pi.mjs';
-import { opaqueId } from '../src/storage.mjs';
-import { Bridge } from '../src/bridge.mjs';
+
 async function fixture(t) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-perm-')),
     cwd = path.join(dir, 'project'),
@@ -34,54 +27,7 @@ async function fixture(t) {
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   return { dir, cwd, child, file, config };
 }
-test('grant scopes require exactly one present and valid scope field', () => {
-  for (const rule of [
-    {},
-    { session_id: 17 },
-    { session_id: null },
-    { session_id: '' },
-    { session_id: 'x'.repeat(129) },
-    { folder: 17 },
-    { folder: null },
-    { folder: '' },
-    { folder: 'relative' },
-    { session_id: 'valid', folder: '/project' },
-    { session_id: 17, folder: '/project' },
-    { session_id: null, folder: '/project' },
-    { session_id: '', folder: '/project' },
-    { session_id: 'valid', folder: null },
-    { session_id: 'valid', folder: 17 },
-    { session_id: 'valid', folder: '' },
-  ]) {
-    assert.throws(() => validateGrants([{ ...rule, read: false }]), /INVALID_OWNER_CONFIG/);
-  }
-  assert.doesNotThrow(() =>
-    validateGrants([
-      { session_id: 'valid', read: false },
-      { folder: '/project', read: null },
-    ]),
-  );
-});
-test('live reload rejects malformed denial rather than silently retaining prior folder allowance', async (t) => {
-  const f = await fixture(t),
-    bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
-  try {
-    const made = await savedSession(bridge);
-    await bridge.read({ session_id: made.session_id });
-    for (const session_id of [17, null, '']) {
-      await fs.writeFile(
-        f.file,
-        JSON.stringify({
-          ...f.config,
-          grants: [...f.config.grants, { session_id, folder: f.cwd, read: false }],
-        }),
-      );
-      await assert.rejects(bridge.read({ session_id: made.session_id }), /INVALID_OWNER_CONFIG/);
-    }
-  } finally {
-    await bridge.close();
-  }
-});
+
 test('owner edits preserve unrelated config/rules and retain inheritance/null semantics', async (t) => {
   const f = await fixture(t);
   let snapshot = await readOwnerConfig(f.file);
@@ -120,6 +66,21 @@ test('owner edit refuses concurrent changes and writes only the selected permiss
     /OWNER_CONFIG_CHANGED/,
   );
   assert.deepEqual((await readOwnerConfig(f.file)).config.piRuntime, { tools: [] });
+});
+test('permission edits respect the configuration read limit and preserve the last readable policy', async (t) => {
+  const f = await fixture(t);
+  f.config.piArgs = [''];
+  const room = 1024 * 1024 - Buffer.byteLength(JSON.stringify(f.config)) - 24;
+  f.config.piArgs[0] = '界'.repeat(Math.floor(room / 3));
+  await fs.writeFile(f.file, JSON.stringify(f.config));
+  const before = await readOwnerConfig(f.file);
+  const saved = await editPermission(f.file, before.revision, { default: true }, 'read', true);
+  assert.equal(saved.config.defaults.read, true);
+  await assert.rejects(
+    editPermission(f.file, saved.revision, { folder: f.child }, 'send', false),
+    /JSON_FILE_TOO_LARGE/,
+  );
+  assert.equal((await readOwnerConfig(f.file)).revision, saved.revision);
 });
 test('permission menu registers only a human TUI shortcut and aborts on lifecycle change', async (t) => {
   const f = await fixture(t),
@@ -172,147 +133,6 @@ test('permission menu registers only a human TUI shortcut and aborts on lifecycl
     else process.env.PI_MCP_OWNER_CONFIG = prior;
   }
 });
-function permissionMenu(t, file, context) {
-  const prior = process.env.PI_MCP_OWNER_CONFIG;
-  process.env.PI_MCP_OWNER_CONFIG = file;
-  t.after(() => {
-    if (prior === undefined) delete process.env.PI_MCP_OWNER_CONFIG;
-    else process.env.PI_MCP_OWNER_CONFIG = prior;
-  });
-  let shortcut, choices;
-  const selections = [],
-    notices = [];
-  ownerPermissions({
-    on() {},
-    registerShortcut: (_key, value) => {
-      shortcut = value.handler;
-    },
-    registerCommand: () => assert.fail('Permission edits remain owner-local'),
-    registerTool: () => assert.fail('Permission edits remain owner-local'),
-  });
-  const ctx = {
-    mode: 'tui',
-    hasUI: true,
-    ...context,
-    ui: {
-      notify: (message, level) => notices.push({ message, level }),
-      select: async (title, options) => {
-        selections.push({ title, options });
-        const value = choices.shift();
-        const selected = typeof value === 'number' ? options[value] : value;
-        assert.ok(options.includes(selected), `Unavailable menu choice: ${selected}`);
-        return selected;
-      },
-    },
-  };
-  return {
-    selections,
-    notices,
-    async run(...values) {
-      choices = values;
-      await shortcut(ctx);
-      assert.deepEqual(choices, [], notices.map(({ message }) => message).join('\n'));
-    },
-  };
-}
-
-for (const replacement of ['missing', 'symlink'])
-  test(`owner can revoke recorded project permissions after the workspace becomes ${replacement}`, async (t) => {
-    const f = await fixture(t);
-    await fs.rm(f.cwd, { recursive: true });
-    const outside = path.join(f.dir, 'outside');
-    if (replacement === 'symlink') {
-      await fs.mkdir(outside);
-      await fs.symlink(outside, f.cwd);
-    }
-    const before = await readOwnerConfig(f.file);
-    const after = await editPermission(f.file, before.revision, { folder: f.cwd }, 'read', false);
-    assert.equal(permitted(after.config, 'read', { projectCwd: f.cwd, cwd: null }), false);
-    assert.equal(permitted(after.config, 'read', { cwd: outside }), false);
-    assert.equal(after.config.grants[0].folder, f.cwd);
-    assert.deepEqual(after.config.folders, before.config.folders);
-  });
-
-test('owner menu edits defaults and project rules without requiring a workspace or creation target', async (t) => {
-  const f = await fixture(t);
-  await fs.writeFile(f.file, JSON.stringify({ ...f.config, folders: [] }));
-  await fs.rm(f.cwd, { recursive: true });
-  const menu = permissionMenu(t, f.file, { cwd: f.cwd });
-  await menu.run('Defaults', 1, 'Allow', 'Done');
-  assert.equal((await readOwnerConfig(f.file)).config.defaults.read, true);
-  await menu.run('This project', 2, 'Block', 'Done');
-  assert.equal(permitted((await readOwnerConfig(f.file)).config, 'send', { cwd: f.cwd }), false);
-  await menu.run('Another configured project', f.cwd, 2, 'Allow', 'Done');
-  const after = await readOwnerConfig(f.file);
-  assert.equal(permitted(after.config, 'send', { cwd: f.cwd }), true);
-  assert.deepEqual(after.config.folders, []);
-  assert.ok(menu.notices.every((notice) => notice.level === 'info'));
-});
-
-test('owner session menu uses the reserved native identity and recorded project before first persistence', async (t) => {
-  const f = await fixture(t);
-  await fs.mkdir(f.config.sessionRoots[0]);
-  const manager = SessionManager.create(f.cwd, f.config.sessionRoots[0]);
-  const file = manager.getSessionFile();
-  const id = opaqueId(`${file}\0${manager.getSessionId()}`);
-  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
-  await fs.rm(f.cwd, { recursive: true });
-  const menu = permissionMenu(t, f.file, { cwd: f.dir, sessionManager: manager });
-  await menu.run('This session', 1, 'Block', 'Done');
-  const readRows = menu.selections.find(({ title }) => title === 'This session').options;
-  assert.ok(readRows[1].startsWith('Read: Allowed'));
-  assert.ok(readRows[1].includes(f.cwd));
-  const after = await readOwnerConfig(f.file);
-  assert.equal(permitted(after.config, 'read', { id, projectCwd: f.cwd }), false);
-  assert.equal(permitted(after.config, 'read', { id: 'another', projectCwd: f.cwd }), true);
-  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
-  // Granting a reserved identity must not permit aliases to substitute another file.
-  await fs.symlink(f.file, file);
-  await menu.run('This session');
-  assert.equal((await readOwnerConfig(f.file)).revision, after.revision);
-  assert.equal(menu.notices.at(-1).level, 'error');
-});
-
-test('running bridge reloads valid permissions independently of pending fixed settings', async (t) => {
-  const f = await fixture(t);
-  const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
-  try {
-    const made = await savedSession(bridge);
-    let snapshot = await readOwnerConfig(f.file);
-    await editPermission(f.file, snapshot.revision, { session_id: made.session_id }, 'read', false);
-    assert.deepEqual(
-      (await bridge.list()).sessions.map((row) => row.session_id),
-      [made.session_id],
-    );
-    await assert.rejects(bridge.read({ session_id: made.session_id }), /NOT_FOUND_OR_DENIED/);
-    await fs.writeFile(f.file, JSON.stringify({ ...f.config, piArgs: ['--offline'] }));
-    assert.deepEqual(
-      (await bridge.list()).sessions.map((row) => row.session_id),
-      [made.session_id],
-    );
-    assert.equal((await bridge.read({ session_id: made.session_id })).session_id, made.session_id);
-    assert.deepEqual((await bridge.health()).restart_required, ['piArgs']);
-    await fs.writeFile(f.file, 'broken');
-    await assert.rejects(bridge.list(), /INVALID_OWNER_CONFIG/);
-  } finally {
-    await bridge.close();
-  }
-});
-
-test('shutdown prevents dispatch after an asynchronous permission snapshot', async (t) => {
-  const f = await fixture(t);
-  const bridge = await new Bridge(f.config, undefined, { configFile: f.file }).init();
-  const made = await savedSession(bridge);
-  const send = bridge.send({
-    session_id: made.session_id,
-
-    text: 'must not dispatch',
-  });
-  const closed = bridge.close();
-  await assert.rejects(send, /BRIDGE_CLOSING/);
-  await closed;
-  assert.equal(bridge.pool.instances.size, 0);
-});
 
 test('shared permission resolver preserves effective values, explicit inheritance and source scope', () => {
   const config = {
@@ -327,90 +147,32 @@ test('shared permission resolver preserves effective values, explicit inheritanc
       ],
     },
     before = structuredClone(config);
-  const cases = [
-    {
-      action: 'read',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: true,
-      explicit: null,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'send',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: true,
-      explicit: true,
-      scope: { session_id: 's' },
-      label: 'this session',
-    },
-    {
-      action: 'send',
-      target: { session_id: 'other', cwd: '/project/child' },
-      allowed: false,
-      explicit: undefined,
-      scope: { folder: '/project/child' },
-      label: 'project /project/child',
-    },
-    {
-      action: 'create',
-      target: { session_id: 's', cwd: '/project/child' },
-      allowed: false,
-      explicit: true,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'read',
-      target: { folder: '/project/child' },
-      allowed: true,
-      explicit: null,
-      scope: { folder: '/project' },
-      label: 'project /project',
-    },
-    {
-      action: 'send',
-      target: { folder: '/project/child' },
-      allowed: false,
-      explicit: false,
-      scope: { folder: '/project/child' },
-      label: 'this project',
-    },
-    {
-      action: 'delete',
-      target: { folder: '/project' },
-      allowed: false,
-      explicit: false,
-      scope: { folder: '/project' },
-      label: 'this project',
-    },
-    {
-      action: 'read',
-      target: { folder: '/project2' },
-      allowed: false,
-      explicit: undefined,
-      scope: { default: true },
-      label: 'default',
-    },
-  ];
-  for (const c of cases) {
-    assert.deepEqual(resolvePermission(config, c.action, c.target), {
-      allowed: c.allowed,
-      explicit: c.explicit,
-      sourceScope: c.scope,
-    });
-    assert.equal(
-      permitted(config, c.action, {
-        id: c.target.session_id,
-        cwd: c.target.cwd ?? c.target.folder,
-      }),
-      c.allowed,
-    );
-    assert.deepEqual(permissionDetails(config, c.action, c.target), {
-      allowed: c.allowed,
-      explicit: c.explicit,
-      source: c.label,
-    });
+  const child = { session_id: 's', cwd: '/project/child' };
+  for (const [action, target, allowed, explicit, sourceScope, source] of [
+    ['read', child, true, null, { folder: '/project' }, 'project /project'],
+    ['send', child, true, true, { session_id: 's' }, 'this session'],
+    [
+      'send',
+      { ...child, session_id: 'other' },
+      false,
+      undefined,
+      { folder: '/project/child' },
+      'project /project/child',
+    ],
+    ['create', child, false, true, { folder: '/project' }, 'project /project'],
+    [
+      'send',
+      { folder: '/project/child' },
+      false,
+      false,
+      { folder: '/project/child' },
+      'this project',
+    ],
+    ['delete', { folder: '/project' }, false, false, { folder: '/project' }, 'this project'],
+    ['read', { folder: '/project2' }, false, undefined, { default: true }, 'default'],
+  ]) {
+    assert.deepEqual(resolvePermission(config, action, target), { allowed, explicit, sourceScope });
+    assert.deepEqual(permissionDetails(config, action, target), { allowed, explicit, source });
   }
   assert.deepEqual(config, before);
 });

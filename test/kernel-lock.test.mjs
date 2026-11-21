@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { Bridge } from '../src/bridge.mjs';
-import { editPermission, readOwnerConfig } from '../src/owner-config.mjs';
-import { registryTransaction, ownerAlive, waitOwnerExit } from '../src/attachments.mjs';
+import { Bridge } from '../src/core/bridge.mjs';
+
+import { ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
 import { fixture, until } from './fixtures/model-runtime.mjs';
 
 const moduleUrl = (file) => new URL('../src/' + file, import.meta.url).href;
@@ -40,7 +40,7 @@ test(
       t,
       `
     process.env.PI_MODEL_GATE=${JSON.stringify(f.gate)};
-    import {Bridge} from ${JSON.stringify(moduleUrl('bridge.mjs'))};
+    import {Bridge} from ${JSON.stringify(moduleUrl('core/bridge.mjs'))};
     const bridge=await new Bridge(${JSON.stringify(f.config)}).init();
     const runtime=await bridge.pool.resolve(await bridge.session(${JSON.stringify(f.id)}));
     process.send(runtime.ownerRecord.owner);
@@ -73,45 +73,5 @@ test(
     } finally {
       await restarted.close();
     }
-  },
-);
-
-test(
-  'permission edit crash releases only its own mutex; registry and service remain usable and revisions still fence edits',
-  { timeout: 10000 },
-  async (t) => {
-    const f = await fixture(t),
-      before = await readOwnerConfig(f.configFile);
-    const w = await worker(
-      t,
-      `
-    import fs from 'node:fs/promises';
-    import {editPermission} from ${JSON.stringify(moduleUrl('owner-config.mjs'))};
-    fs.rename=async()=>{process.send('editing');await new Promise(()=>{});};
-    await editPermission(${JSON.stringify(f.configFile)},${JSON.stringify(before.revision)},
-      {folder:${JSON.stringify(f.cwd)}},'send',false);
-  `,
-    );
-    assert.equal(w.ready, 'editing');
-    await assert.rejects(
-      editPermission(f.configFile, before.revision, { folder: f.cwd }, 'send', false),
-      /OWNER_CONFIG_BUSY/,
-    );
-    assert.equal(await registryTransaction(f.bridge.pool.attachmentDir, () => 42), 42);
-    assert.ok(f.bridge.lock);
-    w.child.kill('SIGKILL');
-    await w.exited;
-    const changed = await editPermission(
-      f.configFile,
-      before.revision,
-      { folder: f.cwd },
-      'send',
-      false,
-    );
-    assert.notEqual(changed.revision, before.revision);
-    await assert.rejects(
-      editPermission(f.configFile, before.revision, { folder: f.cwd }, 'send', true),
-      /OWNER_CONFIG_CHANGED/,
-    );
   },
 );

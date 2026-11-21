@@ -1,114 +1,91 @@
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { BridgeStdioTransport } from './protocol-stdio.mjs';
-import { Bridge } from './bridge.mjs';
-import { publicSchemas, publicOutputSchemas, publicAnnotations } from './tool-schemas.mjs';
-import { toolNames, descriptions, objectSchema, callBridgeTool, SERVER_INFO } from './protocol.mjs';
-import { publicError } from './errors.mjs';
-import { diagnostics } from './diagnostics.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
-export function makeServer(bridge, { execute = (run) => run() } = {}) {
-  const server = new McpServer(SERVER_INFO);
-  for (const name of toolNames)
-    server.registerTool(
-      name,
-      {
-        description: descriptions[name],
-        inputSchema: objectSchema(publicSchemas[name]),
-        ...(publicOutputSchemas[name]
-          ? { outputSchema: publicOutputSchemas[name], annotations: publicAnnotations[name] }
-          : {}),
-      },
-      (args, extra) =>
-        callBridgeTool(bridge, name, args, {
-          execute,
-          requestId: extra.requestId,
-        }),
-    );
-  return server;
-}
-async function main() {
-  const configFile = process.argv[2];
-  if (!configFile)
-    throw new Error('Usage: node src/server.mjs /absolute/path/to/owner-config.json');
-  const { config } = await readOwnerConfig(path.resolve(configFile));
-  const bridge = new Bridge(config, undefined, { configFile: path.resolve(configFile) });
-  let server,
-    transport,
+import { StdioTransport } from './mcp/protocol-stdio.mjs';
+import { dispatchMcp } from './mcp/protocol.mjs';
+import { Bridge } from './core/bridge.mjs';
+import { publicError } from './core/errors.mjs';
+import { diagnostics } from './core/diagnostics.mjs';
+import { readOwnerConfig } from './core/owner-config.mjs';
+// Both entry points own the same lifecycle. A signal during Bridge.init must
+// wait until init has settled, including any resources it acquired.
+export async function runService(bridge, createService, { stdio = false, failureCode } = {}) {
+  let service,
     initializing,
     closing,
     exitCode = 0;
   const close = (code = 0) => {
     exitCode = Math.max(exitCode, code);
     if (closing) return closing;
-    diagnostics.emit('service.stopping', { transport: 'stdio' });
-    process.stdin.pause();
-    // Init may still acquire its lock after a stop arrives. Wait for it to settle
-    // before cleanup; never let init create resources after close has finished.
+    if (stdio) process.stdin.pause();
     closing = (async () => {
       await initializing?.catch(() => {});
       try {
-        await bridge.prepareClose();
-        await transport?.drain();
-        await bridge.close();
+        await (service ? service.close() : bridge.close());
       } catch {
         exitCode = 1;
         console.error('SHUTDOWN_FAILED');
-      }
-      try {
-        await server?.close();
-      } catch {
-        exitCode = 1;
       }
       process.exit(exitCode);
     })();
     return closing;
   };
-  process.on('SIGINT', () => {
-    void close();
-  });
-  process.on('SIGTERM', () => {
-    void close();
-  });
-  process.stdin.on('end', () => {
-    void close();
-  });
-  process.stdin.on('close', () => {
-    void close();
-  });
-  process.stdin.on('error', () => {
-    void close(1);
-  });
-  process.stdout.on('error', () => {
-    void close(1);
-  });
-  process.stdout.on('close', () => {
-    void close(1);
-  });
+  const stop = () => void close();
+  const fail = () => void close(1);
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  if (stdio) {
+    process.stdin.on('end', stop);
+    process.stdin.on('close', stop);
+    process.stdin.on('error', fail);
+    process.stdout.on('error', fail);
+    process.stdout.on('close', fail);
+  }
   try {
-    initializing = bridge.init();
-    await initializing;
-    if (closing) return closing;
-    server = makeServer(bridge, {
-      execute: (run) => {
-        const task = Promise.resolve().then(run);
-        transport.track(task);
-        return task;
-      },
+    initializing = bridge.init().then(() => {
+      if (closing) return;
+      service = createService(fail);
+      return service.listen();
     });
-    server.server.onclose = () => {
-      void close();
-    };
-    transport = new BridgeStdioTransport(bridge);
-    await server.connect(transport);
-    diagnostics.emit('service.ready', { transport: 'stdio' });
+    await initializing;
   } catch (error) {
-    console.error(publicError(error));
+    console.error(publicError(error, failureCode));
     await close(1);
   }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+async function main() {
+  if (!process.argv[2])
+    throw new Error('Usage: node src/server.mjs /absolute/path/to/owner-config.json');
+  const configFile = path.resolve(process.argv[2]);
+  const { config } = await readOwnerConfig(configFile);
+  const bridge = new Bridge(config, undefined, { configFile });
+  return runService(
+    bridge,
+    (fail) => {
+      // A cancelled stdio reply does not cancel an admitted Bridge operation.
+      const transport = new StdioTransport(
+        async (body) => (await dispatchMcp(bridge, body)).message,
+      );
+      transport.onerror = fail;
+      return {
+        listen() {
+          transport.start();
+          diagnostics.emit('service.ready', { transport: 'stdio' });
+        },
+        async close() {
+          diagnostics.emit('service.stopping', { transport: 'stdio' });
+          try {
+            await bridge.prepareClose();
+            await transport.drain();
+            await bridge.close();
+          } finally {
+            transport.close();
+          }
+        },
+      };
+    },
+    { stdio: true },
+  );
+}
+if (import.meta.main)
   main().catch((e) => {
     console.error(publicError(e));
     process.exitCode = 1;

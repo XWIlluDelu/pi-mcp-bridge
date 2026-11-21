@@ -1,122 +1,55 @@
 import http from 'node:http';
-import { publicError } from './errors.mjs';
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import { once } from 'node:events';
+import { publicError } from './core/errors.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { Bridge } from './bridge.mjs';
-import { makeServer } from './server.mjs';
-import { diagnostics } from './diagnostics.mjs';
-import {
-  SUPPORTED_VERSIONS,
-  modernMessage,
-  isRpcRequest,
-  dispatchModern,
-  validateModernHeaders,
-  boundMessage,
-  rpcError,
-} from './protocol.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
-import { readPrivateFile } from './storage.mjs';
+import { Bridge } from './core/bridge.mjs';
+import { runService } from './server.mjs';
+import { diagnostics } from './core/diagnostics.mjs';
+import { dispatchMcp, readJson, rpcError, MCP_INPUT_LIMIT } from './mcp/protocol.mjs';
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 
-export const HTTP_BODY_LIMIT = 8 * 1024 * 1024;
-export const TOKEN_HEADER = 'x-pi-bridge-token';
 const digest = (value) => createHash('sha256').update(value).digest();
 
-export async function loadHttpConfig(file) {
-  const { config } = await readOwnerConfig(file);
-  const settings = config.http;
-  if (!settings) throw new Error('INVALID_HTTP_CONFIG');
-  const token = (await readPrivateFile(settings.tokenFile, 257)).text.replace(/\n$/, '');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
-  return { config, token, port: settings.port };
+function extractHttpToken(headers) {
+  const headerTokens = headers[TOKEN_HEADER];
+  const authHeaders = headers.authorization;
+  if ((headerTokens?.length ?? 0) > 1 || (authHeaders?.length ?? 0) > 1) return null;
+  let token = headerTokens?.[0] ?? null;
+  if (authHeaders?.length === 1) {
+    const match = /^Bearer\s+(\S+)$/i.exec(authHeaders[0].trim());
+    if (!match) return null;
+    if (token !== null && token !== match[1]) return null;
+    token = match[1];
+  }
+  return token;
 }
 
-function headers(req, name) {
-  const values = [];
-  for (let i = 0; i < req.rawHeaders.length; i += 2)
-    if (req.rawHeaders[i].toLowerCase() === name) values.push(req.rawHeaders[i + 1]);
-  return values;
-}
-function reject(res, status, code) {
+const refuse = (res, code) => respond(res, NOT_ADMITTED[code], { error: code }, true);
+function respond(res, status, message, close = false) {
   if (res.destroyed || res.writableEnded) return;
-  diagnostics.emit('http.rejected', { http_status: status });
+  if (close) diagnostics.emit('http.rejected', { http_status: status });
+  else
+    diagnostics.emit('http.rpc_response', {
+      http_status: status,
+      rpc_status: message.error ? 'error' : 'result',
+      rpc_code: message.error?.code,
+      callback_reason: message.error?.data?.reason,
+    });
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
-    Connection: 'close',
+    ...(close ? { Connection: 'close' } : {}),
   });
-  res.end(JSON.stringify({ error: code }));
-}
-function logRpcResponse(message, httpStatus) {
-  diagnostics.emit('http.rpc_response', {
-    http_status: httpStatus,
-    rpc_status: message.error ? 'error' : message.result !== undefined ? 'result' : undefined,
-    rpc_code: message.error?.code,
-    callback_reason: message.error?.data?.reason,
-  });
-}
-function jsonResponse(res, status, message) {
-  if (res.destroyed || res.writableEnded) return;
-  logRpcResponse(message, status);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(message));
 }
-async function parseBody(req) {
-  const raw = await new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    const cleanup = () => {
-      req.off('data', data);
-      req.off('end', end);
-      req.off('error', error);
-      req.off('aborted', aborted);
-    };
-    const error = () => {
-      cleanup();
-      reject(new Error('INCOMPLETE_BODY'));
-    };
-    const aborted = () => error();
-    const end = () => {
-      cleanup();
-      resolve(Buffer.concat(chunks));
-    };
-    const data = (chunk) => {
-      size += chunk.length;
-      if (size > HTTP_BODY_LIMIT) {
-        cleanup();
-        req.pause();
-        reject(Object.assign(new Error('BODY_TOO_LARGE'), { status: 413 }));
-      } else chunks.push(chunk);
-    };
-    req.on('data', data);
-    req.once('end', end);
-    req.once('error', error);
-    req.once('aborted', aborted);
-  });
-  try {
-    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
-    // The MCP batch tool is supported; JSON-RPC envelope arrays are not.
-    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
-    return value;
-  } catch {
-    throw Object.assign(new Error('INVALID_JSON_OBJECT'), { status: 400 });
-  }
-}
-
-// The caller initializes one Bridge. Only this service's close(), never an HTTP
-// connection or request transport, owns its shutdown.
-export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
-  if (!Number.isSafeInteger(waitTimeoutMs) || waitTimeoutMs < 1 || waitTimeoutMs > 300000)
-    throw new Error('INVALID_WAIT_TIMEOUT');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
+// The token and port come from loadHttpConfig, which validates them.
+export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 40000 }) {
   const tokenDigest = digest(token),
-    operations = new Set(),
-    requests = new Set();
+    requests = new Map();
   let stopping = false,
+    listening,
     closing,
-    expectedHost;
+    allowedHosts;
   const listener = http.createServer(
     { maxHeaderSize: 8192, requestTimeout: 15000, headersTimeout: 10000 },
     (req, res) => {
@@ -133,155 +66,125 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
             response_finished: res.writableFinished,
           }),
         );
-        void handle(req, res).catch(() => reject(res, 500, 'REQUEST_FAILED'));
+        void handle(req, res).catch(() => respond(res, 500, { error: 'REQUEST_FAILED' }, true));
       });
     },
   );
   listener.maxConnections = 32;
   async function handle(req, res) {
-    const host = headers(req, 'host');
-    if (host.length !== 1 || host[0] !== expectedHost) return reject(res, 403, 'INVALID_HOST');
-    if (headers(req, 'origin').length) return reject(res, 403, 'ORIGIN_DENIED');
-    const credentials = headers(req, TOKEN_HEADER);
-    if (credentials.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
-      return reject(res, 401, 'UNAUTHORIZED');
-    if (req.url !== '/mcp') return reject(res, 404, 'NOT_FOUND');
-    if (req.method !== 'POST') return reject(res, 405, 'METHOD_NOT_ALLOWED');
-    if (stopping) return reject(res, 503, 'SERVICE_STOPPING');
-    if (requests.size >= 16) return reject(res, 503, 'SERVICE_BUSY');
-    const contentType = headers(req, 'content-type');
+    const headers = req.headersDistinct;
+    const host = headers.host;
+    if (host?.length !== 1 || !allowedHosts.includes(host[0])) return refuse(res, 'INVALID_HOST');
+    if (headers.origin) return refuse(res, 'ORIGIN_DENIED');
+    const credential = extractHttpToken(headers);
+    if (!credential || !timingSafeEqual(digest(credential), tokenDigest))
+      return refuse(res, 'UNAUTHORIZED');
+    if (req.url !== '/mcp') return refuse(res, 'NOT_FOUND');
+    if (req.method === 'DELETE') {
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+    if (req.method !== 'POST') return refuse(res, 'METHOD_NOT_ALLOWED');
+    if (stopping) return refuse(res, 'SERVICE_STOPPING');
+    if (requests.size >= 16) return refuse(res, 'SERVICE_BUSY');
+    const contentType = headers['content-type'];
     if (
-      contentType.length !== 1 ||
+      contentType?.length !== 1 ||
       !/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(contentType[0]) ||
-      headers(req, 'content-encoding').length
+      headers['content-encoding']
     )
-      return reject(res, 415, 'UNSUPPORTED_CONTENT_TYPE');
-    const length = req.headers['content-length'];
-    if (length !== undefined && (!/^\d+$/.test(length) || Number(length) > HTTP_BODY_LIMIT))
-      return reject(res, 413, 'BODY_TOO_LARGE');
-    const record = {
-      req,
-      res,
-      pending: 0,
-      disconnected: false,
-      server: null,
-    };
-    requests.add(record);
-    const release = () => {
-      if (record.disconnected && record.pending === 0) requests.delete(record);
-    };
-    res.once('close', () => {
-      record.disconnected = true;
-      void record.server?.close().catch(() => {});
-      release();
-    });
+      return refuse(res, 'UNSUPPORTED_CONTENT_TYPE');
+    if (Number(headers['content-length']?.[0]) > MCP_INPUT_LIMIT)
+      return refuse(res, 'BODY_TOO_LARGE');
+    requests.set(res, null);
+    let deadline;
     try {
-      const body = await parseBody(req);
-      if (record.disconnected) return;
+      let body;
+      try {
+        // Leave the socket open long enough to reject an oversized upload.
+        body = await readJson(
+          req.iterator({ destroyOnReturn: false }),
+          MCP_INPUT_LIMIT,
+          'BODY_TOO_LARGE',
+        );
+      } catch (error) {
+        return refuse(
+          res,
+          error.message === 'BODY_TOO_LARGE' ? error.message : 'INVALID_JSON_OBJECT',
+        );
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body))
+        return refuse(res, 'INVALID_JSON_OBJECT');
+      if (res.destroyed) return;
+      if (stopping) return refuse(res, 'SERVICE_STOPPING');
       diagnostics.emit('http.request', { method: body.method });
-      if (!isRpcRequest(body))
-        return jsonResponse(res, 400, rpcError(null, -32600, 'Invalid request'));
-      const deadline = setTimeout(() => {
-        if (body.id !== undefined)
-          jsonResponse(
-            res,
-            504,
-            rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
-              recovery:
-                'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
-            }),
+      const response = await dispatchMcp(bridge, body, {
+        headers,
+        execute(run) {
+          deadline = setTimeout(
+            () =>
+              respond(
+                res,
+                504,
+                rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
+                  recovery:
+                    'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list_sessions/read before deciding whether to submit again. Do not automatically resubmit.',
+                }),
+              ),
+            waitTimeoutMs,
           );
-        else reject(res, 504, 'REQUEST_WAIT_EXPIRED');
-      }, waitTimeoutMs);
-      deadline.unref();
-      res.once('close', () => clearTimeout(deadline));
-      res.once('finish', () => clearTimeout(deadline));
-      if (stopping) return reject(res, 503, 'SERVICE_STOPPING');
-      const execute = (run) => {
-        if (stopping || record.disconnected) throw new Error('REQUEST_NOT_ADMITTED');
-        // Track the entire tool (including every batch item). Transport close
-        // may abort SDK response delivery; it never cancels this operation.
-        record.pending++;
-        const task = Promise.resolve().then(run);
-        operations.add(task);
-        void task
-          .finally(() => {
-            operations.delete(task);
-            record.pending--;
-            release();
-          })
-          .catch(() => {});
-        return task;
-      };
-      const versions = headers(req, 'mcp-protocol-version');
-      const modern =
-        modernMessage(body) ||
-        versions.some((version) => !SUPPORTED_VERSIONS.slice(1).includes(version));
-      if (modern) {
-        const mismatch = validateModernHeaders(body, (name) => headers(req, name));
-        if (mismatch) return jsonResponse(res, 400, mismatch);
-        const response = await dispatchModern(bridge, body, {
-          execute,
-        });
-        if (!record.disconnected) jsonResponse(res, response.status, response.message);
-        return;
-      }
-      record.server = makeServer(bridge, { execute });
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined,
-        enableJsonResponse: true,
+          deadline.unref();
+          // Keep admitted work in the request map after the response closes.
+          const task = Promise.resolve().then(run);
+          requests.set(res, task);
+          return task;
+        },
       });
-      const send = transport.send.bind(transport);
-      transport.send = (message) => {
-        const bounded = boundMessage(message);
-        logRpcResponse(bounded); // The SDK owns HTTP status; http.closed records it.
-        return send(bounded);
-      };
-      await record.server.connect(transport);
-      if (record.disconnected) {
-        await record.server.close();
-        return;
+      if (response.message === null) {
+        if (!res.destroyed && !res.writableEnded) {
+          res.writeHead(response.status, { 'Cache-Control': 'no-store' });
+          res.end();
+        }
+      } else {
+        respond(res, response.status, response.message);
       }
-      res.setHeader('Cache-Control', 'no-store');
-      await transport.handleRequest(req, res, body);
-    } catch (error) {
-      reject(res, error.status ?? 500, error.status ? error.message : 'REQUEST_FAILED');
+    } finally {
+      clearTimeout(deadline);
+      if (res.destroyed) requests.delete(res);
+      else res.once('close', () => requests.delete(res));
     }
   }
   return {
     async listen() {
-      await new Promise((resolve, reject) => {
-        listener.once('error', reject);
-        listener.listen(port, '127.0.0.1', () => {
-          listener.off('error', reject);
-          resolve();
-        });
-      });
-      expectedHost = `127.0.0.1:${listener.address().port}`;
+      if (stopping) throw new Error('SERVICE_STOPPING');
+      listening = once(listener.listen(port, '127.0.0.1'), 'listening');
+      await listening;
+      const authority = `127.0.0.1:${listener.address().port}`;
+      const endpoint = new URL(`http://${authority}/mcp`);
+      // HTTP clients normally omit the default port from Host.
+      allowedHosts = [authority, endpoint.host];
       diagnostics.emit('service.ready', { transport: 'http' });
-      return `http://${expectedHost}/mcp`;
+      return endpoint.href;
     },
     close() {
       if (closing) return closing;
       stopping = true;
       diagnostics.emit('service.stopping', { transport: 'http' });
       closing = (async () => {
-        const stopped = new Promise((resolve, reject) =>
-          listener.close((error) =>
-            error && error.code !== 'ERR_SERVER_NOT_RUNNING' ? reject(error) : resolve(),
-          ),
+        const stopped = listening?.then(
+          () => listener[Symbol.asyncDispose](),
+          () => {},
         );
-        // Stop incomplete uploads/validation; admitted tools remain alive.
-        for (const record of requests) if (record.pending === 0) record.res.destroy();
+        // Disconnect unfinished uploads. A detached, admitted request stays in
+        // the map until dispatch finishes, even after its HTTP deadline.
+        for (const [res, task] of requests) if (!task) res.destroy();
         try {
           await bridge.prepareClose();
-          await Promise.allSettled([...operations]);
+          await Promise.allSettled(requests.values());
           await bridge.close();
         } finally {
-          for (const record of requests) {
-            await record.server?.close().catch(() => {});
-            record.res.destroy();
-          }
+          for (const res of requests.keys()) res.destroy();
           listener.closeAllConnections();
           await stopped;
         }
@@ -296,46 +199,11 @@ async function main() {
   if (!configFile) throw new Error('OWNER_CONFIG_REQUIRED');
   const { config, token, port } = await loadHttpConfig(configFile);
   const bridge = new Bridge(config, undefined, { configFile });
-  let service,
-    initializing,
-    closing,
-    exitCode = 0;
-  const close = (code = 0) => {
-    exitCode = Math.max(exitCode, code);
-    if (closing) return closing;
-    closing = (async () => {
-      await initializing?.catch(() => {});
-      try {
-        if (service) await service.close();
-        else await bridge.close();
-      } catch {
-        exitCode = 1;
-        console.error('SHUTDOWN_FAILED');
-      }
-      process.exit(exitCode);
-    })();
-    return closing;
-  };
-  process.on('SIGINT', () => {
-    void close();
+  return runService(bridge, () => createHttpService(bridge, { token, port }), {
+    failureCode: 'HTTP_SERVICE_FAILED',
   });
-  process.on('SIGTERM', () => {
-    void close();
-  });
-  try {
-    initializing = (async () => {
-      await bridge.init();
-      if (closing) return;
-      service = createHttpService(bridge, { token, port });
-      await service.listen();
-    })();
-    await initializing;
-  } catch (error) {
-    console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
-    await close(1);
-  }
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch((error) => {
     console.error(publicError(error, 'HTTP_SERVICE_FAILED'));
     process.exitCode = 1;

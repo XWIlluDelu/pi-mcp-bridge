@@ -1,14 +1,15 @@
 # Owner configuration and permissions
 
-Use a canonical JSON file owned by the service user with no group/other
-permissions. [The example](../deploy/owner.example.json) denies every operation;
+Use a JSON file owned by the service user that is not writable by group or other
+users (symlinks such as dotfiles and read-only modes like `0644` are allowed; secret
+files like `http.tokenFile` still require `0600` without symlinks).
+[The example](../deploy/owner.example.json) denies every operation;
 replace its paths with the projects and native session roots intended for access.
 The Bridge rejects unsafe configuration files without changing their permissions.
 
 ## Configure one project
 
-Start from the example copied in the [local setup](../README.md#start-locally).
-For a project such as `/home/example/project`, edit these fields together:
+Copy [the example](../deploy/owner.example.json) and edit these fields together:
 
 1. Choose `stateDir` for Bridge's private state, separate from native session
    storage. Leave `attachmentDir` unset to use `stateDir/ipc`, or choose a shared
@@ -53,20 +54,18 @@ The settings reference below covers additional controls and later policy edits.
 
 ## Settings
 
-Unknown fields and incomplete baseline permissions are rejected. Project and
-session grants may override subsets of their applicable rights. Projects use
-canonical paths; there is no caller `principal` field.
+Unknown keys reject.
 
 | Key                       | Meaning                                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete) and service-exclusivity namespace.                           |
+| `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete-session-delete_session) and service-exclusivity namespace.    |
 | `sessionRoots`            | Nonempty array of absolute native session-storage directories.                                                           |
 | `folders`                 | Configured creation targets, each `{path}` with an absolute project cwd. Inclusion grants no rights.                     |
-| `defaults`                | All seven permission keys, each boolean or `null`; `null` denies.                                                        |
+| `defaults`                | Default rights as booleans or `null`. Omitted and null rights deny.                                                      |
 | `grants`                  | Project/session permission overrides.                                                                                    |
 | `attachmentDir`           | Shared private registry directory; defaults to `stateDir/ipc`. Cooperating owners must use the same canonical directory. |
 | `attachmentExitTimeoutMs` | Owner-exit budget, 50–30000 ms, default 5000. Delete uses it as the SIGTERM grace period before SIGKILL.                 |
-| `piExecutable`            | Absolute installed Pi CLI path, including symlinks. Omission selects Pi from the launch environment's PATH.              |
+| `piExecutable`            | Absolute Pi CLI or official managed-launcher path; symlinks accepted. Omission uses the launch PATH.                     |
 | `piArgs`                  | Additional native CLI arguments; incompatible ownership/selection flags reject.                                          |
 | `compatibilityModules`    | Optional trusted plugin integrations; see [module configuration and API](compatibility.md#owner-configuration).          |
 | `herdr`                   | Boolean, default `false`; hot-read when launching a new RPC writer.                                                      |
@@ -95,9 +94,10 @@ canonical paths; there is no caller `principal` field.
   Missing/empty cwd grants no project scope and cannot cold-start a writer;
   session/default permissions may still authorize history access.
 - Workspace removal does not revoke history, control or notification rights.
-  Create and cold startup require the project directory at its canonical path;
-  file or symlink replacements cannot redirect execution. Existing cooperating
-  owners remain controllable under their grants if their original cwd disappears.
+  Create and cold startup require the project path to resolve to an existing
+  directory (symlinks to directories are resolved; missing or non-directory paths
+  reject). Existing cooperating owners remain controllable under their grants if
+  their original cwd disappears.
 
 ### Native environment
 
@@ -107,14 +107,24 @@ A service's PATH may differ from an interactive shell; configure it or set
 `piExecutable` explicitly. Relative PATH entries resolve from the Bridge/launcher
 cwd, not the target project.
 
-The CLI's real path identifies the external Pi package whose declared SDK and
-dependencies supply all native APIs. Bridge has no bundled Pi dependency.
+The selected npm CLI identifies the external Pi package whose declared SDK and
+dependencies supply all native APIs. The official managed installer is also
+supported: Bridge reads its current `releases-v1` installation marker and release
+selection, then binds that release's CLI and SDK together. It launches the selected
+CLI directly, preserving the installer's managed Node PATH and
+`PI_MANAGED_INSTALL_ROOT`; a concurrent update cannot switch that launch to another
+release after SDK resolution. Bridge has no bundled Pi dependency.
 Missing/non-executable selections report `PI_EXECUTABLE_NOT_FOUND` or
-`PI_EXECUTABLE_NOT_EXECUTABLE`; wrappers without an identifiable matching SDK
-report `PI_INSTALLATION_UNAVAILABLE`. An explicit selection does not fall back
+`PI_EXECUTABLE_NOT_EXECUTABLE`; invalid managed metadata, mismatched releases and
+other wrappers without an identifiable matching SDK report
+`PI_INSTALLATION_UNAVAILABLE`. An explicit selection does not fall back
 to PATH. Existing cooperating writers are reused without resolving another
-executable. After replacing Pi, restart Bridge and reopen affected owners at a
-safe boundary so their loaded native modules agree.
+executable.
+
+Managed updates select a new release for subsequent resolutions; existing owners
+continue using their loaded release. After an in-place npm update, restart Bridge
+and reopen affected owners at a safe boundary to replace Node's cached native
+modules.
 
 `piRuntime` accepts:
 
@@ -123,8 +133,8 @@ safe boundary so their loaded native modules agree.
 - `inheritEnv`: environment-variable allowlist. Omission inherits normally; an
   empty list removes inherited variables except PATH, which is preserved or
   defaults to `/usr/bin:/bin`.
-- `tools`: subset of native read/write/edit/bash/grep/find/ls. Omission uses
-  native defaults; an empty array disables built-in tools.
+- `tools`: selectors passed to Pi's native `--tools`, including extension
+  tools. Omission uses native defaults. An empty array passes `--no-tools`.
 
 These settings change the runtime, not its permission grants. Model tools and
 extensions can access files, shell and network: denying the direct Bridge
@@ -132,11 +142,14 @@ extensions can access files, shell and network: denying the direct Bridge
 
 ### Herdr process placement
 
-With `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
-writers. Missing Herdr selects direct startup; installed but unavailable or
-incompatible Herdr fails without relaunching a possibly started writer elsewhere.
-Herdr requires Linux and a working user-systemd bus. Bridge may start its local
-daemon but does not restart an existing daemon or change service enablement/linger.
+On Linux with `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
+writers so remote agents drive Pi inside Herdr just like local Herdr usage.
+Bridge starts the local Herdr daemon on demand without restarting an existing
+daemon or changing service enablement/linger. If Herdr is missing, unavailable,
+incompatible, or user-systemd is unavailable before a pane is launched, Bridge
+silently falls back to direct Pi startup so core sessions continue working. If
+failure occurs after a Herdr worker launch has already started, Bridge aborts
+without launching a duplicate writer elsewhere.
 
 Existing owners take priority. Edits affect subsequent new-session and cold-start
 launches without moving or stopping current writers; there is no per-call or
@@ -147,15 +160,8 @@ and deletion of the allocated worker/tool scope.
 
 ### Native control permissions
 
-`set_model`, prompt settings, `compact` and `reload` use session `send`; a create call's
-initial settings use `create`. Explicit `compact(interrupt:true)` additionally
-requires `stop`, while summary content requires `read`.
-
-`models` requires effective `send`, `command` or `create` on a configured project,
-or effective `send`/`command` on an existing in-scope session. Normal overrides
-apply; superseded grants and nonexistent IDs do not authorize it. Catalog
-admission may read identity metadata, but no history or owner state. See
-[model control](model-control.md) for operation behavior.
+[Model controls](model-control.md) lists rights for model selection, prompt
+settings, compaction and catalog access. `update_session` and `maintain_session` (`compact`/`reload`) use `send` (`compact` with `interrupt:true` also requires `stop`).
 
 ## Seven independent rights
 
@@ -186,53 +192,26 @@ than booleans or `null` reject.
 
 ### Request permission snapshots
 
-The authoritative Bridge starts one policy read on receipt of a complete,
-schema-valid business request, before executor/session queues. Its immutable
-`defaults`, `grants`, `folders` and `sessionRoots` snapshot governs admission,
-execution and returned data through waits, cold startup and ACK handling.
-Later edits affect new requests only. Proxy/client timestamps and native
-execution time do not select the policy.
+Bridge reads policy once when a complete, valid request arrives, before it
+enters any executor or session queue. Batch items and both sides of a fork
+share that snapshot. Each continuation takes a new one. Invalid policy
+rejects the request. Identity, owner state, Stop and handoff checks remain live.
 
-Batch items share the outer snapshot; fork source and destination checks share
-it too. Every new call, including a read cursor page, captures a new policy.
-Invalid or unreadable policy rejects without reusing an older snapshot.
-Identity, cwd, generation, owner state, Stop and handoff checks remain live.
-Input requests register their Stop fence before policy I/O. Late ACKs finish
-identity checks using the admitted request's rights without replaying work.
+`defaults`, `grants`, `folders` and `sessionRoots` hot-update together. Roots
+must remain disjoint from active and proposed state storage. Removed roots
+exclude new requests, including known IDs and cursors. Registered owners keep
+their claims. Removing a folder only removes the creation target. Companions
+read current scope when registering or resuming.
 
-`defaults`, `grants`, `folders` and `sessionRoots` hot-update together. Startup
-provisions its roots; later policy reads create no directories. Discovery skips
-missing roots and validates existing ones on access; native creation provisions
-its selected destination. Removed roots exclude new requests, including known-ID
-and cursor reads, without terminating writers or withdrawing admitted work.
-Removing a folder removes a creation target, not grants for existing sessions.
-Hot scope must remain non-overlapping with both proposed and active storage.
-
-`herdr` is read separately at each writer launch. Other settings remain fixed
-until service restart; pending changes appear by name in unscoped
-`health.restart_required`, while active values continue serving requests.
-An IPC namespace change additionally rejects new writer acquisition with
-`CONFIG_RESTART_REQUIRED`, because the old registry cannot establish ownership
-in the new namespace. Existing owner reuse and reads remain available.
-
-Companions reread scope before native registration and resume admission.
-Registered writers retain claims after scope removal. A previously unregistered
-Pi newly brought into scope needs one safe native reload to register; there is
-no background registration watcher.
+`herdr` is sampled for each new owned RPC. Other settings take effect after
+restart and are listed in `health.restart_required`. Changing the registry
+namespace blocks new writer acquisition with `CONFIG_RESTART_REQUIRED`.
 
 ### Diagnose combinations
 
-`health({})` reports permission issues and pending restart settings. Healthy
-policy with no restart pending returns `{"domain":"permissions","status":"ok"}`.
-Issues identify allowed/blocked conditions and source rules, deduplicating
-inherited issues. A known `session_id` limits diagnosis to that session without
-exposing its project or name. Health never changes permissions.
-
-Warnings cover known-ID-only access, work without progress reading or stop,
-restricted access to new sessions, and direct shell versus model-tool access.
-These combinations remain valid policies. Unscoped health also reports
-unavailable [event storage](events.md#authorization-storage-and-delivery)
-independently of core operation availability.
+[Health](api.md#health) explains limited permission combinations, pending
+restart settings and unavailable event storage. Its warnings leave policy
+decisions to the owner.
 
 ### Native human menu
 
@@ -252,39 +231,18 @@ changes. It neither starts Pi nor writes history.
 
 ## Startup and deployment
 
-Startup validates configuration and filesystem boundaries. For HTTP, create a
-private random token file as described in [transports](transports.md).
-`deploy/pi-mcp-bridge.service` is an optional user-systemd template; review its
-paths, environment and stop budget. Autostart/linger and tunnel authentication
-remain owner deployment choices.
-
-Service exclusivity and permission edits use separate kernel-owned mutexes;
-crashes release them. Edits compare the captured revision before atomic
-replacement. Startup removes only its own stale owner-control socket after
-obtaining service exclusivity. Session writer claims and explicit pauses follow
-the [runtime ownership rules](runtime.md).
+[The Linux user-systemd template](../deploy/pi-mcp-bridge.service) is optional. Set
+its paths, environment and stop budget for your installation. Set up the private
+HTTP token and tunnel as described in [transports](transports.md).
 
 ## Diagnostics
 
-Set `PI_MCP_LOG=1` in the Bridge process's launch environment before its next
-start. For stdio, add it to the MCP client's environment settings; for HTTP, use
-the service's launch environment. This is a startup setting, not an owner JSON
-field or a hot-update option. Coordinate any restart with active work.
+Set `PI_MCP_LOG=1` in the launch environment to emit JSON diagnostics on stderr.
+Group related stages by `trace_id` and identify the process with `run_id` and
+`pid`. Hashed `session_ref` and `mcp_id_ref` correlate operations. Diagnostics
+contain allowlisted metadata. Native and extension output is separate.
 
-Bridge writes newline-delimited JSON diagnostics to **stderr**; stdio stdout
-remains the MCP stream. Collect stderr through the client or service manager.
-Records identify the process with `run_id` and `pid`, with `event`, operation,
-duration and known error codes where applicable. Use `trace_id` to group related
-stages; a stdio request's permission snapshot and tool execution can have
-different trace IDs. `session_ref` and `mcp_id_ref` are hashed correlation keys, not the
-original IDs. These records contain allowlisted metadata rather than prompts,
-transcripts, credentials or arbitrary native error text. Other native or
-extension output is separate and should be reviewed before sharing logs.
-
-Start with the failed operation's code and related trace stages. Model discovery
-adds [`catalog_stage` and `catalog_reason`](model-control.md#session-independent-model-catalog);
-event delivery has [callback-specific diagnostics](events.md#authorization-storage-and-delivery).
-Output is best effort and drops records if the collector stalls. It is not a
-durable audit trail: a missing record cannot prove that work was not admitted.
-Resolve uncertain submissions through the [submission receipt](api.md#submission-receipt),
-not by retrying based only on logs.
+Use the operation code, [model catalog stages](model-control.md#session-independent-model-catalog)
+or [webhook diagnostics](events.md#authorization-storage-and-delivery) to locate
+failures. Delivery of log records is best effort. Use the
+[submission receipt](api.md#submission-receipt) for uncertain input.

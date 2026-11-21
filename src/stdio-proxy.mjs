@@ -1,186 +1,86 @@
-import { pathToFileURL } from 'node:url';
-import { loadHttpConfig, TOKEN_HEADER } from './http-server.mjs';
-import { BridgeStdioTransport } from './protocol-stdio.mjs';
-import { META, modernMessage, isRpcRequest, rpcError, MCP_RESPONSE_LIMIT } from './protocol.mjs';
-
-// Only these exact HTTP rejection pairs prove the backend did not admit work.
-// A status alone, including a server error or timeout, says nothing about execution.
-const beforeAdmissionRejections = new Map([
-  ['INVALID_JSON_OBJECT', 400],
-  ['UNAUTHORIZED', 401],
-  ['INVALID_HOST', 403],
-  ['ORIGIN_DENIED', 403],
-  ['NOT_FOUND', 404],
-  ['METHOD_NOT_ALLOWED', 405],
-  ['BODY_TOO_LARGE', 413],
-  ['UNSUPPORTED_CONTENT_TYPE', 415],
-  ['SERVICE_STOPPING', 503],
-  ['SERVICE_BUSY', 503],
-]);
+import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
+import { StdioTransport } from './mcp/protocol-stdio.mjs';
+import { forwardedMcpHeaders, isModernRequest, readJson, rpcError } from './mcp/protocol.mjs';
+import { MCP_RESPONSE_LIMIT } from './mcp/response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
 // queue or automatic retries live here. HTTP authentication stays owner-local.
 export function createStdioProxy({
-  url,
+  port,
   token,
   input = process.stdin,
   output = process.stdout,
   fetchImpl = fetch,
 }) {
-  const target = new URL(url);
-  if (
-    target.protocol !== 'http:' ||
-    target.hostname !== '127.0.0.1' ||
-    !target.port ||
-    target.pathname !== '/mcp' ||
-    target.search ||
-    target.hash ||
-    target.username ||
-    target.password
-  )
-    throw new Error('INVALID_PROXY_URL');
-  if (!/^[A-Za-z0-9._~-]{32,256}$/.test(token)) throw new Error('INVALID_BACKEND_TOKEN');
-  const controllers = new Map();
-  const encode = (value) =>
-    /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/.test(value) && !value.startsWith('=?base64?')
-      ? value
-      : '=?base64?' + Buffer.from(value).toString('base64') + '?=';
-  class ProxyTransport extends BridgeStdioTransport {
-    line(bytes) {
-      let body;
+  // The token and port come from loadHttpConfig, which validates them.
+  const target = new URL(`http://127.0.0.1:${port}/mcp`);
+  return new StdioTransport(
+    async (body, signal) => {
+      const { id } = body;
       try {
-        body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-      } catch {
-        this.track(this.write(rpcError(null, -32700, 'Parse error')));
-        return;
-      }
-      if (!isRpcRequest(body)) {
-        this.track(this.write(rpcError(null, -32600, 'Invalid request')));
-        return;
-      }
-      if (body.method === 'notifications/cancelled' && controllers.has(body.params?.requestId)) {
-        controllers.get(body.params.requestId).abort();
-        return;
-      }
-      this.track(this.forward(body));
-    }
-    async forward(body) {
-      // Notifications have no correlation ID and must never share a request slot.
-      const key = body.id === undefined ? Symbol() : body.id;
-      if (controllers.has(key)) {
-        await this.write(rpcError(body.id, -32600, 'Duplicate in-flight request ID'));
-        return;
-      }
-      if (controllers.size >= 16) {
-        if (body.id !== undefined)
-          await this.write(rpcError(body.id, -32000, 'PROXY_BUSY', { recovery: 'NOT_FORWARDED' }));
-        return;
-      }
-      const controller = new AbortController();
-      controllers.set(key, controller);
-      try {
-        const headers = {
-          'content-type': 'application/json',
-          accept: 'application/json, text/event-stream',
-          [TOKEN_HEADER]: token,
-        };
-        if (modernMessage(body)) {
-          const version = body.params?._meta?.[META + 'protocolVersion'];
-          if (typeof version === 'string') headers['MCP-Protocol-Version'] = version;
-          headers['Mcp-Method'] = body.method;
-          const name = body.params?.[body.method === 'resources/read' ? 'uri' : 'name'];
-          if (
-            ['tools/call', 'prompts/get', 'resources/read'].includes(body.method) &&
-            typeof name === 'string'
-          )
-            headers['Mcp-Name'] = encode(name);
-        }
         const response = await fetchImpl(target, {
           method: 'POST',
-          headers,
+          headers: {
+            'content-type': 'application/json',
+            accept: 'application/json',
+            [TOKEN_HEADER]: token,
+            ...(isModernRequest(body) ? forwardedMcpHeaders(body) : {}),
+          },
           body: JSON.stringify(body),
           redirect: 'error',
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(40000)]),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(45000)]),
         });
-        if (response.status === 202 && body.id === undefined) return;
         if (!/application\/json/i.test(response.headers.get('content-type') ?? ''))
           throw new Error('INVALID_BACKEND_RESPONSE');
-        let size = 0;
-        const chunks = [];
-        for await (const chunk of response.body) {
-          size += chunk.length;
-          if (size > MCP_RESPONSE_LIMIT) throw new Error('BACKEND_RESPONSE_TOO_LARGE');
-          chunks.push(chunk);
-        }
-        const result = JSON.parse(
-          new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)),
+        const result = await readJson(
+          response.body,
+          MCP_RESPONSE_LIMIT,
+          'BACKEND_RESPONSE_TOO_LARGE',
         );
-        if (body.id !== undefined) {
-          if (
-            result !== null &&
-            typeof result === 'object' &&
-            !Array.isArray(result) &&
-            Object.keys(result).length === 1 &&
-            beforeAdmissionRejections.has(result.error) &&
-            beforeAdmissionRejections.get(result.error) === response.status
-          ) {
-            await this.write(
-              rpcError(body.id, -32000, result.error, {
-                http_status: response.status,
-                recovery: 'NOT_ADMITTED',
-              }),
-            );
-            return;
-          }
-          if (
-            result.jsonrpc !== '2.0' ||
-            result.id !== body.id ||
-            (!result.result && !result.error)
-          )
-            throw new Error('INVALID_BACKEND_RESPONSE');
-          await this.write(result);
+        if (
+          result !== null &&
+          typeof result === 'object' &&
+          !Array.isArray(result) &&
+          Object.keys(result).length === 1 &&
+          Object.hasOwn(NOT_ADMITTED, result.error) &&
+          NOT_ADMITTED[result.error] === response.status
+        ) {
+          return rpcError(id, -32000, result.error, {
+            http_status: response.status,
+            recovery: 'NOT_ADMITTED',
+          });
         }
+        if (result?.jsonrpc !== '2.0' || result.id !== id || (!result.result && !result.error))
+          throw new Error('INVALID_BACKEND_RESPONSE');
+        return result;
       } catch {
-        if (body.id !== undefined && !controller.signal.aborted)
-          await this.write(
-            rpcError(body.id, -32000, 'BRIDGE_CONNECTION_LOST', {
-              recovery:
-                'OUTCOME_UNKNOWN; no automatic replay was attempted. Inspect list/read before deciding whether to submit again.',
-            }),
-          );
-      } finally {
-        controllers.delete(key);
+        return rpcError(id, -32000, 'BRIDGE_CONNECTION_LOST', {
+          recovery:
+            'OUTCOME_UNKNOWN; no automatic replay was attempted. Inspect list/read before deciding whether to submit again.',
+        });
       }
-    }
-    async close() {
-      for (const controller of controllers.values()) controller.abort();
-      await super.close();
-    }
-  }
-  return new ProxyTransport(null, { input, output });
+    },
+    { input, output, capacity: { limit: 16, code: 'PROXY_BUSY' } },
+  );
 }
 async function main() {
   const file = process.argv[2];
   if (!file) throw new Error('OWNER_CONFIG_REQUIRED');
-  const { token, port } = await loadHttpConfig(file);
-  const proxy = createStdioProxy({ url: `http://127.0.0.1:${port}/mcp`, token });
-  let closing;
-  const close = () =>
-    (closing ??= (async () => {
-      process.stdin.pause();
-      await proxy.close();
-      await proxy.drain();
-    })());
-  process.on('SIGINT', () => void close());
-  process.on('SIGTERM', () => void close());
-  process.stdin.on('end', () => void close());
-  process.stdin.on('close', () => void close());
-  process.stdin.on('error', () => void close());
-  process.stdout.on('error', () => void close());
-  proxy.onerror = () => void close();
-  await proxy.start();
+  const proxy = createStdioProxy(await loadHttpConfig(file));
+  const close = () => {
+    process.stdin.pause();
+    proxy.close();
+  };
+  process.on('SIGINT', close);
+  process.on('SIGTERM', close);
+  process.stdin.on('end', close);
+  process.stdin.on('close', close);
+  process.stdin.on('error', close);
+  process.stdout.on('error', close);
+  proxy.onerror = close;
+  proxy.start();
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch(() => {
     console.error('STDIO_PROXY_FAILED');
     process.exitCode = 1;

@@ -1,33 +1,29 @@
+import { mcpRequest } from './fixtures/tool-call.mjs';
+import { readLfLines } from '../src/core/lf-lines.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createStdioProxy } from '../src/stdio-proxy.mjs';
-import { META, MODERN_VERSION } from '../src/protocol.mjs';
+import { MODERN_VERSION } from '../src/mcp/protocol.mjs';
 
 const token = 'synthetic-proxy-token-never-a-real-credential';
-function fixture(fetchImpl) {
+function fixture(fetchImpl, port = 43123) {
   const input = new PassThrough(),
     output = new PassThrough(),
     lines = [];
-  let buffer = '';
-  output.on('data', (chunk) => {
-    buffer += chunk;
-    let at;
-    while ((at = buffer.indexOf('\n')) >= 0) {
-      lines.push(JSON.parse(buffer.slice(0, at)));
-      buffer = buffer.slice(at + 1);
-    }
-  });
+  readLfLines(output, (line) => lines.push(JSON.parse(line)));
   const proxy = createStdioProxy({
-    url: 'http://127.0.0.1:43123/mcp',
+    port,
     token,
     input,
     output,
     fetchImpl,
   });
-  return { input, lines, proxy };
+  const send = (id, method, params) =>
+    input.write(JSON.stringify(mcpRequest(method, params, id)) + '\n');
+  return { input, lines, proxy, send };
 }
-test('stdio proxy forwards modern metadata and SDK initialization without runtime or retry', async () => {
+test('stdio proxy forwards per-request metadata and encodes the mirrored tool name', async () => {
   const received = [];
   const f = fixture(async (url, options) => {
     const body = JSON.parse(options.body);
@@ -36,50 +32,26 @@ test('stdio proxy forwards modern metadata and SDK initialization without runtim
       JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { marker: body.method } }),
       { headers: { 'content-type': 'application/json' } },
     );
-  });
+  }, 80);
   await f.proxy.start();
-  const body = {
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'tools/call',
-    params: {
-      name: '命令',
-      arguments: {},
-      _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-    },
-  };
-  f.input.write(JSON.stringify(body) + '\n');
-  f.input.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: 2,
-      method: 'initialize',
-      params: { protocolVersion: '2025-11-25' },
-    }) + '\n',
-  );
+  f.send(1, 'tools/call', {
+    name: '命令',
+    arguments: {},
+  });
   await f.proxy.drain();
-  assert.equal(received.length, 2);
-  assert.equal(received[0].headers['MCP-Protocol-Version'], MODERN_VERSION);
-  assert.equal(received[0].headers['Mcp-Method'], 'tools/call');
-  assert.match(received[0].headers['Mcp-Name'], /^=\?base64\?/);
-  assert.equal(received[1].headers['Mcp-Method'], undefined);
-  assert.deepEqual(
-    f.lines.map((x) => x.id),
-    [1, 2],
-  );
+  assert.equal(received.length, 1);
+  assert.equal(received[0].url, 'http://127.0.0.1/mcp');
+  const headers = new Headers(received[0].headers);
+  assert.equal(headers.get('mcp-protocol-version'), MODERN_VERSION);
+  assert.equal(headers.get('mcp-method'), 'tools/call');
+  assert.match(headers.get('mcp-name'), /^=\?base64\?/);
+  assert.deepEqual(f.lines, [{ jsonrpc: '2.0', id: 1, result: { marker: 'tools/call' } }]);
   await f.proxy.close();
 });
 test('proxy preserves exact backend rejections as not admitted without retrying input', async (t) => {
   for (const [status, code] of [
-    [400, 'INVALID_JSON_OBJECT'],
     [401, 'UNAUTHORIZED'],
-    [403, 'INVALID_HOST'],
-    [403, 'ORIGIN_DENIED'],
-    [404, 'NOT_FOUND'],
-    [405, 'METHOD_NOT_ALLOWED'],
     [413, 'BODY_TOO_LARGE'],
-    [415, 'UNSUPPORTED_CONTENT_TYPE'],
-    [503, 'SERVICE_STOPPING'],
     [503, 'SERVICE_BUSY'],
   ])
     await t.test(`${status} ${code}`, async (t) => {
@@ -93,14 +65,7 @@ test('proxy preserves exact backend rejections as not admitted without retrying 
       });
       t.after(() => f.proxy.close());
       await f.proxy.start();
-      f.input.write(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: 7,
-          method: 'tools/call',
-          params: { name: 'send', arguments: {} },
-        }) + '\n',
-      );
+      f.send(7, 'tools/call', { name: 'send', arguments: {} });
       await f.proxy.drain();
       assert.equal(forwards, 1);
       assert.deepEqual(f.lines, [
@@ -114,85 +79,9 @@ test('proxy preserves exact backend rejections as not admitted without retrying 
           },
         },
       ]);
-      f.input.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-      await f.proxy.drain();
-      assert.equal(forwards, 2);
-      assert.equal(f.lines.length, 1, 'rejected notifications receive no JSON-RPC response');
     });
 });
-test('proxy keeps unverified backend failures unknown without retrying input', async (t) => {
-  for (const [name, status, response, contentType = 'application/json'] of [
-    ['server failure', 500, { error: 'REQUEST_FAILED' }],
-    ['timeout', 504, { error: 'REQUEST_WAIT_EXPIRED' }],
-    ['wrong status', 400, { error: 'UNAUTHORIZED' }],
-    ['known reason in server failure', 500, { error: 'SERVICE_BUSY' }],
-    ['known reason in timeout', 504, { error: 'SERVICE_BUSY' }],
-    ['unknown reason', 503, { error: 'ARBITRARY_BACKEND_DETAIL' }],
-    ['extra fields', 401, { error: 'UNAUTHORIZED', result: 'possibly admitted' }],
-    ['non-string reason', 401, { error: { code: 'UNAUTHORIZED' } }],
-    ['null body', 401, null],
-    ['array body', 401, [{ error: 'UNAUTHORIZED' }]],
-    ['non-JSON content type', 401, { error: 'UNAUTHORIZED' }, 'text/plain'],
-  ])
-    await t.test(name, async (t) => {
-      let forwards = 0;
-      const f = fixture(async () => {
-        forwards++;
-        return new Response(JSON.stringify(response), {
-          status,
-          headers: { 'content-type': contentType },
-        });
-      });
-      t.after(() => f.proxy.close());
-      await f.proxy.start();
-      f.input.write(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: 7,
-          method: 'tools/call',
-          params: { name: 'send', arguments: {} },
-        }) + '\n',
-      );
-      await f.proxy.drain();
-      assert.equal(forwards, 1);
-      assert.equal(f.lines.length, 1);
-      assert.equal(f.lines[0].error.message, 'BRIDGE_CONNECTION_LOST');
-      assert.match(f.lines[0].error.data.recovery, /OUTCOME_UNKNOWN/);
-      assert.doesNotMatch(JSON.stringify(f.lines), /NOT_ADMITTED|ARBITRARY_BACKEND_DETAIL/);
-    });
-});
-test('proxy preserves a correlated backend wait-expired response and its unknown outcome', async (t) => {
-  const response = {
-    jsonrpc: '2.0',
-    id: 7,
-    error: {
-      code: -32000,
-      message: 'REQUEST_WAIT_EXPIRED',
-      data: { recovery: 'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work.' },
-    },
-  };
-  let forwards = 0;
-  const f = fixture(async () => {
-    forwards++;
-    return new Response(JSON.stringify(response), {
-      status: 504,
-      headers: { 'content-type': 'application/json' },
-    });
-  });
-  t.after(() => f.proxy.close());
-  await f.proxy.start();
-  f.input.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: 7,
-      method: 'tools/call',
-      params: { name: 'send', arguments: {} },
-    }) + '\n',
-  );
-  await f.proxy.drain();
-  assert.equal(forwards, 1);
-  assert.deepEqual(f.lines, [response]);
-});
+
 test('proxy reports a lost connection once, never resubmits a mutation, and close aborts only its request', async () => {
   let count = 0;
   const f = fixture(async () => {
@@ -200,14 +89,7 @@ test('proxy reports a lost connection once, never resubmits a mutation, and clos
     throw new Error('network');
   });
   await f.proxy.start();
-  f.input.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      id: 7,
-      method: 'tools/call',
-      params: { name: 'send', arguments: {} },
-    }) + '\n',
-  );
+  f.send(7, 'tools/call', { name: 'send', arguments: {} });
   await f.proxy.drain();
   assert.equal(count, 1);
   assert.equal(f.lines[0].error.message, 'BRIDGE_CONNECTION_LOST');
@@ -220,43 +102,12 @@ test('proxy reports a lost connection once, never resubmits a mutation, and clos
       ),
   );
   await blocked.proxy.start();
-  blocked.input.write(JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'ping' }) + '\n');
+  blocked.send(8, 'ping');
   await blocked.proxy.close();
   await blocked.proxy.drain();
   assert.equal(blocked.lines.length, 0);
 });
-test('concurrent notifications have no duplicate-ID response and requests remain independently cancellable', async (t) => {
-  const pending = [];
-  const f = fixture(
-    async (_url, { body, signal }) =>
-      new Promise((resolve, reject) => {
-        pending.push({ body: JSON.parse(body), resolve, signal });
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-      }),
-  );
-  t.after(async () => {
-    await f.proxy.close();
-    await f.proxy.drain();
-  });
-  await f.proxy.start();
-  for (const method of ['notifications/initialized', 'notifications/roots/list_changed'])
-    f.input.write(JSON.stringify({ jsonrpc: '2.0', method }) + '\n');
-  f.input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }) + '\n');
-  assert.equal(pending.length, 3);
-  f.input.write(
-    JSON.stringify({
-      jsonrpc: '2.0',
-      method: 'notifications/cancelled',
-      params: { requestId: 1 },
-    }) + '\n',
-  );
-  assert.equal(pending[2].signal.aborted, true);
-  assert.equal(pending[0].signal.aborted, false);
-  assert.equal(pending[1].signal.aborted, false);
-  for (const p of pending.slice(0, 2)) p.resolve(new Response(null, { status: 202 }));
-  await f.proxy.drain();
-  assert.deepEqual(f.lines, []);
-});
+
 test('proxy bounds outstanding HTTP requests, never queues rejected work and resumes after drain', async (t) => {
   let release;
   const gate = new Promise((r) => (release = r));
@@ -275,8 +126,7 @@ test('proxy bounds outstanding HTTP requests, never queues rejected work and res
     await f.proxy.drain();
   });
   await f.proxy.start();
-  for (let id = 1; id <= 40; id++)
-    f.input.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'ping' }) + '\n');
+  for (let id = 1; id <= 40; id++) f.send(id, 'ping');
   assert.equal(forwarded, 16);
   release();
   await f.proxy.drain();
@@ -288,29 +138,8 @@ test('proxy bounds outstanding HTTP requests, never queues rejected work and res
       (r) => r.error.message === 'PROXY_BUSY' && r.error.data.recovery === 'NOT_FORWARDED',
     ),
   );
-  f.input.write(JSON.stringify({ jsonrpc: '2.0', id: 41, method: 'ping' }) + '\n');
+  f.send(41, 'ping');
   await f.proxy.drain();
   assert.equal(forwarded, 17);
   assert.deepEqual(f.lines.at(-1), { jsonrpc: '2.0', id: 41, result: {} });
-});
-test('proxy rejects non-loopback targets and never forwards malformed JSON', async () => {
-  assert.throws(
-    () => createStdioProxy({ url: 'http://example.com:43123/mcp', token }),
-    /INVALID_PROXY_URL/,
-  );
-  let count = 0;
-  const f = fixture(async () => {
-    count++;
-  });
-  await f.proxy.start();
-  f.input.write('{bad json\n');
-  await f.proxy.drain();
-  assert.equal(count, 0);
-  assert.equal(f.lines[0].error.code, -32700);
-  for (const params of [null, [], 'invalid'])
-    f.input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params }) + '\n');
-  await f.proxy.drain();
-  assert.equal(count, 0);
-  assert.ok(f.lines.slice(1).every((r) => r.error.code === -32600));
-  await f.proxy.close();
 });

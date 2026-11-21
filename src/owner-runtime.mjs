@@ -1,108 +1,84 @@
 // Owner-local Unix control only; deliberately not an MCP tool or HTTP route.
 import net from 'node:net';
+import { json } from 'node:stream/consumers';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { opaqueId } from './storage.mjs';
-import { privateDirectory } from './attachments.mjs';
-import { readOwnerConfig } from './owner-config.mjs';
+import { ifMissing, opaqueId } from './core/storage.mjs';
+import { privateDirectory } from './runtime/attachments.mjs';
+import { readOwnerConfig, registryDirectory } from './core/owner-config.mjs';
+import { readRequest, listenPrivate } from './runtime/attachment-protocol.mjs';
+const methods = {
+  release: 'releaseForLocal',
+  settled: 'settledForLocal',
+  idle_candidate: 'idleCandidateForLocal',
+  reset: 'resetColdResume',
+  handoff: 'handoffForLocal',
+  handoff_cancel: 'cancelHandoff',
+};
 export function ownerSocket(config) {
-  const dir = config.attachmentDir ?? path.join(config.stateDir, 'ipc');
-  return path.join(dir, `owner-${opaqueId(config.stateDir).slice(3, 11)}.sock`);
+  return path.join(
+    registryDirectory(config),
+    `owner-${opaqueId(config.stateDir).slice(3, 11)}.sock`,
+  );
 }
 export async function serveOwnerControl(bridge) {
   const socket = ownerSocket(bridge.config);
   await privateDirectory(path.dirname(socket));
   // Called only after acquiring this service namespace's lifetime mutex.
-  const previous = await fs.lstat(socket).catch((error) => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
+  const previous = await fs.lstat(socket).catch(ifMissing);
   if (previous) {
     if (!previous.isSocket() || previous.uid !== process.getuid())
       throw new Error('INVALID_OWNER_SOCKET');
     await fs.unlink(socket);
   }
-  const connections = new Set(),
-    operations = new Set(),
-    handoffs = new Set();
+  const connections = new Map();
   let closing = false;
   const server = net.createServer({ allowHalfOpen: true }, (connection) => {
-    connections.add(connection);
-    connection.setEncoding('utf8');
-    let buffer = '',
-      admitted = false,
-      controller,
-      completed = false;
+    const requestState = {};
+    connections.set(connection, requestState);
     connection.setTimeout(30000, () => connection.destroy());
     connection.on('error', () => {});
-    connection.on('close', () => {
+    connection.once('close', async () => {
+      requestState.controller?.abort();
+      // Keep disconnected native work in the same shutdown ledger until it ends.
+      await requestState.task?.catch(() => {});
       connections.delete(connection);
-      if (!completed) controller?.abort();
     });
-    connection.on('end', () => {
-      if (!completed) controller?.abort();
+    connection.once('end', () => requestState.controller?.abort());
+    readRequest(connection, 8192, (frame) => {
+      if (!closing) return (requestState.task = handle(frame));
     });
-    connection.on('data', (chunk) => {
-      if (admitted || closing) return;
-      buffer += chunk;
-      if (Buffer.byteLength(buffer) > 8192) {
-        connection.destroy();
-        return;
-      }
-      if (!buffer.includes('\n')) return;
-      admitted = true;
-      const task = (async () => {
-        try {
-          const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n')));
-          const methods = {
-            release: 'releaseForLocal',
-            settled: 'settledForLocal',
-            input_activity: 'inputActivityForLocal',
-            idle_candidate: 'idleCandidateForLocal',
-            reset: 'resetColdResume',
-            handoff: 'handoffForLocal',
-            handoff_cancel: 'cancelHandoff',
-          };
-          if (
-            !request ||
-            !Object.hasOwn(methods, request.op) ||
-            !/^ps_[a-f0-9]{32}$/.test(request.session_id)
-          )
-            throw new Error('INVALID_OWNER_COMMAND');
-          if (request.op === 'handoff') {
-            controller = new AbortController();
-            handoffs.add(controller);
-            connection.setTimeout(0);
-          }
-          const data = await bridge[methods[request.op]](request, { signal: controller?.signal });
-          completed = true;
-          connection.end(JSON.stringify({ data }) + '\n');
-        } catch (error) {
-          completed = true;
-          connection.end(
-            JSON.stringify({
-              error: {
-                code: controller?.signal.aborted
-                  ? 'HANDOFF_CANCELLED'
-                  : (error.code ?? error.message),
-              },
-            }) + '\n',
-          );
-        } finally {
-          if (controller) handoffs.delete(controller);
+    async function handle(frame) {
+      let reply;
+      try {
+        const request = JSON.parse(frame);
+        if (
+          !request ||
+          !Object.hasOwn(methods, request.op) ||
+          !/^ps_[a-f0-9]{32}$/.test(request.session_id)
+        )
+          throw new Error('INVALID_OWNER_COMMAND');
+        if (request.op === 'handoff') {
+          requestState.controller = new AbortController();
+          connection.setTimeout(0);
         }
-      })();
-      operations.add(task);
-      void task.finally(() => operations.delete(task)).catch(() => {});
-    });
+        reply = {
+          data: await bridge[methods[request.op]](request, {
+            signal: requestState.controller?.signal,
+          }),
+        };
+      } catch (error) {
+        const code = requestState.controller?.signal.aborted
+          ? 'HANDOFF_CANCELLED'
+          : (error.code ?? error.message);
+        reply = { error: { code } };
+      }
+      requestState.controller = null;
+      connection.end(JSON.stringify(reply) + '\n');
+    }
   });
   try {
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socket, resolve);
-    });
-    await fs.chmod(socket, 0o600);
+    await listenPrivate(server, socket);
   } catch (error) {
     await new Promise((resolve) => server.close(resolve));
     throw error;
@@ -110,46 +86,35 @@ export async function serveOwnerControl(bridge) {
   return {
     async close() {
       closing = true;
-      for (const controller of handoffs) controller.abort();
+      for (const { controller } of connections.values()) controller?.abort();
       const stopped = new Promise((resolve) => server.close(resolve));
-      await Promise.allSettled([...operations]);
-      for (const connection of connections) connection.destroy();
+      await Promise.allSettled(connections.values().map(({ task }) => task));
+      for (const connection of connections.keys()) connection.destroy();
       await stopped;
     },
   };
 }
 export async function ownerRequest(config, request, { signal } = {}) {
-  return new Promise((resolve, reject) => {
-    const connection = net.createConnection(ownerSocket(config));
-    let buffer = '';
-    const cancel = () => connection.destroy(new Error('HANDOFF_CANCELLED'));
-    signal?.addEventListener('abort', cancel, { once: true });
-    if (signal?.aborted) cancel();
-    connection.on('close', () => signal?.removeEventListener('abort', cancel));
-    connection.setEncoding('utf8');
-    connection.setTimeout(request.op === 'handoff' ? 0 : 30000, () =>
+  if (signal?.aborted) throw new Error('HANDOFF_CANCELLED');
+  const handoff = request.op === 'handoff';
+  const connection = net.createConnection({ path: ownerSocket(config), signal });
+  try {
+    connection.setTimeout(handoff ? 0 : 30000, () =>
       connection.destroy(new Error('OWNER_CONTROL_TIMEOUT')),
     );
-    connection.on('error', reject);
-    connection.on('connect', () => {
-      if (request.op === 'handoff') connection.write(JSON.stringify(request) + '\n');
-      else connection.end(JSON.stringify(request) + '\n');
-    });
-    connection.on('data', (chunk) => {
-      buffer += chunk;
-    });
-    connection.on('end', () => {
-      connection.end();
-      try {
-        const result = JSON.parse(buffer);
-        if (result.error)
-          throw Object.assign(new Error(result.error.code), { code: result.error.code });
-        resolve(result.data);
-      } catch (error) {
-        reject(error);
-      }
-    });
-  });
+    const frame = JSON.stringify(request) + '\n';
+    if (handoff) connection.write(frame);
+    else connection.end(frame);
+    const result = await json(connection);
+    if (result.error)
+      throw Object.assign(new Error(result.error.code), { code: result.error.code });
+    return result.data;
+  } catch (error) {
+    if (signal?.aborted) throw new Error('HANDOFF_CANCELLED');
+    throw error;
+  } finally {
+    connection.destroy();
+  }
 }
 async function main() {
   const [file, op, session_id, confirmation, ...rest] = process.argv.slice(2);
@@ -177,7 +142,7 @@ async function main() {
     ),
   );
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+if (import.meta.main)
   main().catch((error) => {
     console.error(error.code ?? error.message);
     process.exitCode = 1;

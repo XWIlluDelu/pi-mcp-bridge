@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
-import { prepareContextRead as prepare } from '../../src/context-read.mjs';
+import { prepareContextRead as prepare } from '../../src/read/context-read.mjs';
 import { sdk } from './pi.mjs';
 export const prepareContextRead = (data, args) => prepare(data, args, sdk);
-import { ContextReadCache } from '../../src/read-cache.mjs';
+import { ContextReadCache } from '../../src/read/read-cache.mjs';
 
 // Unit-test convenience only: production acquisition and authorization live in Bridge.
 const cache = new ContextReadCache();
 export function renderContextRead(data, args) {
   const identity = {
-    session_id: args.session_id ?? cache.identity(args.cursor).session_id,
+    session_id: cache.target(args),
     file: 'fixture',
     native_id: data.header.id,
   };

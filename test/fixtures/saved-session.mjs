@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { opaqueId } from '../../src/storage.mjs';
+import { sessionKey } from '../../src/core/storage.mjs';
 
 // Seed persisted history without starting Pi or exercising create-and-send.
 // Tests of public creation must call Bridge.create.
@@ -18,10 +18,16 @@ export async function savedSession(bridge, { project = bridge.config.folders[0]?
     JSON.stringify({ type: 'session', version: 3, id, timestamp, cwd: project }) + '\n',
     { flag: 'wx', mode: 0o600 },
   );
-  return { status: 'created', session_id: opaqueId(`${file}\0${id}`) };
+  return { status: 'created', session_id: sessionKey(file, id) };
 }
 
 export async function savedEntries(bridge, id) {
   const session = await bridge.session(id);
   return (await fs.readFile(session.file, 'utf8')).trim().split('\n').map(JSON.parse).slice(1);
+}
+
+export async function restoreManifest({ stateDir }, { restore_token }) {
+  return JSON.parse(
+    await fs.readFile(path.join(stateDir, 'trash', restore_token + '.restore.json'), 'utf8'),
+  );
 }

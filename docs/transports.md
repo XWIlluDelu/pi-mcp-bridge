@@ -19,7 +19,7 @@ Each line is one UTF-8 JSON-RPC message; stdout contains no logs. Oversized inpu
 
 ### Multiple clients: one HTTP Bridge
 
-Start with the private owner configuration from [Start locally](../README.md#start-locally), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
+Start with the private [owner configuration](configuration.md#configure-one-project), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
 
 ```json
 {
@@ -61,7 +61,7 @@ const response = await fetch(`http://127.0.0.1:${config.http.port}/mcp`, {
   method: 'POST',
   headers: {
     'content-type': 'application/json',
-    accept: 'application/json, text/event-stream',
+    accept: 'application/json',
     'x-pi-bridge-token': token,
     'MCP-Protocol-Version': version,
     'Mcp-Method': 'server/discover',
@@ -87,9 +87,9 @@ console.log(JSON.stringify(result, null, 2));
 JS
 ```
 
-A successful response identifies the server as `pi-session-bridge` and includes its version, supported protocols and capabilities. Discovery does not start a Pi writer or require session grants; it verifies the local endpoint, not native session access. `401 UNAUTHORIZED` means the running service and caller do not share the same token.
+A successful response identifies the server as `pi-session-bridge` and includes its version, supported protocol version and capabilities. Discovery does not start a Pi writer or require session grants; it verifies the local endpoint, not native session access. `401 UNAUTHORIZED` means the running service and caller do not share the same token.
 
-The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config and token must be canonical absolute paths to regular files owned by the service user, with no group/other access; symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
+The service binds **127.0.0.1** and accepts **POST /mcp** (plus **DELETE /mcp** returning `204` for standard MCP clients). `Accept` may include `application/json`, `text/event-stream`, or `*/*`. The owner config must be owned by the service user and not writable by group/other (symlinks and `0644` are allowed). The token file must be a canonical absolute regular file owned by the service user with no group/other access (`0600`); symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
 
 The HTTP service and each stdio proxy load the token once at startup. Replacing
 the file does not revoke the token already loaded by a running service or update
@@ -98,9 +98,9 @@ an existing proxy. Changing only the file's contents also does not appear in
 and its proxies at a safe work boundary, and update the tunnel's injected token
 to match. Then repeat the discovery check above.
 
-Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend accepts only `Host: 127.0.0.1:PORT` and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
+Every request requires authentication via either `x-pi-bridge-token: TOKEN` or `Authorization: Bearer TOKEN` (if both headers are sent, they must match). Authentication occurs before body parsing. The backend requires `Host: 127.0.0.1:PORT` (the port may be omitted for port 80) and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
 
-Clients/gateways must accept `application/json` and `text/event-stream`; the backend returns ordinary JSON with `Cache-Control: no-store`. There is no MCP session ID, CORS browser access or GET/SSE endpoint. A disconnected client does not stop the shared service.
+The backend returns `application/json` with `Cache-Control: no-store`. A disconnected client does not stop the shared service.
 
 ### Multiple stdio-only clients: thin shared proxy
 
@@ -122,45 +122,26 @@ Multiple direct stdio services using the same state directory conflict on the se
 
 ## Protocol versions
 
-### MCP 2026-07-28
+Bridge automatically supports **both**:
 
-This protocol uses [per-request metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning) rather than an initialize handshake:
+- **MCP `2026-07-28` (per-request stateless)**: Each request includes protocol version and client capabilities in `params._meta`, uses `server/discover` and `events/*`, returns `resultType:"complete"`, and enforces mirrored HTTP headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`).
+- **Standard MCP (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`)**: Standard `initialize` / `notifications/initialized` handshake plus `ping`, `tools/list`, and `tools/call` on stdio, HTTP, and stdio proxy — with no mandatory `_meta` or `Mcp-Method` headers. HTTP accepts `DELETE /mcp` (`204`) and returns `202` for JSON-RPC notifications.
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "server/discover",
-  "params": {
-    "_meta": {
-      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-      "io.modelcontextprotocol/clientCapabilities": {},
-      "io.modelcontextprotocol/clientInfo": {
-        "name": "example-client",
-        "version": "1.0"
-      }
-    }
-  }
-}
-```
+Bridge uses MCP `2026-07-28` when `server/discover`, `events/*`, `params._meta['io.modelcontextprotocol/protocolVersion']`, `MCP-Protocol-Version: 2026-07-28`, or `Mcp-Method` is present. Otherwise it dispatches using the standard MCP envelope.
 
-Version and capabilities are required on every request; clientInfo is optional. `server/discover` returns supported versions and capabilities. Results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same authenticated endpoint and outbound HTTPS delivery.
+For `2026-07-28` requests, results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same endpoint.
 
-HTTP requests also require:
+For `2026-07-28` HTTP requests, Bridge also requires:
 
-| Header                 | Value                                                                         |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `MCP-Protocol-Version` | The body's protocol version                                                   |
-| `Mcp-Method`           | The body's method                                                             |
-| `Mcp-Name`             | `params.name` for tools/call and prompts/get; `params.uri` for resources/read |
+| Header                 | Value                        |
+| ---------------------- | ---------------------------- |
+| `MCP-Protocol-Version` | The body's protocol version  |
+| `Mcp-Method`           | The body's method            |
+| `Mcp-Name`             | `params.name` for tools/call |
 
-Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020 HeaderMismatch`.
+Header names are case-insensitive, values case-sensitive. `Mcp-Name` accepts the specified UTF-8 Base64 sentinel encoding. Missing, duplicate or inconsistent required headers return HTTP 400 / JSON-RPC `-32020` with message `Header mismatch`.
 
-Unsupported versions return HTTP 400 / `-32022` with `data.supported` and `data.requested`; missing metadata returns 400 / `-32602`; unknown methods return 404 / `-32601`. See the [message schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2026-07-28/schema.ts) and [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) / [HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) bindings.
-
-### MCP SDK clients
-
-The pinned SDK supports initialization-based revisions `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` over stdio, plus its Streamable HTTP bindings. SDK clients initialize first and follow SDK header negotiation. HTTP+SSE is not implemented. Both protocol paths use the same current tool schemas and dispatcher.
+Unsupported versions return HTTP 400 / `-32022` with `data.supported` and `data.requested`. After header validation, missing or malformed request metadata returns 400 / `-32602`. Unknown methods return 404 / `-32601`. See the [message schema](https://github.com/modelcontextprotocol/specification/blob/main/schema/2026-07-28/schema.ts) and [stdio](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio) / [HTTP](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http) bindings.
 
 ## Timeouts and disconnects
 
@@ -169,11 +150,11 @@ JSON-RPC IDs identify communication exchanges; reusing one does not deduplicate 
 | Budget              | Limit                          | Effect                                                              |
 | ------------------- | ------------------------------ | ------------------------------------------------------------------- |
 | HTTP headers/upload | 10 / 15 seconds                | Bounds incoming request handling.                                   |
-| HTTP response wait  | 35 seconds after parsing       | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues.   |
+| HTTP response wait  | 40 seconds after parsing       | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues.   |
 | Native/owner ACK    | Internal 5 seconds per request | Does not bound execution or abort admitted work. No tool parameter. |
-| Proxy network wait  | 40 seconds                     | Exceeds the backend response wait.                                  |
+| Proxy network wait  | 45 seconds                     | Exceeds the backend response wait.                                  |
 
-A client or tunnel may impose a shorter deadline. While the service runs, protocol cancellation, HTTP disconnect and proxy exit suppress replies without cancelling admitted calls or later admitted batch items. On modern stdio, `notifications/cancelled` suppresses that request's subsequent messages. Direct stdio EOF instead shuts down the owned service as described above. Use `stop` to cancel Pi execution and queues.
+A client or tunnel may impose a shorter deadline. While the service runs, protocol cancellation, HTTP disconnect and proxy exit suppress replies without cancelling admitted calls or later admitted batch items. On stdio, `notifications/cancelled` suppresses that request's subsequent messages. Direct stdio EOF shuts down the owned service. Use `stop` to cancel Pi execution and queues.
 
 ## Bounds and errors
 

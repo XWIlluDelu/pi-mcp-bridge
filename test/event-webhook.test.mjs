@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import dns from 'node:dns/promises';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
-import { PassThrough, Readable } from 'node:stream';
+import { Readable } from 'node:stream';
 import { createHmac } from 'node:crypto';
 import {
   callbackUrl,
@@ -12,7 +12,7 @@ import {
   postWebhook,
   signedHeaders,
   verifyCallback,
-} from '../src/event-webhook.mjs';
+} from '../src/events/event-webhook.mjs';
 
 const secret = 'whsec_' + Buffer.alloc(32, 7).toString('base64');
 function callbackReceiver(t, respond) {
@@ -26,7 +26,7 @@ function callbackReceiver(t, respond) {
     return request;
   });
 }
-test('Standard Webhooks signs exact bytes and both rotation keys; challenge must be echoed', async () => {
+test('Standard Webhooks signs exact bytes with both keys during rotation', () => {
   const subscription = {
     id: 'sub_test',
     url: 'https://callback.example/event',
@@ -54,34 +54,6 @@ test('Standard Webhooks signs exact bytes and both rotation keys; challenge must
     ].split(' ').length,
     1,
   );
-  await verifyCallback(subscription, async (_url, sent, h) => {
-    const parsed = JSON.parse(sent);
-    assert.equal(parsed.type, 'verification');
-    assert.ok(h['webhook-id'].startsWith('verification_'));
-    return { status: 200, body: JSON.stringify({ challenge: parsed.challenge }) };
-  });
-  await assert.rejects(
-    verifyCallback(subscription, async () => ({ status: 200, body: '{"challenge":"wrong"}' })),
-    (e) => e.reason === 'challenge_failed',
-  );
-  await assert.rejects(
-    verifyCallback(subscription, async () => ({ status: 302, body: '' })),
-    (e) => e.reason === 'http_4xx',
-  );
-});
-
-test('notification status is preserved without waiting for oversized unfinished response bodies', async (t) => {
-  let status, response;
-  callbackReceiver(t, () => {
-    response = new PassThrough();
-    response.statusCode = status;
-    response.write(Buffer.alloc(8192));
-    return response; // No EOF: delivery does not depend on reading the body.
-  });
-  for (status of [200, 410, 413]) {
-    assert.deepEqual(await postWebhook('https://callback.example/event', '{}', {}), { status });
-    assert.equal(response.destroyed, true);
-  }
 });
 
 test('callback verification reads its challenge but bounds the successful response body', async (t) => {

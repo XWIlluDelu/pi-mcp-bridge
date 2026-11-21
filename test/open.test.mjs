@@ -4,9 +4,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { openProfile, openSession } from '../src/open.mjs';
-import { opaqueId } from '../src/storage.mjs';
-import { PiRpc } from '../src/rpc.mjs';
+import { opaqueId } from '../src/core/storage.mjs';
+import { PiRpc } from '../src/runtime/rpc.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
+import { sdk } from './fixtures/pi.mjs';
 test('open starts a fresh native TUI with normal configuration and automatic safe join, never the target file', async (t) => {
   const dir = await fs.mkdtemp('/tmp/pi-open-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
@@ -42,7 +43,7 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   assert.equal(profile.env.SYNTHETIC_NATIVE_VALUE, 'retained');
   assert.equal(profile.env.PI_MCP_OWNER_CONFIG, file);
   assert.equal(profile.env.PI_MCP_ATTACH_DIR, path.join(dir, 'state', 'ipc'));
-  assert.equal(profile.args.at(-1), '/bridge-join ' + id);
+  assert.deepEqual(sdk.parseArgs(profile.args).messages, ['/bridge-join ' + id]);
   for (const forbidden of [
     '--session',
     '--resume',
@@ -52,10 +53,14 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
     target,
   ])
     assert.equal(profile.args.includes(forbidden), false);
-  await fs.writeFile(file, JSON.stringify({ ...config, piExecutable: explicit }));
+  const tools = ['read', 'mcp__example__*'];
+  await fs.writeFile(
+    file,
+    JSON.stringify({ ...config, piExecutable: explicit, piRuntime: { tools } }),
+  );
   const selected = await openProfile(file, id, host);
   assert.equal(selected.command, explicit);
-  assert.equal(selected.args[0], '-e');
+  assert.deepEqual(sdk.parseArgs(selected.args).tools, tools);
   await fs.writeFile(file, JSON.stringify(config), { mode: 0o600 });
   let observed;
   await openSession(file, id, {
@@ -67,30 +72,45 @@ test('open starts a fresh native TUI with normal configuration and automatic saf
   });
   assert.equal(observed[2].stdio, 'inherit');
   assert.equal(observed[2].cwd, cwd);
-  await fs.writeFile(file, JSON.stringify({ ...config, piArgs: ['--session-dir', root] }));
-  const directoryProfile = await openProfile(file, id, host);
-  assert.deepEqual(directoryProfile.args.slice(0, 2), ['--session-dir', root]);
-  assert.equal(directoryProfile.args.at(-1), '/bridge-join ' + id);
-  for (const flag of [
-    '--session',
-    '--session=unsafe',
-    '--session-id',
-    '--session-id=unsafe',
-    '--resume',
-    '--no-session',
-    '--export',
-    '--',
-    '-c',
-    '-p',
+  const piArgs = [
+    '--session-dir',
+    root,
+    '--system-prompt',
     '--continue',
-    '--fork',
-    '--mode',
-    '--print',
-    '-r',
-    '@unsafe',
+    '--append-system-prompt',
+    '@literal',
+    '--fixture-value=--session',
+    '--fixture-switch',
+  ];
+  await fs.writeFile(file, JSON.stringify({ ...config, piArgs }));
+  const parsed = sdk.parseArgs((await openProfile(file, id, host)).args);
+  assert.equal(parsed.sessionDir, root);
+  assert.equal(parsed.systemPrompt, '--continue');
+  assert.deepEqual(parsed.appendSystemPrompt, ['@literal']);
+  assert.equal(parsed.unknownFlags.get('fixture-value'), '--session');
+  assert.equal(parsed.unknownFlags.get('fixture-switch'), true);
+  assert.deepEqual(parsed.messages, ['/bridge-join ' + id]);
+
+  for (const flags of [
+    ['--session', target],
+    ['--session-id', 'native'],
+    ['--fork', target],
+    ['--resume'],
+    ['-r'],
+    ['-c'],
+    ['--no-session'],
+    ['--export', target],
+    ['--mode', 'json'],
+    ['-p'],
+    ['--print'],
+    ['--fixture-switch', '--continue'],
+    ['--', '@unsafe'],
   ]) {
-    await fs.writeFile(file, JSON.stringify({ ...config, piArgs: [flag] }));
+    await fs.writeFile(file, JSON.stringify({ ...config, piArgs: [...piArgs, ...flags] }));
     await assert.rejects(openProfile(file, id, host), /UNSAFE_OPEN_PI_ARGS/);
-    await assert.rejects(new PiRpc({ piArgs: [flag] }, {}).start(), /UNSAFE_PI_ARGS/);
+    await assert.rejects(
+      new PiRpc({ piExecutable: nativePiCli, piArgs: [...piArgs, ...flags] }, {}).start(),
+      /UNSAFE_PI_ARGS/,
+    );
   }
 });

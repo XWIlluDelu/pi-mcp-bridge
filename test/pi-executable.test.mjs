@@ -4,7 +4,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolvePiInstallation, loadPiSdk, loadPiAi } from '../src/pi-installation.mjs';
+import {
+  resolvePiInstallation,
+  piLaunchEnvironment,
+  loadPiSdk,
+  loadPiAi,
+} from '../src/runtime/pi-installation.mjs';
 import { installation, sdk } from './fixtures/pi.mjs';
 
 async function fixture(t) {
@@ -64,56 +69,101 @@ test('PATH and explicit selection resolve CLI and SDK from the same installation
   );
 });
 
-test('PATH skips absent, directory and non-executable entries, not an unusable selected installation', async (t) => {
+async function managedFixture(t) {
   const f = await fixture(t),
-    a = await f.install('native'),
-    bin = await f.link('bin', a.command);
-  await fs.mkdir(path.join(f.dir, 'directory/pi'), { recursive: true });
-  await fs.mkdir(path.join(f.dir, 'denied'));
-  await fs.writeFile(path.join(f.dir, 'denied/pi'), 'not executable', { mode: 0o600 });
-  assert.equal(
-    (
-      await resolvePiInstallation(
-        {},
-        {
-          PATH: ['absent', 'directory', 'denied', 'bin']
-            .map((p) => path.join(f.dir, p))
-            .join(path.delimiter),
-        },
-      )
-    ).command,
-    path.join(bin, 'pi'),
-  );
-  await fs.unlink(path.join(a.root, 'dist/index.js'));
-  await assert.rejects(resolvePiInstallation({}, { PATH: bin }), /PI_INSTALLATION_UNAVAILABLE/);
+    agent = path.join(f.dir, 'managed agent'),
+    managedRoot = path.join(agent, 'install'),
+    launcher = path.join(agent, 'bin/pi');
+  await fs.mkdir(path.dirname(launcher), { recursive: true });
+  // Resolution must select the release, never execute this switching launcher.
+  await fs.writeFile(launcher, '#!/bin/sh\nexit 91\n', { mode: 0o700 });
+  const bin = await f.link('public-bin', launcher),
+    releases = new Map();
+  for (const version of ['1.5.0', '1.6.0']) {
+    const relative = `managed agent/install/releases/${version}/node_modules`,
+      installed = await f.install(`${relative}/@earendil-works/pi-coding-agent`, version);
+    await f.link(`${relative}/.bin`, installed.command);
+    await fs.writeFile(
+      installed.command,
+      `#!/usr/bin/env node\nconsole.log(JSON.stringify({version:${JSON.stringify(version)},root:process.env.PI_MANAGED_INSTALL_ROOT,path:process.env.PATH}));\n`,
+    );
+    releases.set(version, installed);
+  }
+  const marker = {
+    kind: 'pi-managed-install',
+    schemaVersion: 1,
+    layout: 'releases-v1',
+    entrypoint: { type: 'symlink', path: path.join(bin, 'pi') },
+  };
+  await fs.writeFile(path.join(managedRoot, 'managed-install.json'), JSON.stringify(marker));
+  const select = (version) =>
+    fs.writeFile(path.join(managedRoot, 'current-version'), version + '\n');
+  await select('1.5.0');
+  return { ...f, managedRoot, launcher, bin, marker, releases, select };
+}
+
+test('managed PATH and explicit launchers pin one release and preserve native launch environment', async (t) => {
+  const f = await managedFixture(t),
+    env = {
+      PATH: f.bin + path.delimiter + '/usr/bin:/bin',
+      HOME: path.join(f.dir, 'home'),
+      XDG_DATA_HOME: path.join(f.dir, 'data'),
+      PI_MANAGED_INSTALL_ROOT: '/another-installation',
+    },
+    selected = await resolvePiInstallation({}, env);
+  assert.equal(selected.packageRoot, f.releases.get('1.5.0').root);
+  assert.equal((await loadPiSdk(selected)).version, '1.5.0');
+  assert.deepEqual(await resolvePiInstallation({ piExecutable: f.launcher }, env), selected);
+  const withoutManagedNode = await piLaunchEnvironment(selected, env);
+  assert.equal(withoutManagedNode.PATH, env.PATH);
+  assert.equal(withoutManagedNode.PI_MANAGED_INSTALL_ROOT, f.managedRoot);
+
+  const nodeBin = path.join(env.XDG_DATA_HOME, 'pi-node/current/bin');
+  await fs.mkdir(nodeBin, { recursive: true });
+  await fs.symlink(process.execPath, path.join(nodeBin, 'node'));
+  const launchEnv = await piLaunchEnvironment(selected, env);
+  assert.equal(env.PI_MANAGED_INSTALL_ROOT, '/another-installation');
+  assert.equal(launchEnv.PATH, nodeBin + path.delimiter + env.PATH);
+  await f.select('1.6.0');
+  const { stdout } = await promisify(execFile)(selected.command, [], { env: launchEnv });
+  assert.deepEqual(JSON.parse(stdout), {
+    version: '1.5.0',
+    root: f.managedRoot,
+    path: launchEnv.PATH,
+  });
+  assert.equal((await loadPiSdk(selected)).version, '1.5.0');
+  assert.equal((await resolvePiInstallation({}, env)).version, '1.6.0');
 });
 
-test('explicit selection fails accurately without using PATH or installing a fallback', async (t) => {
-  const f = await fixture(t),
-    native = await f.install('native'),
-    bin = await f.link('bin', native.command);
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: path.join(f.dir, 'missing') }, { PATH: bin }),
-    /PI_EXECUTABLE_NOT_FOUND/,
-  );
-  await fs.chmod(native.command, 0o600);
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: native.command }, { PATH: bin }),
-    /PI_EXECUTABLE_NOT_EXECUTABLE/,
-  );
-  await assert.rejects(
-    resolvePiInstallation({ piExecutable: f.dir }),
-    /PI_EXECUTABLE_NOT_EXECUTABLE/,
-  );
-  for (const piExecutable of ['relative', null, '/bad/\0pi'])
-    await assert.rejects(resolvePiInstallation({ piExecutable }), /INVALID_PI_EXECUTABLE/);
-  await assert.rejects(resolvePiInstallation({}, { PATH: f.dir }), /PI_EXECUTABLE_NOT_FOUND/);
+test('invalid managed releases and arbitrary wrappers fail without selecting another installation', async (t) => {
+  const f = await managedFixture(t),
+    fallback = await f.link('fallback', f.releases.get('1.6.0').command),
+    env = { PATH: f.bin + path.delimiter + fallback },
+    markerFile = path.join(f.managedRoot, 'managed-install.json');
+  for (const version of ['../1.6.0', '9.9.9']) {
+    await f.select(version);
+    await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
+  }
+  await f.select('1.5.0');
+  const manifest = path.join(f.releases.get('1.5.0').root, 'package.json'),
+    value = JSON.parse(await fs.readFile(manifest, 'utf8'));
+  await fs.writeFile(manifest, JSON.stringify({ ...value, version: '1.6.0' }));
+  await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
+  await fs.writeFile(manifest, JSON.stringify(value));
+  await fs.writeFile(markerFile, JSON.stringify({ ...f.marker, layout: 'unknown' }));
+  await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
+  await fs.unlink(markerFile);
+  await assert.rejects(resolvePiInstallation({}, env), /PI_INSTALLATION_UNAVAILABLE/);
 });
 
 test('external CLI, SDK and thinking helpers use the selected installation', async () => {
   assert.equal(await loadPiSdk(installation), sdk);
   assert.equal(
-    (await promisify(execFile)(installation.command, ['--version'])).stdout.trim(),
+    (
+      await promisify(execFile)(installation.command, ['--version'], {
+        env: await piLaunchEnvironment(installation, process.env),
+      })
+    ).stdout.trim(),
     installation.version,
   );
   const ai = await loadPiAi(installation);

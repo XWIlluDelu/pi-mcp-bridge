@@ -1,0 +1,475 @@
+import { OwnerFailure } from '../core/errors.mjs';
+// Load once through native Pi settings for ordinary TUI/RPC startup.
+import fs from 'node:fs/promises';
+import { reloadAdmission } from './reload-admission.mjs';
+import { parseCompactInput, compactContext, compactMetadata } from '../ops/compact.mjs';
+import { modelState } from '../ops/models.mjs';
+import { createModelSetter } from '../ops/set-model.mjs';
+import { requestStop, stopReceipt, withdrawalCollector } from '../ops/stop-execution.mjs';
+import path from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import {
+  assertSingleSessionFile,
+  readSessionIdentity,
+  sameSessionIdentity,
+} from '../core/data.mjs';
+import { ifMissing, atomicJson } from '../core/storage.mjs';
+import { attachedPromptInput, promptOptions, remotePromptRejection } from '../ops/prompt-input.mjs';
+import {
+  ownerServer,
+  ownerIdentity,
+  ownerProtocol,
+  nativeSnapshot,
+  nativeOwnerRead,
+  nativeOwnerObservers,
+  observeNativeOwner,
+  dispatchPromptWithoutAck,
+} from './attachment-protocol.mjs';
+import joinExtension from './join-extension.mjs';
+import {
+  companionProfile,
+  currentCompanionScope,
+  companionIncludes,
+} from './companion-profile.mjs';
+import { ownerSocket } from '../owner-runtime.mjs';
+import {
+  processIdentity,
+  sameOwner,
+  ownerAlive,
+  registryTransaction,
+  readClaim,
+  claimFile,
+  newOwnerRecord,
+  retireClaim,
+  updateOwner,
+  assertNoOtherLiveOwner,
+} from './attachments.mjs';
+
+// A completed native shutdown authorizes only its paired successor. Keep this
+// short-lived evidence across factory reloads, not a process-wide writer waiver.
+const replacements = (globalThis[Symbol.for('pi-mcp-bridge.companion-replacements')] ??= new Map());
+const replacementKey = (dir, file) => `${dir}\0${file}`;
+
+export default async function attachExtension(pi, { AgentSession, buildSessionProjection } = {}) {
+  const profile = await companionProfile();
+  if (!profile) return;
+  if (typeof buildSessionProjection !== 'function' || typeof AgentSession !== 'function')
+    throw new Error('INVALID_HOST_PROJECTION');
+  const { dir, file } = profile;
+  const admission = reloadAdmission(AgentSession);
+  let active;
+  pi.registerCommand('bridge-reload', {
+    description: 'Internal Bridge reload dispatch; use /reload for local reloads',
+    handler: async (token, ctx) => {
+      const operation = active?.reload;
+      if (!operation || token !== operation.token || active.manager !== ctx.sessionManager) return;
+      await operation.run(() => ctx.reload());
+    },
+  });
+  joinExtension(pi, { dir, file });
+  pi.on('session_before_switch', async (event, ctx) => {
+    if (
+      !['tui', 'rpc'].includes(ctx.mode) ||
+      event.reason !== 'resume' ||
+      typeof event.targetSessionFile !== 'string'
+    )
+      return;
+    let targetFile = event.targetSessionFile;
+    if (targetFile.startsWith('file://')) targetFile = fileURLToPath(targetFile);
+    else if (targetFile === '~' || targetFile.startsWith('~/'))
+      targetFile = path.join(homedir(), targetFile.slice(1));
+    targetFile = path.resolve(targetFile);
+    try {
+      if (companionIncludes(await currentCompanionScope(profile), targetFile)) {
+        await assertSingleSessionFile(targetFile, { allowMissing: true });
+      } else {
+        // Scope removal does not end an existing writer. Check only the existing
+        // registry and target path metadata; do not register or read its history.
+        if (!(await fs.stat(dir).catch(ifMissing))) return;
+        targetFile = (await fs.realpath(targetFile).catch(ifMissing)) ?? targetFile;
+      }
+      // Refuse an already-owned target before SessionManager.open can switch us.
+      // This is a read-only admission check, not an atomic open reservation.
+      await registryTransaction(dir, () =>
+        assertNoOtherLiveOwner(
+          dir,
+          { file: targetFile },
+          {
+            replacing:
+              active?.observation && active.manager === ctx.sessionManager ? active : undefined,
+            completeHandoff: true,
+          },
+        ),
+      );
+    } catch {
+      try {
+        ctx.ui.notify(
+          'Session switch cancelled: target ownership could not be cleared. Use /bridge-join or host coordination.',
+          'warning',
+        );
+      } catch {}
+      return { cancel: true }; // Pi reports hook errors without cancelling.
+    }
+  });
+  function replacementFor(event, manager) {
+    const file = manager.getSessionFile();
+    const previous = event.reason === 'reload' ? file : event.previousSessionFile;
+    const replacement = replacements.get(replacementKey(dir, previous));
+    if (
+      replacement &&
+      replacement.reason === event.reason &&
+      (event.reason !== 'reload' || replacement.manager === manager) &&
+      (!replacement.target || replacement.target === file)
+    )
+      return replacement;
+  }
+  function consumeReplacement(replacement) {
+    if (
+      replacement &&
+      replacements.get(replacementKey(dir, replacement.session.file)) === replacement
+    )
+      replacements.delete(replacementKey(dir, replacement.session.file));
+  }
+  // Called under the registry mutex. Retire only the native context that
+  // actually shut down, never other managers which happen to share its PID.
+  async function retirePreviousClaim(replacement, currentSession) {
+    if (
+      !replacement ||
+      (replacement.session.file === currentSession?.file &&
+        replacement.session.header.id === currentSession.header.id)
+    )
+      return;
+    const other = await readClaim(dir, replacement.session);
+    const owner = replacement.record.owner;
+    if (other && !['rpc', 'host', 'handoff'].includes(other.kind) && sameOwner(other.owner, owner))
+      await retireClaim(dir, replacement.session, other);
+  }
+  async function validateStorage(runtime) {
+    try {
+      if (
+        !runtime.fileObserved &&
+        !(await assertSingleSessionFile(runtime.session.file, { allowMissing: true })) &&
+        !runtime.ctx.sessionManager
+          .getEntries()
+          .some((e) => e.type === 'message' && ['user', 'assistant'].includes(e.message?.role))
+      ) {
+        if (runtime.session.header.version !== 3)
+          throw new OwnerFailure('ATTACH_REQUIRES_SAVED_SESSION');
+        return;
+      }
+      if (!sameSessionIdentity(await readSessionIdentity(runtime.session.file), runtime.session))
+        throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
+      runtime.fileObserved = true;
+    } catch (error) {
+      if (active === runtime) {
+        runtime.ready = false;
+        if (runtime.ctx.mode === 'tui')
+          try {
+            runtime.ctx.shutdown();
+          } catch {}
+      }
+      throw error; // Retain the claim until exact process death/replacement.
+    }
+  }
+  observeNativeOwner(
+    pi,
+    (ctx) => {
+      if (active?.observation && (!ctx || (active.ready && active.manager === ctx.sessionManager)))
+        return active;
+    },
+    validateStorage,
+  );
+  for (const event of ['session_info_changed', 'session_compact'])
+    pi.on(event, async () => {
+      if (active?.ready) await validateStorage(active);
+    });
+  pi.on('session_shutdown', async (event) => {
+    const current = active;
+    active = undefined;
+    if (!current) return;
+    const { session, record, manager } = current;
+    current.ready = false; // Fence captured callbacks before the first await.
+    current.observation?.reset();
+    try {
+      await updateOwner(dir, session, record, { phase: 'transitioning' });
+    } finally {
+      if (current.server) {
+        await current.server.close();
+        // IPC disconnect does not end admitted native work.
+        await Promise.allSettled(current.mutations.keys());
+      }
+      if (['reload', 'new', 'resume', 'fork'].includes(event.reason))
+        replacements.set(replacementKey(dir, session.file), {
+          session,
+          record,
+          manager,
+          reason: event.reason,
+          target: event.targetSessionFile,
+        });
+    }
+  });
+  pi.on('session_start', async (event, ctx) => {
+    if (!['tui', 'rpc'].includes(ctx.mode)) return;
+    try {
+      const manager = ctx.sessionManager;
+      const file = manager.getSessionFile();
+      // Check only path metadata before inspecting entries or publishing IPC.
+      // No-session runs and sessions outside the owner's roots remain ordinary Pi.
+      if (!companionIncludes(await currentCompanionScope(profile), file)) {
+        if (replacementFor(event, manager))
+          await registryTransaction(dir, async () => {
+            const replacement = replacementFor(event, manager);
+            if (replacement?.session.file === file) {
+              // Scope removal disables control, not the still-live native writer.
+              // Carry only its ownership forward without inspecting excluded data.
+              active = { session: replacement.session, record: replacement.record, manager };
+            } else await retirePreviousClaim(replacement);
+            consumeReplacement(replacement);
+          });
+        return;
+      }
+      const header = ctx.sessionManager.getHeader();
+      if (!file || !header || !path.isAbsolute(file))
+        throw new OwnerFailure('ATTACH_REQUIRES_SAVED_SESSION');
+      const session = { file, header },
+        owner = await processIdentity();
+      const record = {
+        ...newOwnerRecord(dir, session, ctx.mode === 'tui' ? 'tui' : 'extension', owner),
+        mode: ctx.mode,
+        ...(profile.ownerControl ? { completionSocket: ownerSocket(profile.ownerControl) } : {}),
+      };
+      const runtime = {
+        session,
+        record,
+        ctx,
+        manager,
+        mutations: new Map(),
+        ...nativeOwnerObservers(
+          'extension_message_events',
+          record.generation,
+          profile.ownerControl,
+        ),
+      };
+      await registryTransaction(dir, async () => {
+        await validateStorage(runtime);
+        const replacement = replacementFor(event, manager);
+        // The same path cannot be reserved under another live native identity,
+        // whether first persistence has happened yet or not.
+        const old = await assertNoOtherLiveOwner(dir, session, {
+          replacing: replacement,
+          completeHandoff: true,
+        });
+        const sameProcess = sameOwner(old?.owner, owner);
+        // Rebinding UI/actions emits session_start again in the same native
+        // extension runtime. Keep its existing endpoint instead of replacing it.
+        if (
+          active?.ready &&
+          active.manager === manager &&
+          old?.generation === active.record.generation
+        )
+          return;
+        // An installed companion must not replace this writer's existing RPC/host
+        // controller. Its endpoint and lifecycle remain with that controller.
+        if (sameProcess && ['rpc', 'host'].includes(old.kind)) {
+          await retirePreviousClaim(replacement, session);
+          consumeReplacement(replacement);
+          return;
+        }
+        const opening = sameProcess && old.kind === 'handoff' && old.phase === 'opening';
+        if (
+          old &&
+          (await ownerAlive(old.owner)) &&
+          !(sameProcess && (opening || replacement?.session.file === file))
+        )
+          throw new OwnerFailure('LIVE_OWNER_UNREACHABLE');
+        if (old?.noColdReacquire && !opening) record.noColdReacquire = true;
+        await retirePreviousClaim(replacement, session);
+        await atomicJson(claimFile(dir, session), record);
+        active = runtime;
+        consumeReplacement(replacement);
+      });
+      if (active !== runtime) return;
+      // Publish blocking ownership before socket setup or any later fallible initialization.
+      const activity = () => ({
+        idle: ctx.isIdle() && runtime.mutations.size === 0 && admission.idle(manager),
+        pending_messages: ctx.hasPendingMessages(),
+      });
+      const compacting = () => runtime.mutations.values().some((kind) => kind === 'compact');
+      async function trackMutation(operation, kind) {
+        runtime.mutations.set(operation, kind);
+        try {
+          return await operation;
+        } finally {
+          runtime.mutations.delete(operation);
+        }
+      }
+      function check() {
+        if (
+          active !== runtime ||
+          !runtime.ready ||
+          ctx.sessionManager.getSessionFile() !== file ||
+          ctx.sessionManager.getSessionId() !== header.id
+        )
+          throw new OwnerFailure('RUNTIME_SESSION_CHANGED');
+      }
+      const setModel = createModelSetter({
+        state: () => {
+          check();
+          return {
+            ...ownerIdentity(record),
+            model: ctx.model,
+            thinkingLevel: pi.getThinkingLevel(),
+          };
+        },
+        models: () => ctx.modelRegistry.getAvailable(),
+        setModel: (model) => pi.setModel(model),
+        setThinkingLevel: (level) => pi.setThinkingLevel(level),
+      });
+      const server = ownerServer(
+        () => record,
+        async (request, socket, reply) => {
+          check();
+          await validateStorage(runtime);
+          check();
+          let data;
+          const args = request.body ?? {};
+          if (
+            admission.reloading(manager) &&
+            !['state', 'read', 'read_features', 'snapshot'].includes(request.op)
+          )
+            throw new OwnerFailure('RELOAD_IN_PROGRESS');
+          if (request.op === 'state')
+            data = {
+              ...ownerIdentity(record),
+              sessionName: ctx.sessionManager.getSessionName() ?? null,
+              ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
+              contextUsage: ctx.getContextUsage?.() ?? null,
+              isStreaming: !ctx.isIdle(),
+              generation: record.generation,
+              activity: activity(),
+              reloadComplete: admission.completed(manager),
+              capabilities: { send: true, command: false, stop: true },
+            };
+          else if (request.op === 'read_features' || request.op === 'read')
+            data = nativeOwnerRead(pi, record, request, ctx, runtime, buildSessionProjection);
+          else if (request.op === 'snapshot')
+            data = { ...ownerIdentity(record), ...nativeSnapshot(manager) };
+          else if (request.op === 'set_name') {
+            if (typeof args.name !== 'string' || !args.name.trim() || args.name.length > 200)
+              throw new OwnerFailure('INVALID_ARGUMENTS');
+            pi.setSessionName(args.name);
+            check();
+            data = { name: ctx.sessionManager.getSessionName() ?? args.name };
+          } else if (request.op === 'reload') {
+            if (Object.keys(args).length) throw new OwnerFailure('INVALID_ARGUMENTS');
+            const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
+            runtime.reload = operation;
+            // Native reload closes this socket and drains ordinary mutations.
+            // Flush admission first; never add reload itself to that drain set.
+            reply({ data: { reloading: true } }, () => {
+              try {
+                check();
+                pi.sendUserMessage(operation.command, { expandPromptTemplates: true });
+              } catch {
+                operation.cancel();
+              }
+            });
+            return;
+          } else if (request.op === 'set_model') {
+            data = await trackMutation(
+              setModel({
+                model: args.model,
+                thinking_level: args.thinking_level,
+                ...ownerIdentity(record),
+                beforeDispatch: check,
+              }),
+            );
+            check();
+          } else if (request.op === 'compact') {
+            const input = parseCompactInput(args);
+            if (compacting()) throw new OwnerFailure('COMPACTION_PENDING');
+            const compact = () => {
+              check();
+              socket.setTimeout(0); // Disconnect only suppresses the receipt.
+              return trackMutation(compactContext(ctx, input.instructions), 'compact');
+            };
+            const value = input.interrupt
+              ? await compact()
+              : await admission.compact(manager, ctx, compact, runtime.mutations.size > 0);
+            check();
+            data = compactMetadata(value);
+          } else if (request.op === 'send') {
+            if (compacting()) throw new OwnerFailure('COMPACTION_PENDING');
+            if (setModel.pending) throw new OwnerFailure('MODEL_SELECTION_PENDING');
+            const input = attachedPromptInput(args);
+            const rejection = remotePromptRejection(input.text),
+              currentActivity = activity();
+            if (rejection) data = rejection;
+            else if (
+              input.mode === 'idle_only' &&
+              (!currentActivity.idle || currentActivity.pending_messages)
+            )
+              data = { status: 'skipped', reason: 'busy' };
+            else
+              data = dispatchPromptWithoutAck(() =>
+                pi.sendUserMessage(
+                  input.images ? [{ type: 'text', text: input.text }, ...input.images] : input.text,
+                  {
+                    expandPromptTemplates: true,
+                    deliverAs: promptOptions(input.mode).streamingBehavior,
+                  },
+                ),
+              );
+          } else if (request.op === 'bash') {
+            throw new OwnerFailure('BASH_UNSUPPORTED');
+          } else if (request.op === 'stop') {
+            const withdrawn = withdrawalCollector(args.max_chars);
+            const liveSession = admission.session(manager);
+            if (liveSession) {
+              const receipt = await trackMutation(
+                requestStop(liveSession, (value) => withdrawn.add(value), check),
+                'stop',
+              );
+              check();
+              data = { ...receipt, withdrawal: withdrawn.value };
+            } else {
+              ctx.abort();
+              check();
+              const draft = ctx.ui?.getEditorText?.() ?? '';
+              withdrawn.add({ text: draft, includesEditorDraft: Boolean(draft) });
+              data = {
+                ...stopReceipt({
+                  status: 'accepted',
+                  acknowledgement: 'requested',
+                  coverage: 'agent',
+                }),
+                withdrawal: withdrawn.value,
+              };
+            }
+          } else throw new OwnerFailure('INVALID_ATTACHED_OPERATION');
+          return data;
+        },
+      );
+      runtime.server = server;
+      await server.listen(record.socket);
+      runtime.ready = true;
+      await updateOwner(dir, session, record, {
+        phase: 'ready',
+        imagesSupported: true,
+        ...ownerProtocol,
+        reloadSupported: true,
+      });
+    } catch (error) {
+      // Pi catches hook errors. A TUI can request graceful exit; an externally
+      // owned RPC host must remain under its owner's lifecycle control.
+      // A published starting claim is retained until its exact process exits.
+      try {
+        if (ctx.mode === 'tui') ctx.shutdown();
+      } catch {
+        /* Context may already be invalidated by another lifecycle. */
+      }
+      throw error;
+    }
+  });
+}

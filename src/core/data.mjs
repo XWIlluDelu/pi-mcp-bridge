@@ -1,0 +1,233 @@
+import fs from 'node:fs/promises';
+import { nativeSdk } from '../runtime/pi-installation.mjs';
+import path from 'node:path';
+import {
+  ifMissing,
+  sessionKey,
+  assertNativeDirectory,
+  NATIVE_TRASH_DIR,
+  withReadInode,
+} from './storage.mjs';
+import { scanSavedLines } from './lf-lines.mjs';
+// Cooperative storage boundary: reject aliases instead of changing public IDs.
+// Checks do not exclude concurrent filesystem edits by the same Unix owner.
+function sessionDirectory(file) {
+  if (typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file)
+    throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  return assertNativeDirectory(path.dirname(file));
+}
+function checkSessionStat(stat, protectedPath) {
+  if (!stat.isFile() || stat.nlink !== 1) throw new Error('SESSION_FILE_ALIAS_NOT_ALLOWED');
+  if (stat.uid !== process.getuid() || (!protectedPath && stat.mode & 0o022))
+    throw new Error('UNSAFE_NATIVE_SESSION_STORAGE');
+}
+export async function assertSingleSessionFile(file, { allowMissing = false } = {}) {
+  const protectedPath = await sessionDirectory(file);
+  const stat = await fs.lstat(file).catch(allowMissing ? ifMissing : undefined);
+  if (!stat) return null;
+  checkSessionStat(stat, protectedPath);
+  return stat;
+}
+
+export async function withSessionFile(file, read, protectedPath) {
+  protectedPath ??= await sessionDirectory(file);
+  return withReadInode(
+    file,
+    (fd, stat) => {
+      checkSessionStat(stat, protectedPath);
+      return read(fd, stat);
+    },
+    'SESSION_FILE_ALIAS_NOT_ALLOWED',
+  );
+}
+function validateHeader(header) {
+  if (
+    header?.type !== 'session' ||
+    typeof header.id !== 'string' ||
+    !header.id ||
+    header.id.length > 128 ||
+    (header.cwd !== undefined &&
+      header.cwd !== '' &&
+      (typeof header.cwd !== 'string' || !path.isAbsolute(header.cwd) || header.cwd.includes('\0')))
+  )
+    throw new Error('INVALID_SESSION');
+  return header;
+}
+// Identity discovery never parses transcript bodies. Bound the control header,
+// independently of history size; keep an unavailable cwd separate from identity.
+// A saved session keeps its identity while its canonical file, native ID and
+// recorded cwd are unchanged; any change invalidates operations bound to it.
+export function sameSessionIdentity(a, b) {
+  return a.file === b.file && a.header.id === b.header.id && a.header.cwd === b.header.cwd;
+}
+// An owner reply names the native session it actually served.
+export const servesSession = (reply, session) =>
+  reply?.sessionFile === session.file && reply?.sessionId === session.header.id;
+export function fileRevision(stat) {
+  return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
+}
+export function readSessionIdentity(file, protectedPath) {
+  return withSessionFile(
+    file,
+    async (fd, stat) => {
+      const bytes = Buffer.allocUnsafe(65537);
+      let length = 0;
+      while (length < bytes.length) {
+        // Most headers fit in one small read; extend only while looking for LF.
+        const { bytesRead } = await fd.read(
+          bytes,
+          length,
+          Math.min(4096, bytes.length - length),
+          null,
+        );
+        if (!bytesRead) break;
+        const newline = bytes.subarray(length, length + bytesRead).indexOf(10);
+        length += newline < 0 ? bytesRead : newline;
+        if (newline >= 0) break;
+      }
+      if (length === bytes.length) throw new Error('INVALID_SESSION_HEADER');
+      let header;
+      try {
+        header = validateHeader(JSON.parse(bytes.toString('utf8', 0, length)));
+      } catch {
+        throw new Error('INVALID_SESSION_HEADER');
+      }
+      // Authorize against the recorded project, even after it goes offline.
+      const cwd = header.cwd ? path.resolve(header.cwd) : null;
+      return {
+        header,
+        file,
+        id: sessionKey(file, header.id),
+        cwd,
+        mtimeMs: stat.mtime.getTime(),
+        fileRevision: fileRevision(stat),
+      };
+    },
+    protectedPath,
+  );
+}
+export async function validateExecutionCwd(cwd) {
+  try {
+    if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw new Error();
+    const resolved = await fs.realpath(cwd);
+    if (!(await fs.stat(resolved)).isDirectory()) throw new Error();
+    return resolved;
+  } catch {
+    throw new Error('EXECUTION_CWD_UNAVAILABLE');
+  }
+}
+export async function loadSession(file, { omitImageData = false, config, sdk } = {}) {
+  const { parseSessionEntries, migrateSessionEntries, CURRENT_SESSION_VERSION } =
+    sdk ?? (await nativeSdk(config));
+  const entries = [];
+  let skipped = 0;
+  const parse = (line) => {
+    if (!line.trim()) return;
+    const parsed = parseSessionEntries(line);
+    if (!parsed.length) skipped++;
+    for (const entry of parsed) {
+      if (omitImageData) {
+        // Projection drops native image bytes. Raw fork snapshots retain them.
+        const content =
+          entry.type === 'message'
+            ? entry.message?.content
+            : entry.type === 'custom_message'
+              ? entry.content
+              : null;
+        for (const block of Array.isArray(content) ? content : [])
+          if (block?.type === 'image') delete block.data;
+      }
+      entries.push(entry);
+    }
+  };
+  const unterminated = await withSessionFile(file, async (fd, opened) => {
+    // Native pure parsing skips malformed records; never call a loader which
+    // repairs a missing LF or opens/migrates the user's file for writing.
+    const tail = await scanSavedLines(fd.createReadStream({ autoClose: false }), parse);
+    const current = await assertSingleSessionFile(file);
+    if (current.ino !== opened.ino || current.dev !== opened.dev)
+      throw new Error('RUNTIME_SESSION_CHANGED');
+    return tail;
+  });
+  validateHeader(entries[0]);
+  migrateSessionEntries(entries);
+  const header = entries.shift();
+  if (header.version !== CURRENT_SESSION_VERSION) throw new Error('UNSUPPORTED_SESSION_VERSION');
+  const byId = new Map();
+  for (const entry of entries) {
+    if (
+      !entry ||
+      typeof entry.id !== 'string' ||
+      entry.id.length > 128 ||
+      byId.has(entry.id) ||
+      (entry.parentId != null && typeof entry.parentId !== 'string')
+    )
+      throw new Error('INVALID_SESSION_TREE');
+    if (entry.type === 'message' && (!entry.message || typeof entry.message.role !== 'string'))
+      throw new Error('INVALID_SESSION');
+    byId.set(entry.id, entry);
+  }
+  return {
+    header,
+    entries,
+    byId,
+    leafId: entries.at(-1)?.id ?? null,
+    file,
+    ...(skipped || unterminated
+      ? {
+          history: { skipped_malformed_lines: skipped, unterminated_tail: unterminated },
+        }
+      : {}),
+  };
+}
+// Native projection follows parent links. Validate the selected chain and keep
+// the distance to each ancestor for branch relations and retained observations.
+export function traceSessionBranch(entries, leafId, byId) {
+  if (!byId) {
+    byId = new Map();
+    for (const entry of entries) byId.set(entry.id, entry);
+  }
+  const ancestry = new Map();
+  let end = leafId,
+    entry;
+  while ((entry = byId.get(end))) {
+    if (ancestry.has(entry.id)) throw new Error('INVALID_SESSION_TREE');
+    ancestry.set(entry.id, ancestry.size);
+    end = entry.parentId;
+  }
+  return { byId, ancestry, end };
+}
+export async function loadSavedSession(session, options) {
+  const data = await loadSession(session.file, options);
+  if (!sameSessionIdentity(data, session)) throw new Error('RUNTIME_SESSION_CHANGED');
+  return { ...session, ...data };
+}
+export async function discover(config) {
+  const found = [];
+  async function walk(dir, nested = false) {
+    let protectedPath;
+    try {
+      protectedPath = await assertNativeDirectory(dir);
+    } catch (error) {
+      if (error.code === 'ENOENT' || (nested && error.message === 'UNSAFE_NATIVE_SESSION_STORAGE'))
+        return;
+      throw error;
+    }
+    // This traversal uses one validated parent for sibling files. Validate each
+    // opened inode, and revalidate the directory on the next operation.
+    for (const ent of await fs.readdir(dir, { withFileTypes: true })) {
+      if (ent.name === NATIVE_TRASH_DIR) continue;
+      const file = path.join(dir, ent.name);
+      if (ent.isDirectory()) await walk(file, true);
+      else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
+        try {
+          found.push(await readSessionIdentity(file, protectedPath));
+        } catch {
+          /* Invalid or partially written files are not exposed. */
+        }
+      }
+    }
+  }
+  for (const root of config.sessionRoots) await walk(root);
+  return found.sort((a, b) => a.id.localeCompare(b.id));
+}

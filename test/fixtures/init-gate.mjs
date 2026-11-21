@@ -1,6 +1,6 @@
 import net from 'node:net';
 import fs from 'node:fs/promises';
-import { opaqueId } from '../../src/storage.mjs';
+import { opaqueId } from '../../src/core/storage.mjs';
 import { ownerSocket } from '../../src/owner-runtime.mjs';
 
 // Hold an actual initialization boundary, not an obsolete lockfile operation.

@@ -1,17 +1,7 @@
 # Model discovery and native controls
 
-Use `models` to discover configured choices, `list` to inspect a live session's
-current selection, and `set_model` to change that selection without sending work.
-Settings on `send` or `create` instead apply immediately before that call's input
-and have stricter idle and validation requirements. [Runtime capabilities](runtime.md#runtime-capabilities)
-describe which owner types support each operation.
-
-| Operation                | Purpose                                        | Owner support                                                | Permission                             |
-| ------------------------ | ---------------------------------------------- | ------------------------------------------------------------ | -------------------------------------- |
-| `models`                 | Native configured catalog                      | No session owner needed                                      | Effective execution authorization      |
-| `set_model`              | Change current selection, including while busy | Owned RPC, companion or supported host                       | `send`                                 |
-| `send`/`create` settings | Apply settings before input                    | Proven-idle Bridge-owned RPC                                 | `send` / `create`                      |
-| `compact`                | Native context compaction                      | Owned RPC, companion/SDK idle gate; other hosts as supported | `send`; interrupt also requires `stop` |
+Use `models` to discover choices, `list_sessions` for the live selection, and `update_session`
+to change model, thinking level, or display name without submitting input. See [owner capabilities](runtime.md#runtime-capabilities).
 
 ## Session-independent model catalog
 
@@ -19,32 +9,32 @@ describe which owner types support each operation.
 { "offset": 0, "limit": 30 }
 ```
 
-Authorization requires effective `send`, `command` or `create` on a configured project, or `send`/`command` on an existing in-scope session, with normal default/project/session override priority. Native session projects need not be configured creation targets. List/read permission is not required; authorization may inspect session identity metadata without reading transcripts or contacting owners.
+Requires `send`, `command` or `create` on a configured project, or `send` or
+`command` on an in-scope session. The native helper reads the owner's launch
+environment and stored provider/auth configuration without loading sessions or
+extensions, altering credentials or refreshing over the network. Live
+extension-only models can still be available to a running owner.
 
-The catalog uses the same user Pi installation as CLI execution. A short-lived native `ModelRuntime` helper reads the owner's launch-profile agent directory, inherited environment and existing model/provider/auth configuration and caches. It uses the trusted Bridge cwd, disables network refresh and loads no session, resource or extension factories. Credential and cache stores are read-only, including when files are missing. Callers cannot select a different environment.
+`{models,next_offset}` sorts by provider and ID. Offset defaults to 0 and
+limit to 30 (range 1–100). Rows expose `provider`, `id`, `name`, `input`,
+`context_window` and `thinking_levels`. Missing metadata is null. Pages reflect
+the catalog at request time. A helper failure returns `MODEL_CATALOG_UNAVAILABLE`
+with `catalog_stage` and `catalog_reason` in [diagnostics](configuration.md#diagnostics).
 
-Discovery works without saved sessions, but excludes models registered only by extensions or live sessions. Pi installation and launch-profile errors retain their own codes; see [native environment](configuration.md#native-environment). Failures running or decoding the catalog helper return `MODEL_CATALOG_UNAVAILABLE`; [Bridge diagnostics](configuration.md#diagnostics) record `catalog_stage` and `catalog_reason` to identify the failing stage without exposing credentials or provider configuration.
+## Standalone selection and rename
 
-An absent catalog entry therefore does not establish that a model is unavailable
-to an already-running owner. Standalone selection resolves the requested model
-against that owner's available models. The catalog also performs no provider
-request, so it does not verify network access or successful generation.
-
-The response is `{models,next_offset}`, with null at the end. Offset defaults to 0; limit is 1–100, default 30. Items sort by provider/ID and contain only `provider`, `id`, `name`, `input`, `context_window` and `thinking_levels`. `thinking_levels` lists Pi's supported thinking levels (`["off"]` for a model without reasoning). Missing metadata is null. Pages are not frozen across calls. Credentials, endpoints and provider configuration are excluded.
-
-For a live session's actual selection, use [list status](api.md#list): `status.model` and `status.thinking_level` come from its owner and are null when unobserved.
-
-## Standalone selection: `set_model`
+`update_session` changes model, thinking level, or display name without submitting input:
 
 ```json
 {
   "session_id": "ps_…",
   "model": { "provider": "provider-id", "id": "model-id" },
-  "thinking_level": "high"
+  "thinking_level": "high",
+  "name": "Auth refactor"
 }
 ```
 
-Requires `send` and at least one setting. Success returns the actual selection:
+Requires `send` and at least one of `model`, `thinking_level`, or `name`. Passing only `name` renames the session (without starting Pi if saved). Model/thinking success returns the actual selection:
 
 ```json
 {
@@ -58,18 +48,13 @@ Thinking-only calls require a current model and act on it at execution. Selectio
 
 Busy selection is supported. Issued provider requests keep their captured settings; later provider calls, including continuations and queued input, use the current selection. Bridge serializes its own same-session mutations while independent native actions remain possible. Prompt preflight and concurrent Stop do not block selection. An unresolved setter blocks overlapping settings/input until it settles. Partial changes are not rolled back.
 
-Owned RPCs, ordinary TUI/RPC companions and supplied SDK/RPC bindings support native setters. Custom hosts use the optional [setModel callback](runtime.md#host-model-setter); a missing callback returns `MODEL_SELECTION_UNSUPPORTED`. Without a live owner, Bridge validates the saved session/cwd and cold-resumes an owned RPC, which becomes eligible for normal idle release, including after failure. Native launch overrides apply at each cold start.
+Without a live owner, Bridge cold-resumes the saved session. Empty contexts
+restore recorded model/thinking choices from the saved branch if available.
+Explicit native launch overrides take precedence.
 
-The acknowledgement budget is five seconds per native/IPC request; there is no
-tool timeout parameter. A lost or late confirmation produces `uncertain:true`
-and the setting may already have changed. Owned RPCs retain matching late-ACK
-tracking; attached setters stay fenced until their native call settles. Neither
-path retries the selection. Inspect `list.status` and authorized read before
-another call.
-
-### Empty-context resume limitation
-
-In tested Pi 1.3.0 and 1.4.0, startup restores saved model/thinking only when the current branch produces context messages. A session whose first input was handled without a run or refused before dispatch can remain empty: `set_model` writes selection entries, but its next cold resume selects native defaults. Bridge retains normal idle release; restoring those entries requires a fix in the selected Pi installation.
+An ACK timeout can leave a partial change. Owned RPCs track late ACKs and
+attached setters stay fenced until the native call settles. Inspect
+`list_sessions` status before trying another selection.
 
 ## Prompt model and thinking settings
 
@@ -82,60 +67,62 @@ In tested Pi 1.3.0 and 1.4.0, startup restores saved model/thinking only when th
 }
 ```
 
-Send and create accept either setting, including create's first prompt, together with required text or images:
+`send` and `create_session` accept either setting, including `create_session`'s first prompt, together with required text or images:
 
 - Model only: preserve current effort, using Pi's native compatible fallback if unsupported by the new model.
 - Thinking only: validate and set the level on the current model.
 - Both: validate thinking against the target model before either change.
-- Neither: follow native selection, including cold-start restoration, launch overrides, availability and the [empty-context limitation](#empty-context-resume-limitation).
+- Neither: use the owner's selection, including cold-start restoration, launch overrides and model availability.
 
 Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, restricted
 to the target's supported set. Unsupported explicit levels return
 `THINKING_LEVEL_UNSUPPORTED`; unknown support returns `THINKING_SUPPORT_UNKNOWN`.
-This prompt-specific validation differs from standalone `set_model`, which
+This prompt-specific validation differs from standalone `update_session`, which
 returns Pi's actual selection after native clamping.
 
-Explicit prompt settings require a proven-idle Bridge-owned RPC with no pending input. Busy work returns `MODEL_SELECTION_BUSY` (`idle_only` skips without changes), unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`, and companions/shared hosts return `MODEL_SELECTION_UNSUPPORTED`. Plain queued sends use native settings when consumed.
+On a Bridge-owned RPC, explicit prompt settings require a proven-idle session with no pending input (busy work returns `MODEL_SELECTION_BUSY`, `idle_only` skips without changes, unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`). On companions and hosts with owner `set_model` support, Bridge applies standalone model selection first and then submits the prompt (hosts without `set_model` return `MODEL_SELECTION_UNSUPPORTED`). Plain queued sends use native settings when consumed.
 
 Settings and input are separate native commands. Bridge rechecks identity, admission and selected values before dispatch; it refuses a conflicting local change instead of restoring earlier settings. Settings-bearing input omits native queue behavior, so a hook starting concurrent work causes refusal. Pi offers no atomic settings-plus-input transaction or per-message settings binding: an earlier setting can remain after a later failure. Native image processing follows the [send/create image contract](api.md#image-input-send-and-create).
 
 Explicit settings add `model_selection:{model:{provider,id},thinking_level}` only after native verification. These values may accompany a later prompt failure; they do not bind later provider calls. Global defaults are unchanged.
 
-## Prompt settings timeout
+### Prompt settings timeout
 
-Native requests retain their internal five-second acknowledgement budget; there is no tool timeout parameter. A timed-out setter blocks further input until its acknowledgement arrives and identity is validated. It never causes the pending prompt or another setting to be dispatched later.
+A timed-out setter fences further input until its ACK and identity are checked.
+The pending prompt is never submitted later. Inspect `list_sessions` status and history
+for any partial change.
 
-A model step can succeed while thinking remains unapplied. The result stays unknown; inspect `list.status` and native history before another call. Create retains its chosen child ID and nested send result when available. Every new call can submit input or create another child.
+## Manual compaction
 
-## Manual compaction: `compact`
+`maintain_session({action:"compact"})` compacts a session's native context:
 
 ```json
 {
   "session_id": "ps_…",
+  "action": "compact",
   "instructions": "Preserve decisions and open questions"
 }
 ```
 
 Default compaction requires `send` and proven idle. Owned RPCs, ordinary companions
 and SDK bindings installed before local input can establish idle admission. The
-companion/SDK gate checks native idle, queued messages and public operation
+owner-side gate checks native idle, queued messages and public operation
 lifetimes (including asynchronous input preparation and bash), then excludes new
-local work until native compaction settles. Busy work returns `COMPACT_BUSY`.
+local work until native compaction settles. Owned RPC uses its matching observer
+for this atomic admission; a parent-side idle sample alone cannot authorize
+non-interrupting compaction. Input-free model selection remains available.
+Busy work returns `COMPACT_BUSY`.
 The supplied RPC binding has no gate over its remote writer and still requires
 explicit interrupt: it reports `COMPACT_BUSY` for observed busy work or
 `COMPACT_IDLE_UNCONFIRMED` otherwise. Custom hosts may supply their own atomic
 gate; a missing callback returns `COMPACT_UNSUPPORTED`.
 
-Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
+Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate `stop` where supported to cancel ongoing compaction.
 
-`status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. The internal five-second acknowledgement budget does not abort compaction; an expired wait returns an unknown outcome, and native history can show a later completed summary. Attached operations retain their input fence until the native callback or controller Promise settles.
+`status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. If the five-second acknowledgement budget expires after dispatch, the result is `status:"unknown"` with `reason:"ACK_TIMEOUT"`. Native compaction can finish after the caller stops waiting. Attached operations retain their input fence until the native callback or controller Promise settles.
 
-The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect list/read; a new call performs another compaction.
+The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect `list_sessions`/`read`; a new call performs another compaction.
 
 For owned RPC, a `PI_REJECTED` result may include one of three allowlisted `native_reason` values: `Nothing to compact (session too small)`, `Already compacted`, or `Compaction cancelled`. Other native/provider/extension messages are omitted. Small sessions can be refused before the compaction hook because Pi retains a configured recent-token window and needs older content to summarize.
 
 Host implementers should follow the [compact callback contract](runtime.md#host-compact-callback).
-
-## Native settings refresh
-
-Cold starts load current on-disk settings, providers and extensions under the owner's launch profile and explicit overrides. [`reload({session_id})`](api.md#reload) refreshes a supported idle owner without sending a task. The companion retains its writer claim while replacing its endpoint. Unsupported owners require native `/reload` or a host-managed reopen; see the [reload lifecycle](runtime.md#remote-reload).
