@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import dns from 'node:dns/promises';
+import dns from 'node:dns';
 import https from 'node:https';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
@@ -16,7 +16,6 @@ import {
 
 const secret = 'whsec_' + Buffer.alloc(32, 7).toString('base64');
 function callbackReceiver(t, respond) {
-  t.mock.method(dns, 'lookup', async () => [{ address: '8.8.8.8', family: 4 }]);
   t.mock.method(https, 'request', (_url, _options, onResponse) => {
     const request = new EventEmitter();
     request.end = (body) => {
@@ -124,27 +123,29 @@ test('callback inputs and address policy reject nonpublic destinations, includin
 test('every HTTPS connection resolves again, pins a public address, preserves TLS hostname, and never follows redirects', async (t) => {
   let lookups = 0,
     requests = 0;
-  t.mock.method(dns, 'lookup', async () => [
-    { address: ++lookups === 1 ? '8.8.8.8' : '127.0.0.1', family: 4 },
-  ]);
+  t.mock.method(dns, 'lookup', (hostname, { all }, done) => {
+    assert.equal(hostname, 'callback.example');
+    assert.equal(all, true);
+    const addresses = [{ address: '8.8.8.8', family: 4 }];
+    if (++lookups === 2) addresses.push({ address: '127.0.0.1', family: 4 });
+    done(null, addresses);
+  });
   t.mock.method(https, 'request', (url, options, onResponse) => {
-    requests++;
     assert.equal(url.hostname, 'callback.example');
     assert.equal(options.agent, false);
     assert.notEqual(options.rejectUnauthorized, false);
-    options.lookup(url.hostname, {}, (error, address, family) => {
-      assert.equal(error, null);
-      assert.equal(address, '8.8.8.8');
-      assert.equal(family, 4);
-    });
     const req = new EventEmitter();
-    req.end = (body) => {
-      assert.equal(body, '{}');
-      const response = Readable.from([Buffer.from('redirect')]);
-      response.statusCode = 302;
-      response.headers = { location: 'https://127.0.0.1/private' };
-      queueMicrotask(() => onResponse(response));
-    };
+    req.end = (body) =>
+      options.lookup(url.hostname, { all: true }, (error, addresses) => {
+        if (error) return req.emit('error', error);
+        requests++;
+        assert.deepEqual(addresses, [{ address: '8.8.8.8', family: 4 }]);
+        assert.equal(body, '{}');
+        const response = Readable.from([Buffer.from('redirect')]);
+        response.statusCode = 302;
+        response.headers = { location: 'https://127.0.0.1/private' };
+        onResponse(response);
+      });
     return req;
   });
   assert.equal((await postWebhook('https://callback.example/event', '{}', {})).status, 302);

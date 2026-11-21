@@ -1,3 +1,4 @@
+import { mcpRequest } from './fixtures/tool-call.mjs';
 import { until } from './fixtures/until.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -6,7 +7,7 @@ import path from 'node:path';
 import { Webhook } from 'standardwebhooks';
 import { createHttpService } from '../src/http-server.mjs';
 import { TOKEN_HEADER } from '../src/mcp/http-config.mjs';
-import { META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
+import { MODERN_VERSION } from '../src/mcp/protocol.mjs';
 import { nativeOwner, fauxArgs, gatedExtension } from './fixtures/native-owner.mjs';
 
 test(
@@ -76,18 +77,7 @@ test(
           'MCP-Method': method,
           ...(method === 'tools/call' ? { 'MCP-Name': params.name } : {}),
         },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: ++requestId,
-          method,
-          params: {
-            ...params,
-            _meta: {
-              [META + 'protocolVersion']: MODERN_VERSION,
-              [META + 'clientCapabilities']: {},
-            },
-          },
-        }),
+        body: JSON.stringify(mcpRequest(method, params, ++requestId)),
       });
       return { status: response.status, body: await response.json() };
     }

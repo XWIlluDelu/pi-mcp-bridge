@@ -1,3 +1,4 @@
+import { mcpRequest } from './fixtures/tool-call.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +11,7 @@ import { reserveOwner, updateOwner, releaseOwner } from '../src/runtime/attachme
 import { SettledObserver } from '../src/events/settled-observer.mjs';
 import { hash } from '../src/core/storage.mjs';
 
-import { dispatchModern, META, MODERN_VERSION } from '../src/mcp/protocol.mjs';
+import { dispatchModern } from '../src/mcp/protocol.mjs';
 import { savedSession } from './fixtures/saved-session.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import { SessionManager, fauxAssistantMessage } from './fixtures/pi.mjs';
@@ -51,19 +52,7 @@ async function fixture(t, eventOptions = { retryDelays: [0, 0] }) {
   };
   wire();
   const call = async (method, params = {}, options) =>
-    dispatchModern(
-      bridge,
-      {
-        jsonrpc: '2.0',
-        id: 1,
-        method,
-        params: {
-          ...params,
-          _meta: { [META + 'protocolVersion']: MODERN_VERSION, [META + 'clientCapabilities']: {} },
-        },
-      },
-      options,
-    );
+    dispatchModern(bridge, mcpRequest(method, params), options);
   const settle = async (target = session) => {
     bridge.events.observe(target, {
       timestamp: new Date(now).toISOString(),
@@ -310,7 +299,7 @@ test('a retry cannot authorize an old occurrence through a replacement native cw
     return { status: 503 };
   };
   await f.settle(session);
-  assert.equal((await f.bridge.events.authorize(session.id)).header.cwd, replacement);
+  assert.equal((await f.bridge.authorizedSession('read', session.id)).header.cwd, replacement);
   assert.equal(attempts.length, 1, 'new project permission cannot release the old captured result');
   assert.equal(f.bridge.events.deliveries.size, 0);
 });

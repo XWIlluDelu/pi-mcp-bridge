@@ -26,62 +26,45 @@ const MAX_SUBSCRIPTIONS = 32,
 const DEFAULT_TTL = 3600000,
   MAX_TTL = 86400000,
   ROTATION_MS = 300000;
-const argsSchema = z.object({ session_id: z.string().regex(/^ps_[a-f0-9]{32}$/) }).strict();
+const sessionId = z.string().regex(/^ps_[a-f0-9]{32}$/);
+const argsSchema = z.strictObject({ session_id: sessionId });
 const listSchema = z.strictObject({});
-const deliverySchema = z
-  .object({
-    mode: z.string(),
-    url: utf16String(4096),
-    secret: utf16String(100),
-  })
-  .strict();
-const subscribeSchema = z
-  .object({
-    name: z.string(),
-    arguments: argsSchema,
-    delivery: deliverySchema,
-    cursor: z.string().nullable().optional(),
-    ttlMs: z.number().int().positive().safe().nullable().optional(),
-  })
-  .strict();
-const unsubscribeSchema = z
-  .object({
-    name: z.string(),
-    arguments: argsSchema,
-    delivery: deliverySchema.omit({ secret: true }),
-  })
-  .strict();
-const recordSchema = z
-  .object({
-    id: z.string(),
-    owner: z.literal(OWNER),
-    session_id: argsSchema.shape.session_id,
-    url: z.string(),
-    secret: z.string(),
-    expiresAt: z.number().int().safe(),
-    verifiedUntil: z.number().int().safe(),
-    previousSecret: z.string().optional(),
-    rotateUntil: z.number().int().safe().optional(),
-  })
-  .strict();
+const destination = z.strictObject({ mode: z.string(), url: utf16String(4096) });
+const unsubscribeSchema = z.strictObject({
+  name: z.string(),
+  arguments: argsSchema,
+  delivery: destination,
+});
+const subscribeSchema = unsubscribeSchema.extend({
+  delivery: destination.extend({ secret: utf16String(100) }),
+  cursor: z.string().nullable().optional(),
+  ttlMs: z.number().int().positive().safe().nullable().optional(),
+});
+const recordSchema = z.strictObject({
+  id: z.string(),
+  owner: z.literal(OWNER),
+  session_id: sessionId,
+  url: z.string(),
+  secret: z.string(),
+  expiresAt: z.number().int().safe(),
+  verifiedUntil: z.number().int().safe(),
+  previousSecret: z.string().optional(),
+  rotateUntil: z.number().int().safe().optional(),
+});
 
 // Advertised schemas are generated from the same contracts used to validate.
-const payloadSchema = z
-  .object({
-    session_id: z.string(),
-    leaf_id: z.string().nullable(),
-    aborted: z.boolean(),
-    result: settledResultSchema,
-    read: z
-      .object({
-        session_id: z.string(),
-        view: z.literal('session'),
-        leaf_id: z.string().nullable(),
-        range: z.object({ recent: z.literal(1) }).strict(),
-      })
-      .strict(),
-  })
-  .strict();
+const readTarget = { session_id: z.string(), leaf_id: z.string().nullable() };
+const payloadSchema = z.strictObject({
+  ...readTarget,
+  aborted: z.boolean(),
+  result: settledResultSchema,
+  read: z.strictObject({
+    session_id: readTarget.session_id,
+    view: z.literal('session'),
+    leaf_id: readTarget.leaf_id,
+    range: z.strictObject({ recent: z.literal(1) }),
+  }),
+});
 function jsonSchema(schema) {
   const { $schema, ...value } = z.toJSONSchema(schema, { target: 'draft-7' });
   return value;
@@ -158,22 +141,14 @@ export class EventSubscriptions {
     this.records = new Map();
     this.deliveries = new Map();
     this.requests = new Map();
-    this.changes = Promise.resolve();
     this.shutdown = new AbortController();
   }
   async init() {
-    let text;
     try {
-      ({ text } = await readPrivateFile(this.file, 1024 * 1024, {
+      const { text } = await readPrivateFile(this.file, 1024 * 1024, {
         pathError: 'INVALID_EVENT_SUBSCRIPTIONS',
         privacyError: 'EVENT_SUBSCRIPTIONS_NOT_PRIVATE',
-      }));
-    } catch (error) {
-      if (error.code === 'ENOENT') return;
-      this.disableStore(knownErrorCode(error.code ?? error.message, 'INVALID_EVENT_SUBSCRIPTIONS'));
-      return;
-    }
-    try {
+      });
       const records = JSON.parse(text),
         next = new Map(),
         now = this.now();
@@ -195,14 +170,12 @@ export class EventSubscriptions {
         next.set(record.id, record);
       }
       this.records = next;
-    } catch {
-      this.disableStore('INVALID_EVENT_SUBSCRIPTIONS');
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      this.records.clear();
+      this.storeError = knownErrorCode(error.code ?? error.message, 'INVALID_EVENT_SUBSCRIPTIONS');
+      diagnostics.emit('events.store_unavailable', { code: this.storeError });
     }
-  }
-  disableStore(reason) {
-    this.records.clear();
-    this.storeError = reason;
-    diagnostics.emit('events.store_unavailable', { code: reason });
   }
   health() {
     return this.storeError ? { status: 'unavailable', reason: this.storeError } : { status: 'ok' };
@@ -212,11 +185,26 @@ export class EventSubscriptions {
       throw new EventError(-32603, 'EventSubscriptionsUnavailable', { reason: this.storeError });
   }
   activeRecords(now = this.now()) {
-    return new Map([...this.records].filter(([, record]) => record.expiresAt > now));
+    return new Map(this.records.entries().filter(([, record]) => record.expiresAt > now));
+  }
+  // The file has one commit queue. Each subscription has its own request
+  // queue so a receiver being verified cannot stall a different subscription.
+  async ordered(key, run) {
+    const task = Promise.resolve(this.requests.get(key))
+      .catch(() => {})
+      .then(() => {
+        this.bridge.assertOpen();
+        return run();
+      });
+    this.requests.set(key, task);
+    try {
+      return await task;
+    } finally {
+      if (this.requests.get(key) === task) this.requests.delete(key);
+    }
   }
   change(fn) {
-    const task = this.changes.then(async () => {
-      this.bridge.assertOpen();
+    return this.ordered(this.file, async () => {
       this.assertAvailable();
       const next = this.activeRecords();
       const result = fn(next);
@@ -226,65 +214,49 @@ export class EventSubscriptions {
       }
       return result;
     });
-    this.changes = task.catch(() => {});
-    return task;
-  }
-  async authorize(sessionId, requestContext) {
-    const context = await (requestContext ?? this.bridge.captureRequestContext());
-    const session = await this.bridge.session(sessionId, context);
-    this.bridge.check('read', session, context);
-    return session;
   }
   async handle(method, params, { execute = (run) => run() } = {}) {
     this.assertAvailable();
     const { _meta, ...input } = params;
-    let request;
-    if (method === 'events/list') request = parse(listSchema, input);
-    else {
-      request = parse(method === 'events/unsubscribe' ? unsubscribeSchema : subscribeSchema, input);
+    const list = method === 'events/list',
+      unsubscribe = method === 'events/unsubscribe';
+    const request = parse(
+      list ? listSchema : unsubscribe ? unsubscribeSchema : subscribeSchema,
+      input,
+    );
+    if (!list) {
       if (request.name !== NAME) throw new EventError(-32023, 'NotFound', { kind: 'event' });
-      validateDestination(request.delivery, method !== 'events/unsubscribe');
+      validateDestination(request.delivery, !unsubscribe);
       if (request.cursor != null)
         throw new EventError(-32026, 'Unsupported', { feature: 'replay' });
     }
     // Capture only after validation, before executor waits. Outbound deliveries
-    // deliberately call authorize without this context to read current policy.
-    const context =
-      method === 'events/unsubscribe' ? undefined : this.bridge.captureRequestContext();
+    // read current policy again on each attempt.
+    const context = unsubscribe ? undefined : this.bridge.captureRequestContext();
     void context?.catch(() => {});
-    return execute(() => this.executeRequest(method, request, context));
+    return execute(() =>
+      list ? this.list(context) : this.updateSubscription(request, unsubscribe, context),
+    );
   }
-  async executeRequest(method, request, requestContext) {
-    if (method === 'events/list') {
-      const context = await requestContext;
-      const sessions = await this.bridge.sessions(context);
-      return {
-        events: sessions.some((s) => permitted(context.permissions, 'read', s))
-          ? [settledEventDefinition]
-          : [],
-      };
-    }
-    const id = identity(request.arguments.session_id, request.delivery.url);
-    const run = () => {
-      this.bridge.assertOpen();
-      return method === 'events/subscribe'
-        ? this.subscribe(id, request, requestContext)
-        : this.unsubscribe(id);
+  async list(requestContext) {
+    const context = await requestContext;
+    return {
+      events: (await this.bridge.sessions(context)).some((s) =>
+        permitted(context.permissions, 'read', s),
+      )
+        ? [settledEventDefinition]
+        : [],
     };
-    const previous = this.requests.get(id) ?? Promise.resolve();
-    const task = previous.then(run, run);
-    this.requests.set(id, task);
-    try {
-      return await task;
-    } finally {
-      if (this.requests.get(id) === task) this.requests.delete(id);
-    }
   }
-  async unsubscribe(id) {
-    // The authenticated owner can stop its subscription after read revocation.
-    await this.change((next) => next.delete(id));
-    this.cancelDeliveries(id);
-    return {};
+  updateSubscription(request, unsubscribe, context) {
+    const id = identity(request.arguments.session_id, request.delivery.url);
+    return this.ordered(id, async () => {
+      if (!unsubscribe) return this.subscribe(id, request, context);
+      // A receiver can still be removed after read permission is revoked.
+      await this.change((next) => next.delete(id));
+      this.cancelDeliveries(id);
+      return {};
+    });
   }
   cancelDeliveries(id) {
     for (const delivery of this.deliveries.values())
@@ -293,7 +265,11 @@ export class EventSubscriptions {
   async subscribe(id, request, requestContext) {
     let session;
     try {
-      session = await this.authorize(request.arguments.session_id, requestContext);
+      session = await this.bridge.authorizedSession(
+        'read',
+        request.arguments.session_id,
+        requestContext,
+      );
     } catch (error) {
       if (error.message !== 'NOT_FOUND_OR_DENIED') throw error;
       throw new EventError(-32024, 'Forbidden');
@@ -355,20 +331,20 @@ export class EventSubscriptions {
       (record) => record.session_id === session.id && record.expiresAt > now,
     );
     if (!records.length) return;
+    const target = { session_id: session.id, leaf_id: occurrence.leafId };
     const event = {
       eventId: 'evt_' + randomUUID(),
       name: NAME,
       timestamp: occurrence.timestamp,
       data: {
-        session_id: session.id,
-        leaf_id: occurrence.leafId,
+        ...target,
         aborted: occurrence.aborted,
         // Validated at the owner control boundary (Bridge.settledForLocal).
         result: occurrence.result,
         read: {
-          session_id: session.id,
+          session_id: target.session_id,
           view: 'session',
-          leaf_id: occurrence.leafId,
+          leaf_id: target.leaf_id,
           range: { recent: 1 },
         },
       },
@@ -401,7 +377,8 @@ export class EventSubscriptions {
       // Authorization is refreshed for each outbound attempt, not frozen for a
       // subscription's lifetime. A stale file/header cannot retarget an event.
       try {
-        if (!sameSessionIdentity(await this.authorize(session.id), session)) return;
+        if (!sameSessionIdentity(await this.bridge.authorizedSession('read', session.id), session))
+          return;
       } catch (error) {
         if (!this.bridge.closing && error.message === 'NOT_FOUND_OR_DENIED')
           await this.change((next) => next.get(id) === record && next.delete(id));
@@ -420,24 +397,19 @@ export class EventSubscriptions {
           { signal: AbortSignal.any([signal, AbortSignal.timeout(record.expiresAt - now)]) },
         );
       } catch (error) {
-        if (error instanceof CallbackError && error.reason === 'blocked_address') {
-          diagnostics.emit('events.delivery_failed', { session_ref });
-          return;
-        }
+        if (error instanceof CallbackError && error.reason === 'blocked_address') break;
       }
-      if (response?.status >= 200 && response.status < 300) {
-        diagnostics.emit('events.delivered', {
-          session_ref,
-          http_status: response.status,
-        });
+      const status = response?.status;
+      if (status < 500 && status !== 408 && status !== 429) {
+        // Includes 410, 413 and redirects; never follow or retry them.
+        diagnostics.emit(
+          status >= 200 && status < 300 ? 'events.delivered' : 'events.delivery_failed',
+          {
+            session_ref,
+            http_status: status,
+          },
+        );
         return;
-      }
-      if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {
-        diagnostics.emit('events.delivery_failed', {
-          session_ref,
-          http_status: response.status,
-        });
-        return; // Includes 410, 413 and redirects; never follow or retry them.
       }
       if (attempt < this.retryDelays.length)
         await delay(this.retryDelays[attempt], undefined, { signal });
@@ -446,6 +418,6 @@ export class EventSubscriptions {
   }
   async close() {
     this.shutdown.abort();
-    await Promise.allSettled([this.changes, ...this.requests.values(), ...this.deliveries.keys()]);
+    await Promise.allSettled([...this.requests.values(), ...this.deliveries.keys()]);
   }
 }

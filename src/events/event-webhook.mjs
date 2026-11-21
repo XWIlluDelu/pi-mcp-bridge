@@ -1,10 +1,11 @@
 // ChatGPT MCP Events uses signed outbound HTTPS, not MCP/SSE notifications.
 import https from 'node:https';
-import dns from 'node:dns/promises';
+import dns from 'node:dns';
 import { isIP } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import ipaddr from 'ipaddr.js';
 import { Webhook } from 'standardwebhooks';
+import { readBoundedBytes } from '../core/storage.mjs';
 
 export class CallbackError extends Error {
   constructor(reason) {
@@ -14,13 +15,8 @@ export class CallbackError extends Error {
 }
 export function callbackUrl(value) {
   if (typeof value !== 'string' || value.length > 4096) throw new Error('INVALID_CALLBACK_URL');
-  let url;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new Error('INVALID_CALLBACK_URL');
-  }
-  if (url.protocol !== 'https:' || url.username || url.password || url.hash)
+  const url = URL.parse(value);
+  if (url?.protocol !== 'https:' || url.username || url.password || url.hash)
     throw new Error('INVALID_CALLBACK_URL');
   return url;
 }
@@ -55,74 +51,56 @@ function networkReason(error) {
   return 'connection_refused';
 }
 
-// Fresh resolution for EVERY connection; pin that resolution in lookup while
-// keeping the URL hostname for Host/SNI/certificate checks. No proxy or redirect.
+// Resolve inside the actual HTTPS connection. Only its first verified address
+// can be used, while Host, SNI and certificate checks keep the original name.
+function lookupPublic(host, options, done) {
+  dns.lookup(host, { all: true }, (error, addresses) => {
+    if (error) return done(error);
+    if (!addresses.length || addresses.some(({ address }) => !publicAddress(address)))
+      return done(new CallbackError('blocked_address'));
+    const [first] = addresses;
+    if (options.all) done(null, [first]);
+    else done(null, first.address, first.family);
+  });
+}
+
 export async function postWebhook(urlValue, body, headers, { signal, readBody = false } = {}) {
   const url = callbackUrl(urlValue);
   const deadline = AbortSignal.timeout(10000);
   signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
   const hostname = url.hostname.replace(/^\[|\]$/g, '');
-  let abort;
+  let response;
   try {
     signal.throwIfAborted();
-    const addresses = isIP(hostname)
-      ? [{ address: hostname, family: isIP(hostname) }]
-      : await Promise.race([
-          dns.lookup(hostname, { all: true }),
-          new Promise((_, reject) => {
-            abort = () => reject(signal.reason);
-            signal.addEventListener('abort', abort, { once: true });
-          }),
-        ]);
-    if (!addresses.length || addresses.some(({ address }) => !publicAddress(address)))
-      throw new CallbackError('blocked_address');
-    signal.throwIfAborted();
-    const address = addresses[0];
-    return await new Promise((resolve, reject) => {
+    // Node bypasses lookup for IP literals.
+    if (isIP(hostname) && !publicAddress(hostname)) throw new CallbackError('blocked_address');
+    response = await new Promise((resolve, reject) => {
       const request = https.request(
         url,
         {
           method: 'POST',
           agent: false,
           signal,
-          lookup: (_host, options, done) => {
-            if (options.all) done(null, [address]);
-            else done(null, address.address, address.family);
-          },
+          lookup: lookupPublic,
           headers: { ...headers, 'Content-Length': Buffer.byteLength(body) },
         },
-        (response) => {
-          response.on('error', reject);
-          const status = response.statusCode;
-          // Delivery is acknowledged by status alone. Only successful callback
-          // verification needs a bounded body; discard other response streams.
-          if (!readBody || status < 200 || status >= 300) {
-            resolve({ status });
-            response.destroy();
-            return;
-          }
-          const chunks = [];
-          let size = 0;
-          response.on('data', (chunk) => {
-            size += chunk.length;
-            if (size > 4096) response.destroy(new CallbackError('response_too_large'));
-            else chunks.push(chunk);
-          });
-          response.on('end', () =>
-            resolve({
-              status: response.statusCode,
-              body: Buffer.concat(chunks).toString('utf8'),
-            }),
-          );
-        },
+        resolve,
       );
-      request.on('error', reject);
+      request.once('error', reject);
       request.end(body);
     });
+    const status = response.statusCode;
+    if (!readBody || status < 200 || status >= 300) return { status };
+    const bytes = await readBoundedBytes(
+      response,
+      4096,
+      () => new CallbackError('response_too_large'),
+    );
+    return { status, body: bytes.toString('utf8') };
   } catch (error) {
-    throw new CallbackError(networkReason(error));
+    throw new CallbackError(signal.aborted ? 'timeout' : networkReason(error));
   } finally {
-    if (abort) signal.removeEventListener('abort', abort);
+    response?.destroy();
   }
 }
 export function signedHeaders(subscription, id, body, now = new Date()) {
