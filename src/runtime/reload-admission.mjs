@@ -42,6 +42,7 @@ export function reloadAdmission(AgentSession) {
   // replaces the implementation they delegate to, preserving other observers.
   shared.invoke = async (session, name, args, original) => {
     const current = state(session.sessionManager);
+    current.session = session;
     const operation = current.operation;
     if (operation?.kind === 'seal') {
       // Native shutdown hooks may append their final message synchronously.
@@ -120,6 +121,7 @@ export function reloadAdmission(AgentSession) {
     return operation;
   }
   return {
+    session: (manager) => state(manager).session ?? null,
     idle(manager) {
       const current = state(manager);
       return current.pending === 0 && !current.operation;

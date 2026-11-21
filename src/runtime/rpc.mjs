@@ -232,6 +232,7 @@ export class PiRpc {
             ? 'EXTENSION_UI_STARTUP_UNAVAILABLE'
             : 'EXTENSION_UI_SHUTDOWN_UNAVAILABLE';
       log('rpc.ui_request', { code, ui_method: event.method, generation });
+      this.runtimeEvents.recordUiCancelled(event, phase);
       if (phase === 'cancel_sent') {
         // Written to a running reader; Pi does not ACK consumption/completion.
         this.child.stdin.write(
@@ -246,6 +247,7 @@ export class PiRpc {
     if (event.type === 'agent_start') this.requiredSettlementSequence = this.settlementSequence + 1;
     if (event.type === 'agent_settled' && typeof event.aborted === 'boolean') {
       this.settlementSequence++;
+      this.onSettled?.({ aborted: event.aborted, generation });
       this.onIdleCandidate?.();
       return; // Settlement alone never clears an unresolved prompt ACK fence.
     }
@@ -536,6 +538,7 @@ export class PiRpc {
     )
       return result('unknown');
     const observed = await this.#attachment().state();
+    if (observed.contextUsage) state.contextUsage = observed.contextUsage;
     if (nativeBusy(observed) || this.hasUnsettledWork()) return result('busy');
     if (observed.isIdle !== true || observed.hasPendingMessages !== false) return result('unknown');
     return result('idle');
@@ -654,10 +657,21 @@ export class PiRpc {
       { beforeDispatch },
     );
   }
-  async executeBash({ command, max_chars, beforeDispatch }) {
+  async setSessionName(name, beforeDispatch) {
+    await this.command({ type: 'set_session_name', name }, { beforeDispatch });
+    return { name };
+  }
+  async executeBash({ command, exclude_from_context, max_chars, beforeDispatch }) {
     this.activeBashes++;
     try {
-      const result = await this.command({ type: 'bash', command }, { beforeDispatch });
+      const result = await this.command(
+        {
+          type: 'bash',
+          command,
+          ...(exclude_from_context ? { excludeFromContext: true } : {}),
+        },
+        { beforeDispatch },
+      );
       try {
         return limitBashResult(result, max_chars);
       } catch (error) {

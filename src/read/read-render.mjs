@@ -273,6 +273,7 @@ export function renderPreparedContextRead(
     ...(snapshot.query ? { query: snapshot.query, matches: units.length } : {}),
     ...(snapshot.expanded_refs ? { expanded_refs: snapshot.expanded_refs } : {}),
     ...(snapshot.history ? { history: snapshot.history } : {}),
+    ...(!cursor && snapshot.commands?.length ? { commands: snapshot.commands } : {}),
     live: null,
   };
   let base = {

@@ -89,7 +89,7 @@ test('current Pi can reopen a raw fork without changing the source', async (t) =
   const history = await f.bridge.read({ session_id: f.id, content: ALL_CONTENT });
   assert.equal(history.history.unterminated_tail, true);
   assert.equal(history.history.skipped_malformed_lines, 1);
-  const fork = await f.bridge.create({ project: f.cwd, fork_from: f.id });
+  const fork = await f.bridge.create_session({ project: f.cwd, fork_from: f.id });
   assert.equal(fork.status, 'created', JSON.stringify(fork));
   const child = await f.bridge.session(fork.session_id);
   const manager = SessionManager.open(child.file);

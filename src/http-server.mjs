@@ -5,7 +5,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { Bridge } from './core/bridge.mjs';
 import { runService } from './server.mjs';
 import { diagnostics } from './core/diagnostics.mjs';
-import { dispatchModern, readJson, rpcError, MCP_INPUT_LIMIT } from './mcp/protocol.mjs';
+import { dispatchMcp, readJson, rpcError, MCP_INPUT_LIMIT } from './mcp/protocol.mjs';
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 
 const digest = (value) => createHash('sha256').update(value).digest();
@@ -29,7 +29,7 @@ function respond(res, status, message, close = false) {
   res.end(JSON.stringify(message));
 }
 // The token and port come from loadHttpConfig, which validates them.
-export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 35000 }) {
+export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 40000 }) {
   const tokenDigest = digest(token),
     requests = new Map();
   let stopping = false,
@@ -66,6 +66,11 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
     if (credentials?.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
       return refuse(res, 'UNAUTHORIZED');
     if (req.url !== '/mcp') return refuse(res, 'NOT_FOUND');
+    if (req.method === 'DELETE') {
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
     if (req.method !== 'POST') return refuse(res, 'METHOD_NOT_ALLOWED');
     if (stopping) return refuse(res, 'SERVICE_STOPPING');
     if (requests.size >= 16) return refuse(res, 'SERVICE_BUSY');
@@ -100,7 +105,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
       if (res.destroyed) return;
       if (stopping) return refuse(res, 'SERVICE_STOPPING');
       diagnostics.emit('http.request', { method: body.method });
-      const response = await dispatchModern(bridge, body, {
+      const response = await dispatchMcp(bridge, body, {
         headers,
         execute(run) {
           deadline = setTimeout(
@@ -122,7 +127,14 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 350
           return task;
         },
       });
-      respond(res, response.status, response.message);
+      if (response.message === null) {
+        if (!res.destroyed && !res.writableEnded) {
+          res.writeHead(response.status, { 'Cache-Control': 'no-store' });
+          res.end();
+        }
+      } else {
+        respond(res, response.status, response.message);
+      }
     } finally {
       clearTimeout(deadline);
       if (res.destroyed) requests.delete(res);

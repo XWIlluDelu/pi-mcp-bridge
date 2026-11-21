@@ -63,12 +63,12 @@ test('scope reload stays read-only; fixed settings await restart without blockin
   await save({ ...f.config, sessionRoots: [root], folders: [] });
   const context = await bridge.captureRequestContext();
   assert.deepEqual(context.scope, { sessionRoots: [root], folders: [] });
-  assert.deepEqual((await bridge.list()).sessions, []);
+  assert.deepEqual((await bridge.list_sessions()).sessions, []);
   await assert.rejects(fs.stat(root), { code: 'ENOENT' });
   await fs.mkdir(root, { mode: 0o700 });
   await fs.symlink(root, alias);
   await save({ ...f.config, sessionRoots: [alias] });
-  await assert.rejects(bridge.list(), /UNSAFE_NATIVE_SESSION_STORAGE/);
+  await assert.rejects(bridge.list_sessions(), /UNSAFE_NATIVE_SESSION_STORAGE/);
   await save({ ...f.config, sessionRoots: [f.config.stateDir] });
   await assert.rejects(bridge.captureRequestContext(), /OVERLAPPING_STORAGE/);
   for (const patch of [

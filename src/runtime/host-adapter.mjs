@@ -271,6 +271,7 @@ export async function reserveHostSession({
       job.lane = op;
       const result = await callbacks.bash({
         command: args.command,
+        excludeFromContext: Boolean(args.exclude_from_context),
         ...identity,
         beforeDispatch,
         onResult: async (value) => {

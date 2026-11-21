@@ -19,16 +19,15 @@ import { MAX_IMAGES } from '../src/ops/prompt-input.mjs';
 
 // Every tool call captures its receive-time policy before execution.
 const captureRequestContext = async () => ({});
-const stub = { captureRequestContext, list: async (args) => ({ sessions: [], args }) };
+const stub = { captureRequestContext, list_sessions: async (args) => ({ sessions: [], args }) };
 
 test('oversized input collections reject before inspecting elements or admitting work', async () => {
   const bridge = { captureRequestContext: () => assert.fail('Invalid request reached admission') };
   for (const [name, field, limit, identity] of [
     ['batch', 'operations', 10, {}],
     ['read', 'refs', 8, { session_id: 'fixture' }],
-    ['search', 'content', CONTENT_KINDS.length, { session_id: 'fixture', query: 'needle' }],
     ['send', 'images', MAX_IMAGES, { session_id: 'fixture' }],
-    ['create', 'images', MAX_IMAGES, { project: '/fixture' }],
+    ['create_session', 'images', MAX_IMAGES, { project: '/fixture' }],
   ]) {
     const values = new Array(limit + 1);
     Object.defineProperty(values, 0, {
@@ -48,9 +47,9 @@ test('oversized input collections reject before inspecting elements or admitting
 
 test('public text limits retain UTF-16 units and trim search before validation', () => {
   for (const [name, field, limit, identity] of [
-    ['search', 'query', 2048, { session_id: 'fixture' }],
+    ['read', 'query', 2048, { session_id: 'fixture' }],
     ['send', 'text', 100000, { session_id: 'fixture' }],
-    ['compact', 'instructions', 100000, { session_id: 'fixture' }],
+    ['maintain_session', 'instructions', 100000, { session_id: 'fixture', action: 'compact' }],
   ]) {
     const text = '😀'.repeat(limit / 2);
     assert.equal(publicSchemas[name].safeParse({ ...identity, [field]: text }).success, true);
@@ -60,8 +59,7 @@ test('public text limits retain UTF-16 units and trim search before validation',
     );
   }
   assert.equal(
-    publicSchemas.search.parse({ session_id: 'fixture', query: ' '.repeat(2048) + 'needle ' })
-      .query,
+    publicSchemas.read.parse({ session_id: 'fixture', query: ' '.repeat(2048) + 'needle ' }).query,
     'needle',
   );
 });
@@ -95,7 +93,7 @@ test('modern requests are self-contained; discovery and tool list carry required
   assert.ok(!(read.required ?? []).includes('range'));
   const direct = await dispatchModern(
     stub,
-    message('tools/call', { name: 'list', arguments: { project: 'abc' } }),
+    message('tools/call', { name: 'list_sessions', arguments: { project: 'abc' } }),
   );
   assert.deepEqual(direct.message.result.structuredContent.args, { project: 'abc' });
 });
@@ -135,26 +133,32 @@ test('public mutation payloads are validated before dispatch', async () => {
   const calls = [];
   const bridge = {
     captureRequestContext,
-    create: async (args) => (calls.push(args), { status: 'started' }),
-    reload: async (args) => (calls.push(args), { status: 'skipped', reason: 'no_active_owner' }),
+    create_session: async (args) => (calls.push(args), { status: 'started' }),
+    maintain_session: async (args) => (
+      calls.push(args),
+      { status: 'skipped', reason: 'no_active_owner' }
+    ),
   };
   const call = async (name, args) =>
     (await dispatchModern(bridge, message('tools/call', { name, arguments: args }))).message.result;
   const project = '/tmp/p';
   for (const args of [{ project }, { project, text: 'initial' }])
-    assert.equal((await call('create', args)).isError, undefined);
+    assert.equal((await call('create_session', args)).isError, undefined);
   for (const args of [
     { project, thinking_level: 'high' },
     { project, unexpected: true },
   ])
-    assert.equal((await call('create', args)).structuredContent.error.code, 'INVALID_ARGUMENTS');
-  const target = { session_id: 'ps_test' };
-  assert.deepEqual((await call('reload', target)).structuredContent, {
+    assert.equal(
+      (await call('create_session', args)).structuredContent.error.code,
+      'INVALID_ARGUMENTS',
+    );
+  const target = { session_id: 'ps_test', action: 'reload' };
+  assert.deepEqual((await call('maintain_session', target)).structuredContent, {
     status: 'skipped',
     reason: 'no_active_owner',
   });
   assert.equal(
-    (await call('reload', { ...target, interrupt: true })).structuredContent.error.code,
+    (await call('maintain_session', { ...target, interrupt: true })).structuredContent.error.code,
     'INVALID_ARGUMENTS',
   );
   assert.deepEqual(calls, [{ project }, { project, text: 'initial' }, target]);
@@ -168,7 +172,7 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
     release = Promise.withResolvers();
   const bridge = {
     captureRequestContext,
-    list: async (_args, options) => {
+    list_sessions: async (_args, options) => {
       assert.equal(Object.hasOwn(options, 'signal'), false);
       entered.resolve();
       await release.promise;
@@ -183,7 +187,9 @@ test('bounded stdio handles modern no-handshake calls, cancellation and oversize
     },
   );
   await transport.start();
-  input.write(JSON.stringify(message('tools/call', { name: 'list', arguments: {} }, 42)) + '\n');
+  input.write(
+    JSON.stringify(message('tools/call', { name: 'list_sessions', arguments: {} }, 42)) + '\n',
+  );
   await entered.promise;
   input.write(
     JSON.stringify({

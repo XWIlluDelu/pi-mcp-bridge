@@ -56,6 +56,7 @@ export class RuntimePool {
     if (this.runtimeEvents.size > 16)
       this.runtimeEvents.delete(this.runtimeEvents.keys().next().value);
     runtime.onIdleCandidate = () => this.onIdleCandidate?.(runtime);
+    runtime.onSettled = (info) => this.onSettled?.(runtime, info);
     runtime.retainObservation = async () => {
       // Observe directly without scheduling another close. An unavailable
       // observer does not erase a dated request snapshot.

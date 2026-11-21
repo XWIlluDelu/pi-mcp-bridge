@@ -1,6 +1,6 @@
 import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mjs';
 import { StdioTransport } from './mcp/protocol-stdio.mjs';
-import { forwardedMcpHeaders, readJson, rpcError } from './mcp/protocol.mjs';
+import { forwardedMcpHeaders, isModernRequest, readJson, rpcError } from './mcp/protocol.mjs';
 import { MCP_RESPONSE_LIMIT } from './mcp/response-budget.mjs';
 
 // Thin stdio -> one shared loopback Bridge. No runtime, owner lock, reconnect
@@ -24,11 +24,11 @@ export function createStdioProxy({
             'content-type': 'application/json',
             accept: 'application/json',
             [TOKEN_HEADER]: token,
-            ...forwardedMcpHeaders(body),
+            ...(isModernRequest(body) ? forwardedMcpHeaders(body) : {}),
           },
           body: JSON.stringify(body),
           redirect: 'error',
-          signal: AbortSignal.any([signal, AbortSignal.timeout(40000)]),
+          signal: AbortSignal.any([signal, AbortSignal.timeout(45000)]),
         });
         if (!/application\/json/i.test(response.headers.get('content-type') ?? ''))
           throw new Error('INVALID_BACKEND_RESPONSE');

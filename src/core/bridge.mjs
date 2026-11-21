@@ -43,8 +43,10 @@ export class Bridge {
     this.readCache = new ContextReadCache();
     this.events = new EventSubscriptions(this);
     this.completionSequences = new Map();
+    this.settlementWaiters = new Map();
     this.submissions = new Submissions();
     this.pool.onIdleCandidate = (runtime) => this.scheduleAutoRelease(runtime);
+    this.pool.onSettled = (runtime, info) => this.notifySettled(runtime.session.id, info);
     for (const [name, query] of Object.entries(queries))
       this[name] = async (args, options) => query(this, args, await this.#requestOptions(options));
     for (const name of Object.keys(mutations)) this[name] = this.#mutation.bind(this, name);
@@ -118,7 +120,7 @@ export class Bridge {
     this.assertOpen();
     if (stopped || this.lane(sessionId, 'stop')) throw new Error('STOP_IN_PROGRESS');
     const fence = this.handoff(sessionId);
-    if (fence && (fence.kind === 'delete' || name === 'command' || name === 'create'))
+    if (fence && (fence.kind === 'delete' || name === 'command' || name === 'create_session'))
       throw new Error('HANDOFF_PENDING');
   }
   handoff(id) {
@@ -202,7 +204,7 @@ export class Bridge {
     if (lane === 'bash' && this.lane(id, lane))
       return { status: 'rejected', reason: 'BASH_IN_PROGRESS', output_available: false };
     // These calls own distinct admission checks once their lane begins.
-    if (lane === 'bash' || lane === 'delete' || name === 'set_model')
+    if (lane === 'bash' || lane === 'delete' || name === 'update_session')
       return this.locked(id, run, lane);
     const reject = (reason) => ({
       status: 'rejected',
@@ -327,11 +329,12 @@ export class Bridge {
         try {
           target = await this.authorizedSession(right, args.session_id, request.requestContext);
         } catch (error) {
-          if (name !== 'send' && name !== 'delete') throw error;
+          if (name !== 'send' && name !== 'delete_session') throw error;
           return { status: 'rejected', reason: 'NOT_FOUND_OR_DENIED' };
         }
       }
-      if (name === 'compact' && args.interrupt) this.check('stop', target, request.requestContext);
+      if (name === 'maintain_session' && args.action === 'compact' && args.interrupt)
+        this.check('stop', target, request.requestContext);
       const run = () =>
         action(this, args, {
           ...request,
@@ -356,6 +359,50 @@ export class Bridge {
       }
     }
   }
+  notifySettled(sessionId, occurrence) {
+    const waiters = this.settlementWaiters.get(sessionId);
+    if (!waiters?.size) return;
+    for (const resolve of [...waiters]) resolve(occurrence);
+  }
+  async waitForSettlement(sessionId, waitMs, { runtime, baselineSequence } = {}) {
+    if (!waitMs || waitMs <= 0 || this.closing) return null;
+    if (runtime && !runtime.attached && runtime.settlementSequence > (baselineSequence ?? -1)) {
+      return { settled: true };
+    }
+    const deadline = Date.now() + waitMs;
+    return new Promise((resolve) => {
+      let waiters = this.settlementWaiters.get(sessionId);
+      if (!waiters) this.settlementWaiters.set(sessionId, (waiters = new Set()));
+      let done = false,
+        pollTimer;
+      const finish = (occurrence) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        clearInterval(pollTimer);
+        waiters.delete(onSettled);
+        if (!waiters.size) this.settlementWaiters.delete(sessionId);
+        resolve(occurrence);
+      };
+      const onSettled = (occurrence) => finish(occurrence);
+      waiters.add(onSettled);
+      const timer = setTimeout(() => finish(null), Math.max(1, deadline - Date.now()));
+      timer.unref();
+      // Fallback poll for external owners without completionSocket (e.g., hosts or directory-only companions).
+      if (runtime?.attached && !this.events.supports(runtime)) {
+        pollTimer = setInterval(async () => {
+          if (done || this.closing) return finish(null);
+          try {
+            const { status } = await runtime.idleSnapshot();
+            if (status === 'idle') finish({ aborted: false });
+          } catch {
+            finish(null);
+          }
+        }, 200);
+        pollTimer.unref();
+      }
+    });
+  }
   assertOpen() {
     if (this.closing) throw new Error('BRIDGE_CLOSING');
   }
@@ -363,6 +410,9 @@ export class Bridge {
     // Freeze business admission before transport drain: already-dispatched
     // work finishes, queued mutations cannot start another writer.
     this.closing = true;
+    for (const waiters of this.settlementWaiters.values())
+      for (const resolve of [...waiters]) resolve(null);
+    this.settlementWaiters.clear();
     return (this.closePreparation ??= Promise.all([
       this.pool.prepareClose(),
       this.ownerControl?.close(),

@@ -51,7 +51,7 @@ async function fixture(t, defaults = {}) {
 
 test('list permission owns metadata; hidden known IDs can still be read and sent', async (t) => {
   const f = await fixture(t, { list: false });
-  assert.deepEqual((await f.bridge.list()).creatable_projects, []);
+  assert.deepEqual((await f.bridge.list_sessions()).creatable_projects, []);
   const seed = await savedSession(f.bridge),
     id = seed.session_id,
     session = await f.bridge.session(id);
@@ -59,7 +59,7 @@ test('list permission owns metadata; hidden known IDs can still be read and sent
     session.file,
     JSON.stringify({ type: 'session_info', id: 'name', parentId: null, name: 'a"b' }) + '\n',
   );
-  assert.deepEqual((await f.bridge.list()).sessions, []);
+  assert.deepEqual((await f.bridge.list_sessions()).sessions, []);
   assert.ok(
     ['started', 'queued', 'handled'].includes(
       (await f.bridge.send({ session_id: id, text: 'hello' })).status,
@@ -68,7 +68,7 @@ test('list permission owns metadata; hidden known IDs can still be read and sent
   );
   assert.equal((await f.bridge.read({ session_id: id })).session_id, id);
   f.config.grants = [{ session_id: id, list: true, read: false }];
-  const list = await f.bridge.list({ name: 'a"b' });
+  const list = await f.bridge.list_sessions({ name: 'a"b' });
   assert.equal(list.sessions[0].name, 'a"b');
   assert.equal(list.sessions[0].project, f.project);
   assert.equal(list.sessions[0].status.state, 'idle');
@@ -79,7 +79,7 @@ test('creation targets use project list/create rights independently of session p
   const f = await fixture(t, { read: false, send: false });
   const other = path.join(f.dir, 'other'),
     unused = path.join(f.dir, 'unused');
-  assert.deepEqual((await f.bridge.list()).creatable_projects, [f.project]);
+  assert.deepEqual((await f.bridge.list_sessions()).creatable_projects, [f.project]);
   for (const project of [other, unused]) {
     await fs.mkdir(project);
     f.config.folders.push({ path: project });
@@ -90,22 +90,28 @@ test('creation targets use project list/create rights independently of session p
     { session_id, list: false },
   ];
   for (const query of [{}, { offset: 100 }, { project: other, name: 'missing' }, { session_id }]) {
-    const result = await f.bridge.list(query);
+    const result = await f.bridge.list_sessions(query);
     assert.deepEqual(result.creatable_projects, [f.project, unused]);
     assert.deepEqual(result.sessions, []);
   }
   f.config.grants.push({ folder: other, create: true }, { folder: unused, list: false });
-  assert.deepEqual((await f.bridge.list()).creatable_projects, [f.project, other]);
-  assert.equal((await f.bridge.create({ project: unused, text: 'FIRST' })).status, 'started');
+  assert.deepEqual((await f.bridge.list_sessions()).creatable_projects, [f.project, other]);
+  assert.equal(
+    (await f.bridge.create_session({ project: unused, text: 'FIRST' })).status,
+    'started',
+  );
   const unconfigured = path.join(f.project, 'unconfigured');
   await fs.mkdir(unconfigured);
-  assert.equal((await f.bridge.create({ project: unconfigured })).reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal(
+    (await f.bridge.create_session({ project: unconfigured })).reason,
+    'NOT_FOUND_OR_DENIED',
+  );
 });
 
 test('create-and-send uses only create permission and returns its child identity', async (t) => {
   const f = await fixture(t, { send: false, read: false, list: false });
   const args = { project: f.project, text: 'first prompt', name: 'child' };
-  const result = await f.bridge.create(args);
+  const result = await f.bridge.create_session(args);
   assert.ok(['started', 'queued', 'handled'].includes(result.status), JSON.stringify(result));
   assert.equal(result.created, true);
   assert.equal(f.calls.length, 1);
@@ -120,7 +126,7 @@ test('create-and-send uses only create permission and returns its child identity
 
 test('fork copies committed native branch, keeps parent owner, and uses target permissions', async (t) => {
   const f = await fixture(t);
-  const parent = await f.bridge.create({
+  const parent = await f.bridge.create_session({
     project: f.project,
     text: 'parent',
   });
@@ -128,7 +134,7 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   const before = await fs.readFile(source.file, 'utf8'),
     runtime = f.bridge.pool.get(source.id);
   f.config.defaults.send = false;
-  const prepared = await f.bridge.create({ project: f.project, fork_from: source.id });
+  const prepared = await f.bridge.create_session({ project: f.project, fork_from: source.id });
   assert.equal(prepared.status, 'created');
   assert.equal(prepared.submission_id, undefined);
   assert.equal(f.bridge.pool.get(prepared.session_id), null);
@@ -137,7 +143,7 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
     saved.entries.filter((e) => e.type === 'message').map((e) => e.message.content);
   assert.deepEqual(prompts(await history(prepared.session_id)), ['parent']);
   assert.equal(f.calls.length, 1, 'Preparing a fork must not send another prompt');
-  const child = await f.bridge.create({
+  const child = await f.bridge.create_session({
     project: f.project,
     text: 'child prompt',
     fork_from: source.id,
@@ -149,13 +155,14 @@ test('fork copies committed native branch, keeps parent owner, and uses target p
   assert.equal(saved.header.parentSession, source.file);
   assert.deepEqual(prompts(saved), ['parent', 'child prompt']);
   assert.equal(
-    (await f.bridge.list({ session_id: child.session_id })).sessions[0].parent_session_id,
+    (await f.bridge.list_sessions({ session_id: child.session_id })).sessions[0].parent_session_id,
     source.id,
   );
   f.config.grants = [{ session_id: source.id, read: false }];
   for (const prompt of [{}, { text: 'denied' }])
     assert.equal(
-      (await f.bridge.create({ project: f.project, fork_from: source.id, ...prompt })).reason,
+      (await f.bridge.create_session({ project: f.project, fork_from: source.id, ...prompt }))
+        .reason,
       'NOT_FOUND_OR_DENIED',
     );
 });

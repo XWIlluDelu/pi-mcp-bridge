@@ -56,7 +56,8 @@ const readerError = (cause) =>
   });
 
 // A distinct capability under the shared module lifecycle, not a replacement
-// for input mappings. Each reader assesses the target session's own evidence.
+// for input mappings. Multiple independent readers can compose on one session
+// unless a reader explicitly opts into exclusive: true.
 export class SessionReaders {
   constructor() {
     this.readers = new Map();
@@ -70,7 +71,12 @@ export class SessionReaders {
       typeof reader?.read !== 'function'
     )
       throw new Error('INVALID_SESSION_READER');
-    const registration = { id, matches: reader.matches, read: reader.read };
+    const registration = {
+      id,
+      matches: reader.matches,
+      read: reader.read,
+      exclusive: reader.exclusive === true,
+    };
     this.readers.set(id, registration);
     return () => {
       if (this.readers.get(id) === registration) this.readers.delete(id);
@@ -84,12 +90,14 @@ export class SessionReaders {
     } catch (cause) {
       throw readerError(cause);
     }
-    if (matches.length > 1) throw new Error('SESSION_READER_CONFLICT');
-    return matches[0];
+    if (matches.length > 1 && matches.some((r) => r.exclusive))
+      throw new Error('SESSION_READER_CONFLICT');
+    return matches;
   }
 }
 
-export async function captureSessionRead(reader, context, args, query) {
+export async function captureSessionRead(selected, context, args, query) {
+  const readers = Array.isArray(selected) ? selected : [selected];
   let nativeCapture, entryIds;
   const nativeRead = (options = {}) => {
     const { entry_ids } = parseAs(nativeOptions, options, 'INVALID_SESSION_READ');
@@ -104,63 +112,79 @@ export async function captureSessionRead(reader, context, args, query) {
     }
     return nativeCapture;
   };
-  let value;
-  try {
-    value = await reader.read({ ...context, nativeRead });
-  } catch (cause) {
-    throw readerError(cause);
-  }
-  const result = parseAs(readerResponse, value, 'INVALID_SESSION_READ');
-  const target = { units: [], accountedBytes: 0 };
-  const { content } = contextSelection(args);
+  const selection = context.selection ?? contextSelection(args);
+  const { content } = selection;
   const enabled = (kind) => Boolean(content[contentKind(kind)]);
-  const items = new Map(result.items.map((item) => [item.id, item]));
-  if (items.size !== result.items.length) throw new Error('INVALID_SESSION_READ');
-  const keep = new Set();
-  for (const item of result.items) {
-    if (item.related?.some((link) => !items.has(link.id))) throw new Error('INVALID_SESSION_READ');
-    if (
-      enabled(item.kind) &&
-      (!query || matchesReadText(item.title, item.preview, item.text, query))
-    )
-      keep.add(item);
-  }
-  // Set iteration also visits newly reached items, including transitive links.
-  for (const item of keep)
-    for (const { id } of item.related ?? []) {
-      const related = items.get(id);
-      if (enabled(related.kind)) keep.add(related);
+  const target = { units: [], accountedBytes: 0 };
+  const coverage = [];
+  let includeNative = false;
+  const multi = readers.length > 1;
+  for (const reader of readers) {
+    let value;
+    try {
+      value = await reader.read({ ...context, selection, nativeRead });
+    } catch (cause) {
+      throw readerError(cause);
     }
-  for (const item of result.items) {
-    if (!keep.has(item)) continue;
-    const kind = contentKind(item.kind);
-    const originalKind =
-      !CONTENT_KINDS.includes(item.kind) && kind === 'native' ? { content_kind: item.kind } : {};
-    appendSnapshotUnit(target, {
-      type: kind,
-      source: { reader_item: item.id, ...originalKind },
-      message: { role: 'custom', customType: item.kind, content: item.text },
-      kind,
-      title: item.title || undefined,
-      preview: item.preview || undefined,
-      provenance: item.source && { ...item.source, ...originalKind },
-      branch_relation: item.branch_relation,
-      related: item.related,
-    });
+    const result = parseAs(readerResponse, value, 'INVALID_SESSION_READ');
+    if (result.native) includeNative = true;
+    const prefix = multi ? `${reader.id}:` : '';
+    const items = new Map(result.items.map((item) => [item.id, item]));
+    if (items.size !== result.items.length) throw new Error('INVALID_SESSION_READ');
+    const keep = new Set();
+    for (const item of result.items) {
+      if (item.related?.some((link) => !items.has(link.id)))
+        throw new Error('INVALID_SESSION_READ');
+      if (
+        enabled(item.kind) &&
+        (!query || matchesReadText(item.title, item.preview, item.text, query))
+      )
+        keep.add(item);
+    }
+    // Set iteration also visits newly reached items, including transitive links.
+    for (const item of keep)
+      for (const { id } of item.related ?? []) {
+        const related = items.get(id);
+        if (enabled(related.kind)) keep.add(related);
+      }
+    for (const item of result.items) {
+      if (!keep.has(item)) continue;
+      const kind = contentKind(item.kind);
+      const originalKind =
+        !CONTENT_KINDS.includes(item.kind) && kind === 'native' ? { content_kind: item.kind } : {};
+      appendSnapshotUnit(target, {
+        type: kind,
+        source: { reader_item: prefix + item.id, ...originalKind },
+        message: { role: 'custom', customType: item.kind, content: item.text },
+        kind,
+        title: item.title || undefined,
+        preview: item.preview || undefined,
+        provenance: item.source && { ...item.source, ...originalKind },
+        branch_relation: item.branch_relation,
+        related: item.related?.map((link) => ({ ...link, id: prefix + link.id })),
+      });
+    }
+    if (result.coverage) {
+      for (const row of structuredClone(result.coverage)) {
+        if (!enabled(row.type)) row.selected = 0;
+        if (multi && !row.reader) row.reader = reader.id;
+        coverage.push(row);
+      }
+    }
   }
-  const capture = await (result.native ? nativeRead() : nativeCapture);
-  const native = result.native ? capture : null;
+  const capture = await (includeNative ? nativeRead() : nativeCapture);
+  const native = includeNative ? capture : null;
   if (
     native &&
     target.accountedBytes + readSnapshotBytes(native.units, native.units.length) >
       READ_SNAPSHOT_LIMIT
   )
     throw new Error('READ_SNAPSHOT_TOO_LARGE');
-  const info = { id: reader.id };
-  if (result.coverage) {
-    info.coverage = structuredClone(result.coverage);
-    for (const row of info.coverage) if (!enabled(row.type)) row.selected = 0;
-  }
+  const info = {
+    id: multi ? readers.map((r) => r.id).join('+') : readers[0].id,
+    ...(multi ? { readers: readers.map((r) => r.id) } : {}),
+    ...(coverage.length ? { coverage } : {}),
+  };
   return {
     contract: READ_CONTRACT,
     view: 'adapted',
@@ -169,6 +193,7 @@ export async function captureSessionRead(reader, context, args, query) {
     leaf_id: capture ? capture.leaf_id : context.owner.leaf_id,
     selection: native?.selection ?? null,
     omissions: native?.omissions ?? null,
+    ...(native?.commands ? { commands: native.commands } : {}),
     units: native ? target.units.concat(native.units) : target.units,
     live: native?.live ?? null,
   };

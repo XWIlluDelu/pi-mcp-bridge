@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { StdioTransport } from './mcp/protocol-stdio.mjs';
-import { dispatchModern } from './mcp/protocol.mjs';
+import { dispatchMcp } from './mcp/protocol.mjs';
 import { Bridge } from './core/bridge.mjs';
 import { publicError } from './core/errors.mjs';
 import { diagnostics } from './core/diagnostics.mjs';
@@ -62,7 +62,7 @@ async function main() {
     (fail) => {
       // A cancelled stdio reply does not cancel an admitted Bridge operation.
       const transport = new StdioTransport(
-        async (body) => (await dispatchModern(bridge, body)).message,
+        async (body) => (await dispatchMcp(bridge, body)).message,
       );
       transport.onerror = fail;
       return {

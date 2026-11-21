@@ -140,6 +140,7 @@ export default async function rpcObserver(pi) {
               isIdle: ctx.isIdle() && admission.idle(manager),
               hasPendingMessages: ctx.hasPendingMessages(),
               sealed: admission.sealed(manager),
+              contextUsage: ctx.getContextUsage?.() ?? null,
             };
           case 'read_features':
           case 'read':

@@ -180,7 +180,7 @@ test('one batch snapshot retains permissions and directory scope across late lan
     operations: [
       { op: 'read', args: { session_id: f.id } },
       { op: 'send', args: { session_id: f.id, text: 'ADMITTED_BATCH' } },
-      { op: 'list', args: { session_id: f.id } },
+      { op: 'list_sessions', args: { session_id: f.id } },
       { op: 'health', args: { session_id: f.id } },
     ],
   });
@@ -199,7 +199,7 @@ test('one batch snapshot retains permissions and directory scope across late lan
   assert.deepEqual(result.results[2].result.creatable_projects, [f.cwd]);
   const health = JSON.stringify(result.results[3].result);
   assert.match(health, /NO_REMOTE_STOP|MODEL_TOOLS_ARE_SEPARATE/);
-  const fresh = await f.bridge.list({ session_id: f.id });
+  const fresh = await f.bridge.list_sessions({ session_id: f.id });
   assert.deepEqual(fresh.sessions, []);
   assert.deepEqual(fresh.creatable_projects, []);
   await until(() => !f.bridge.pool.get(f.id) && !f.bridge.lane(f.id));
@@ -227,15 +227,15 @@ test('scope reload applies to cached IDs and cursors while preserving cleanup id
   const context = await bridge.captureRequestContext();
   await assert.rejects(fs.stat(root), { code: 'ENOENT' });
   const added = await savedSession({ config: { ...expanded, sessionRoots: [root] } });
-  assert.equal((await bridge.list()).sessions.length, 2);
+  assert.equal((await bridge.list_sessions()).sessions.length, 2);
   await writePolicy(f, { ...expanded, sessionRoots: [root], folders: [] });
   await assert.rejects(bridge.read({ session_id: id }), /NOT_FOUND_OR_DENIED/);
   await assert.rejects(bridge.read({ cursor: page.next_cursor }), /NOT_FOUND_OR_DENIED/);
   assert.deepEqual(
-    (await bridge.list()).sessions.map((row) => row.session_id),
+    (await bridge.list_sessions()).sessions.map((row) => row.session_id),
     [added.session_id],
   );
-  assert.equal((await bridge.create({ project: f.cwd })).reason, 'NOT_FOUND_OR_DENIED');
+  assert.equal((await bridge.create_session({ project: f.cwd })).reason, 'NOT_FOUND_OR_DENIED');
   assert.equal(
     (await bridge.read({ cursor: page.next_cursor }, { requestContext: context })).session_id,
     id,
@@ -267,7 +267,7 @@ for (const initialRead of [true, false])
         await release.promise;
         return context;
       });
-      const pending = f.bridge.create({ project: f.cwd, fork_from: f.id, text: 'FORK' });
+      const pending = f.bridge.create_session({ project: f.cwd, fork_from: f.id, text: 'FORK' });
       await entered.promise;
       await writePolicy(f, { ...allowed, grants: [{ folder: f.cwd, read: true }] });
       release.resolve();

@@ -86,7 +86,7 @@ const modernHeaders = (body) => ({
 });
 test('HTTP accepts matching per-request headers and rejects mismatches or duplicates', async (t) => {
   const f = await fixture(t);
-  const body = modern('tools/call', { name: 'list', arguments: {} });
+  const body = modern('tools/call', { name: 'list_sessions', arguments: {} });
   const success = await request(f.url, body);
   assert.equal(success.status, 200);
   assert.equal(success.headers['mcp-session-id'], undefined);
@@ -105,11 +105,16 @@ test('HTTP accepts matching per-request headers and rejects mismatches or duplic
     jsonrpc: '2.0',
     id: 1,
     method: 'initialize',
-    params: { protocolVersion: '2025-11-25' },
+    params: {
+      protocolVersion: '2025-11-25',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '1' },
+    },
   });
-  assert.equal(initialize.status, 400);
-  assert.equal(initialize.body.error.code, -32020);
-  for (const method of ['GET', 'DELETE', 'OPTIONS'])
+  assert.equal(initialize.status, 200);
+  assert.equal(initialize.body.result.protocolVersion, '2025-11-25');
+  assert.equal((await request(f.url, '', { method: 'DELETE' })).status, 204);
+  for (const method of ['GET', 'OPTIONS'])
     assert.equal((await request(f.url, '', { method })).status, 405);
 });
 test('HTTP response deadline reports uncertainty and does not replay admitted work', async (t) => {
@@ -161,9 +166,9 @@ test('HTTP enforces exact Host, denies every Origin, and authenticates before pa
   }
   for (const [body, headers, status] of [
     ['{bad json', {}, 400],
-    [[rpc('list')], {}, 400],
-    [rpc('list'), { 'Content-Encoding': 'gzip' }, 415],
-    [{ jsonrpc: '2.0', id: 1, method: 'tools/list' }, {}, 400],
+    [[rpc('list_sessions')], {}, 400],
+    [rpc('list_sessions'), { 'Content-Encoding': 'gzip' }, 415],
+    [{ jsonrpc: '2.0', id: 1, method: 'server/discover' }, {}, 400],
   ])
     assert.equal((await request(f.url, body, { headers })).status, status);
 });
@@ -227,7 +232,7 @@ test('HTTP shutdown drains input ACKs without publishing a later batch create', 
       operations: [
         { op: 'send', args: { session_id: f.id, text: 'fixture' } },
         {
-          op: 'create',
+          op: 'create_session',
           args: { project: f.config.folders[0].path, fork_from: f.id, text: 'fixture' },
         },
       ],

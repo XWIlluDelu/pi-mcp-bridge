@@ -15,19 +15,21 @@ import { READ_CONTRACT } from '../src/read/context-read.mjs';
 import { atomicJson } from '../src/core/storage.mjs';
 import { reserveOwner, updateOwner, readClaim, claimFile } from '../src/runtime/attachments.mjs';
 
+const reload = (bridge, args) => bridge.maintain_session({ action: 'reload', ...args });
+
 test('reload requires send and leaves saved sessions and explicit local pauses unopened', async (t) => {
   const f = await fixture(t),
     args = { session_id: f.id };
   const claim = () => readClaim(f.config.attachmentDir, f.session);
-  assert.equal((await f.bridge.reload(args)).reason, 'no_active_owner');
+  assert.equal((await reload(f.bridge, args)).reason, 'no_active_owner');
   await f.bridge.releaseForLocal(args);
   const held = await claim();
   assert.equal(held.noColdReacquire, true);
-  assert.equal((await f.bridge.reload(args)).reason, 'no_active_owner');
+  assert.equal((await reload(f.bridge, args)).reason, 'no_active_owner');
   assert.deepEqual(await claim(), held);
   assert.equal(f.bridge.pool.instances.size, 0);
   await fs.writeFile(f.configFile, JSON.stringify({ ...f.config, grants: [] }));
-  await assert.rejects(f.bridge.reload(args), /NOT_FOUND_OR_DENIED/);
+  await assert.rejects(reload(f.bridge, args), /NOT_FOUND_OR_DENIED/);
 });
 
 // Exercise the actual owner socket, loss of its ACK, and generation publication.
@@ -108,7 +110,7 @@ async function attached(
 
 test('attached reload confirms replacement after a lost ACK and reports an incompatible read contract', async (t) => {
   const f = await attached(t, { loseAck: true, version: '0.0.0', contract: 'unsupported' });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
+  assert.deepEqual(await reload(f.bridge, { session_id: f.id }), {
     status: 'completed',
     owner_version: '0.0.0',
     read_compatible: false,
@@ -118,7 +120,7 @@ test('attached reload confirms replacement after a lost ACK and reports an incom
 
 test('owners without reload support are rejected before dispatch', async (t) => {
   const f = await attached(t, { supported: false });
-  assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
+  assert.deepEqual(await reload(f.bridge, { session_id: f.id }), {
     status: 'rejected',
     reason: 'RELOAD_UNSUPPORTED',
   });
@@ -130,7 +132,7 @@ test(
   { timeout: 15000 },
   async (t) => {
     const f = await attached(t, { leaveUnchanged: true });
-    assert.deepEqual(await f.bridge.reload({ session_id: f.id }), {
+    assert.deepEqual(await reload(f.bridge, { session_id: f.id }), {
       status: 'unknown',
       reason: 'RELOAD_UNCONFIRMED',
     });
@@ -145,7 +147,7 @@ test(
 test('a newly published owner must finish native initialization before reload completes', async (t) => {
   const f = await attached(t, { initializing: true });
   let finished = false;
-  const work = f.bridge.reload({ session_id: f.id }).then((value) => {
+  const work = reload(f.bridge, { session_id: f.id }).then((value) => {
     finished = true;
     return value;
   });

@@ -317,7 +317,7 @@ test('Bridge search finds older effective content, expands frozen evidence and r
   assert.equal(f.acquisitions(), 0, 'internal predicates are rejected before source acquisition');
   const brief = await f.bridge.read({ session_id: f.id, range: { recent: 1 } });
   assert.doesNotMatch(JSON.stringify(brief.items), /unique middle decision/);
-  const found = await f.bridge.search({ session_id: f.id, query: 'UNIQUE MIDDLE DECISION' });
+  const found = await f.bridge.read({ session_id: f.id, query: 'UNIQUE MIDDLE DECISION' });
   assert.equal(found.matches, 1);
   assert.equal(found.next_cursor, null);
   assert.match(found.items[0].text, /unique middle decision/);
@@ -349,7 +349,7 @@ test('Bridge reference expansion rejects a changed native cwd without reacquirin
 test('Bridge reference expansion supports refs from multiple captures of the same session', async (t) => {
   const f = await bridgeFixture(t);
   const first = await f.bridge.read({ session_id: f.id, range: { recent: 1 } });
-  const second = await f.bridge.search({ session_id: f.id, query: 'unique middle decision' });
+  const second = await f.bridge.read({ session_id: f.id, query: 'unique middle decision' });
   const expanded = await f.bridge.read({ refs: [first.items[0].ref, second.items[0].ref] });
   const text = JSON.stringify(expanded.items);
   assert.match(text, /unique middle decision/);

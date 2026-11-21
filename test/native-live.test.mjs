@@ -29,7 +29,8 @@ test(
   { timeout: 15000 },
   async (t) => {
     const { bridge, session, finish } = await fixture(t);
-    const status = async () => (await bridge.list({ session_id: session.id })).sessions[0].status;
+    const status = async () =>
+      (await bridge.list_sessions({ session_id: session.id })).sessions[0].status;
     const saved = await status();
     assert.equal(saved.state, 'saved');
     assert.equal(Object.hasOwn(saved, 'capabilities'), false);

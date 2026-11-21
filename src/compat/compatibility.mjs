@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
@@ -16,12 +17,18 @@ const entriesSchema = z
 export const validateCompatibilityModules = (entries = []) =>
   parseAs(entriesSchema, entries, 'INVALID_COMPATIBILITY_CONFIG');
 
+async function resolveModuleEntry(file) {
+  const stat = await fs.stat(file).catch(() => null);
+  return stat?.isDirectory() ? path.join(file, 'index.mjs') : file;
+}
+
 // Preflight the entire set before starting any owner-selected code.
 async function load(entries) {
   const modules = new Map();
   for (const { module: file, options, enabled } of entries) {
     if (enabled === false) continue;
-    const { default: module } = await import(pathToFileURL(file).href).catch((cause) => {
+    const entry = await resolveModuleEntry(file);
+    const { default: module } = await import(pathToFileURL(entry).href).catch((cause) => {
       throw new Error('COMPATIBILITY_MODULE_LOAD_FAILED', { cause });
     });
     if (

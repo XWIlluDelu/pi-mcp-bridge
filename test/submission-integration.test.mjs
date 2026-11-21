@@ -73,7 +73,7 @@ test(
 test('submission lookup checks current read/send/create grants and exact session without acquiring an owner', async (t) => {
   const f = await fixture(t);
   f.config.defaults = { ...denyAllPermissions(), create: true };
-  const made = await f.bridge.create({ project: f.project, text: 'CREATE_ONLY_INPUT' });
+  const made = await f.bridge.create_session({ project: f.project, text: 'CREATE_ONLY_INPUT' });
   assert.equal(made.status, 'handled', JSON.stringify(made));
   const createQuery = { session_id: made.session_id, submission_id: made.submission_id };
   assert.equal((await f.bridge.submission(createQuery)).operation, 'create');
@@ -121,7 +121,7 @@ test('a native late ACK winning the timeout race removes the obsolete uncertaint
       .receipt,
     { status: 'started' },
   );
-  const made = await f.bridge.create({ project: f.project, text: 'RACE_CREATE_INPUT' });
+  const made = await f.bridge.create_session({ project: f.project, text: 'RACE_CREATE_INPUT' });
   assert.equal(made.status, 'started');
   assert.equal(made.send.reason, undefined);
 });

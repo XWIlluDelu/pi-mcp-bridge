@@ -36,7 +36,7 @@ function itemBudget(operations) {
 
 function fitQuery(op, result, args, budget) {
   if (fitsResult(result, budget)) return result;
-  if (op === 'models' || op === 'list') {
+  if (op === 'models' || op === 'list_sessions') {
     const key = op === 'models' ? 'models' : 'sessions',
       rows = result[key];
     const page = (count) => ({

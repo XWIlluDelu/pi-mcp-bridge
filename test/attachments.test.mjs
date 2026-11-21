@@ -138,7 +138,7 @@ test('official TUI session replacement registers a fresh identity and socket los
   assert.equal(result.reason, 'LIVE_OWNER_UNREACHABLE');
   assert.equal(await ownerAlive(claim.owner), true);
   assert.equal(f.bridge.pool.get(replacement.id).attached, true);
-  const removed = await f.bridge.delete({
+  const removed = await f.bridge.delete_session({
     session_id: replacement.id,
   });
   assert.equal(removed.status, 'deleted', JSON.stringify(removed));

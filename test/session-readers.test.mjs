@@ -177,7 +177,7 @@ test('search budgets only matching reader content and its related refs', async (
     }),
   });
   await assert.rejects(bridge.read({ session_id: id }), /READ_SNAPSHOT_TOO_LARGE/);
-  const found = await bridge.search({ session_id: id, query: 'search marker' });
+  const found = await bridge.read({ session_id: id, query: 'search marker' });
   assert.equal(found.matches, 1);
   const [row] = found.items;
   const expanded = await bridge.read({ refs: [row.ref, row.related[0].ref] });
@@ -209,12 +209,23 @@ test('reader routing uses the captured capabilities and selects again for a new 
     submit: () => assert.fail('Read must not submit work'),
   });
   const read = () => bridge.read({ session_id: session.id });
-  const unregister = bridge.compatibilityServices.sessionReaders.register('conflict', {
+  const unregisterComposed = bridge.compatibilityServices.sessionReaders.register('secondary', {
+    matches: () => true,
+    read: () => ({
+      items: [{ id: 'extra', kind: 'memory', text: 'Composed memory from second reader' }],
+    }),
+  });
+  const composed = await read();
+  assert.deepEqual(composed.reader.readers, ['fixture-memory', 'secondary']);
+  assert.ok(composed.items.some((item) => item.text.includes('Composed memory')));
+  unregisterComposed();
+  const unregisterExclusive = bridge.compatibilityServices.sessionReaders.register('conflict', {
+    exclusive: true,
     matches: () => true,
     read: () => ({ items: [] }),
   });
   await assert.rejects(read(), /SESSION_READER_CONFLICT/);
-  unregister();
+  unregisterExclusive();
   disableDuringRead = true;
   assert.equal((await read()).reader.id, 'fixture-memory');
   assert.equal((await read()).view, 'session');

@@ -15,6 +15,8 @@ async function populate(f) {
   await released(f);
 }
 
+const compact = (bridge, args) => bridge.maintain_session({ action: 'compact', ...args });
+
 test('too-small cold compact returns a safe native reason without changing history', async (t) => {
   const f = await fixture(t);
   const settings = JSON.parse(await fs.readFile(f.settings, 'utf8'));
@@ -23,7 +25,7 @@ test('too-small cold compact returns a safe native reason without changing histo
   await f.bridge.send({ session_id: f.id, text: 'SMALL_COMPACT_MARKER' });
   await released(f);
   const before = await savedEntries(f.bridge, f.id);
-  assert.deepEqual(await f.bridge.compact({ session_id: f.id }), {
+  assert.deepEqual(await compact(f.bridge, { session_id: f.id }), {
     status: 'rejected',
     reason: 'PI_REJECTED',
     native_reason: 'Nothing to compact (session too small)',
@@ -44,7 +46,7 @@ test(
       JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, send: true }] }),
     );
     const args = { session_id: f.id, instructions: 'RETAIN_THE_MARKER' };
-    const result = await f.bridge.compact(args);
+    const result = await compact(f.bridge, args);
     assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.equal(result.interrupt_requested, false);
     assert.ok(!JSON.stringify(result).includes('RETAIN_THE_MARKER'));
@@ -53,7 +55,7 @@ test(
     const entries = await savedEntries(f.bridge, f.id);
     assert.equal(entries.filter((e) => e.type === 'compaction').length, 1);
     assert.ok(entries.find((e) => e.type === 'compaction').summary.includes('RETAIN_THE_MARKER'));
-    await assert.rejects(f.bridge.compact({ ...args, interrupt: true }), /NOT_FOUND_OR_DENIED/);
+    await assert.rejects(compact(f.bridge, { ...args, interrupt: true }), /NOT_FOUND_OR_DENIED/);
     await assert.rejects(f.bridge.read({ session_id: f.id }), /NOT_FOUND_OR_DENIED/);
   },
 );
@@ -66,11 +68,11 @@ test(
     await populate(f);
     await f.bridge.send({ session_id: f.id, text: 'HOLD_MODEL' });
     const runtime = f.bridge.pool.get(f.id);
-    const refused = await f.bridge.compact({ session_id: f.id });
+    const refused = await compact(f.bridge, { session_id: f.id });
     assert.equal(refused.status, 'rejected');
     assert.equal(refused.reason, 'COMPACT_BUSY');
     assert.equal((await runtime.state()).isStreaming, true);
-    const result = await f.bridge.compact({ session_id: f.id, interrupt: true });
+    const result = await compact(f.bridge, { session_id: f.id, interrupt: true });
     assert.equal(result.status, 'completed', JSON.stringify(result));
     assert.equal(result.interrupt_requested, true);
     await released(f);
@@ -83,7 +85,7 @@ test(
       JSON.stringify({ ...f.config, grants: [{ folder: f.cwd, send: true }] }),
     );
     await assert.rejects(
-      f.bridge.compact({ session_id: f.id, interrupt: true }),
+      compact(f.bridge, { session_id: f.id, interrupt: true }),
       /NOT_FOUND_OR_DENIED/,
     );
   },
@@ -96,7 +98,7 @@ test(
     const f = await fixture(t);
     await populate(f);
     ackTimeout(t, ['compact']);
-    const result = await f.bridge.compact({
+    const result = await compact(f.bridge, {
       session_id: f.id,
       instructions: 'HOLD_COMPACT',
     });
@@ -108,7 +110,7 @@ test(
     );
     await until(() => exists(f.gate + '.compact-start'));
     assert.deepEqual(
-      await f.bridge.set_model({
+      await f.bridge.update_session({
         session_id: f.id,
         model: { provider: 'model-fixture', id: 'vision' },
         thinking_level: 'high',
@@ -157,7 +159,7 @@ for (const [text, marker] of [
         await until(() => exists(f.gate + marker));
         return result;
       });
-      const result = await f.bridge.compact({ session_id: f.id });
+      const result = await compact(f.bridge, { session_id: f.id });
       assert.equal(result.status, 'rejected', JSON.stringify(result));
       assert.equal(result.reason, 'COMPACT_BUSY');
       assert.equal(result.native_effects, 'none');
@@ -180,7 +182,7 @@ test(
   async (t) => {
     const f = await fixture(t);
     await populate(f);
-    const compacting = f.bridge.compact({ session_id: f.id, instructions: 'HOLD_COMPACT' });
+    const compacting = compact(f.bridge, { session_id: f.id, instructions: 'HOLD_COMPACT' });
     await until(() => exists(f.gate + '.compact-start'));
     const stop = await f.bridge.stop({ session_id: f.id });
     assert.equal(stop.status, 'accepted', JSON.stringify(stop));

@@ -102,7 +102,7 @@ for (const outputBroken of [false, true])
       await stopped(f, owner);
       assert.doesNotMatch(server.stderr(), /Unhandled/);
       const restarted = launchStdio(f);
-      const result = await restarted.call('list', { session_id: f.id });
+      const result = await restarted.call('list_sessions', { session_id: f.id });
       assert.equal(result.structuredContent.sessions[0].session_id, f.id);
       restarted.child.stdin.end();
       assert.equal(await restarted.exit(), 0);

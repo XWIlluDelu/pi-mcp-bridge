@@ -4,10 +4,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { promisify } from 'node:util';
-import { z } from 'zod';
 
-import { contextSelection } from '../../src/read/read-schema.mjs';
-
+// Standalone external module: uses only Node.js built-ins and Bridge's public reader context.
 const execFileAsync = promisify(execFile);
 const PROJECT = `
   SELECT project_path FROM session_projects AS project
@@ -33,42 +31,60 @@ const MEMORIES = `
     AND superseded_by_memory_id IS NULL
   ORDER BY COALESCE(importance, 50) ASC, updated_at ASC, id ASC`;
 
-// Validate the values we interpret, not MC's unrelated migration history.
-// Unknown rebase states stay readable but never establish a native history leaf.
-const integer = z.number().int().safe();
-const text = z.string().nullable();
-const compartmentSchema = z.object({
-  id: integer,
-  sequence: integer,
-  title: z.string(),
-  content: z.string(),
-  p1: text,
-  p2: text,
-  p3: text,
-  p4: text,
-  start_message_id: text,
-  end_message_id: text,
-  start_block_index: integer.nullable(),
-  end_block_index: integer.nullable(),
-  rebase_status: z.string(),
-  created_at: integer,
-});
-const memorySchema = z.object({
-  id: integer,
-  category: z.string(),
-  content: z.string(),
-  status: z.enum(['active', 'permanent']),
-  expires_at: integer.nullable(),
-  importance: z.number().finite().nullable(),
-  verification_status: text,
-  updated_at: integer,
-  source_type: text,
-  source_session_id: text,
-});
+const isInt = (v) => Number.isSafeInteger(v);
+const isNullableInt = (v) => v === null || isInt(v);
+const isNullableStr = (v) => v === null || typeof v === 'string';
 
-const optionsSchema = z.strictObject({
-  database: z.string().refine((value) => path.isAbsolute(value) && !value.includes('\0')),
-});
+function isValidCompartment(row) {
+  return (
+    row &&
+    isInt(row.id) &&
+    isInt(row.sequence) &&
+    typeof row.title === 'string' &&
+    typeof row.content === 'string' &&
+    isNullableStr(row.p1) &&
+    isNullableStr(row.p2) &&
+    isNullableStr(row.p3) &&
+    isNullableStr(row.p4) &&
+    isNullableStr(row.start_message_id) &&
+    isNullableStr(row.end_message_id) &&
+    isNullableInt(row.start_block_index) &&
+    isNullableInt(row.end_block_index) &&
+    typeof row.rebase_status === 'string' &&
+    isInt(row.created_at)
+  );
+}
+
+function isValidMemory(row) {
+  return (
+    row &&
+    isInt(row.id) &&
+    typeof row.category === 'string' &&
+    typeof row.content === 'string' &&
+    (row.status === 'active' || row.status === 'permanent') &&
+    isNullableInt(row.expires_at) &&
+    (row.importance === null ||
+      (typeof row.importance === 'number' && Number.isFinite(row.importance))) &&
+    isNullableStr(row.verification_status) &&
+    isInt(row.updated_at) &&
+    isNullableStr(row.source_type) &&
+    isNullableStr(row.source_session_id)
+  );
+}
+
+function parseOptions(options) {
+  if (
+    !options ||
+    typeof options !== 'object' ||
+    Array.isArray(options) ||
+    Object.keys(options).some((key) => key !== 'database') ||
+    typeof options.database !== 'string' ||
+    !path.isAbsolute(options.database) ||
+    options.database.includes('\0')
+  )
+    throw new Error('MAGIC_CONTEXT_INVALID_OPTIONS');
+  return { database: options.database };
+}
 
 function withDatabase(database, read) {
   let db;
@@ -227,9 +243,7 @@ function memoryItem(row, capturedAt) {
 }
 
 export function createMagicContextReader(options) {
-  const parsed = optionsSchema.safeParse(options);
-  if (!parsed.success) throw new Error('MAGIC_CONTEXT_INVALID_OPTIONS');
-  const { database } = parsed.data;
+  const { database } = parseOptions(options);
   // Prepare the actual queries to check the consumed schema at startup.
   withDatabase(database, (db) => {
     for (const sql of [PROJECT, COMPARTMENTS, MEMORIES]) db.prepare(sql);
@@ -247,7 +261,12 @@ export function createMagicContextReader(options) {
       if (context.request.leaf_id !== undefined)
         throw new Error('MAGIC_CONTEXT_EXPLICIT_LEAF_UNSUPPORTED');
       const identity = await projectIdentity(context.session.cwd);
-      const { content } = contextSelection(context.request);
+      const content = {
+        summary: 2,
+        memory: 3,
+        ...context.selection?.content,
+        ...context.request?.content,
+      };
       const { capturedAt, compartments, summaryTotal, memories } = withDatabase(database, (db) => {
         if (sessionProject(db, context) !== identity)
           throw new Error('MAGIC_CONTEXT_SESSION_MISMATCH');
@@ -258,14 +277,13 @@ export function createMagicContextReader(options) {
           content.summary === 0
             ? db.prepare(`SELECT count(*) AS total ${sessionCompartments}`).get(id).total
             : compartments.length;
-        if (compartments.some((row) => !compartmentSchema.safeParse(row).success))
+        if (compartments.some((row) => !isValidCompartment(row)))
           throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
         // Validate timestamps before comparing so SQLite coercion cannot
         // make an incompatible stored value active.
         const memories = [];
         for (const row of db.prepare(MEMORIES).iterate(identity)) {
-          if (!memorySchema.safeParse(row).success)
-            throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
+          if (!isValidMemory(row)) throw new Error('MAGIC_CONTEXT_SCHEMA_MISMATCH');
           if (row.expires_at === null || row.expires_at > capturedAt) memories.push(row);
         }
         return { capturedAt, compartments, summaryTotal, memories };

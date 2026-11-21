@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { parseAs } from '../mcp/schema.mjs';
+import { parseAs, utf16String } from '../mcp/schema.mjs';
 import { modelPreferenceFields, modelIdentity, thinkingLevelSchema, sameModel } from './models.mjs';
 
 export const modelSettingsSchema = z
@@ -7,6 +7,17 @@ export const modelSettingsSchema = z
   .refine((args) => args.model !== undefined || args.thinking_level !== undefined, {
     message: 'Model or thinking level required',
   });
+
+export const sessionSettingsSchema = z
+  .strictObject({
+    ...modelPreferenceFields,
+    name: utf16String(200).min(1).optional(),
+  })
+  .refine(
+    (args) =>
+      args.model !== undefined || args.thinking_level !== undefined || args.name !== undefined,
+    { message: 'Model, thinking_level, or name required' },
+  );
 
 const selection = z.object({ model: modelIdentity, thinking_level: thinkingLevelSchema });
 export const modelSettings = (value) => parseAs(selection, value, 'INVALID_MODEL_SELECTION');

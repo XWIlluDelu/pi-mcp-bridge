@@ -59,7 +59,7 @@ for (const stage of ['native readiness', 'failed startup cleanup'])
       const rpc = f.bridge.pool.starting.get(target.id).runtime,
         owner = structuredClone(rpc.childIdentity);
       assert.equal(await ownerAlive(owner), true);
-      const deleted = await f.bridge.delete({ session_id: target.id });
+      const deleted = await f.bridge.delete_session({ session_id: target.id });
       assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
       assert.equal((await sent).status, 'rejected');
       assert.equal(await ownerAlive(owner), false);
@@ -101,7 +101,7 @@ test('delete ends an unsupported live claim without treating its socket metadata
       socket: unrelated,
     }),
   );
-  const result = await f.bridge.delete({ session_id: target.id });
+  const result = await f.bridge.delete_session({ session_id: target.id });
   assert.equal(result.status, 'deleted', JSON.stringify(result));
   await live.exited;
   assert.equal(await ownerAlive(live.owner), false);
@@ -134,7 +134,7 @@ for (const callback of ['cancel', 'release'])
           throw new Error('ordinary release failure');
         },
       });
-      const result = await f.bridge.delete({ session_id: target.id });
+      const result = await f.bridge.delete_session({ session_id: target.id });
       assert.equal(failed, true, 'exercise the actual callback, not a transport timeout');
       assert.equal(released, callback === 'release');
       assert.equal(await ownerAlive(b.owner), true);
@@ -173,7 +173,7 @@ test('lost release ACK uses confirmed target closure without terminating the sha
     released = true;
     throw new Error('lost release acknowledgement');
   });
-  const result = await f.bridge.delete({ session_id: target.id });
+  const result = await f.bridge.delete_session({ session_id: target.id });
   assert.equal(released, true, 'complete release over real IPC before discarding the ACK');
   assert.equal(await ownerAlive(a.owner), true);
   assert.ok(await fs.stat(neighbor.file));
@@ -201,7 +201,7 @@ test('a failing host release cannot authorize termination after its binding chan
       throw new Error('ordinary release failure after replacement');
     },
   });
-  const result = await f.bridge.delete({ session_id: target.id });
+  const result = await f.bridge.delete_session({ session_id: target.id });
   assert.equal(result.reason, 'RUNTIME_SESSION_CHANGED', JSON.stringify(result));
   assert.equal(await ownerAlive(a.owner), true);
   assert.equal((await readClaim(f.config.attachmentDir, target)).generation, 'replacement');
@@ -214,7 +214,7 @@ test('denied delete or replaced target leaves the live owner and history alone',
     a = await idleProcess(t);
   await reserveOwner(f.config.attachmentDir, target, 'extension', a.owner);
   f.config.grants = [];
-  const result = await f.bridge.delete({ session_id: target.id });
+  const result = await f.bridge.delete_session({ session_id: target.id });
   assert.equal(result.reason, 'NOT_FOUND_OR_DENIED');
 
   // Both projects allow deletion. The request must still target the identity
@@ -228,7 +228,7 @@ test('denied delete or replaced target leaves the live owner and history alone',
     return locked(key, run, lane);
   });
   assert.equal(
-    (await f.bridge.delete({ session_id: target.id })).reason,
+    (await f.bridge.delete_session({ session_id: target.id })).reason,
     'RUNTIME_SESSION_CHANGED',
   );
   assert.equal(await ownerAlive(a.owner), true);

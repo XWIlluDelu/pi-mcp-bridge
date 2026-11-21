@@ -189,7 +189,7 @@ test(
     assert.deepEqual(await fs.readFile(b.file), bytes);
     f.config.grants = [{ session_id: f.id, list: true, read: true }];
     await f.bridge.read({ session_id: f.id });
-    await f.bridge.list({ session_id: f.id });
+    await f.bridge.list_sessions({ session_id: f.id });
     assert.equal(runtime.child.exitCode, null);
   },
 );

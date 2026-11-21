@@ -5,6 +5,7 @@ import { reloadAdmission } from './reload-admission.mjs';
 import { parseCompactInput, compactContext, compactMetadata } from '../ops/compact.mjs';
 import { modelState } from '../ops/models.mjs';
 import { createModelSetter } from '../ops/set-model.mjs';
+import { requestStop, stopReceipt, withdrawalCollector } from '../ops/stop-execution.mjs';
 import path from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -343,16 +344,24 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
               ...ownerIdentity(record),
               sessionName: ctx.sessionManager.getSessionName() ?? null,
               ...modelState({ model: ctx.model, thinkingLevel: pi.getThinkingLevel() }),
+              contextUsage: ctx.getContextUsage?.() ?? null,
               isStreaming: !ctx.isIdle(),
               generation: record.generation,
               activity: activity(),
               reloadComplete: admission.completed(manager),
+              capabilities: { send: true, command: false, stop: true },
             };
           else if (request.op === 'read_features' || request.op === 'read')
             data = nativeOwnerRead(pi, record, request, ctx, runtime, buildSessionProjection);
           else if (request.op === 'snapshot')
             data = { ...ownerIdentity(record), ...nativeSnapshot(manager) };
-          else if (request.op === 'reload') {
+          else if (request.op === 'set_name') {
+            if (typeof args.name !== 'string' || !args.name.trim() || args.name.length > 200)
+              throw new OwnerFailure('INVALID_ARGUMENTS');
+            pi.setSessionName(args.name);
+            check();
+            data = { name: ctx.sessionManager.getSessionName() ?? args.name };
+          } else if (request.op === 'reload') {
             if (Object.keys(args).length) throw new OwnerFailure('INVALID_ARGUMENTS');
             const operation = admission.begin(manager, ctx, runtime.mutations.size > 0);
             runtime.reload = operation;
@@ -415,10 +424,29 @@ export default async function attachExtension(pi, { AgentSession, buildSessionPr
           } else if (request.op === 'bash') {
             throw new OwnerFailure('BASH_UNSUPPORTED');
           } else if (request.op === 'stop') {
-            // TUI ctx.abort + getEditorText can recover joined text (including
-            // prior draft), but no public context API aborts independent bash.
-            // RPC ctx also lacks clearQueue. Don't claim partial work is stop-all.
-            throw new OwnerFailure('STOP_UNSUPPORTED');
+            const withdrawn = withdrawalCollector(args.max_chars);
+            const liveSession = admission.session(manager);
+            if (liveSession) {
+              const receipt = await trackMutation(
+                requestStop(liveSession, (value) => withdrawn.add(value), check),
+                'stop',
+              );
+              check();
+              data = { ...receipt, withdrawal: withdrawn.value };
+            } else {
+              ctx.abort();
+              check();
+              const draft = ctx.ui?.getEditorText?.() ?? '';
+              withdrawn.add({ text: draft, includesEditorDraft: Boolean(draft) });
+              data = {
+                ...stopReceipt({
+                  status: 'accepted',
+                  acknowledgement: 'requested',
+                  coverage: 'agent',
+                }),
+                withdrawal: withdrawn.value,
+              };
+            }
           } else throw new OwnerFailure('INVALID_ATTACHED_OPERATION');
           return data;
         },

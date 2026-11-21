@@ -65,6 +65,7 @@ export async function settledForLocal(bridge, request) {
       generation: request.generation,
       sequence: request.sequence,
     });
+    bridge.notifySettled(session.id, request);
     bridge.events.observe(session, request);
     return {};
   });

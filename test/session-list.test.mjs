@@ -39,12 +39,12 @@ test('delete preparation failure leaves an owned runtime alive and creates no re
   await f.bridge.send({ session_id: f.id, text: 'fixture' });
   await fs.mkdir(path.join(f.config.stateDir, 'trash'), { mode: 0o755 });
   await fs.chmod(path.join(f.config.stateDir, 'trash'), 0o755);
-  const result = await f.bridge.delete({ session_id: f.id });
+  const result = await f.bridge.delete_session({ session_id: f.id });
   assert.equal(result.status, 'rejected');
   assert.equal(f.runtime.alive, true);
   assert.deepEqual(await fs.readdir(path.join(f.config.stateDir, 'trash')), []);
   assert.deepEqual(await fs.readdir(path.join(f.config.sessionRoots[0], '.pi-mcp-trash')), []);
-  assert.equal((await f.bridge.list()).sessions.length, 1);
+  assert.equal((await f.bridge.list_sessions()).sessions.length, 1);
 });
 
 test('name filtering scans list-authorized metadata until its page and one extra match', async (t) => {
@@ -67,7 +67,7 @@ test('name filtering scans list-authorized metadata until its page and one extra
   f.config.grants.push({ session_id: sessions[1].id, list: false });
   const check = async (args, expectedRows, expectedReads, next) => {
     seen.length = 0;
-    const result = await f.bridge.list({ name: 'needle', limit: 1, ...args });
+    const result = await f.bridge.list_sessions({ name: 'needle', limit: 1, ...args });
     assert.deepEqual(
       result.sessions.map((s) => s.session_id),
       expectedRows.map((i) => sessions[i].id),
@@ -111,14 +111,14 @@ test('live names share the status snapshot without scanning growing saved histor
         data: 'more history',
       }) + '\n',
     );
-    const [row] = (await f.bridge.list()).sessions;
+    const [row] = (await f.bridge.list_sessions()).sessions;
     assert.equal(row.name, current);
     assert.equal(row.status.state, 'busy');
   }
   assert.equal(states, 3);
   assert.deepEqual(seen, []);
   f.runtime.alive = false;
-  assert.equal((await f.bridge.list()).sessions[0].name, 'disk name');
+  assert.equal((await f.bridge.list_sessions()).sessions[0].name, 'disk name');
   assert.equal(seen.length, 1);
 });
 
@@ -133,12 +133,12 @@ test('an admitted list finishes its observation after admission closes, while ne
     return { sessionName: 'CAPTURED_TITLE', isIdle: true };
   };
   f.bridge.pool.instances.set(f.id, f.runtime);
-  const listing = f.bridge.list({ session_id: f.id });
+  const listing = f.bridge.list_sessions({ session_id: f.id });
   await entered.promise;
   await f.bridge.prepareClose();
   release.resolve();
   const result = await listing;
   assert.equal(result.sessions.length, 1);
   assert.equal(result.sessions[0].name, 'CAPTURED_TITLE');
-  await assert.rejects(f.bridge.list({ session_id: f.id }), /BRIDGE_CLOSING/);
+  await assert.rejects(f.bridge.list_sessions({ session_id: f.id }), /BRIDGE_CLOSING/);
 });

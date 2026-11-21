@@ -53,7 +53,9 @@ test('native profile discovery leaves an owned RPC claim intact and registers an
   assert.equal(external.kind, 'extension');
   assert.equal(external.phase, 'ready');
   const args = { session_id: f.id };
-  assert.equal((await f.bridge.stop(args)).reason, 'STOP_UNSUPPORTED');
+  const stopped = await f.bridge.stop(args);
+  assert.equal(stopped.status, 'accepted');
+  assert.equal(stopped.withdrawn_available, true);
   const sent = await f.bridge.send({ ...args, text: 'companion dispatch proof' });
   assert.equal(sent.status, 'dispatched');
   assert.equal(sent.admission, 'unobservable');

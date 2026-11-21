@@ -64,7 +64,7 @@ test(
       text: 'NEVER',
       model: choice('absent'),
     };
-    const made = await bridge.create(args);
+    const made = await bridge.create_session(args);
     assert.equal(made.created, true);
     assert.equal(made.send.status, 'rejected');
     assert.equal(made.send.reason, 'MODEL_UNAVAILABLE');

@@ -38,21 +38,21 @@ export const ALL_CONTENT = Object.freeze(
 );
 const rangeSchema = z
   .object({
-    recent: count.describe('Last N turns (default 3; -1 = all).').optional(),
-    earliest: count.describe('First N turns (default 0; overlaps deduplicated).').optional(),
+    recent: count.optional(),
+    earliest: count.optional(),
   })
   .strict();
 const contentSchema = z
   .object({
-    input: z.boolean().describe('Turn input message (default true).').optional(),
-    assistant: count.describe('Last N assistant messages per turn (-1 = all, default).').optional(),
-    thinking: count.describe('Last N thinking messages per turn (default 1; 0 = omit).').optional(),
-    tool: count.describe('Last N tool operations per turn (default 1; 0 = omit).').optional(),
-    summary: count.describe('Background summaries (default 2; 0 = omit, -1 = all).').optional(),
-    memory: count.describe('Reader memory items (default 3; 0 = omit, -1 = all).').optional(),
-    system: z.boolean().describe('System instructions (default false).').optional(),
-    command: count.describe('Last N shell commands (default 0; -1 = all).').optional(),
-    native: z.boolean().describe('Other custom/native context (default true).').optional(),
+    input: z.boolean().optional(),
+    assistant: count.optional(),
+    thinking: count.optional(),
+    tool: count.optional(),
+    summary: count.optional(),
+    memory: count.optional(),
+    system: z.boolean().optional(),
+    command: count.optional(),
+    native: z.boolean().optional(),
   })
   .strict();
 
@@ -60,21 +60,14 @@ const view = z.enum(['session', 'runtime']);
 export const readSchema = z
   .object({
     session_id: utf16String(256).min(1).optional(),
-    view: view
-      .describe(
-        'Omit for default source; "session" = native context; "runtime" = last request capture.',
-      )
-      .optional(),
+    query: utf16String(2048, { trim: true }).min(1).optional(),
+    view: view.optional(),
     range: rangeSchema.optional(),
     content: contentSchema.optional(),
     leaf_id: utf16String(128).min(1).nullable().optional(),
     cursor: utf16String(4096).min(1).optional(),
-    refs: z
-      .array(utf16String(4096).min(1))
-      .min(1)
-      .max(8)
-      .describe('Expand up to 8 refs from one session.')
-      .optional(),
+    refs: z.array(utf16String(4096).min(1)).min(1).max(8).optional(),
+    include_images: z.boolean().optional(),
     max_bytes: z.number().int().min(4096).max(65536).optional(),
   })
   .strict()
@@ -87,13 +80,19 @@ export const readSchema = z
   .refine(
     (args) =>
       !args.refs ||
-      [args.cursor, args.view, args.range, args.content, args.leaf_id].every(
+      [args.cursor, args.query, args.view, args.range, args.content, args.leaf_id].every(
         (v) => v === undefined,
       ),
     {
-      message: 'References accept only optional session_id and max_bytes',
+      message: 'References accept only optional session_id, include_images and max_bytes',
     },
   )
+  .refine((args) => !args.cursor || args.query === undefined, {
+    message: 'Cursor continuations inherit query from the original read',
+  })
+  .refine((args) => !args.include_images || Boolean(args.refs), {
+    message: 'include_images requires refs',
+  })
   .refine(
     (args) =>
       args.view !== 'runtime' ||
@@ -107,25 +106,6 @@ export const readSchema = z
         'Runtime captures accept content switches (booleans or 0/-1), but no turn range, finite counts or leaf override',
     },
   );
-
-export const searchSchema = z
-  .object({
-    session_id: readSchema.shape.session_id.unwrap(),
-    query: utf16String(2048, { trim: true }).min(1).describe('Case-insensitive literal text.'),
-    view: view.optional(),
-    content: z
-      .array(z.enum(CONTENT_KINDS))
-      .min(1)
-      .max(CONTENT_KINDS.length)
-      .describe('Kinds to search (omit for all).')
-      .optional(),
-    leaf_id: readSchema.shape.leaf_id,
-    max_bytes: readSchema.shape.max_bytes,
-  })
-  .strict()
-  .refine((args) => args.view !== 'runtime' || args.leaf_id === undefined, {
-    message: 'Runtime captures do not accept a leaf override',
-  });
 
 export function contextSelection(args = {}) {
   return {

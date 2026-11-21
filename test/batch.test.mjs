@@ -23,12 +23,12 @@ test('batch preserves result order, forks use their source lane, and other sessi
       if (text === 'b1') independent.resolve();
       return { text };
     },
-    create: async () => (calls.push('fork'), { session_id: 'child' }),
+    create_session: async () => (calls.push('fork'), { session_id: 'child' }),
   });
   const pending = callBridgeTool(bridge, 'batch', {
     operations: [
       send('a', 'a1'),
-      { op: 'create', args: { project: '/project', fork_from: 'a' } },
+      { op: 'create_session', args: { project: '/project', fork_from: 'a' } },
       send('a', 'a2'),
       send('b', 'b1'),
     ],

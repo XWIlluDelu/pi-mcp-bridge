@@ -1,5 +1,5 @@
 import { loadModelCatalog } from '../ops/model-catalog.mjs';
-import { ALL_CONTENT } from '../read/read-schema.mjs';
+import { ALL_CONTENT, contextSelection } from '../read/read-schema.mjs';
 import { inside, permitted, permissionsHealth } from './permissions.mjs';
 import { savedSessionName, runtimeMetadata } from '../read/session-metadata.mjs';
 import { prepareContextRead } from '../read/context-read.mjs';
@@ -11,6 +11,7 @@ import { launchProfile, nativeSdk } from '../runtime/pi-installation.mjs';
 import { diagnostics } from './diagnostics.mjs';
 import { nativeReadFeatures } from '../read/read-features.mjs';
 import { pick } from '../read/read-render.mjs';
+import { MCP_EXTRA_CONTENT } from '../mcp/protocol.mjs';
 
 // A read-only operation waits for an admitted auto-release to finish, then
 // reselects the current owner under the same request policy.
@@ -102,8 +103,14 @@ async function listSessions(bridge, args = {}, { requestContext }) {
   for (const [index, session] of page.entries()) {
     if (title && index && page[index + 3]) pending.push(observe(page[index + 3]));
     const observed = await pending.shift();
-    const name = Object.hasOwn(observed, 'name')
-      ? observed.name
+    let effective = observed;
+    if (args.session_id && args.wait_ms > 0 && effective.status.state === 'busy') {
+      const runtime = await bridge.pool.forRead(session).catch(() => null);
+      await bridge.waitForSettlement(session.id, args.wait_ms, { runtime });
+      effective = await runtimeMetadata(bridge.pool, session);
+    }
+    const name = Object.hasOwn(effective, 'name')
+      ? effective.name
       : await savedSessionName(session, bridge.titleCache).catch(() => null);
     if (title && (!matches(name, title) || matching++ < offset)) continue;
     if (selected.length === limit) {
@@ -125,7 +132,7 @@ async function listSessions(bridge, args = {}, { requestContext }) {
       parent_session_id:
         parent && permitted(requestContext.permissions, 'list', parent) ? parent.id : null,
       last_activity: new Date(session.mtimeMs).toISOString(),
-      status: observed.status,
+      status: effective.status,
     });
   }
   return {
@@ -162,23 +169,48 @@ async function getHealth(bridge, { session_id } = {}, { requestContext }) {
   };
 }
 
-async function searchSession(bridge, { query, content, ...args }, options = {}) {
-  const selected =
-    content === undefined
-      ? ALL_CONTENT
-      : Object.fromEntries(
-          Object.entries(ALL_CONTENT).map(([kind, value]) => [
-            kind,
-            content.includes(kind) ? value : typeof value === 'boolean' ? false : 0,
-          ]),
-        );
-  return bridge.read(
-    { ...args, content: selected, ...(args.view !== 'runtime' ? { range: { recent: -1 } } : {}) },
-    { ...options, searchQuery: query },
-  );
+const MAX_RETURNED_IMAGES = 4;
+const MAX_RETURNED_IMAGE_CHARS = 180 * 1024;
+
+async function extractRefImages(bridge, target, units, requestContext) {
+  const entryIds = new Set();
+  for (const unit of units) {
+    const hasOmitted =
+      unit.block?.type === 'image' ||
+      (Array.isArray(unit.message?.content) &&
+        unit.message.content.some((block) => block?.type === 'image'));
+    if (hasOmitted && typeof unit.source?.entry_id === 'string') entryIds.add(unit.source.entry_id);
+  }
+  if (!entryIds.size) return [];
+  const { session, runtime } = await readableOwner(bridge, target, requestContext);
+  const raw = runtime
+    ? runtime.attached
+      ? await runtime.snapshot()
+      : await runtime.entries()
+    : await loadSavedSession(session, { omitImageData: false, config: bridge.config });
+  const images = [];
+  let totalChars = 0;
+  for (const entry of raw.entries ?? []) {
+    if (!entryIds.has(entry?.id)) continue;
+    const content = entry.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (
+        block?.type !== 'image' ||
+        typeof block.data !== 'string' ||
+        typeof block.mimeType !== 'string'
+      )
+        continue;
+      if (images.length >= MAX_RETURNED_IMAGES) return images;
+      if (totalChars + block.data.length > MAX_RETURNED_IMAGE_CHARS) continue;
+      totalChars += block.data.length;
+      images.push({ type: 'image', data: block.data, mimeType: block.mimeType });
+    }
+  }
+  return images;
 }
 
-async function readSession(bridge, args, { requestContext, resultBudget, readPins, searchQuery }) {
+async function readSession(bridge, args, { requestContext, resultBudget, readPins }) {
   // Routing metadata only. Cached content is accessed after authorization and
   // today's canonical path/native identity check; a cursor is never a grant.
   const id = bridge.readCache.target(args);
@@ -197,13 +229,36 @@ async function readSession(bridge, args, { requestContext, resultBudget, readPin
         { ...snapshot.sourceRequest, max_bytes: args.max_bytes },
         { requestContext, resultBudget, readPins },
       );
-    return bridge.readCache.render(snapshot, { max_bytes: args.max_bytes }, renderOptions);
+    const rendered = bridge.readCache.render(
+      snapshot,
+      { max_bytes: args.max_bytes },
+      renderOptions,
+    );
+    if (args.include_images) {
+      const images = await extractRefImages(bridge, target, snapshot.units, requestContext).catch(
+        () => [],
+      );
+      if (images.length) rendered[MCP_EXTRA_CONTENT] = images;
+    }
+    return rendered;
   }
   if (args.cursor) {
     const captured = bridge.readCache.get(args, identity);
     return bridge.readCache.render(captured.snapshot, args, { ...captured, ...renderOptions });
   }
-  args = { ...args, session_id: id };
+  const { query: searchQuery, ...baseArgs } = args;
+  args = {
+    ...baseArgs,
+    session_id: id,
+    ...(searchQuery !== undefined
+      ? {
+          content: { ...ALL_CONTENT, ...baseArgs.content },
+          ...(baseArgs.view !== 'runtime' && baseArgs.range === undefined
+            ? { range: { recent: -1 } }
+            : {}),
+        }
+      : {}),
+  };
   const { session: s, runtime } = await readableOwner(bridge, target, requestContext);
   const kind = runtime ? (runtime.attached ? 'attached' : 'rpc') : 'saved';
   diagnostics.emit('read.source', { kind });
@@ -245,10 +300,13 @@ async function readSession(bridge, args, { requestContext, resultBudget, readPin
           session: Object.freeze({ id, file: s.file, native_id: s.header.id, cwd: s.header.cwd }),
           owner: runtime ? await runtime.readFeatures() : nativeReadFeatures(),
           request: args,
+          selection: contextSelection(args),
           nativeRead,
         };
-        const reader = await readers.select(context);
-        return reader ? captureSessionRead(reader, context, args, searchQuery) : nativeRead();
+        const selected = await readers.select(context);
+        return selected.length
+          ? captureSessionRead(selected, context, args, searchQuery)
+          : nativeRead();
       };
       // Keep the owner through feature discovery and the reader's full capture.
       captured = runtime instanceof PiRpc ? await runtime.observeRead(acquire) : await acquire();
@@ -273,6 +331,7 @@ async function readSession(bridge, args, { requestContext, resultBudget, readPin
         'selection',
         'omissions',
         'history',
+        'commands',
         'units',
       ]),
       source: retained ? 'retained' : runtime?.attached ? runtime.record.kind : kind,
@@ -288,9 +347,8 @@ async function readSession(bridge, args, { requestContext, resultBudget, readPin
 }
 
 export const queries = {
-  list: listSessions,
+  list_sessions: listSessions,
   read: readSession,
-  search: searchSession,
   models: listModels,
   health: getHealth,
   submission: getSubmission,

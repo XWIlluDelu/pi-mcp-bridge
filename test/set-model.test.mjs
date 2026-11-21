@@ -20,7 +20,7 @@ test('standalone selection updates a busy native RPC without aborting its captur
   await until(() => exists(f.gate + '.provider-start'));
   const runtime = bridge.pool.get(id);
   assert.deepEqual(
-    await bridge.set_model({
+    await bridge.update_session({
       session_id: id,
       model: choice('vision'),
       thinking_level: 'high',
@@ -62,7 +62,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
   ackTimeout(t, ['set_model']);
   await fs.writeFile(f.gate + '.hold-selection', 'hold');
   await assert.rejects(
-    bridge.set_model({
+    bridge.update_session({
       session_id: id,
       model: choice('vision'),
       thinking_level: 'high',
@@ -71,7 +71,7 @@ test('a timed-out native setter remains fenced until its exact ACK and never app
   );
   assert.ok(runtime.hasPendingCommand('set_model'));
   await assert.rejects(
-    bridge.set_model({ session_id: id, thinking_level: 'low' }),
+    bridge.update_session({ session_id: id, thinking_level: 'low' }),
     /MODEL_SELECTION_PENDING/,
   );
   assert.equal(
@@ -96,7 +96,7 @@ test('native selection remains available during unresolved prompt preflight and 
     await until(() => exists(f.gate + '.preflight-start'));
     assert.ok(runtime.hasPendingCommand('prompt'));
     assert.deepEqual(
-      await bridge.set_model({
+      await bridge.update_session({
         session_id: id,
         model: choice('vision'),
         thinking_level: 'high',
@@ -126,7 +126,7 @@ test('native selection remains available during unresolved prompt preflight and 
     stopping = bridge.stop({ session_id: id });
     await stopEntered.promise;
     assert.ok(Boolean(bridge.lane(id, 'stop')));
-    assert.deepEqual(await bridge.set_model({ session_id: id, model: choice('alpha') }), {
+    assert.deepEqual(await bridge.update_session({ session_id: id, model: choice('alpha') }), {
       model: choice('alpha'),
       thinking_level: 'off',
     });
@@ -150,14 +150,18 @@ test('cold setters return native thinking adjustment, produce no prompt and rele
   const f = await fixture(t),
     { bridge, id } = f;
   const defaults = await fs.readFile(f.settings, 'utf8');
-  assert.deepEqual(await bridge.set_model({ session_id: id, thinking_level: 'high' }), {
+  assert.deepEqual(await bridge.update_session({ session_id: id, thinking_level: 'high' }), {
     model: choice('alpha'),
     thinking_level: 'off',
   });
   let entries = await releasedEntries(bridge, id);
   assert.equal(entries.filter((e) => e.message).length, 0);
   assert.deepEqual(
-    await bridge.set_model({ session_id: id, model: choice('vision'), thinking_level: 'high' }),
+    await bridge.update_session({
+      session_id: id,
+      model: choice('vision'),
+      thinking_level: 'high',
+    }),
     { model: choice('vision'), thinking_level: 'high' },
   );
   entries = await releasedEntries(bridge, id);
@@ -169,7 +173,7 @@ test('cold send restores a standalone model selection from a branch with no mess
   const { bridge, id, settings } = await fixture(t, { modelArgs: [] });
   const defaults = await fs.readFile(settings, 'utf8');
   const selection = { model: choice('vision'), thinking_level: 'low' };
-  assert.deepEqual(await bridge.set_model({ session_id: id, ...selection }), selection);
+  assert.deepEqual(await bridge.update_session({ session_id: id, ...selection }), selection);
   const saved = await releasedEntries(bridge, id);
   assert.equal(
     saved.some((entry) => entry.type === 'message'),
@@ -205,7 +209,7 @@ test('explicit native model and thinking options override a saved empty-branch s
     modelArgs: ['--model', 'model-fixture/reasoner:medium'],
   });
   const selection = { model: choice('vision'), thinking_level: 'low' };
-  assert.deepEqual(await bridge.set_model({ session_id: id, ...selection }), selection);
+  assert.deepEqual(await bridge.update_session({ session_id: id, ...selection }), selection);
   assert.equal(
     (await releasedEntries(bridge, id)).some((entry) => entry.message),
     false,

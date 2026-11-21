@@ -67,7 +67,7 @@ export function withdrawalOutput(receipt, record, args, resultBudget) {
 const receipt = z.object({
   status: z.literal('accepted'),
   acknowledgement: z.enum(['native_ack', 'requested']),
-  coverage: z.literal('agent_and_bash'),
+  coverage: z.enum(['agent_and_bash', 'agent']),
 });
 export const stopReceipt = (value) => ({
   ...parseAs(receipt, value, 'INVALID_STOP_RECEIPT'),

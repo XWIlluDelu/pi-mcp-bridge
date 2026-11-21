@@ -24,7 +24,7 @@ async function fixture(t) {
 }
 test('warm known-ID lookup and listing avoid discovery but revalidate identity and current permissions', async (t) => {
   const f = await fixture(t);
-  await f.bridge.list({ session_id: f.session.id });
+  await f.bridge.list_sessions({ session_id: f.session.id });
   let scans = 0;
   const discover = f.bridge.sessions.bind(f.bridge);
   t.mock.method(f.bridge, 'sessions', async () => {
@@ -32,13 +32,13 @@ test('warm known-ID lookup and listing avoid discovery but revalidate identity a
     return discover();
   });
   assert.equal((await f.bridge.session(f.session.id)).id, f.session.id);
-  assert.equal((await f.bridge.list({ session_id: f.session.id })).sessions.length, 1);
+  assert.equal((await f.bridge.list_sessions({ session_id: f.session.id })).sessions.length, 1);
   assert.equal(scans, 0);
   const header = { ...f.session.header, cwd: '/unavailable' };
   await fs.writeFile(f.session.file, JSON.stringify(header) + '\n');
   const moved = await f.bridge.session(f.session.id);
   assert.equal(moved.cwd, '/unavailable');
-  assert.deepEqual((await f.bridge.list({ session_id: f.session.id })).sessions, []);
+  assert.deepEqual((await f.bridge.list_sessions({ session_id: f.session.id })).sessions, []);
   assert.equal(scans, 0);
   await fs.writeFile(f.session.file, JSON.stringify({ ...header, id: 'replacement' }) + '\n');
   await assert.rejects(f.bridge.session(f.session.id), /NOT_FOUND_OR_DENIED/);
@@ -54,7 +54,7 @@ test('identity discovery ignores unrelated transcript bodies, content parse foll
   await fs.appendFile(f.session.file, 'not JSON at all\n');
   assert.equal((await discover(f.config))[0].id, f.session.id);
   f.config.grants = [{ session_id: f.session.id, read: false, delete: true }];
-  assert.deepEqual((await f.bridge.list()).sessions, []);
+  assert.deepEqual((await f.bridge.list_sessions()).sessions, []);
   await assert.rejects(f.bridge.read({ session_id: f.session.id }), /NOT_FOUND_OR_DENIED/);
   f.config.grants.push({ session_id: f.session.id, list: true, read: true, send: true });
   const before = await fs.readFile(f.session.file, 'utf8'),
@@ -66,12 +66,12 @@ test('identity discovery ignores unrelated transcript bodies, content parse foll
   );
   assert.equal(f.starts(), 1);
   assert.equal(await fs.readFile(f.session.file, 'utf8'), before);
-  const other = await f.bridge.create({
+  const other = await f.bridge.create_session({
     project: f.cwd,
     text: 'first',
   });
   assert.equal(other.status, 'rejected');
-  assert.equal((await f.bridge.delete({ session_id: f.session.id })).status, 'deleted');
+  assert.equal((await f.bridge.delete_session({ session_id: f.session.id })).status, 'deleted');
 });
 test('missing cwd retains project history and deletion rights without permitting a new writer', async (t) => {
   const f = await fixture(t);
@@ -90,7 +90,7 @@ test('missing cwd retains project history and deletion rights without permitting
   const identity = await readSessionIdentity(f.session.file);
   assert.equal(identity.cwd, f.cwd);
   assert.equal(identity.header.cwd, f.cwd);
-  assert.equal((await f.bridge.list()).sessions[0].session_id, f.session.id);
+  assert.equal((await f.bridge.list_sessions()).sessions[0].session_id, f.session.id);
   assert.deepEqual(
     (await f.bridge.read({ session_id: f.session.id })).items.map(({ ref, ...item }) => item),
     previous.items.map(({ ref, ...item }) => item),
@@ -101,11 +101,11 @@ test('missing cwd retains project history and deletion rights without permitting
   );
   assert.equal(f.starts(), 0);
   assert.equal(
-    (await f.bridge.create({ project: f.cwd, text: 'first' })).reason,
+    (await f.bridge.create_session({ project: f.cwd, text: 'first' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
   );
   assert.equal((await fs.readdir(f.config.sessionRoots[0])).length, 1);
-  const deleted = await f.bridge.delete({ session_id: f.session.id });
+  const deleted = await f.bridge.delete_session({ session_id: f.session.id });
   assert.equal(deleted.status, 'deleted');
   assert.equal(deleted.project, f.cwd);
 });
@@ -126,7 +126,7 @@ test('file replacement refuses cold execution while symlinked project directory 
   await fs.rename(f.cwd, f.cwd + '-moved');
   await fs.writeFile(f.cwd, 'fixture');
   assert.equal(
-    (await f.bridge.create({ project: f.cwd, text: 'first' })).reason,
+    (await f.bridge.create_session({ project: f.cwd, text: 'first' })).reason,
     'EXECUTION_CWD_UNAVAILABLE',
   );
   assert.equal(
@@ -144,7 +144,7 @@ test('file replacement refuses cold execution while symlinked project directory 
   );
   // Recorded project identity remains the original configured path, not the symlink target.
   f.config.grants = [{ folder: f.cwd + '-moved', list: true, read: true }];
-  assert.deepEqual((await f.bridge.list()).sessions, []);
+  assert.deepEqual((await f.bridge.list_sessions()).sessions, []);
   await assert.rejects(f.bridge.read({ session_id: f.session.id }), /NOT_FOUND_OR_DENIED/);
 });
 

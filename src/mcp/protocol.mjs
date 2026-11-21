@@ -9,52 +9,67 @@ import { MCP_RESPONSE_LIMIT } from './response-budget.mjs';
 import { EventError } from '../events/events.mjs';
 
 export const MODERN_VERSION = '2026-07-28';
+export const LEGACY_VERSIONS = Object.freeze([
+  '2025-11-25',
+  '2025-06-18',
+  '2025-03-26',
+  '2024-11-05',
+]);
 const SUPPORTED_VERSIONS = [MODERN_VERSION];
 const SERVER_INFO = { name: 'pi-session-bridge', version: packageInfo.version };
 export const META = 'io.modelcontextprotocol/';
 export const MCP_INPUT_LIMIT = 8 * 1024 * 1024;
+export const MCP_EXTRA_CONTENT = Symbol('pi-mcp-bridge.extra-content');
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const parseJson = (bytes) => JSON.parse(decoder.decode(bytes));
 export async function readJson(stream, limit, tooLarge) {
   return parseJson(await readBoundedBytes(stream, limit, () => new Error(tooLarge)));
 }
-// Keep descriptions concise to minimize per-conversation token overhead.
-// Detailed semantics live in docs/api.md and error recovery hints.
+// Concise tool descriptions grouped by layer: session lifecycle (*_session),
+// in-session actions (read/send/command/stop/submission), and Bridge-level utilities.
 const descriptions = {
-  list: 'List authorized Pi sessions (newest first) with status, model, thinking level, capabilities and creatable_projects. Requires list; never starts Pi.',
-  read: 'Read a Pi session in source order (default: last 3 turns); requires read, never starts Pi. Expand item refs with read({refs:[...]}); continue pages with read({cursor}). Omit view for default source (including configured readers).',
-  search:
-    'Search literal case-insensitive text across a session’s full effective context; requires read, never starts Pi. Returns snippets with refs for read({refs}) and cursor for read({cursor}).',
-  models:
-    'List configured native Pi models (provider, id, context_window, thinking_levels) without network refresh. Requires send, command or create.',
-  set_model:
-    'Change a session’s model and/or thinking_level without sending a prompt (works while busy); requires send. Returns actual selection after native adjustment.',
-  compact:
-    'Run native context compaction on an idle session (requires send; interrupt:true also requires stop). Returns metadata; on unknown check list/read before retrying.',
-  reload:
-    'Reload Pi extensions and settings for an idle active owner; requires send. Never interrupts or queues work; check list/read before retrying after unknown.',
-  send: 'Submit text and/or images to a session; requires send. mode: steer (default), follow_up or idle_only. Returns submission_id and admission status (not completion); check submission/list/read after unknown—never resubmit automatically.',
+  list_sessions:
+    'List Pi sessions with status, model, context_usage, capabilities, and creatable_projects. With session_id+wait_ms, waits up to wait_ms for settlement.',
+  create_session:
+    'Create or fork (fork_from) a session in creatable_projects; optional name, initial prompt, model, thinking_level, and wait_ms.',
+  update_session:
+    'Update a session’s model, thinking_level, or display name without prompting (rename works offline).',
+  maintain_session:
+    'Run idle session maintenance: action="compact" (optional instructions, interrupt:true) or action="reload" (refresh extensions/settings).',
+  delete_session:
+    'Stop a session’s writer and move its file to recoverable trash (project files untouched).',
+  read: 'Read or search session context (default: last 3 turns; set query for full-session literal search). Expand {refs,include_images?}; paginate {cursor}; content.system:true lists slash commands.',
+  send: 'Send text/images to a session (mode: steer|follow_up|idle_only). Optional wait_ms (<=30000) waits for settlement; never auto-retry after unknown.',
+  command: 'Run a shell command in Pi (omit !; exclude_from_context:true matches !!).',
+  stop: 'Abort active work and withdraw queued input. Never starts Pi.',
   submission:
-    'Look up a send/create admission receipt (including late native ACKs) without contacting Pi. Requires read, send, or create for a create receipt.',
-  command:
-    'Run a native Pi shell command (omit leading !); requires command. Returns output, exitCode and cancelled. Never retry automatically after unknown.',
-  stop: 'Cancel active work and withdraw queued input; requires stop, never starts Pi. Acts on current work each time.',
-  create:
-    'Create a saved session in a configured project (see list.creatable_projects); requires create. Optional text/images send the first prompt; fork_from copies a parent branch (also requires read). Never recreate automatically after unknown.',
-  delete:
-    'Stop the session’s writer and move the session file to recoverable trash (project files untouched); requires delete. Returns restore_token.',
-  batch:
-    'Run 1–10 operations as {op,args}. Same-session items run in order, different sessions concurrently; items fail independently. Repeating a batch repeats its mutations.',
-  health:
-    'Check permission policy warnings, settings awaiting restart, and event-store status. Optional session_id scopes to one session.',
+    'Check a send/create_session admission receipt (including late ACKs) without contacting Pi.',
+  models: 'List configured Pi models (provider, id, context_window, thinking_levels).',
+  batch: 'Run 1–10 operations in parallel across sessions (in order per session).',
+  health: 'Diagnose permission grants, restart-pending settings, and event-store status.',
 };
 const toolNames = Object.keys(descriptions);
+function compactSchema(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) return node.map(compactSchema);
+  const out = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === '$schema' || key === 'additionalProperties') continue;
+    if (key === 'pattern' && (node.format === 'date-time' || node.format === 'uuid')) continue;
+    if (key === 'maximum' && value === Number.MAX_SAFE_INTEGER) continue;
+    if (key === 'minimum' && value === -Number.MAX_SAFE_INTEGER) continue;
+    out[key] = compactSchema(value);
+  }
+  return out;
+}
 let tools;
 export function toolDefinitions() {
   return (tools ??= toolNames.map((name) => ({
     name,
     description: descriptions[name],
-    inputSchema: z.toJSONSchema(publicSchemas[name], { target: 'draft-7', io: 'input' }),
+    inputSchema: compactSchema(
+      z.toJSONSchema(publicSchemas[name], { target: 'draft-7', io: 'input' }),
+    ),
     ...(publicAnnotations[name] ? { annotations: publicAnnotations[name] } : {}),
   })));
 }
@@ -62,13 +77,14 @@ const ownerRecovery =
   'Use a session owner that supports the current control protocol and operation. A safe native reload can update the endpoint at an idle boundary.';
 const recoveryByCode = {
   OWNER_READ_REFRESH_REQUIRED:
-    'Call reload for this session at an idle boundary, then retry read. If reload is unsupported, update the configured companion and use native /reload or a host-managed reopen once. Changing read arguments will not refresh the owner.',
+    'Call maintain_session({session_id, action:"reload"}) at an idle boundary, then retry read. If reload is unsupported, update the configured companion and use native /reload or a host-managed reopen once. Changing read arguments will not refresh the owner.',
   ATTACHMENT_PROTOCOL_MISMATCH: ownerRecovery,
   OWNER_COMPONENT_UPDATE_REQUIRED: ownerRecovery,
 };
 function toolResult(result) {
+  const extra = Array.isArray(result?.[MCP_EXTRA_CONTENT]) ? result[MCP_EXTRA_CONTENT] : [];
   return {
-    content: [{ type: 'text', text: JSON.stringify(result) }],
+    content: [{ type: 'text', text: JSON.stringify(result) }, ...extra],
     structuredContent: result,
   };
 }
@@ -142,25 +158,42 @@ export function rpcError(id, code, message, data) {
 }
 // The budget covers the full JSON-RPC envelope, including the duplicated text
 // and the request ID. Keep the fallback within the same response contract.
-function success(id, result) {
+function success(id, result, modern = true) {
   const envelope = (value) => ({
     jsonrpc: '2.0',
     id,
-    result: {
-      resultType: 'complete',
-      ...value,
-      _meta: { ...value._meta, [META + 'serverInfo']: SERVER_INFO },
-    },
+    result: modern
+      ? {
+          resultType: 'complete',
+          ...value,
+          _meta: { ...value._meta, [META + 'serverInfo']: SERVER_INFO },
+        }
+      : value,
   });
   let message = envelope(result);
-  if (Buffer.byteLength(JSON.stringify(message)) > MCP_RESPONSE_LIMIT)
-    message = envelope(
-      toolError('RESPONSE_TOO_LARGE', {
-        recovery:
-          'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
-      }),
-    );
+  if (Buffer.byteLength(JSON.stringify(message)) > MCP_RESPONSE_LIMIT) {
+    // If extra image content blocks pushed the envelope over the limit, fall back to text-only first.
+    if (Array.isArray(result?.content) && result.content.length > 1) {
+      message = envelope({ ...result, content: [result.content[0]] });
+    }
+    if (Buffer.byteLength(JSON.stringify(message)) > MCP_RESPONSE_LIMIT)
+      message = envelope(
+        toolError('RESPONSE_TOO_LARGE', {
+          recovery:
+            'OUTCOME_UNKNOWN; inspect list/read or request a smaller read. Do not automatically resubmit mutations.',
+        }),
+      );
+  }
   return { status: 200, message };
+}
+
+export function isModernRequest(body, headers) {
+  if (!body || typeof body !== 'object') return false;
+  if (body.method === 'server/discover' || body.method?.startsWith?.('events/')) return true;
+  if (body.params?._meta && Object.hasOwn(body.params._meta, META + 'protocolVersion')) return true;
+  if (headers?.['mcp-protocol-version']?.[0] === MODERN_VERSION) return true;
+  if (headers?.['mcp-method'] !== undefined) return true;
+  return false;
 }
 
 export async function dispatchModern(bridge, body, options = {}) {
@@ -226,6 +259,68 @@ export async function dispatchModern(bridge, body, options = {}) {
     default:
       return reject(-32601, 'Method not found', undefined, 404);
   }
+}
+
+async function dispatchLegacy(bridge, body, options = {}) {
+  if (!isRpcRequest(body))
+    return { status: 400, message: rpcError(null, -32600, 'Invalid request') };
+  const { id, params = {}, method } = body;
+  // Standard MCP notifications (e.g. notifications/initialized, notifications/cancelled) have no id.
+  if (id === undefined) return { status: 202, message: null };
+  const reject = (code, reason, data, status = 400) => ({
+    status,
+    message: rpcError(id, code, reason, data),
+  });
+  const headerVersion = options.headers?.['mcp-protocol-version'];
+  if (headerVersion !== undefined) {
+    if (headerVersion.length !== 1 || !LEGACY_VERSIONS.includes(headerVersion[0]))
+      return reject(-32022, 'Unsupported protocol version', {
+        supported: [...SUPPORTED_VERSIONS, ...LEGACY_VERSIONS],
+        requested: String(headerVersion[0] ?? '').slice(0, 64),
+      });
+  }
+  switch (method) {
+    case 'initialize': {
+      const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : '';
+      const protocolVersion = LEGACY_VERSIONS.includes(requested) ? requested : LEGACY_VERSIONS[0];
+      return success(
+        id,
+        {
+          protocolVersion,
+          capabilities: { tools: {} },
+          serverInfo: SERVER_INFO,
+        },
+        false,
+      );
+    }
+    case 'ping':
+      return success(id, {}, false);
+    case 'tools/list':
+      if (params.cursor !== undefined) return reject(-32602, 'Invalid cursor');
+      return success(id, { tools: toolDefinitions() }, false);
+    case 'tools/call':
+      if (
+        typeof params.name !== 'string' ||
+        (params.arguments !== undefined && !object(params.arguments))
+      )
+        return reject(-32602, 'Malformed tool call');
+      if (!toolNames.includes(params.name)) return reject(-32602, 'Unknown tool');
+      return success(
+        id,
+        await callBridgeTool(bridge, params.name, params.arguments, { ...options, requestId: id }),
+        false,
+      );
+    default:
+      return reject(-32601, 'Method not found', undefined, 404);
+  }
+}
+
+// Unified MCP dispatcher: supports both 2026-07-28 per-request stateless MCP
+// (ChatGPT/Dots/Events) and standard MCP initialize-based clients (Claude, Cursor, Pi).
+export function dispatchMcp(bridge, body, options = {}) {
+  return isModernRequest(body, options.headers)
+    ? dispatchModern(bridge, body, options)
+    : dispatchLegacy(bridge, body, options);
 }
 
 function modernHeaderFields(body) {

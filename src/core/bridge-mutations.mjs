@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { compactReceipt, nativeCompactReason } from '../ops/compact.mjs';
 import { permitted } from './permissions.mjs';
 import { prepareSession, persistSession } from '../ops/create-session.mjs';
@@ -25,22 +27,23 @@ async function submit(
   target,
   operation,
   input,
-  { requestContext, checkInput, markForAutoRelease },
+  { requestContext, checkInput, markForAutoRelease, waitMs },
 ) {
   const submissionId = bridge.submissions.start(target.id, operation);
   const selection = {};
   const record = (receipt) => bridge.submissions.update(submissionId, receipt) ?? receipt;
-  let receipt;
+  let receipt, runtime, baselineSequence;
   try {
     checkInput();
     if (operation === 'send') target = await bridge.revalidateSession(target, requestContext);
-    const runtime = await bridge.pool.resolve(target, {
+    runtime = await bridge.pool.resolve(target, {
       beforeStart: checkInput,
       onStart: markForAutoRelease,
     });
     if (operation === 'create') markForAutoRelease(runtime);
     checkInput();
     if (operation === 'create' && runtime.attached) throw new Error('RUNTIME_SESSION_CHANGED');
+    baselineSequence = runtime.settlementSequence;
     receipt = await runtime.submitPrompt(input, {
       submissionId,
       selection,
@@ -51,7 +54,27 @@ async function submit(
   } catch (error) {
     receipt = rejected(bridge, error);
   }
-  return { ...selection, ...record(receipt), submission_id: submissionId };
+  const base = { ...selection, ...record(receipt), submission_id: submissionId };
+  if (waitMs > 0) {
+    if (base.status === 'handled') return { ...base, settled: true };
+    if (['started', 'queued', 'dispatched'].includes(base.status)) {
+      const settled = await bridge.waitForSettlement(target.id, waitMs, {
+        runtime,
+        baselineSequence,
+      });
+      if (settled) {
+        return {
+          ...base,
+          settled: true,
+          ...(typeof settled.aborted === 'boolean' ? { aborted: settled.aborted } : {}),
+          ...(settled.leafId !== undefined ? { leaf_id: settled.leafId } : {}),
+          ...(settled.result ? { result: settled.result } : {}),
+        };
+      }
+      return { ...base, settled: false };
+    }
+  }
+  return base;
 }
 
 async function reloadSession(bridge, _args, { target: session, markForAutoRelease, checkInput }) {
@@ -114,6 +137,20 @@ async function compactSession(bridge, args, { target: session, markForAutoReleas
   }
 }
 
+async function appendSavedSessionName(bridge, target, name) {
+  const saved = await loadSavedSession(target, { omitImageData: true, config: bridge.config });
+  const entry = {
+    type: 'session_info',
+    id: randomUUID(),
+    parentId: saved.leafId ?? saved.entries.at(-1)?.id ?? null,
+    timestamp: new Date().toISOString(),
+    name,
+  };
+  await fs.appendFile(target.file, JSON.stringify(entry) + '\n', 'utf8');
+  bridge.titleCache.delete(target.file);
+  return { name };
+}
+
 async function setSessionModel(bridge, args, { target, requestContext, markForAutoRelease }) {
   // The request policy is frozen and permission was checked for this exact
   // identity. These rechecks bind each dispatch and its result to that target.
@@ -124,6 +161,16 @@ async function setSessionModel(bridge, args, { target, requestContext, markForAu
     await bridge.revalidateSession(target, requestContext);
   };
   await authorized();
+  const hasModelSettings = args.model !== undefined || args.thinking_level !== undefined;
+  if (!hasModelSettings && args.name !== undefined) {
+    const live = await bridge.pool.forRead(target);
+    if (!live) return appendSavedSessionName(bridge, target, args.name);
+    await authorized();
+    const renamed = await live.setSessionName(args.name, authorized);
+    bridge.titleCache.delete(target.file);
+    await authorized();
+    return renamed;
+  }
   const runtime = await bridge.pool.resolve(target, {
     beforeStart: authorized,
     onStart: markForAutoRelease,
@@ -134,8 +181,12 @@ async function setSessionModel(bridge, args, { target, requestContext, markForAu
     nativeThinking: true,
     beforeDispatch: authorized,
   });
+  if (args.name !== undefined) {
+    await runtime.setSessionName(args.name, authorized);
+    bridge.titleCache.delete(target.file);
+  }
   await authorized();
-  return actual;
+  return args.name !== undefined ? { ...actual, name: args.name } : actual;
 }
 
 function sendPrompt(bridge, args, admission) {
@@ -144,7 +195,7 @@ function sendPrompt(bridge, args, admission) {
     admission.target,
     'send',
     { ...promptInput(args), mode: args.mode ?? 'steer' },
-    admission,
+    { ...admission, waitMs: args.wait_ms },
   );
 }
 
@@ -267,7 +318,7 @@ async function createSession(bridge, args, admission) {
         child,
         'create',
         { ...input, mode: 'steer' },
-        admission,
+        { ...admission, waitMs: args.wait_ms },
       );
       return { status: send.status, created, session_id: child.id, submission_id, send };
     });
@@ -324,13 +375,18 @@ async function deleteSession(bridge, _args, { target, requestContext, resultBudg
   );
 }
 
+function maintainSession(bridge, args, admission) {
+  return args.action === 'reload'
+    ? reloadSession(bridge, args, admission)
+    : compactSession(bridge, args, admission);
+}
+
 export const mutations = {
   send: [sendPrompt, 'send', 'work'],
   command: [runCommand, 'command', 'bash'],
-  compact: [compactSession, 'send', 'work'],
-  reload: [reloadSession, 'send', 'work'],
-  set_model: [setSessionModel, 'send', 'work'],
+  maintain_session: [maintainSession, 'send', 'work'],
+  update_session: [setSessionModel, 'send', 'work'],
   stop: [stopSession, 'stop', 'stop'],
-  create: [createSession],
-  delete: [deleteSession, 'delete', 'delete'],
+  create_session: [createSession],
+  delete_session: [deleteSession, 'delete', 'delete'],
 };

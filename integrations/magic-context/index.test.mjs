@@ -120,9 +120,9 @@ test('explicit database, supported schema, and lifecycle registration are requir
     { database: f.database },
   );
   f.compartment();
-  assert.equal((await sessionReaders.select(f.context)).id, module.id);
+  assert.equal((await sessionReaders.select(f.context))[0].id, module.id);
   cleanup();
-  assert.equal(await sessionReaders.select(f.context), undefined);
+  assert.deepEqual(await sessionReaders.select(f.context), []);
   f.db.exec('ALTER TABLE compartments DROP COLUMN rebase_status');
   assert.throws(
     () => createMagicContextReader({ database: f.database }),

@@ -120,6 +120,20 @@ export const nativeSnapshot = (manager) => ({
   leafId: manager.getLeafId(),
 });
 
+function summarizeCommands(commands) {
+  if (!Array.isArray(commands)) return undefined;
+  return commands
+    .filter((cmd) => typeof cmd?.name === 'string' && cmd.name.length <= 128)
+    .slice(0, 128)
+    .map((cmd) => ({
+      name: cmd.name,
+      ...(typeof cmd.source === 'string' ? { source: cmd.source.slice(0, 32) } : {}),
+      ...(typeof cmd.description === 'string' && cmd.description
+        ? { description: cmd.description.slice(0, 160) }
+        : {}),
+    }));
+}
+
 export function nativeOwnerRead(pi, binding, request, ctx, observers, buildSessionProjection) {
   const manager = ctx.sessionManager;
   if (request.op === 'read_features')
@@ -128,14 +142,19 @@ export function nativeOwnerRead(pi, binding, request, ctx, observers, buildSessi
       nativeReadFeatures(pi.getAllTools(), pi.getCommands(), manager.getLeafId()),
     );
   const body = request.body ?? {};
-  return body.view === 'runtime'
-    ? { ...ownerIdentity(binding), ...observers.observation.read(body, ctx) }
-    : ownerRead(
-        binding,
-        { ...nativeSnapshot(manager), live: observers.liveMessage.snapshot() },
-        body,
-        { buildSessionProjection, readAdapters: request.readAdapters },
-      );
+  if (body.view === 'runtime')
+    return { ...ownerIdentity(binding), ...observers.observation.read(body, ctx) };
+  const result = ownerRead(
+    binding,
+    { ...nativeSnapshot(manager), live: observers.liveMessage.snapshot() },
+    body,
+    { buildSessionProjection, readAdapters: request.readAdapters },
+  );
+  if (body.content?.system === true && typeof pi.getCommands === 'function') {
+    const commands = summarizeCommands(pi.getCommands());
+    if (commands?.length) result.commands = commands;
+  }
+  return result;
 }
 
 export function nativeOwnerObservers(source, generation, control, lifecycle) {

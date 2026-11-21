@@ -2,7 +2,7 @@
 // and receipts, scoped to the RPC generation that actually emitted them.
 import { jsonBytes, largestFittingSize } from '../mcp/response-budget.mjs';
 
-const textFields = ['extension_path', 'event', 'error', 'message'];
+const textFields = ['extension_path', 'event', 'error', 'message', 'title', 'method'];
 function clipped(event, limit) {
   const result = { ...event };
   const truncated = new Set(event.truncated_fields ?? []);
@@ -72,6 +72,24 @@ export class RuntimeEvents {
         level: ['info', 'warning', 'error'].includes(event.notifyType) ? event.notifyType : 'info',
       };
     } else return false;
+    this.record(payload);
+    return true;
+  }
+  recordUiCancelled(event, phase) {
+    if (!this.events) return;
+    this.record({
+      type: 'ui_cancelled',
+      method: String(event.method ?? 'unknown').slice(0, 32),
+      phase,
+      ...(typeof event.title === 'string' ? { title: event.title } : {}),
+      ...(typeof event.message === 'string' ? { message: event.message } : {}),
+      ...(Array.isArray(event.options)
+        ? { options: event.options.slice(0, 12).map((opt) => String(opt).slice(0, 120)) }
+        : {}),
+    });
+  }
+  record(payload) {
+    if (!this.events) return;
     this.events.push(
       clipped(
         { sequence: ++this.sequence, observed_at: new Date().toISOString(), ...payload },
@@ -79,7 +97,6 @@ export class RuntimeEvents {
       ),
     );
     if (this.events.length > 32) this.events.shift();
-    return true;
   }
   snapshot() {
     if (!this.events?.length) return null;

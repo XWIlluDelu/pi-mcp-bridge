@@ -123,7 +123,7 @@ test('two official SDK sessions in one host PID release independently without sh
   assert.equal(sentA.status, 'dispatched');
   await until(() => !hosts[0].session.isStreaming && faux.state.callCount === 1);
   assert.match(JSON.stringify(await f.bridge.read({ session_id: savedA.id })), /PUBLIC_A_INPUT/);
-  const removed = await f.bridge.delete({ session_id: savedA.id });
+  const removed = await f.bridge.delete_session({ session_id: savedA.id });
   assert.equal(removed.status, 'deleted');
   assert.equal(hosts[0].released, 1);
   assert.equal(hosts[1].released, 0);

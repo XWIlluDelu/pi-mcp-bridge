@@ -34,11 +34,7 @@ function matchesMime(bytes, mime) {
 const imageSchema = z
   .strictObject({
     type: z.literal('image'),
-    data: z
-      .string()
-      .min(1)
-      .max(MAX_BASE64)
-      .describe('Canonical base64 image bytes (no data URL or path).'),
+    data: z.string().min(1).max(MAX_BASE64),
     mimeType: z.enum(mimeTypes),
   })
   .superRefine((image, ctx) => {
@@ -54,7 +50,6 @@ export const imagesSchema = z
   .array(imageSchema)
   .min(1)
   .max(MAX_IMAGES)
-  .describe('PNG/JPEG/GIF/WebP images, up to 32 items and 5 MiB decoded total.')
   .superRefine((images, ctx) => {
     if (
       images.reduce((sum, image) => sum + Buffer.byteLength(image.data, 'base64'), 0) >

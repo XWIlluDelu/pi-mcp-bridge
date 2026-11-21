@@ -42,11 +42,27 @@ function runtimeCapabilities(runtime, state) {
       send: true,
       reload: runtime.record?.reloadSupported === true,
       command: host ? (typeof command === 'boolean' ? command : null) : false,
-      stop: host ? (typeof stop === 'boolean' ? stop : null) : false,
+      stop: typeof stop === 'boolean' ? stop : host ? null : false,
     };
   }
   // Bridge-owned RPC implements every control natively.
   return { send: true, reload: true, command: true, stop: true };
+}
+
+function sanitizeContextUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  const tokens =
+    Number.isFinite(usage.tokens) && usage.tokens >= 0 ? Math.round(usage.tokens) : null;
+  const context_window =
+    Number.isFinite(usage.contextWindow) && usage.contextWindow > 0
+      ? Math.round(usage.contextWindow)
+      : null;
+  const percent =
+    Number.isFinite(usage.percent) && usage.percent >= 0
+      ? Math.round(usage.percent * 10) / 10
+      : null;
+  if (tokens === null && context_window === null && percent === null) return null;
+  return { tokens, context_window, percent };
 }
 
 export async function runtimeMetadata(pool, session) {
@@ -59,6 +75,7 @@ export async function runtimeMetadata(pool, session) {
     if (!runtime) return inactive('saved');
     const { state, status, pending } = await runtime.idleSnapshot();
     const selection = modelState(state);
+    const context_usage = sanitizeContextUsage(state.contextUsage);
     return {
       ...(Object.hasOwn(state, 'sessionName') || runtime.ownerRecord?.kind === 'rpc'
         ? { name: typeof state.sessionName === 'string' ? state.sessionName.trim() || null : null }
@@ -69,6 +86,7 @@ export async function runtimeMetadata(pool, session) {
         pending_messages: pending,
         model: selection.model,
         thinking_level: selection.thinkingLevel,
+        ...(context_usage ? { context_usage } : {}),
         ...uiSnapshot(runtime.uiFacts),
         capabilities: runtimeCapabilities(runtime, state),
       },

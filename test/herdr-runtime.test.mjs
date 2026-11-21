@@ -125,7 +125,7 @@ test(
     const cancelled = new Promise((resolve) =>
       start.controller.signal.addEventListener('abort', resolve, { once: true }),
     );
-    const deleting = bridge.delete({ session_id: session.id });
+    const deleting = bridge.delete_session({ session_id: session.id });
     await cancelled;
     failStartup.resolve();
     const result = await deleting;
@@ -321,7 +321,7 @@ test(
       await until(async () => !(await ownerAlive(deleting.childIdentity)), 'native EOF', 5000);
       assert.equal(bridge.handoff(session.id)?.kind, 'auto_release');
       assert.equal(await ownerAlive(toolOwner), true);
-      const deleted = await bridge.delete({ session_id: session.id });
+      const deleted = await bridge.delete_session({ session_id: session.id });
       assert.equal(deleted.status, 'deleted', JSON.stringify(deleted));
     } finally {
       if (await ownerAlive(toolOwner)) process.kill(toolOwner.pid, 'SIGKILL');

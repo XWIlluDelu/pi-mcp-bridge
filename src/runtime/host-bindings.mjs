@@ -101,6 +101,7 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
     nativeActivity.isIdle() && !pendingBashes && admission.idle(session.sessionManager);
   const state = async () => ({
     ...hostState(session),
+    contextUsage: session.getContextUsage?.() ?? null,
     isIdle: isIdle(),
     isBashRunning: session.isBashRunning,
   });
@@ -165,7 +166,13 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         onError,
       );
     },
-    bash: async ({ command, onResult, beforeDispatch, ...expected }) => {
+    bash: async ({
+      command,
+      excludeFromContext = false,
+      onResult,
+      beforeDispatch,
+      ...expected
+    }) => {
       verify(expected);
       beforeDispatch?.();
       // Native executeBash observation excludes the user_bash hook and result
@@ -175,19 +182,19 @@ export function createSdkHostBinding(session, { release, onError } = {}) {
         const handled = await session.extensionRunner.emitUserBash({
           type: 'user_bash',
           command,
-          excludeFromContext: false,
+          excludeFromContext,
           cwd: session.sessionManager.getCwd(),
         });
         verify(expected);
         let result;
         if (handled?.result) {
           result = handled.result;
-          session.recordBashResult(command, result, { excludeFromContext: false });
+          session.recordBashResult(command, result, { excludeFromContext });
         } else {
           beforeDispatch?.();
           result = await tracked.track(
             session.executeBash(command, undefined, {
-              excludeFromContext: false,
+              excludeFromContext,
               operations: handled?.operations,
             }),
           );

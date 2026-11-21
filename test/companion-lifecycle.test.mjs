@@ -277,14 +277,14 @@ for (const allowed of [true, false])
           );
         } else
           selection = f.bridge
-            .set_model({
+            .update_session({
               session_id: f.a.id,
               model: { provider: 'bridge-fixture', id: 'other' },
             })
             .catch((error) => ({ error: error.message }));
         await entered.promise;
         assert.equal(
-          (await f.bridge.list({ session_id: f.a.id })).sessions[0].status.state,
+          (await f.bridge.list_sessions({ session_id: f.a.id })).sessions[0].status.state,
           'busy',
         );
         socket?.destroy();

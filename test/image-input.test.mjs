@@ -22,7 +22,7 @@ const lastText = (entries) =>
 
 test('image schemas expose native blocks and reject malformed, mislabeled and oversized data', () => {
   const image = pngImage();
-  for (const tool of ['send', 'create']) {
+  for (const tool of ['send', 'create_session']) {
     const identity = tool === 'send' ? { session_id: 'session' } : { project: '/project' };
     assert.ok(publicSchemas[tool].safeParse({ ...identity, images: [image] }).success);
     assert.ok(toolDefinitions().find((t) => t.name === tool).inputSchema.properties.images);
@@ -79,7 +79,7 @@ test('owned RPC create/send preserve image handling, transformation and native m
   const image = pngImage(),
     evidence = imageEvidence(image);
   const model = { provider: 'image-fixture', id: 'text-only' };
-  const made = await bridge.create({
+  const made = await bridge.create_session({
     project: cwd,
     model,
     text: 'HANDLE_IMAGE_TEST ' + evidence.sha256,
