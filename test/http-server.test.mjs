@@ -26,9 +26,11 @@ function request(url, message, options = {}) {
       ...(message?.params?._meta ? modernHeaders(message) : {}),
       ...options.headers,
     };
-    const rawHeaders = Object.entries(values).flatMap(([name, value]) =>
-      (Array.isArray(value) ? value : [value]).flatMap((item) => [name, item]),
-    );
+    const rawHeaders = Object.entries(values)
+      .filter(([, value]) => value !== undefined)
+      .flatMap(([name, value]) =>
+        (Array.isArray(value) ? value : [value]).flatMap((item) => [name, item]),
+      );
     const req = http.request(
       url,
       { method: options.method ?? 'POST', headers: rawHeaders, agent: false },
@@ -283,4 +285,38 @@ test('HTTP owner configuration requires canonical private token and config files
     JSON.stringify({ ...config, http: { ...config.http, host: '0.0.0.0' } }),
   );
   await assert.rejects(loadHttpConfig(file), /INVALID_HTTP_CONFIG/);
+});
+
+test('HTTP accepts Authorization Bearer token and rejects conflicting or invalid credentials', async (t) => {
+  const f = await fixture(t);
+  const body = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-11-25',
+      capabilities: {},
+      clientInfo: { name: 't', version: '1' },
+    },
+  };
+  const bearerOnly = await request(f.url, body, {
+    headers: { [TOKEN_HEADER]: undefined, Authorization: `Bearer ${token}` },
+  });
+  assert.equal(bearerOnly.status, 200);
+  assert.equal(bearerOnly.body.result.protocolVersion, '2025-11-25');
+
+  const bothMatching = await request(f.url, body, {
+    headers: { [TOKEN_HEADER]: token, Authorization: `bearer ${token}` },
+  });
+  assert.equal(bothMatching.status, 200);
+
+  for (const badHeaders of [
+    { [TOKEN_HEADER]: undefined, Authorization: 'Bearer wrong-token' },
+    { [TOKEN_HEADER]: undefined, Authorization: 'Basic dXNlcjpwYXNz' },
+    { [TOKEN_HEADER]: token, Authorization: 'Bearer mismatched-token' },
+    { [TOKEN_HEADER]: undefined, Authorization: [`Bearer ${token}`, `Bearer ${token}`] },
+  ]) {
+    const res = await request(f.url, body, { headers: badHeaders });
+    assert.equal(res.status, 401);
+  }
 });

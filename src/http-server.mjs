@@ -10,6 +10,20 @@ import { loadHttpConfig, TOKEN_HEADER, NOT_ADMITTED } from './mcp/http-config.mj
 
 const digest = (value) => createHash('sha256').update(value).digest();
 
+function extractHttpToken(headers) {
+  const headerTokens = headers[TOKEN_HEADER];
+  const authHeaders = headers.authorization;
+  if ((headerTokens?.length ?? 0) > 1 || (authHeaders?.length ?? 0) > 1) return null;
+  let token = headerTokens?.[0] ?? null;
+  if (authHeaders?.length === 1) {
+    const match = /^Bearer\s+(\S+)$/i.exec(authHeaders[0].trim());
+    if (!match) return null;
+    if (token !== null && token !== match[1]) return null;
+    token = match[1];
+  }
+  return token;
+}
+
 const refuse = (res, code) => respond(res, NOT_ADMITTED[code], { error: code }, true);
 function respond(res, status, message, close = false) {
   if (res.destroyed || res.writableEnded) return;
@@ -62,8 +76,8 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 400
     const host = headers.host;
     if (host?.length !== 1 || !allowedHosts.includes(host[0])) return refuse(res, 'INVALID_HOST');
     if (headers.origin) return refuse(res, 'ORIGIN_DENIED');
-    const credentials = headers[TOKEN_HEADER];
-    if (credentials?.length !== 1 || !timingSafeEqual(digest(credentials[0]), tokenDigest))
+    const credential = extractHttpToken(headers);
+    if (!credential || !timingSafeEqual(digest(credential), tokenDigest))
       return refuse(res, 'UNAUTHORIZED');
     if (req.url !== '/mcp') return refuse(res, 'NOT_FOUND');
     if (req.method === 'DELETE') {
@@ -115,7 +129,7 @@ export function createHttpService(bridge, { token, port = 0, waitTimeoutMs = 400
                 504,
                 rpcError(body.id, -32000, 'REQUEST_WAIT_EXPIRED', {
                   recovery:
-                    'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list/read before deciding whether to submit again. Do not automatically resubmit.',
+                    'OUTCOME_UNKNOWN; timeout does not stop submitted Pi work. Inspect list_sessions/read before deciding whether to submit again. Do not automatically resubmit.',
                 }),
               ),
             waitTimeoutMs,

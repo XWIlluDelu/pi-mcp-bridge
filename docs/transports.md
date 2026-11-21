@@ -98,7 +98,7 @@ an existing proxy. Changing only the file's contents also does not appear in
 and its proxies at a safe work boundary, and update the tunnel's injected token
 to match. Then repeat the discovery check above.
 
-Every request requires `x-pi-bridge-token: TOKEN`. Authentication occurs before body parsing. The backend requires `Host: 127.0.0.1:PORT` (the port may be omitted for port 80) and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
+Every request requires authentication via either `x-pi-bridge-token: TOKEN` or `Authorization: Bearer TOKEN` (if both headers are sent, they must match). Authentication occurs before body parsing. The backend requires `Host: 127.0.0.1:PORT` (the port may be omitted for port 80) and rejects any `Origin` header. A remote tunnel must authenticate its public caller, rewrite upstream Host, remove browser Origin and inject the private backend token. The loopback service supplies owner-local authentication, not an MCP OAuth server.
 
 The backend returns `application/json` with `Cache-Control: no-store`. A disconnected client does not stop the shared service.
 
