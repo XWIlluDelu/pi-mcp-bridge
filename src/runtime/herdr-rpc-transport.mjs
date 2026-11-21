@@ -18,6 +18,7 @@ const exec = promisify(execFile);
 // Preflight Herdr and user-systemd before any pane or Pi worker is created.
 // Failures here can safely fall back to direct spawn without risking a second writer.
 export async function prepareHerdr(binary, { signal, daemonEnvironment = process.env } = {}) {
+  if (process.platform !== 'linux') throw new Error('HERDR_UNAVAILABLE');
   const control = await HerdrControl.open(binary, daemonEnvironment);
   signal?.throwIfAborted();
   await exec('systemctl', ['--user', 'show-environment'], { timeout: 8000, signal });

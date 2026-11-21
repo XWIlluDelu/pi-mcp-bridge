@@ -19,8 +19,10 @@ import {
   isOwnerMutation,
   knownErrorCode,
 } from '../core/errors.mjs';
-// Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
+// Cooperative, owner-private Linux/macOS Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { modelSettings } from '../ops/set-model.mjs';
 import path from 'node:path';
 import net from 'node:net';
@@ -41,27 +43,70 @@ import {
   readPrivateInode,
 } from '../core/storage.mjs';
 import { kernelLock } from '../core/kernel-lock.mjs';
+
+const execFileAsync = promisify(execFile);
+let darwinBootId;
+
+async function getDarwinBootId() {
+  if (darwinBootId) return darwinBootId;
+  const { stdout } = await execFileAsync('sysctl', ['-n', 'kern.boottime'], {
+    encoding: 'utf8',
+    timeout: 3000,
+  });
+  const match = stdout.match(/sec\s*=\s*(\d+)/);
+  if (!match) throw new Error('INVALID_PROCESS_IDENTITY');
+  return (darwinBootId = `darwin-boot-${match[1]}`);
+}
+
+export function parseDarwinProcessIdentity(stdout, boot, pid) {
+  const line = stdout.trim();
+  if (!line) return null;
+  const match = line.match(/^(\S+)\s+(.+)$/);
+  if (!match || !boot) throw new Error('INVALID_PROCESS_IDENTITY');
+  return { pid, start: match[2].trim(), boot, state: match[1] };
+}
+
 export async function processIdentity(pid = process.pid) {
-  if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid < 1)
-    throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE');
-  try {
-    let stat;
+  if (!Number.isSafeInteger(pid) || pid < 1) throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE');
+  if (process.platform === 'linux') {
     try {
-      stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8');
-    } catch (error) {
-      // Linux can open stat while the task exists, then return ESRCH from
-      // read after it exits. Only errors from this PID's stat prove absence.
-      if (['ENOENT', 'ESRCH'].includes(error.code)) return null;
-      throw error;
+      let stat;
+      try {
+        stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8');
+      } catch (error) {
+        // Linux can open stat while the task exists, then return ESRCH from
+        // read after it exits. Only errors from this PID's stat prove absence.
+        if (['ENOENT', 'ESRCH'].includes(error.code)) return null;
+        throw error;
+      }
+      const boot = await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (!/^\d+$/.test(fields[19] ?? '') || !fields[0] || !boot.trim())
+        throw new Error('INVALID_PROCESS_IDENTITY');
+      return { pid, start: fields[19], boot: boot.trim(), state: fields[0] };
+    } catch (cause) {
+      throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE', false, { cause });
     }
-    const boot = await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    if (!/^\d+$/.test(fields[19] ?? '') || !fields[0] || !boot.trim())
-      throw new Error('INVALID_PROCESS_IDENTITY');
-    return { pid, start: fields[19], boot: boot.trim(), state: fields[0] };
-  } catch (cause) {
-    throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE', false, { cause });
   }
+  if (process.platform === 'darwin') {
+    try {
+      const boot = await getDarwinBootId();
+      try {
+        const { stdout } = await execFileAsync('ps', ['-o', 'state=,lstart=', '-p', String(pid)], {
+          encoding: 'utf8',
+          env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+          timeout: 3000,
+        });
+        return parseDarwinProcessIdentity(stdout, boot, pid);
+      } catch (error) {
+        if (error.code === 1 && !error.killed) return null;
+        throw error;
+      }
+    } catch (cause) {
+      throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE', false, { cause });
+    }
+  }
+  throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE');
 }
 export function isReleasedOwner(record) {
   return record?.owner === null && record.phase === 'released' && record.noColdReacquire === true;
@@ -72,7 +117,7 @@ export const sameOwner = (a, b) =>
 export async function ownerAlive(owner) {
   if (owner === null) return false;
   const current = await processIdentity(owner.pid);
-  return sameOwner(current, owner) && !['Z', 'X'].includes(current.state);
+  return sameOwner(current, owner) && !['Z', 'X'].includes(current.state?.[0]);
 }
 export async function privateDirectory(dir) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir))
@@ -624,8 +669,22 @@ export class AttachedRuntime {
       await this.request('send', { text, images, mode }, { beforeDispatch: authorize }),
     );
   }
-  executeBash({ command, max_chars, beforeDispatch }) {
-    return this.#mutationResult('bash', { command, max_chars }, beforeDispatch, inlineBashResult);
+  setSessionName(name, beforeDispatch) {
+    return this.#mutationResult('set_name', { name }, beforeDispatch, (value) => ({
+      name: typeof value?.name === 'string' ? value.name : name,
+    }));
+  }
+  executeBash({ command, exclude_from_context, max_chars, beforeDispatch }) {
+    return this.#mutationResult(
+      'bash',
+      {
+        command,
+        max_chars,
+        ...(exclude_from_context ? { exclude_from_context: true } : {}),
+      },
+      beforeDispatch,
+      inlineBashResult,
+    );
   }
   async reload(beforeDispatch) {
     if (this.record.reloadSupported !== true) throw new OwnerFailure('RELOAD_UNSUPPORTED');
