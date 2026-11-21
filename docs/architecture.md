@@ -17,7 +17,7 @@ stdio-only ──► stdio-proxy.mjs ──HTTP─────┘  & 2025-11-25.
                       ▼                                   ▼                               ▼
            Bridge-owned Pi RPC                  Companion extension                Optional integrations
          (rpc.mjs + rpc-observer.mjs)      (attach-extension.mjs / companion.mjs)   (integrations/*)
-                      └────── single-writer registry (attachments.mjs) ──────┘
+                      └────── single-writer registry (attachments.mjs, Linux/macOS) ──────┘
                                                Native Pi JSONL files
 ```
 
@@ -78,7 +78,7 @@ isolated agent environments and synthetic providers without credentials or paid
 endpoints. CI runs both commands on Node 22 and 26 for pushes and pull requests
 targeting `main`. Local development uses the same checks. Native PTY checks
 require `script`, and the test environment must permit Unix sockets and preserve
-POSIX file ownership needed by storage-integrity checks (Linux).
+POSIX file ownership needed by storage-integrity checks (Linux and macOS).
 
 Module tests live beside their implementations under `integrations/`.
 
@@ -100,7 +100,8 @@ opt-in check. `npm audit` checks dependency advisories separately.
 ## Operational boundaries
 
 The cooperative registry requires one machine and a shared canonical IPC
-directory and shared Linux PID and network namespaces. Unregistered writers need host
+directory. Linux also requires shared PID and network namespaces. macOS uses
+private directory locks with `sysctl`/`ps` process identity. Unregistered writers need host
 coordination before reopening; see [runtime](runtime.md). The HTTP backend uses
 an owner-local token, with public authentication supplied by a tunnel; see
 [transports](transports.md).

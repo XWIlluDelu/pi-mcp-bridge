@@ -56,6 +56,8 @@ export async function syncDir(dir) {
   const handle = await fs.open(dir, 'r');
   try {
     await handle.sync();
+  } catch (error) {
+    if (!['EINVAL', 'ENOTSUP'].includes(error.code)) throw error;
   } finally {
     await handle.close();
   }

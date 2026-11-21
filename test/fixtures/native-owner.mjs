@@ -1,3 +1,4 @@
+import { shortTempDir } from './temp-dir.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -36,7 +37,7 @@ export async function nativeOwner(
   t,
   { prefix = 'owner', configure, factory, reloadConfig = false, seed = true } = {},
 ) {
-  const dir = await fs.mkdtemp('/tmp/pi-' + prefix + '-');
+  const dir = await shortTempDir('pi-' + prefix + '-');
   const cwd = path.join(dir, 'project');
   const configFile = path.join(dir, 'owner.json');
   const config = {
@@ -153,7 +154,21 @@ export async function nativeTui(fixture, session, extraArgs = []) {
 export function launchNativeTui(fixture, args, env = fixture.env) {
   const command = [process.execPath, nativePiCli, ...args];
   const quote = (arg) => "'" + arg.replaceAll("'", "'\\''") + "'";
-  const child = spawn('script', ['-qefc', command.map(quote).join(' '), '/dev/null'], {
+  // Apple's script rejects libuv's stdin socket. Feed it through a pipe
+  // and exec script so the tracked child still owns the terminal.
+  const [program, scriptArgs] =
+    process.platform === 'darwin'
+      ? [
+          '/bin/bash',
+          [
+            '-c',
+            'exec 3<&0; exec /usr/bin/script -q /dev/null "$@" < <(/bin/cat <&3) 3<&-',
+            'pi-test-pty',
+            ...command,
+          ],
+        ]
+      : ['script', ['-qefc', command.map(quote).join(' '), '/dev/null']];
+  const child = spawn(program, scriptArgs, {
     cwd: fixture.cwd,
     env: { ...env, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -176,10 +191,20 @@ export function launchNativeTui(fixture, args, env = fixture.env) {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     }
   });
+  const observed = async (fn, label) => {
+    try {
+      return await until(fn, label);
+    } catch (cause) {
+      throw new Error(
+        `${label} (script exit ${child.exitCode}, signal ${child.signalCode}): ${JSON.stringify(output.slice(-2500))}`,
+        { cause },
+      );
+    }
+  };
   return {
     child,
     ready: (session) =>
-      until(async () => {
+      observed(async () => {
         const current = await readClaim(fixture.config.attachmentDir, session);
         if (current?.kind === 'tui' && current.phase === 'ready') {
           record = current;
@@ -187,6 +212,6 @@ export function launchNativeTui(fixture, args, env = fixture.env) {
         }
       }, 'native TUI registration'),
     type: (text) => child.stdin.write(text),
-    waitFor: (text) => until(() => output.includes(text), text),
+    waitFor: (text) => observed(() => output.includes(text), text),
   };
 }

@@ -1,6 +1,6 @@
 # Pi MCP Bridge
 
-Expose native local [Pi](https://github.com/earendil-works/pi) coding-agent sessions to external MCP agents (ChatGPT/Dots, Claude Desktop/Code/Duet, Cursor, Grok, or Pi itself) with owner-controlled permissions, low-token tool design, and single-writer safety on **Linux**.
+Expose native local [Pi](https://github.com/earendil-works/pi) coding-agent sessions to external MCP agents (ChatGPT/Dots, Claude Desktop/Code/Duet, Cursor, Grok, or Pi itself) with owner-controlled permissions, low-token tool design, and single-writer safety on **Linux and macOS**.
 
 ```text
 ChatGPT / Dots (MCP 2026-07-28 + webhooks) ──HTTP──┐
@@ -33,7 +33,7 @@ Bridge automatically serves **both** modern stateless MCP and standard initializ
 
 ## Quick start
 
-Requires Linux, Node.js 22.19+, and an existing Pi installation.
+Requires Linux or macOS, Node.js 22.19+, and an existing Pi installation.
 
 ```sh
 git clone https://github.com/XWIlluDelu/pi-mcp-bridge.git
@@ -76,7 +76,7 @@ After your MCP client connects:
 ### Architecture & runtime internals
 
 - [Architecture and module map](docs/architecture.md) — system layout, `src/` map, invariants, and verification
-- [Native runtime, ownership and local entry](docs/runtime.md) — single-writer registry, TUI companion, handoff, and host bindings
+- [Native runtime, ownership and local entry](docs/runtime.md) — single-writer registry (Linux & macOS), TUI companion, handoff, and host bindings
 
 ## Development
 

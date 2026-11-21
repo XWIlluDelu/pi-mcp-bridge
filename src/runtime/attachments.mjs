@@ -19,7 +19,7 @@ import {
   isOwnerMutation,
   knownErrorCode,
 } from '../core/errors.mjs';
-// Cooperative, owner-private Linux/Unix-socket attachment transport. No credentials.
+// Cooperative, owner-private Linux/macOS Unix-socket attachment transport. No credentials.
 import fs from 'node:fs/promises';
 import { modelSettings } from '../ops/set-model.mjs';
 import path from 'node:path';
@@ -41,39 +41,14 @@ import {
   readPrivateInode,
 } from '../core/storage.mjs';
 import { kernelLock } from '../core/kernel-lock.mjs';
-export async function processIdentity(pid = process.pid) {
-  if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid < 1)
-    throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE');
-  try {
-    let stat;
-    try {
-      stat = await fs.readFile(`/proc/${pid}/stat`, 'utf8');
-    } catch (error) {
-      // Linux can open stat while the task exists, then return ESRCH from
-      // read after it exits. Only errors from this PID's stat prove absence.
-      if (['ENOENT', 'ESRCH'].includes(error.code)) return null;
-      throw error;
-    }
-    const boot = await fs.readFile('/proc/sys/kernel/random/boot_id', 'utf8');
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    if (!/^\d+$/.test(fields[19] ?? '') || !fields[0] || !boot.trim())
-      throw new Error('INVALID_PROCESS_IDENTITY');
-    return { pid, start: fields[19], boot: boot.trim(), state: fields[0] };
-  } catch (cause) {
-    throw new OwnerFailure('PROCESS_IDENTITY_UNAVAILABLE', false, { cause });
-  }
-}
+
+import { processIdentity, sameOwner, ownerAlive } from '../core/process-identity.mjs';
+
+export { processIdentity, sameOwner, ownerAlive };
 export function isReleasedOwner(record) {
   return record?.owner === null && record.phase === 'released' && record.noColdReacquire === true;
 }
-export const sameOwner = (a, b) =>
-  Boolean(a && b && a.pid === b.pid && a.start === b.start && a.boot === b.boot);
 
-export async function ownerAlive(owner) {
-  if (owner === null) return false;
-  const current = await processIdentity(owner.pid);
-  return sameOwner(current, owner) && !['Z', 'X'].includes(current.state);
-}
 export async function privateDirectory(dir) {
   if (typeof dir !== 'string' || !path.isAbsolute(dir))
     throw new OwnerFailure('INVALID_ATTACHMENT_DIRECTORY');
@@ -624,8 +599,22 @@ export class AttachedRuntime {
       await this.request('send', { text, images, mode }, { beforeDispatch: authorize }),
     );
   }
-  executeBash({ command, max_chars, beforeDispatch }) {
-    return this.#mutationResult('bash', { command, max_chars }, beforeDispatch, inlineBashResult);
+  setSessionName(name, beforeDispatch) {
+    return this.#mutationResult('set_name', { name }, beforeDispatch, (value) => ({
+      name: typeof value?.name === 'string' ? value.name : name,
+    }));
+  }
+  executeBash({ command, exclude_from_context, max_chars, beforeDispatch }) {
+    return this.#mutationResult(
+      'bash',
+      {
+        command,
+        max_chars,
+        ...(exclude_from_context ? { exclude_from_context: true } : {}),
+      },
+      beforeDispatch,
+      inlineBashResult,
+    );
   }
   async reload(beforeDispatch) {
     if (this.record.reloadSupported !== true) throw new OwnerFailure('RELOAD_UNSUPPORTED');

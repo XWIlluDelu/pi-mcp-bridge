@@ -6,7 +6,7 @@ Give external agents a reliable, focused way to work with native Pi sessions. Br
 
 ## Success criteria
 
-- External agents across modern stateless MCP (`2026-07-28`) and standard initialize-based MCP (`2025-11-25`–`2024-11-05`) can find relevant native Pi sessions, understand their context, delegate and steer work, observe outcomes, and manage session lifecycle on Linux through a small, low-token, layered interface.
+- External agents across modern stateless MCP (`2026-07-28`) and standard initialize-based MCP (`2025-11-25`–`2024-11-05`) can find relevant native Pi sessions, understand their context, delegate and steer work, observe outcomes, and manage session lifecycle on Linux and macOS through a small, low-token, layered interface.
 - Existing Pi TUI, RPC, and SDK-host sessions can participate without competing writers or losing native session semantics.
 - Ownership, authorization, process identity, uncertain outcomes, and lifecycle handoffs remain reliable.
 - Community Pi extensions that reshape context or memory plug in as standalone, zero-coupling external modules without editing Bridge core.

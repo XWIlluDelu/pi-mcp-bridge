@@ -11,12 +11,21 @@ A **session** is a saved native Pi history. Its **owner** is the process permitt
 
 ## Ownership and cooperating writers
 
-Every cooperating process uses the same canonical private registry and shares
-Linux PID and network namespaces. A writer claim binds a canonical file to a
-verified process identity (PID, process start and boot ID from `/proc`).
-Native ID, generation and socket bind its endpoint. Live or uncertain claims
-block new writers through socket loss and component mismatches. The registry
-mutex uses an abstract Unix socket and has a separate lifetime from the claim.
+Every cooperating process uses the same canonical private registry on the same
+host (and shared Linux PID/network namespaces on Linux). A writer claim binds a
+canonical file to a verified process identity: PID, process start time, and
+system boot time (`/proc` + boot ID on Linux; `sysctl`/`ps` + `kern.boottime` on
+macOS). Native ID, generation and socket bind its endpoint. Live or uncertain
+claims block new writers through socket loss and component mismatches. The
+registry mutex has a separate lifetime. Linux uses an abstract Unix socket.
+macOS publishes a private directory with an exact process marker and reclaims
+it after confirming that process has exited.
+
+During a macOS upgrade, the mutex also occupies the previous socket paths in
+the system temporary directories and the configured `TMPDIR`. Components using
+a custom `TMPDIR` must keep that setting through the upgrade. A socket left by a
+crashed older component blocks acquisition until its owner confirms the old
+processes have exited and clears the stale socket.
 
 A matching native reload or switch may retire only its own context after draining
 mutations and closing the old listener. The shutdown reason, previous file and

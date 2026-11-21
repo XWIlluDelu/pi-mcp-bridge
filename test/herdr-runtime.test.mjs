@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -43,7 +44,7 @@ async function fixture(t, compatibilityModules = []) {
 }
 
 test('Herdr discovery uses executable PATH/local installation, not a cached availability flag', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/bridge-herdr-discovery-');
+  const dir = await shortTempDir('bridge-herdr-discovery-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const env = { HOME: dir, PATH: dir };
   assert.equal(await findHerdr(env), null);
@@ -76,10 +77,11 @@ test('unavailable Herdr preflight silently falls back to direct startup; post-la
     throw new Error('HERDR_UNAVAILABLE');
   });
   const fallback = await bridge.pool.resolve(session);
-  assert.equal(sawFilteredEnv, true);
+  assert.equal(sawFilteredEnv, process.platform === 'linux');
   assert.equal(fallback.child instanceof HerdrRpcTransport, false);
   assert.equal(fallback.alive, true);
   await fallback.stop();
+  if (process.platform !== 'linux') return;
   // Once a Herdr worker launch is underway (after preflight), failure must NOT spawn a second Pi.
   const fakeControl = {
     address: path.join(dir, 'herdr.sock'),
@@ -102,7 +104,7 @@ test('unavailable Herdr preflight silently falls back to direct startup; post-la
 
 test(
   'delete completes when Herdr startup fails before reporting a Pi PID',
-  { timeout: 10000 },
+  { timeout: 10000, skip: process.platform !== 'linux' },
   async (t) => {
     const { dir, bridge, config, session, cleanup } = await fixture(t),
       entered = Promise.withResolvers(),
@@ -144,11 +146,11 @@ test(
 test(
   'real Herdr: cold start, hot placement changes, reuse, native EOF and explicit cleanup',
   {
-    skip: !process.env.BRIDGE_TEST_HERDR,
+    skip: process.platform !== 'linux' || !process.env.BRIDGE_TEST_HERDR,
     timeout: 60000,
   },
   async (t) => {
-    const dir = await fs.mkdtemp('/tmp/bridge-herdr-native-');
+    const dir = await shortTempDir('bridge-herdr-native-');
     const bin = path.join(dir, 'bin'),
       wrapper = path.join(bin, 'herdr');
     await fs.mkdir(bin);

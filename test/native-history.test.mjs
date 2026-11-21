@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import { message, text } from './fixtures/native-history.mjs';
 import { nativeOwner } from './fixtures/native-owner.mjs';
 import { ALL_CONTENT } from '../src/read/read-schema.mjs';
@@ -11,7 +12,7 @@ import { SessionManager } from './fixtures/pi.mjs';
 import { loadSession, readSessionIdentity } from '../src/core/data.mjs';
 
 test('discarded broken branches do not block native current context; traversed cycles and duplicate IDs reject', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/pi-history-branch-');
+  const dir = await shortTempDir('pi-history-branch-');
   await fs.mkdir(dir + '/sessions', { mode: 0o700 });
   const file = dir + '/sessions/history.jsonl';
   const rows = [

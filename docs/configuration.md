@@ -145,7 +145,7 @@ extensions can access files, shell and network: denying the direct Bridge
 On Linux with `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
 writers so remote agents drive Pi inside Herdr just like local Herdr usage.
 Bridge starts the local Herdr daemon on demand without restarting an existing
-daemon or changing service enablement/linger. If Herdr is missing, unavailable,
+daemon or changing service enablement/linger. On macOS, or on Linux if Herdr is missing, unavailable,
 incompatible, or user-systemd is unavailable before a pane is launched, Bridge
 silently falls back to direct Pi startup so core sessions continue working. If
 failure occurs after a Herdr worker launch has already started, Bridge aborts

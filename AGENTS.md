@@ -3,8 +3,8 @@
 This is an early-stage project. Support the current per-request MCP protocol
 (`2026-07-28`) alongside standard initialize-based MCP (`2025-11-25` through
 `2024-11-05`) so both modern stateless agents and existing local MCP clients
-work out of the box, and support the current Bridge control protocol on
-Linux. Judge live owner compatibility by the wire contract and the
+work out of the box, and support the current Bridge control protocol across
+Linux and macOS. Judge live owner compatibility by the wire contract and the
 operation's required capability. Remove obsolete Bridge-internal protocol
 versions and their code, fixtures and documentation.
 
