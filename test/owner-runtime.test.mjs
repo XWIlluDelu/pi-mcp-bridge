@@ -14,7 +14,12 @@ import { promisify } from 'node:util';
 import { nativeRpc } from './fixtures/native-rpc.mjs';
 import { Bridge } from '../src/core/bridge.mjs';
 import { ownerRequest } from '../src/owner-runtime.mjs';
-import { readClaim, ownerAlive, waitOwnerExit } from '../src/runtime/attachments.mjs';
+import {
+  AttachedRuntime,
+  readClaim,
+  ownerAlive,
+  waitOwnerExit,
+} from '../src/runtime/attachments.mjs';
 const exec = promisify(execFile),
   base = path.resolve('.');
 async function fixture(t, extraArgs = []) {
@@ -188,3 +193,32 @@ test(
     assert.equal(runtime.child.exitCode, null);
   },
 );
+
+test('a lost seal acknowledgement keeps the writer fenced until explicit release', async (t) => {
+  const f = await fixture(t);
+  const rpc = await f.bridge.pool.resolve(f.session);
+  const { generation } = rpc.ownerRecord;
+  const release = () => f.bridge.releaseForLocal({ session_id: f.id });
+  const sendSeal = AttachedRuntime.prototype.seal;
+  let attempts = 0;
+  t.mock.method(AttachedRuntime.prototype, 'seal', async function (beforeDispatch) {
+    const result = await sendSeal.call(this, beforeDispatch);
+    if (++attempts === 1) throw new OwnerFailure('ACK_TIMEOUT', true);
+    return result;
+  });
+
+  await assert.rejects(release(), { code: 'ACK_TIMEOUT', uncertain: true });
+  assert.equal(rpc.exitSeal, 'unknown');
+  assert.equal(rpc.child.stdin.writableEnded, false);
+  const claim = await readClaim(f.bridge.pool.attachmentDir, f.session);
+  assert.equal(claim.generation, generation);
+  assert.equal((await new AttachedRuntime(f.config, f.session, claim).state()).sealed, true);
+
+  rpc.autoReleaseWanted = true;
+  await f.bridge.scheduleAutoRelease(rpc);
+  assert.equal(attempts, 1);
+
+  assert.equal((await release()).status, 'released');
+  assert.equal(attempts, 2);
+  assert.equal(rpc.exited, true);
+});
