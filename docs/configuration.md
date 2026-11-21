@@ -9,7 +9,7 @@ The Bridge rejects unsafe configuration files without changing their permissions
 
 ## Configure one project
 
-Copy [the example](../deploy/owner.example.json) and edit these fields together:
+The fastest way to bootstrap a private owner config is `pi-mcp-bridge init --project /home/example/project` followed by `pi-mcp-bridge doctor` (see [Quick start](../README.md#quick-start-linux--macos)). To configure manually from [the example](../deploy/owner.example.json), edit these fields together:
 
 1. Choose `stateDir` for Bridge's private state, separate from native session
    storage. Leave `attachmentDir` unset to use `stateDir/ipc`, or choose a shared

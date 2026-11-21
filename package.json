@@ -1,10 +1,38 @@
 {
   "name": "pi-mcp-bridge",
-  "private": true,
   "type": "module",
   "version": "0.8.0",
   "description": "Permissioned MCP access to native Pi sessions with single-writer coordination.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XWIlluDelu/pi-mcp-bridge.git"
+  },
+  "homepage": "https://github.com/XWIlluDelu/pi-mcp-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/XWIlluDelu/pi-mcp-bridge/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pi",
+    "pi-coding-agent",
+    "ai-agent",
+    "coding-agent",
+    "bridge"
+  ],
+  "bin": {
+    "pi-mcp-bridge": "./bin/pi-mcp-bridge.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "integrations/",
+    "deploy/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
   "engines": {
     "node": ">=22.19.0"
   },
@@ -12,8 +40,8 @@
     "test": "node --import ./test/fixtures/pi-installation.mjs --test test/*.test.mjs integrations/*/*.test.mjs",
     "start": "node src/server.mjs",
     "start:http": "node src/http-server.mjs",
-    "format": "prettier --write .github src test integrations deploy docs README.md package.json",
-    "format:check": "prettier --check .github src test integrations deploy docs README.md package.json"
+    "format": "prettier --write .github bin src test integrations deploy docs README.md package.json",
+    "format:check": "prettier --check .github bin src test integrations deploy docs README.md package.json"
   },
   "dependencies": {
     "ipaddr.js": "2.5.0",

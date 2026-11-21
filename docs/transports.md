@@ -19,7 +19,7 @@ Each line is one UTF-8 JSON-RPC message; stdout contains no logs. Oversized inpu
 
 ### Multiple clients: one HTTP Bridge
 
-Start with the private [owner configuration](configuration.md#configure-one-project), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
+Start with the private owner configuration from [Quick start](../README.md#quick-start-linux--macos) (or generate one with `pi-mcp-bridge init --http-port 43123`), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
 
 ```json
 {
@@ -43,7 +43,7 @@ await writeFile(process.argv[2], randomBytes(32).toString('base64url') + '\n', {
 JS
 ```
 
-Start the service using that owner file:
+Start the service using that owner file (or `pi-mcp-bridge http /absolute/private/path/owner.json`):
 
 ```sh
 node /absolute/path/to/pi-mcp-bridge/src/http-server.mjs /absolute/private/path/owner.json

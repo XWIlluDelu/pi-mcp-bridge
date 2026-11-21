@@ -31,23 +31,29 @@ Bridge automatically serves **both** modern stateless MCP and standard initializ
 | ChatGPT / OpenAI Dots                          | `2026-07-28` (`server/discover`)           | HTTP (behind tunnel)        | `session.settled` webhooks + `wait_ms`                        |
 | Claude Desktop / Code / Cursor / Grok / Pi MCP | `2025-11-25` … `2024-11-05` (`initialize`) | stdio, HTTP, or stdio proxy | `send` / `create_session` / `list_sessions` bounded `wait_ms` |
 
-## Quick start
+## Quick start (Linux & macOS)
 
-Requires Linux or macOS, Node.js 22.19+, and an existing Pi installation.
+Requires **Linux or macOS**, **Node.js 22.19+**, and an existing [Pi](https://github.com/earendil-works/pi) installation (npm or official managed installer).
 
 ```sh
 git clone https://github.com/XWIlluDelu/pi-mcp-bridge.git
 cd pi-mcp-bridge
 npm ci
-mkdir -p -m 700 /absolute/private/path
-cp deploy/owner.example.json /absolute/private/path/owner.json
-chmod 600 /absolute/private/path/owner.json
+
+# Generate owner.json for your current project and verify your environment:
+node bin/pi-mcp-bridge.mjs init --project /absolute/path/to/your/project
+node bin/pi-mcp-bridge.mjs doctor
 ```
 
-[Configure one project](docs/configuration.md#configure-one-project), then connect your client to
-`node /absolute/path/to/pi-mcp-bridge/src/server.mjs /absolute/private/path/owner.json`.
-[Transport setup](docs/transports.md) covers the shared HTTP service and proxy.
-[Load the companion](docs/runtime.md#daily-tui-and-ordinary-rpc-registration) to control sessions already open in Pi.
+`init` creates a private `~/.config/pi-mcp-bridge/owner.json` (`0600`), prints the exact JSON snippet for your MCP client (Claude Desktop, Claude Code, Cursor, etc.), and optionally sets up an HTTP port and `0600` token with `--http-port 43123`.
+
+To also control sessions you already have open in Pi TUI, register the companion extension in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "extensions": ["/absolute/path/to/pi-mcp-bridge/src/attach-extension.mjs"]
+}
+```
 
 ### Verify the first connection
 
@@ -57,6 +63,21 @@ After your MCP client connects:
 2. `list_sessions({})` discovers authorized sessions with status, model, `context_usage`, capabilities, and `creatable_projects`.
 3. `read({session_id:"<ID from list_sessions>"})` opens the last three turns without starting Pi.
 4. `send({session_id:"<ID>", text:"Summarize the repo", wait_ms: 20000})` submits work and optionally waits up to 20s for settlement (for non-webhook clients).
+
+## CLI commands
+
+```sh
+pi-mcp-bridge init [owner.json] [--project DIR] [--http-port PORT] [--allow-command] [--allow-delete]
+pi-mcp-bridge doctor [owner.json] [--json]
+pi-mcp-bridge stdio <owner.json>
+pi-mcp-bridge http <owner.json>
+pi-mcp-bridge proxy <owner.json>
+pi-mcp-bridge open <owner.json> <session_id>
+pi-mcp-bridge release <owner.json> <session_id> [--interrupt]
+pi-mcp-bridge reset <owner.json> <session_id> --confirm-local-closed
+```
+
+Direct `node src/server.mjs` and `node src/http-server.mjs` entry points remain unchanged for existing setups and systemd units.
 
 ## Documentation
 

@@ -172,6 +172,8 @@ See the [SDK and RPC integration examples](../test/host-integration.test.mjs).
 With the owner Bridge running:
 
 ```sh
+pi-mcp-bridge open /absolute/path/owner.json ps_SESSION_ID
+# or directly:
 node src/open.mjs /absolute/path/owner.json ps_SESSION_ID
 ```
 
@@ -205,6 +207,8 @@ the reservation until confirmed closure or exact requester exit.
 Release a Bridge-owned writer before using the file with an unregistered Pi:
 
 ```sh
+pi-mcp-bridge release /absolute/path/owner.json ps_SESSION_ID
+# or directly:
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID
 ```
 
@@ -220,6 +224,8 @@ owner confirms local closure. A cancelled join preserves the pause. To reset it,
 close any local writer using the file and run:
 
 ```sh
+pi-mcp-bridge reset /absolute/path/owner.json ps_SESSION_ID --confirm-local-closed
+# or directly:
 node src/owner-runtime.mjs /absolute/path/owner.json reset ps_SESSION_ID --confirm-local-closed
 ```
 
