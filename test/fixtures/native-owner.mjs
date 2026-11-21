@@ -154,11 +154,21 @@ export async function nativeTui(fixture, session, extraArgs = []) {
 export function launchNativeTui(fixture, args, env = fixture.env) {
   const command = [process.execPath, nativePiCli, ...args];
   const quote = (arg) => "'" + arg.replaceAll("'", "'\\''") + "'";
-  const scriptArgs =
+  // Apple's script rejects libuv's stdin socket. Feed it through a pipe
+  // and exec script so the tracked child still owns the terminal.
+  const [program, scriptArgs] =
     process.platform === 'darwin'
-      ? ['-q', '/dev/null', ...command]
-      : ['-qefc', command.map(quote).join(' '), '/dev/null'];
-  const child = spawn(process.platform === 'darwin' ? '/usr/bin/script' : 'script', scriptArgs, {
+      ? [
+          '/bin/bash',
+          [
+            '-c',
+            'exec 3<&0; exec /usr/bin/script -q /dev/null "$@" < <(/bin/cat <&3) 3<&-',
+            'pi-test-pty',
+            ...command,
+          ],
+        ]
+      : ['script', ['-qefc', command.map(quote).join(' '), '/dev/null']];
+  const child = spawn(program, scriptArgs, {
     cwd: fixture.cwd,
     env: { ...env, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -181,10 +191,20 @@ export function launchNativeTui(fixture, args, env = fixture.env) {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
     }
   });
+  const observed = async (fn, label) => {
+    try {
+      return await until(fn, label);
+    } catch (cause) {
+      throw new Error(
+        `${label} (script exit ${child.exitCode}, signal ${child.signalCode}): ${JSON.stringify(output.slice(-2500))}`,
+        { cause },
+      );
+    }
+  };
   return {
     child,
     ready: (session) =>
-      until(async () => {
+      observed(async () => {
         const current = await readClaim(fixture.config.attachmentDir, session);
         if (current?.kind === 'tui' && current.phase === 'ready') {
           record = current;
@@ -192,6 +212,6 @@ export function launchNativeTui(fixture, args, env = fixture.env) {
         }
       }, 'native TUI registration'),
     type: (text) => child.stdin.write(text),
-    waitFor: (text) => until(() => output.includes(text), text),
+    waitFor: (text) => observed(() => output.includes(text), text),
   };
 }
