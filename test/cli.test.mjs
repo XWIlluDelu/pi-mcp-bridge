@@ -1,12 +1,12 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { initConfig, runDoctor } from '../bin/pi-mcp-bridge.mjs';
 
 test('CLI init and doctor create and validate a working owner configuration', async (t) => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-bridge-cli-'));
+  const root = await shortTempDir('pi-bridge-cli-');
   await fs.chmod(root, 0o700);
   t.after(() => fs.rm(root, { recursive: true, force: true }));
 

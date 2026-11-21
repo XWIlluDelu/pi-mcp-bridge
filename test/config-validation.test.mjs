@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -9,7 +10,7 @@ import { loadHttpConfig } from '../src/mcp/http-config.mjs';
 import { Bridge } from '../src/core/bridge.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-config-');
+  const dir = await shortTempDir('pi-config-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const tokenFile = path.join(dir, 'token'),
     file = path.join(dir, 'owner.json');

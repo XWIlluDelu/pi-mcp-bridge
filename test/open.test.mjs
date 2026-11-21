@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,7 +10,7 @@ import { PiRpc } from '../src/runtime/rpc.mjs';
 import { nativePiCli } from './fixtures/isolated-runtime.mjs';
 import { sdk } from './fixtures/pi.mjs';
 test('open starts a fresh native TUI with normal configuration and automatic safe join, never the target file', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/pi-open-');
+  const dir = await shortTempDir('pi-open-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const cwd = path.join(dir, 'project'),
     root = path.join(dir, 'sessions');

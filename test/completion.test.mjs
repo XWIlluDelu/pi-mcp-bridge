@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
@@ -17,7 +18,7 @@ test(
   'settlement freezes its boundary and an unresponsive Bridge does not block later local work',
   { timeout: 8000 },
   async (t) => {
-    const dir = await fs.mkdtemp('/tmp/pi-settled-observer-');
+    const dir = await shortTempDir('pi-settled-observer-');
     const control = { stateDir: dir, attachmentDir: dir };
     const connections = new Set(),
       requests = [];

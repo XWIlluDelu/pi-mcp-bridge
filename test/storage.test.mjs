@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -6,7 +7,7 @@ import { atomicJson } from '../src/core/storage.mjs';
 test('atomic JSON failures preserve the published record and remove uncommitted temporary files', async (t) => {
   for (const stage of ['write', 'file sync', 'rename', 'directory sync'])
     await t.test(stage, async (t) => {
-      const dir = await fs.mkdtemp('/tmp/bridge-atomic-storage-'),
+      const dir = await shortTempDir('bridge-atomic-storage-'),
         file = dir + '/record.json',
         previous = { generation: 'old' },
         next = { generation: 'new' };

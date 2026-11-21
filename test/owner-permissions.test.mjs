@@ -1,16 +1,16 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import os from 'node:os';
 import { permitted, resolvePermission } from '../src/core/permissions.mjs';
 import { readOwnerConfig, editPermission, permissionDetails } from '../src/core/owner-config.mjs';
 import ownerPermissions from '../src/owner-permissions-extension.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pi-perm-')),
+  const dir = await shortTempDir('pi-perm-'),
     cwd = path.join(dir, 'project'),
     child = path.join(cwd, 'child');
   await fs.mkdir(child, { recursive: true });

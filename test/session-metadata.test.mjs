@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -8,7 +9,7 @@ import { AttachedRuntime } from '../src/runtime/attachments.mjs';
 import { ownedRuntime } from './fixtures/owned-runtime.mjs';
 
 test('title cache reuses only unchanged files; append, incomplete record, truncation and replacement invalidate', async (t) => {
-  const dir = await fs.mkdtemp('/tmp/pi-metadata-');
+  const dir = await shortTempDir('pi-metadata-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'session.jsonl'),
     cache = new Map();

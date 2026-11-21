@@ -103,8 +103,8 @@ opt-in check. `npm audit` checks dependency advisories separately.
 ## Operational boundaries
 
 The cooperative registry requires one machine and a shared canonical IPC
-directory (plus shared PID/network namespaces on Linux; macOS uses private Unix
-socket locks and `sysctl`/`ps` process identity). Unregistered writers need host
+directory. Linux also requires shared PID and network namespaces. macOS uses
+private directory locks with `sysctl`/`ps` process identity. Unregistered writers need host
 coordination before reopening; see [runtime](runtime.md). The HTTP backend uses
 an owner-local token, with public authentication supplied by a tunnel; see
 [transports](transports.md).

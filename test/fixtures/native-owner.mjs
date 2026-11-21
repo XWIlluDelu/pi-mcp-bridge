@@ -1,3 +1,4 @@
+import { shortTempDir } from './temp-dir.mjs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -36,7 +37,7 @@ export async function nativeOwner(
   t,
   { prefix = 'owner', configure, factory, reloadConfig = false, seed = true } = {},
 ) {
-  const dir = await fs.mkdtemp('/tmp/pi-' + prefix + '-');
+  const dir = await shortTempDir('pi-' + prefix + '-');
   const cwd = path.join(dir, 'project');
   const configFile = path.join(dir, 'owner.json');
   const config = {
@@ -153,7 +154,11 @@ export async function nativeTui(fixture, session, extraArgs = []) {
 export function launchNativeTui(fixture, args, env = fixture.env) {
   const command = [process.execPath, nativePiCli, ...args];
   const quote = (arg) => "'" + arg.replaceAll("'", "'\\''") + "'";
-  const child = spawn('script', ['-qefc', command.map(quote).join(' '), '/dev/null'], {
+  const scriptArgs =
+    process.platform === 'darwin'
+      ? ['-q', '/dev/null', ...command]
+      : ['-qefc', command.map(quote).join(' '), '/dev/null'];
+  const child = spawn(process.platform === 'darwin' ? '/usr/bin/script' : 'script', scriptArgs, {
     cwd: fixture.cwd,
     env: { ...env, TERM: 'xterm-256color', LANG: 'C.UTF-8' },
     stdio: ['pipe', 'pipe', 'pipe'],

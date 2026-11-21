@@ -1,3 +1,4 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -13,7 +14,7 @@ import {
 import { installation, sdk } from './fixtures/pi.mjs';
 
 async function fixture(t) {
-  const dir = await fs.mkdtemp('/tmp/pi-installation-');
+  const dir = await shortTempDir('pi-installation-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   async function install(relative, version = 'fixture') {
     const root = path.join(dir, relative);

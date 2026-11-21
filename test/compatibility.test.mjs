@@ -1,7 +1,7 @@
+import { shortTempDir } from './fixtures/temp-dir.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
@@ -13,7 +13,7 @@ import { denyAllPermissions } from './fixtures/permissions.mjs';
 
 const intercom = fileURLToPath(new URL('../integrations/intercom/index.mjs', import.meta.url));
 async function fixture(t) {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-compatibility-'));
+  const dir = await shortTempDir('bridge-compatibility-');
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   return {
     dir,

@@ -30,3 +30,10 @@ Do not collapse these checks into a single coarse lock or wrapper:
 
 - **Owner selection vs. control exchange vs. native admission vs. confirmed exit**: An existing live claim blocks a new writer even if its endpoint is unusable; an idle sample cannot prevent native work from arriving before EOF (the native seal owns that decision); a ready owner can acknowledge a prompt before provider work settles; and a received reply still awaits identity validation before returning a receipt.
 - **Raw forks vs. request observations vs. public read pages**: Each carries different lifetimes, payload shapes, and identity/authorization checks; consolidating read/runtime layers must preserve exact identity across dispatch awaits and preserve fragment offsets across page budgets.
+
+On macOS the service, registry, and permission mutexes reserve the old socket
+addresses as well as a shared short address. A liveness probe alone would leave
+an interval in which an older process could bind the same namespace. Publish
+the lock directory with its process marker already present. Recovery removes
+only the marker for a confirmed dead process, so it cannot remove a successor
+that has already published its own marker.
