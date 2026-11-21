@@ -2,6 +2,17 @@
 
 Expose native local [Pi](https://github.com/earendil-works/pi) coding-agent sessions to external MCP agents (ChatGPT/Dots, Claude Desktop/Code/Duet, Cursor, Grok, or Pi itself) with owner-controlled permissions, low-token tool design, and single-writer safety on **Linux and macOS**.
 
+```text
+ChatGPT / Dots (MCP 2026-07-28 + webhooks) ──HTTP──┐
+                                                   ▼
+Claude / Cursor / Grok (MCP 2025-11-25) ──stdio─► Pi MCP Bridge (13 layered tools, 7-right policy)
+                                                   │
+                 ┌─────────────────────────────────┼────────────────────────────────┐
+                 ▼                                 ▼                                ▼
+      Bridge-owned Pi RPC                 Live Pi TUI Companion           External Extension Modules
+  (cold-start / Herdr on Linux)      (share active terminal + /bridge-join)  (Magic Context, Intercom…)
+```
+
 ## Why Pi MCP Bridge?
 
 Most coding-agent MCP wrappers are stateless CLI spawners that dump full transcripts into context and cannot coexist with a live terminal session. Pi MCP Bridge instead gives external agents:

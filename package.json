@@ -1,9 +1,26 @@
 {
   "name": "pi-mcp-bridge",
   "type": "module",
-  "version": "0.8.0-dev.31",
+  "version": "0.8.0-dev.33",
   "description": "Permissioned MCP access to native Pi sessions with single-writer coordination.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XWIlluDelu/pi-mcp-bridge.git"
+  },
+  "homepage": "https://github.com/XWIlluDelu/pi-mcp-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/XWIlluDelu/pi-mcp-bridge/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "pi",
+    "pi-coding-agent",
+    "ai-agent",
+    "coding-agent",
+    "bridge"
+  ],
   "bin": {
     "pi-mcp-bridge": "./bin/pi-mcp-bridge.mjs"
   },

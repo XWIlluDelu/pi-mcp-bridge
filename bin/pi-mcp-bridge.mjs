@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { readOwnerConfig, registryDirectory } from '../src/core/owner-config.mjs';
 import { loadHttpConfig } from '../src/mcp/http-config.mjs';
 import { assertNativeDirectory, assertPrivateDirectory, ifMissing } from '../src/core/storage.mjs';
+import { privateDirectory } from '../src/runtime/attachments.mjs';
 import { resolvePiLaunch } from '../src/runtime/pi-installation.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -80,8 +81,22 @@ export async function initConfig(args = []) {
   const sessionsDir = await canonicalEnsureDir(sessionsInput, 0o700);
   const stateDir = await canonicalEnsureDir(path.resolve(flags.state ?? defaultStateDir()), 0o700);
 
+  // Unix domain socket paths are capped at 104 bytes on macOS (108 on Linux).
+  // If stateDir/ipc would exceed the 100-byte safety ceiling, pick a short private attachmentDir.
+  let attachmentDir;
+  const defaultIpc = path.join(stateDir, 'ipc');
+  if (Buffer.byteLength(path.join(defaultIpc, '2147483647-12345678.sock')) > 100) {
+    const shortHomeIpc = path.join(os.homedir(), '.pi-mcp-ipc');
+    const candidate =
+      Buffer.byteLength(path.join(shortHomeIpc, '2147483647-12345678.sock')) <= 100
+        ? shortHomeIpc
+        : path.join('/tmp', `pm-ipc-${process.getuid?.() ?? 'u'}`);
+    attachmentDir = await canonicalEnsureDir(candidate, 0o700);
+  }
+
   const config = {
     stateDir,
+    ...(attachmentDir ? { attachmentDir } : {}),
     sessionRoots: [sessionsDir],
     folders: [{ path: project }],
     defaults: {
@@ -239,7 +254,13 @@ export async function runDoctor(args = []) {
       record('tui-companion', false, `could not read ${settingsFile} (optional)`, true);
     }
 
-    record('attachmentDir', true, registryDirectory(config));
+    const ipcDir = registryDirectory(config);
+    try {
+      await privateDirectory(ipcDir);
+      record('attachmentDir', true, ipcDir);
+    } catch (error) {
+      record('attachmentDir', false, `${ipcDir}: ${error.code ?? error.message}`);
+    }
   }
 
   const ok = checks.every((c) => c.status !== 'fail');
@@ -259,9 +280,21 @@ function forward(script, scriptArgs) {
   const child = spawn(process.execPath, [path.join(ROOT, 'src', script), ...scriptArgs], {
     stdio: 'inherit',
   });
+  const onSigint = () => child.kill('SIGINT');
+  const onSigterm = () => child.kill('SIGTERM');
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
   child.once('exit', (code, signal) => {
+    process.off('SIGINT', onSigint);
+    process.off('SIGTERM', onSigterm);
     process.exitCode = code ?? (signal ? 1 : 0);
   });
+}
+
+function requireArgs(args, min, hint) {
+  if (args.length < min || args.slice(0, min).some((a) => !a || a.startsWith('--'))) {
+    throw new Error(`Missing required arguments.\nUsage: pi-mcp-bridge ${hint}`);
+  }
 }
 
 function usage() {
@@ -278,23 +311,28 @@ Usage:
   pi-mcp-bridge reset <owner.json> <session_id> --confirm-local-closed`);
 }
 
-async function main() {
-  const [command, ...rest] = process.argv.slice(2);
+export async function runCli(argv = process.argv.slice(2)) {
+  const [command, ...rest] = argv;
   switch (command) {
     case 'init':
       return initConfig(rest);
     case 'doctor':
       return runDoctor(rest);
     case 'stdio':
+      requireArgs(rest, 1, 'stdio <owner.json>');
       return forward('server.mjs', rest);
     case 'http':
+      requireArgs(rest, 1, 'http <owner.json>');
       return forward('http-server.mjs', rest);
     case 'proxy':
+      requireArgs(rest, 1, 'proxy <owner.json>');
       return forward('stdio-proxy.mjs', rest);
     case 'open':
+      requireArgs(rest, 2, 'open <owner.json> <session_id>');
       return forward('open.mjs', rest);
     case 'release':
     case 'reset':
+      requireArgs(rest, 2, `${command} <owner.json> <session_id>`);
       return forward('owner-runtime.mjs', [rest[0], command, ...rest.slice(1)]);
     case '-h':
     case '--help':
@@ -302,14 +340,12 @@ async function main() {
       usage();
       return;
     default:
-      console.error(`Unknown command: ${command}\n`);
-      usage();
-      process.exitCode = 1;
+      throw new Error(`Unknown command: ${command}`);
   }
 }
 
 if (import.meta.main) {
-  main().catch((error) => {
+  runCli().catch((error) => {
     console.error(error.message ?? error);
     process.exitCode = 1;
   });
