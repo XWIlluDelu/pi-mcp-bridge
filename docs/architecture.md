@@ -3,21 +3,24 @@
 ## System shape
 
 ```text
-MCP clients ──stdio──► server.mjs ────────┐
-(Dot/Duet/Grok) ─HTTP─► http-server.mjs ──┼──► protocol.mjs / batch.mjs
-stdio-only ──► stdio-proxy.mjs ──HTTP─────┘              │
-                                                         ▼
-                                               Bridge (bridge.mjs)
-                                    bridge-read · bridge-mutations · bridge-local
-                                    permissions · read-cache · submissions · events
-                                                         │
-                     ┌───────────────────────────────────┼───────────────────────────────┐
-                     │                                   │                               │
-                     ▼                                   ▼                               ▼
-          Bridge-owned Pi RPC                  Companion extension                Optional integrations
-        (rpc.mjs + rpc-observer.mjs)      (attach-extension.mjs / companion.mjs)   (integrations/*)
-                     └────────── single-writer registry (attachments.mjs) ───────────────┘
-                                              Native Pi JSONL files
+CLI / Onboarding ──► bin/pi-mcp-bridge.mjs (init · doctor · stdio · http · proxy · open · release · reset)
+
+MCP clients ──stdio──► server.mjs ────────┐  MCP 2026-07-28 (per-request)
+(Dots/Claude/Grok) ─► http-server.mjs ────┼──► protocol.mjs / batch.mjs
+stdio-only ──► stdio-proxy.mjs ──HTTP─────┘  & 2025-11-25..2024-11-05 (initialize)
+                                                          │
+                                                          ▼
+                                                Bridge (bridge.mjs)
+                                     bridge-read · bridge-mutations · bridge-local
+                                     permissions · read-cache · submissions · events
+                                                          │
+                      ┌───────────────────────────────────┼───────────────────────────────┐
+                      │                                   │                               │
+                      ▼                                   ▼                               ▼
+           Bridge-owned Pi RPC                  Companion extension                Optional integrations
+         (rpc.mjs + rpc-observer.mjs)      (attach-extension.mjs / companion.mjs)   (integrations/*)
+                      └────── single-writer registry (attachments.mjs, Linux/macOS) ──────┘
+                                               Native Pi JSONL files
 ```
 
 Bridge never writes to a session file alongside another live Pi process. Each session has at most one live writer (a Bridge-owned Pi RPC child, a user's TUI/RPC companion, or an embedded SDK/RPC host), coordinated through the shared owner registry. Reads never start Pi.
@@ -28,8 +31,9 @@ Runnable entry points and Pi extensions stay at top-level `src/` paths (so syste
 
 | Directory / Entry                   | Modules                                                                                                                                                                                                                                                                                                                                         | Responsibility                                                                                                                                                                                  |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`bin/` (CLI)**                    | `pi-mcp-bridge.mjs`                                                                                                                                                                                                                                                                                                                             | Onboarding (`init`, `doctor`) and unified command wrapper (`stdio`, `http`, `proxy`, `open`, `release`, `reset`)                                                                                |
 | **`src/` (entry points)**           | `server.mjs`, `http-server.mjs`, `stdio-proxy.mjs`, `attach-extension.mjs`, `owner-permissions-extension.mjs`, `open.mjs`, `owner-runtime.mjs`                                                                                                                                                                                                  | Direct stdio MCP server, shared HTTP MCP server, stdio-to-HTTP proxy, Pi TUI/RPC companion, TUI permission menu, terminal handoff launcher, owner-local release/reset CLI                       |
-| **`src/mcp/`**                      | `protocol.mjs`, `protocol-stdio.mjs`, `http-config.mjs`, `tool-schemas.mjs`, `schema.mjs`, `batch.mjs`, `response-budget.mjs`                                                                                                                                                                                                                   | Per-request MCP `2026-07-28` dispatch, Zod tool schemas, batch lane ordering, exact UTF-8 & duplicated wire budgeting                                                                           |
+| **`src/mcp/`**                      | `protocol.mjs`, `protocol-stdio.mjs`, `http-config.mjs`, `tool-schemas.mjs`, `schema.mjs`, `batch.mjs`, `response-budget.mjs`                                                                                                                                                                                                                   | Dual MCP dispatch (`2026-07-28` per-request + `2025-11-25`..`2024-11-05` initialize), 13 layered Zod tool schemas, batch lane ordering, exact UTF-8 & duplicated wire budgeting                 |
 | **`src/core/`**                     | `bridge.mjs`, `bridge-read.mjs`, `bridge-mutations.mjs`, `bridge-local.mjs`, `permissions.mjs`, `owner-config.mjs`, `storage.mjs`, `data.mjs`, `submissions.mjs`, `errors.mjs`, `diagnostics.mjs`, `kernel-lock.mjs`, `lf-lines.mjs`                                                                                                            | Request policy snapshots, session lanes & automatic release, read/mutation/local handoff, 7-right permission resolution, JSONL discovery & storage, late-ACK receipts, error codes, diagnostics |
 | **`src/read/`**                     | `context-read.mjs`, `read-render.mjs`, `read-navigation.mjs`, `read-cache.mjs`, `read-snapshots.mjs`, `read-schema.mjs`, `read-adapters.mjs`, `read-features.mjs`, `context-observation.mjs`, `live-message.mjs`, `runtime-events.mjs`, `session-metadata.mjs`                                                                                  | Native projection selection, sanitization, code-point paging & rendering, preview rows & ref expansion, frozen LRU snapshot cache, runtime request observation, live streaming tail             |
 | **`src/compat/` & `integrations/`** | `compatibility.mjs`, `compatibility-services.mjs`, `session-readers.mjs`, `integrations/magic-context/`, `integrations/intercom/`                                                                                                                                                                                                               | External module loader/lifecycle, input-mapping & session-reader service ports, optional extension adapters                                                                                     |
@@ -75,10 +79,9 @@ The writer claim remains in force through interface mismatches. See
 Run `npm test` and `npm run format:check`. Tests use temporary native stores,
 isolated agent environments and synthetic providers without credentials or paid
 endpoints. CI runs both commands on Node 22 and 26 for pushes and pull requests
-targeting `main`. Local development uses the same checks. Native subprocess and
-PTY checks require `script`, and the service-unit check requires `systemd-analyze`.
-The test environment must permit Unix sockets and preserve the Linux file
-ownership needed by the storage-integrity checks.
+targeting `main`. Local development uses the same checks. Native PTY checks
+require `script`, and the test environment must permit Unix sockets and preserve
+POSIX file ownership needed by storage-integrity checks (Linux and macOS).
 
 Module tests live beside their implementations under `integrations/`.
 
@@ -88,7 +91,7 @@ Pi is an external test dependency. Tests use PATH or an explicit installation:
 BRIDGE_TEST_PI_CLI=/absolute/path/to/pi npm test
 ```
 
-The optional real Herdr check needs a working user-systemd bus:
+The optional real Herdr check requires Linux with a working user-systemd bus:
 
 ```sh
 BRIDGE_TEST_HERDR=/absolute/path/to/herdr node --test test/herdr-runtime.test.mjs
@@ -99,8 +102,9 @@ opt-in check. `npm audit` checks dependency advisories separately.
 
 ## Operational boundaries
 
-The cooperative registry requires one machine, a shared canonical IPC directory
-and compatible Linux PID/network namespaces. Unregistered writers need host
+The cooperative registry requires one machine and a shared canonical IPC
+directory (plus shared PID/network namespaces on Linux; macOS uses private Unix
+socket locks and `sysctl`/`ps` process identity). Unregistered writers need host
 coordination before reopening; see [runtime](runtime.md). The HTTP backend uses
 an owner-local token, with public authentication supplied by a tunnel; see
 [transports](transports.md).

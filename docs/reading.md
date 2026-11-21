@@ -1,36 +1,35 @@
 # Reading a Pi session
 
 `read({session_id})` selects the last three input turns. Set `range.recent` for
-more history, use `search` to locate evidence, or expand a result's refs.
+more history, pass `query` to search for evidence, or expand a result's refs.
 
 The default source is an applicable [session reader](compatibility.md#session-specific-read-routing)
 or Pi's native projection. `view:"session"` selects **Session Context**, the
 effective context at a native leaf after compaction and context edits.
-`view:"runtime"` selects a captured provider-request stage. Both tools require
-`read` and work without starting Pi.
+`view:"runtime"` selects a captured provider-request stage. All modes require
+`read` permission and work without starting Pi.
 
 ## Browse, find and expand
 
-| Tool   | Example                                                                    |
-| ------ | -------------------------------------------------------------------------- |
-| Browse | `read({session_id, range:{recent:1}, content:{thinking:3,tool:0}})`        |
-| Find   | `search({session_id, query:"retry policy", content:["assistant","tool"]})` |
-| Expand | `read({refs:[item.ref, related.ref], max_bytes:12000})`                    |
-| Next   | `read({cursor:page.next_cursor, max_bytes:12000})`                         |
+| Action | Example                                                                       |
+| ------ | ----------------------------------------------------------------------------- |
+| Browse | `read({session_id, range:{recent:1}, content:{thinking:3,tool:0}})`           |
+| Search | `read({session_id, query:"retry policy", content:{assistant:-1,tool:-1}})`    |
+| Expand | `read({refs:[item.ref, related.ref], include_images:false, max_bytes:12000})` |
+| Next   | `read({cursor:page.next_cursor, max_bytes:12000})`                            |
 
-`search` matches case-insensitive literal text across the session's selected
-source, including reader titles and previews. Supply a nonempty `query` of up to
-2048 UTF-16 units. Optional `content` limits the kinds searched. Results give
-the query, match count, snippets and refs.
+Passing `query` to `read` matches case-insensitive literal text across the session's selected
+source (defaulting to all turns and all content kinds unless narrowed), including reader titles and previews. Supply a nonempty `query` of up to
+2048 UTF-16 units. Results give the query, match count, snippets, refs, and cursor.
 
 Browse and search accept an optional native `leaf_id`; explicit null selects
-the empty root. Runtime captures use their own leaf. Both tools return preview
+the empty root. Runtime captures use their own leaf. Both browse and search return preview
 rows with `text`, `ref`, source locators and optional titles or related refs.
 A shortened preview carries `truncated:true`. Reader `coverage` counts selection
 before search and pagination, for example `{type:"memory",selected:3,total:12}`.
 
 Expand up to eight refs from one session (including across captures) for frozen source content in original
-order and formatting. Duplicate refs expand once. An `operation` link opens
+order and formatting. Pass `include_images:true` to append referenced image attachments (bounded) as MCP `image` content blocks. Duplicate refs expand once. An `operation` link opens
 a recorded nested tool call. Open a `source_context` link by itself for a fresh
 Session Context read at the verified historical leaf.
 
@@ -61,7 +60,7 @@ boundary rather than a recoverable user message.
 | `tool`          | `1`     | Last N logical tool operations per turn; call and paired result count once.                                                                                         |
 | `summary`       | `2`     | Background summaries, independent of turn range. Native active summaries form one group; positive values include that group. A reader counts its own summary items. |
 | `memory`        | `3`     | Reader memory items in its documented order/scope, independent of turn range. Native Session Context has no memory store.                                           |
-| `system`        | `false` | Native system instructions and sections.                                                                                                                            |
+| `system`        | `false` | Native system instructions, sections, and (on a live owner) discoverable slash `commands`.                                                                          |
 | `command`       | `0`     | Last N native shell command records, independent of turns.                                                                                                          |
 | `native`        | `true`  | Other native/custom context in selected turns and global prefixes.                                                                                                  |
 
@@ -112,7 +111,7 @@ SDK before transfer. Fork requests use a separate [raw snapshot](runtime.md#read
 Expanded pages (`presentation:"source"`) preserve the captured leaf, entry,
 message and block positions, and `prompt_id`.
 
-- Images retain MIME type with `data_omitted:true`.
+- Images retain MIME type with `data_omitted:true` in JSON text; expanding `refs` with `include_images:true` appends bounded image bytes as MCP `image` content blocks.
 - Assistant blocks retain termination status. Shared errors can appear as
   `message_metadata`. Internal signatures, response IDs and provider usage
   are removed. Tool arguments and business details survive.
@@ -172,4 +171,4 @@ search. Captures have no inactivity timeout.
 Its tail is limited to 65,536 UTF-16 units including block overhead. It is
 sampled with history on the first read. Cursor and explicit-leaf reads carry
 no moving preview. `runtime_events` carries bounded owned-RPC extension
-errors and notifications outside native history.
+errors, notifications, and auto-cancelled extension UI dialog details (`ui_cancelled`) outside native history.

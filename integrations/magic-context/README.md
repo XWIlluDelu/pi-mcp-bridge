@@ -1,7 +1,9 @@
 # Magic Context reader
 
-This optional reader uses Node's built-in `node:sqlite` to read Magic Context's
-stored summaries and memories. Configure its module and database explicitly.
+This standalone, zero-dependency optional reader uses only Node.js built-ins
+(including `node:sqlite`, with zero imports from Bridge internals) to read Magic
+Context's stored summaries and memories. Configure its module (file or directory
+path) and database explicitly:
 
 ```json
 {

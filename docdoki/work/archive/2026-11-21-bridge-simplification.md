@@ -11,7 +11,9 @@ status: ready-for-review
 
 # Bridge simplification
 
-Preserve the external-agent workflows in [Northstar](../northstar.md). The
+> **Archived (2026-11-21):** Historical record of the `0.8.0-dev.27`–`0.8.0-dev.30` simplification passes (under the earlier 15-tool / Linux-only / single-protocol baseline). Durable state-ownership boundaries were routed to [[state-ownership]]; subsequent architecture and interface changes live in [[overview]] and [[northstar]].
+
+Preserve the external-agent workflows in [Northstar](../../northstar.md). The
 original review inspected `b3c6ed9` and is available in Git at `578f7de`.
 The first implementation started from `5dc7c53`. The initial deletion pass
 started at `0eb95b7`. The follow-up started at `e779cb2`, with a clean
@@ -241,5 +243,5 @@ preserve fragment offsets when the page budget changes.
 ## Publication
 
 `auto-dev` uses the current `0.8.0-dev.N` series and local verification.
-[CI](../../.github/workflows/ci.yml) runs for `main`. A main release uses the
+[CI](../../../.github/workflows/ci.yml) runs for `main`. A main release uses the
 plain version from `package.json` with a matching tag.

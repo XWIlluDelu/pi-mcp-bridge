@@ -1,7 +1,7 @@
 # Model discovery and native controls
 
-Use `models` to discover choices, `list` for the live selection, and `set_model`
-to change it without submitting input. See [owner capabilities](runtime.md#runtime-capabilities).
+Use `models` to discover choices, `list_sessions` for the live selection, and `update_session`
+to change model, thinking level, or display name without submitting input. See [owner capabilities](runtime.md#runtime-capabilities).
 
 ## Session-independent model catalog
 
@@ -21,17 +21,20 @@ limit to 30 (range 1–100). Rows expose `provider`, `id`, `name`, `input`,
 the catalog at request time. A helper failure returns `MODEL_CATALOG_UNAVAILABLE`
 with `catalog_stage` and `catalog_reason` in [diagnostics](configuration.md#diagnostics).
 
-## Standalone selection: `set_model`
+## Standalone selection and rename
+
+`update_session` changes model, thinking level, or display name without submitting input:
 
 ```json
 {
   "session_id": "ps_…",
   "model": { "provider": "provider-id", "id": "model-id" },
-  "thinking_level": "high"
+  "thinking_level": "high",
+  "name": "Auth refactor"
 }
 ```
 
-Requires `send` and at least one setting. Success returns the actual selection:
+Requires `send` and at least one of `model`, `thinking_level`, or `name`. Passing only `name` renames the session (without starting Pi if saved). Model/thinking success returns the actual selection:
 
 ```json
 {
@@ -51,7 +54,7 @@ Explicit native launch overrides take precedence.
 
 An ACK timeout can leave a partial change. Owned RPCs track late ACKs and
 attached setters stay fenced until the native call settles. Inspect
-`list.status` before trying another selection.
+`list_sessions` status before trying another selection.
 
 ## Prompt model and thinking settings
 
@@ -64,7 +67,7 @@ attached setters stay fenced until the native call settles. Inspect
 }
 ```
 
-Send and create accept either setting, including create's first prompt, together with required text or images:
+`send` and `create_session` accept either setting, including `create_session`'s first prompt, together with required text or images:
 
 - Model only: preserve current effort, using Pi's native compatible fallback if unsupported by the new model.
 - Thinking only: validate and set the level on the current model.
@@ -74,10 +77,10 @@ Send and create accept either setting, including create's first prompt, together
 Levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`, restricted
 to the target's supported set. Unsupported explicit levels return
 `THINKING_LEVEL_UNSUPPORTED`; unknown support returns `THINKING_SUPPORT_UNKNOWN`.
-This prompt-specific validation differs from standalone `set_model`, which
+This prompt-specific validation differs from standalone `update_session`, which
 returns Pi's actual selection after native clamping.
 
-On a Bridge-owned RPC, explicit prompt settings require a proven-idle session with no pending input (busy work returns `MODEL_SELECTION_BUSY`, `idle_only` skips without changes, unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`). On companions and hosts with `set_model` support, Bridge applies standalone model selection first and then submits the prompt (hosts without `set_model` return `MODEL_SELECTION_UNSUPPORTED`). Plain queued sends use native settings when consumed.
+On a Bridge-owned RPC, explicit prompt settings require a proven-idle session with no pending input (busy work returns `MODEL_SELECTION_BUSY`, `idle_only` skips without changes, unconfirmed idle returns `MODEL_SELECTION_IDLE_UNCONFIRMED`). On companions and hosts with owner `set_model` support, Bridge applies standalone model selection first and then submits the prompt (hosts without `set_model` return `MODEL_SELECTION_UNSUPPORTED`). Plain queued sends use native settings when consumed.
 
 Settings and input are separate native commands. Bridge rechecks identity, admission and selected values before dispatch; it refuses a conflicting local change instead of restoring earlier settings. Settings-bearing input omits native queue behavior, so a hook starting concurrent work causes refusal. Pi offers no atomic settings-plus-input transaction or per-message settings binding: an earlier setting can remain after a later failure. Native image processing follows the [send/create image contract](api.md#image-input-send-and-create).
 
@@ -86,14 +89,17 @@ Explicit settings add `model_selection:{model:{provider,id},thinking_level}` onl
 ### Prompt settings timeout
 
 A timed-out setter fences further input until its ACK and identity are checked.
-The pending prompt is never submitted later. Inspect `list.status` and history
+The pending prompt is never submitted later. Inspect `list_sessions` status and history
 for any partial change.
 
-## Manual compaction: `compact`
+## Manual compaction
+
+`maintain_session({action:"compact"})` compacts a session's native context:
 
 ```json
 {
   "session_id": "ps_…",
+  "action": "compact",
   "instructions": "Preserve decisions and open questions"
 }
 ```
@@ -111,11 +117,11 @@ explicit interrupt: it reports `COMPACT_BUSY` for observed busy work or
 `COMPACT_IDLE_UNCONFIRMED` otherwise. Custom hosts may supply their own atomic
 gate; a missing callback returns `COMPACT_UNSUPPORTED`.
 
-Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate stop where supported to cancel ongoing compaction; ordinary companions do not support remote stop-all.
+Explicit `interrupt:true` additionally requires `stop` and invokes native abort-before-compaction. The agent may be interrupted even if summarization fails. This does not withdraw queued messages. Use native cancellation or a separate `stop` where supported to cancel ongoing compaction.
 
 `status:"completed"` confirms that native compaction finished. The result includes `first_kept_entry_id`, `tokens_before` and nullable `estimated_tokens_after`; read permission is required for the native summary. Optional instructions are at most 100000 UTF-16 units. If the five-second acknowledgement budget expires after dispatch, the result is `status:"unknown"` with `reason:"ACK_TIMEOUT"`. Native compaction can finish after the caller stops waiting. Attached operations retain their input fence until the native callback or controller Promise settles.
 
-The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect list/read; a new call performs another compaction.
+The supplied RPC binding reports `HOST_COMPACT_UNCERTAIN` when its plain native Error cannot distinguish rejection from a lost acknowledgement. SDK and companion callbacks can report definite failure. After an unknown result, inspect `list_sessions`/`read`; a new call performs another compaction.
 
 For owned RPC, a `PI_REJECTED` result may include one of three allowlisted `native_reason` values: `Nothing to compact (session too small)`, `Already compacted`, or `Compaction cancelled`. Other native/provider/extension messages are omitted. Small sessions can be refused before the compaction hook because Pi retains a configured recent-token window and needs older content to summarize.
 

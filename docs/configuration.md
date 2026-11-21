@@ -9,8 +9,7 @@ The Bridge rejects unsafe configuration files without changing their permissions
 
 ## Configure one project
 
-Start from the example copied in the [local setup](../README.md#start-locally).
-For a project such as `/home/example/project`, edit these fields together:
+The fastest way to bootstrap a private owner config is `pi-mcp-bridge init --project /home/example/project` followed by `pi-mcp-bridge doctor` (see [Quick start](../README.md#quick-start-linux--macos)). To configure manually from [the example](../deploy/owner.example.json), edit these fields together:
 
 1. Choose `stateDir` for Bridge's private state, separate from native session
    storage. Leave `attachmentDir` unset to use `stateDir/ipc`, or choose a shared
@@ -59,7 +58,7 @@ Unknown keys reject.
 
 | Key                       | Meaning                                                                                                                  |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete) and service-exclusivity namespace.                           |
+| `stateDir`                | Private Bridge state, [trash recovery index](api.md#delete-session-delete_session) and service-exclusivity namespace.    |
 | `sessionRoots`            | Nonempty array of absolute native session-storage directories.                                                           |
 | `folders`                 | Configured creation targets, each `{path}` with an absolute project cwd. Inclusion grants no rights.                     |
 | `defaults`                | Default rights as booleans or `null`. Omitted and null rights deny.                                                      |
@@ -143,10 +142,10 @@ extensions can access files, shell and network: denying the direct Bridge
 
 ### Herdr process placement
 
-With `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
+On Linux with `"herdr":true`, Bridge checks PATH then `~/.local/bin/herdr` for new RPC
 writers so remote agents drive Pi inside Herdr just like local Herdr usage.
 Bridge starts the local Herdr daemon on demand without restarting an existing
-daemon or changing service enablement/linger. If Herdr is missing, unavailable,
+daemon or changing service enablement/linger. On macOS, or on Linux if Herdr is missing, unavailable,
 incompatible, or user-systemd is unavailable before a pane is launched, Bridge
 silently falls back to direct Pi startup so core sessions continue working. If
 failure occurs after a Herdr worker launch has already started, Bridge aborts
@@ -162,7 +161,7 @@ and deletion of the allocated worker/tool scope.
 ### Native control permissions
 
 [Model controls](model-control.md) lists rights for model selection, prompt
-settings, compaction and catalog access. Reload uses `send`.
+settings, compaction and catalog access. `update_session` and `maintain_session` (`compact`/`reload`) use `send` (`compact` with `interrupt:true` also requires `stop`).
 
 ## Seven independent rights
 
@@ -232,7 +231,7 @@ changes. It neither starts Pi nor writes history.
 
 ## Startup and deployment
 
-[The user-systemd template](../deploy/pi-mcp-bridge.service) is optional. Set
+[The Linux user-systemd template](../deploy/pi-mcp-bridge.service) is optional. Set
 its paths, environment and stop budget for your installation. Set up the private
 HTTP token and tunnel as described in [transports](transports.md).
 

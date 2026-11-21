@@ -10,14 +10,16 @@ subscribe and react in the subscribing chat through outbound signed HTTPS webhoo
   [transport setup](transports.md).
 - Obtain the target's `session_id` and grant `read`. Sending work separately
   requires `send`; subscription does not grant execution access. For a new task,
-  `create` without input gives you a saved ID to subscribe to before the first send.
+  `create_session` without input gives you a saved ID to subscribe to before the first send.
 - Connect a [supported owner](#scope-and-completion-meaning).
 - Allow outbound HTTPS from the Bridge host to the ChatGPT-provided callback.
   An authenticated incoming tunnel does not provide this outbound connection.
 
 The normal order is **subscribe, confirm verification, send, receive, unsubscribe**.
 The [calling workflow](api.md#calling-workflow) explains when the
-settlement excerpt is sufficient and when to read further.
+settlement excerpt is sufficient and when to read further. For MCP clients
+without webhook support (Claude Desktop/Code, Cursor, Grok, etc.), pass bounded
+`wait_ms` (0–30000 ms) to `send`, `create_session`, or `list_sessions` instead.
 
 ## Scope and completion meaning
 

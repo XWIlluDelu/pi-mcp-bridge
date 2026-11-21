@@ -18,11 +18,7 @@ for stored summaries and project memory. Native reading works without modules.
 }
 ```
 
-The list defaults to empty. Entries accept an absolute ESM `module` path,
-`enabled` (default true) and module-specific `options` object. Disabled modules
-are not imported. Changes require service restart and appear in
-[`health.restart_required`](configuration.md#request-permission-snapshots).
-Duplicate paths and active module IDs reject.
+The list defaults to empty. Entries accept an absolute ESM `module` path (file or directory containing `index.mjs`), `enabled` (default true) and module-specific `options` object. External modules need zero imports from Bridge internals. Disabled modules are not imported. Changes require service restart and appear in [`health.restart_required`](configuration.md#request-permission-snapshots). Duplicate paths and active module IDs reject.
 
 After restarting, read a session that uses the extension. An applicable
 session reader reports `view:"adapted"` and `reader.id`.
@@ -82,16 +78,9 @@ export default {
 };
 ```
 
-`matches` and `read` may be asynchronous. Both receive the session's Bridge ID,
-canonical file, native ID and recorded cwd in `session`, live registration
-evidence in `owner`, and parsed args in `request`. The reader may also use
-stored evidence tied to the session. RPC hosts supply extension commands and
-leaf ID. SDK hosts and companions can include tool registrations.
+`matches` and `read` may be asynchronous. Both receive the session's Bridge ID, canonical file, native ID and recorded cwd in `session`, live registration evidence in `owner`, parsed args in `request`, and normalized `{ range, content }` in `selection` (so external modules never import Bridge internals). The reader may also use stored evidence tied to the session. RPC hosts supply extension commands and leaf ID. SDK hosts and companions can include tool registrations.
 
-A match selects the default source for read and search. Explicit
-`view:"session"` and `view:"runtime"` select native sources. Readers handle
-selection and source-specific request limits. Turn range controls the native
-portion independently of stored summaries and memory.
+Multiple independent readers may match the same session and compose their items and coverage automatically (with item IDs namespaced by reader ID). A reader may opt into `exclusive: true` if it cannot coexist with another reader (`SESSION_READER_CONFLICT`). Explicit `view:"session"` and `view:"runtime"` always select native sources.
 
 ## Reader content contract
 
@@ -130,8 +119,4 @@ A verified historical endpoint can supply `source_entry_id` and
 `source_context` ref at that native leaf. Other extension coordinates
 remain provenance as supplied.
 
-Each fresh read selects a reader once. Multiple matches report
-`SESSION_READER_CONFLICT` and reader failures report `SESSION_READER_FAILED`
-(including a safe uppercase module error code in `detail` when available).
-Bridge rechecks native identity before returning the capture. Subsequent
-pages and ordinary refs use that frozen capture and recheck authorization.
+Each fresh read selects matching readers once. Multiple non-exclusive readers compose in configuration order; conflicting `exclusive: true` matches report `SESSION_READER_CONFLICT`, and reader failures report `SESSION_READER_FAILED` (including a safe uppercase module error code in `detail` when available). Bridge rechecks native identity before returning the capture. Subsequent pages and ordinary refs use that frozen capture and recheck authorization.

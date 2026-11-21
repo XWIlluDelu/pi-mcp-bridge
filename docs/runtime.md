@@ -11,12 +11,15 @@ A **session** is a saved native Pi history. Its **owner** is the process permitt
 
 ## Ownership and cooperating writers
 
-Every cooperating process uses the same canonical private registry and Linux
-PID/network namespaces. A writer claim binds a canonical file to a PID, process
-start time and boot ID. Native ID, generation and socket bind its endpoint.
-Live or uncertain claims block new writers through socket loss and component
-mismatches. The short registry mutex is released by process exit independently
-of the writer claim.
+Every cooperating process uses the same canonical private registry on the same
+host (and shared Linux PID/network namespaces on Linux). A writer claim binds a
+canonical file to a verified process identity: PID, process start time, and
+system boot time (`/proc` + boot ID on Linux; `sysctl`/`ps` + `kern.boottime` on
+macOS). Native ID, generation and socket bind its endpoint. Live or uncertain
+claims block new writers through socket loss and component mismatches. The short
+registry mutex (abstract Unix socket on Linux; private Unix socket file with
+live-peer probe and stale-socket reaping on macOS) is released by process exit
+independently of the writer claim.
 
 A matching native reload or switch may retire only its own context after draining
 mutations and closing the old listener. The shutdown reason, previous file and
@@ -32,21 +35,22 @@ close before reopening. See [component versions](architecture.md#component-versi
 
 ## Runtime capabilities
 
-| Capability              | Bridge-owned RPC                     | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
-| ----------------------- | ------------------------------------ | ----------------------------------------------------- | --------------------------------------- |
-| Read context            | Session + runtime                    | Session + runtime                                     | Session projection; runtime unavailable |
-| Live text/thinking      | Cumulative extension events          | Cumulative extension events                           | When supplied by the host               |
-| Send text/images        | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
-| `idle_only` send        | Native admission check               | Native admission gate                                 | SDK gate; unsupported by RPC binding    |
-| Standalone `set_model`  | Native setters; busy supported       | Public setters; busy supported                        | Native setters; busy supported          |
-| Prompt + model/thinking | Proven-idle only                     | Supported via `set_model` then `send`                 | Supported via `set_model` then `send`   |
-| Native command / stop   | Including queued-input withdrawal    | Unsupported                                           | Yes                                     |
-| Manual compact          | Idle by default; explicit interrupt  | Idle with admission gate; explicit interrupt          | SDK idle gate; RPC explicit interrupt   |
-| Reload                  | Idle refresh through owned lifecycle | Native resource reload when idle                      | SDK native reload; RPC host callback    |
-| TUI handoff             | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
-| Completion events       | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
+| Capability                   | Bridge-owned RPC                     | Ordinary TUI/RPC companion                            | Supplied SDK/RPC host bindings          |
+| ---------------------------- | ------------------------------------ | ----------------------------------------------------- | --------------------------------------- |
+| Read context                 | Session + runtime                    | Session + runtime                                     | Session projection; runtime unavailable |
+| Live text/thinking           | Cumulative extension events          | Cumulative extension events                           | When supplied by the host               |
+| Send text/images             | Native ACK                           | Confirmed dispatch; admission unobservable            | Native RPC ACK or SDK dispatch evidence |
+| `idle_only` send             | Native admission check               | Native admission gate                                 | SDK gate; unsupported by RPC binding    |
+| Standalone `update_session`  | Native setters + rename; busy OK     | Public setters + rename; busy OK                      | Native setters; busy supported          |
+| Prompt + model/thinking      | Proven-idle only                     | Supported via `set_model` then `send`                 | Supported via `set_model` then `send`   |
+| Native command (`!`/`!!`)    | Yes (`exclude_from_context`)         | Unsupported                                           | Yes                                     |
+| Remote `stop`                | Agent, bash, and queued withdrawal   | Agent/bash + queue withdrawal (or `ctx.abort`)        | Yes                                     |
+| `maintain_session` (compact) | Idle by default; explicit interrupt  | Idle with admission gate; explicit interrupt          | SDK idle gate; RPC explicit interrupt   |
+| `maintain_session` (reload)  | Idle refresh through owned lifecycle | Native resource reload when idle                      | SDK native reload; RPC host callback    |
+| TUI handoff                  | Drain, normal EOF, reserved join     | Local `/bridge-join`; cold resume after graceful quit | Host controls lifecycle                 |
+| Completion events            | Native settlement                    | Native settlement with the owner profile              | Unsupported                             |
 
-Check `list.status.capabilities` for the current writer. A custom host may
+Check `list_sessions` (`status.capabilities`) for the current writer. A custom host may
 declare `supportsIdleOnly:true` when its submit callback fences new input
 and observes asynchronous preparation. The supplied RPC binding returns
 `HOST_ADMISSION_UNSUPPORTED` because a state sample cannot enforce idle admission.
@@ -130,7 +134,7 @@ use an owner profile for scoped daily access and [completion events](events.md).
 
 Apply a new extension setting to a running TUI with `/reload`, or reopen through
 its host. Registration follows native file open. To open a session another
-writer owns, use handoff or shared control. [Session status](api.md#list) shows
+writer owns, use handoff or shared control. [Session status](api.md#list-sessions-list_sessions) shows
 `saved` when Bridge finds no cooperating live owner.
 
 ## Host registration lifecycle
@@ -162,6 +166,8 @@ See the [SDK and RPC integration examples](../test/host-integration.test.mjs).
 With the owner Bridge running:
 
 ```sh
+pi-mcp-bridge open /absolute/path/owner.json ps_SESSION_ID
+# or directly:
 node src/open.mjs /absolute/path/owner.json ps_SESSION_ID
 ```
 
@@ -195,6 +201,8 @@ the reservation until confirmed closure or exact requester exit.
 Release a Bridge-owned writer before using the file with an unregistered Pi:
 
 ```sh
+pi-mcp-bridge release /absolute/path/owner.json ps_SESSION_ID
+# or directly:
 node src/owner-runtime.mjs /absolute/path/owner.json release ps_SESSION_ID
 ```
 
@@ -210,6 +218,8 @@ owner confirms local closure. A cancelled join preserves the pause. To reset it,
 close any local writer using the file and run:
 
 ```sh
+pi-mcp-bridge reset /absolute/path/owner.json ps_SESSION_ID --confirm-local-closed
+# or directly:
 node src/owner-runtime.mjs /absolute/path/owner.json reset ps_SESSION_ID --confirm-local-closed
 ```
 

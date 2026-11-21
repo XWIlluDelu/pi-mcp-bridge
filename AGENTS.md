@@ -1,9 +1,12 @@
 # Development principles
 
-This is an early-stage project. Support only the current per-request MCP
-protocol and the current Bridge control protocol. Judge live compatibility by
-the wire contract and the operation's required capability. Remove obsolete
-protocol versions and their code, fixtures and documentation.
+This is an early-stage project. Support the current per-request MCP protocol
+(`2026-07-28`) alongside standard initialize-based MCP (`2025-11-25` through
+`2024-11-05`) so both modern stateless agents and existing local MCP clients
+work out of the box, and support the current Bridge control protocol across
+Linux and macOS. Judge live owner compatibility by the wire contract and the
+operation's required capability. Remove obsolete Bridge-internal protocol
+versions and their code, fixtures and documentation.
 
 Use `package.json` as the single Bridge product version source. Product releases
 identify components. Owner reads use the explicit contract in `src/read/context-read.mjs`;

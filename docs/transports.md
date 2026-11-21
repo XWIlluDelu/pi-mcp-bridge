@@ -19,7 +19,7 @@ Each line is one UTF-8 JSON-RPC message; stdout contains no logs. Oversized inpu
 
 ### Multiple clients: one HTTP Bridge
 
-Start with the private owner configuration from [Start locally](../README.md#start-locally), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
+Start with the private owner configuration from [Quick start](../README.md#quick-start-linux--macos) (or generate one with `pi-mcp-bridge init --http-port 43123`), with your native session paths and grants already set. Add this top-level field to that file, choosing an unused local port:
 
 ```json
 {
@@ -43,7 +43,7 @@ await writeFile(process.argv[2], randomBytes(32).toString('base64url') + '\n', {
 JS
 ```
 
-Start the service using that owner file:
+Start the service using that owner file (or `pi-mcp-bridge http /absolute/private/path/owner.json`):
 
 ```sh
 node /absolute/path/to/pi-mcp-bridge/src/http-server.mjs /absolute/private/path/owner.json
@@ -89,7 +89,7 @@ JS
 
 A successful response identifies the server as `pi-session-bridge` and includes its version, supported protocol version and capabilities. Discovery does not start a Pi writer or require session grants; it verifies the local endpoint, not native session access. `401 UNAUTHORIZED` means the running service and caller do not share the same token.
 
-The service binds **127.0.0.1** and accepts **POST /mcp**. The owner config must be owned by the service user and not writable by group/other (symlinks and `0644` are allowed). The token file must be a canonical absolute regular file owned by the service user with no group/other access (`0600`); symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
+The service binds **127.0.0.1** and accepts **POST /mcp** (plus **DELETE /mcp** returning `204` for standard MCP clients). `Accept` may include `application/json`, `text/event-stream`, or `*/*`. The owner config must be owned by the service user and not writable by group/other (symlinks and `0644` are allowed). The token file must be a canonical absolute regular file owned by the service user with no group/other access (`0600`); symlinks are rejected. The token contains 32–256 characters from `A-Z a-z 0-9 . _ ~ -`, optionally followed by one newline in its file.
 
 The HTTP service and each stdio proxy load the token once at startup. Replacing
 the file does not revoke the token already loaded by a running service or update
@@ -120,13 +120,18 @@ The proxy reads the same HTTP/token configuration and forwards requests without 
 
 Multiple direct stdio services using the same state directory conflict on the service lock. Use proxies to share one runtime pool.
 
-## Protocol version
+## Protocol versions
 
-Bridge uses MCP `2026-07-28`. Each request includes the protocol version and client capabilities in `params._meta`, as shown in the discovery example above. Clients can also supply `io.modelcontextprotocol/clientInfo` with a name and version. See [per-request metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
+Bridge automatically supports **both**:
 
-Results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same endpoint.
+- **MCP `2026-07-28` (per-request stateless)**: Each request includes protocol version and client capabilities in `params._meta`, uses `server/discover` and `events/*`, returns `resultType:"complete"`, and enforces mirrored HTTP headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`).
+- **Standard MCP (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`)**: Standard `initialize` / `notifications/initialized` handshake plus `ping`, `tools/list`, and `tools/call` on stdio, HTTP, and stdio proxy — with no mandatory `_meta` or `Mcp-Method` headers. HTTP accepts `DELETE /mcp` (`204`) and returns `202` for JSON-RPC notifications.
 
-HTTP requests also require:
+Bridge uses MCP `2026-07-28` when `server/discover`, `events/*`, `params._meta['io.modelcontextprotocol/protocolVersion']`, `MCP-Protocol-Version: 2026-07-28`, or `Mcp-Method` is present. Otherwise it dispatches using the standard MCP envelope.
+
+For `2026-07-28` requests, results include `resultType:"complete"` and server identity metadata. Discovery and tools/list return `ttlMs:0` and `cacheScope:"private"`. [Events](events.md) use the same endpoint.
+
+For `2026-07-28` HTTP requests, Bridge also requires:
 
 | Header                 | Value                        |
 | ---------------------- | ---------------------------- |
@@ -145,9 +150,9 @@ JSON-RPC IDs identify communication exchanges; reusing one does not deduplicate 
 | Budget              | Limit                          | Effect                                                              |
 | ------------------- | ------------------------------ | ------------------------------------------------------------------- |
 | HTTP headers/upload | 10 / 15 seconds                | Bounds incoming request handling.                                   |
-| HTTP response wait  | 35 seconds after parsing       | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues.   |
+| HTTP response wait  | 40 seconds after parsing       | Returns 504 / `REQUEST_WAIT_EXPIRED`; admitted Pi work continues.   |
 | Native/owner ACK    | Internal 5 seconds per request | Does not bound execution or abort admitted work. No tool parameter. |
-| Proxy network wait  | 40 seconds                     | Exceeds the backend response wait.                                  |
+| Proxy network wait  | 45 seconds                     | Exceeds the backend response wait.                                  |
 
 A client or tunnel may impose a shorter deadline. While the service runs, protocol cancellation, HTTP disconnect and proxy exit suppress replies without cancelling admitted calls or later admitted batch items. On stdio, `notifications/cancelled` suppresses that request's subsequent messages. Direct stdio EOF shuts down the owned service. Use `stop` to cancel Pi execution and queues.
 
